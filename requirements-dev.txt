@@ -1,0 +1,18 @@
+-r requirements.txt
+fastapi
+uvicorn[standard]
+pydantic
+pinecone-client
+sentence-transformers
+pytest
+pytest-asyncio
+requests
+python-dotenv
+loguru
+black
+isort
+pre-commit
+ruff
+flake8
+bandit
+mypy

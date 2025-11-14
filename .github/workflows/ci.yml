@@ -23,8 +23,7 @@ jobs:
 
     - name: Install Dependencies
       run: |
-        pip install -r requirements.txt
-        pip install pytest, ruff, black, isort, flake8, bandit, mypy
+        pip install -r requirements-dev.txt
 
     - name: Run Unit Tests
       run: pytest -v
