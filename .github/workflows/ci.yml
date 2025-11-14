@@ -9,6 +9,8 @@ on:
 jobs:
   test-and-quality:
     runs-on: ubuntu-latest
+    env:
+      PINECONE_API_KEY: ${{ secrets.pinecone_api_key }}
 
     steps:
     - name: Checkout Repo
