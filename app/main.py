@@ -1,8 +1,5 @@
 from fastapi import FastAPI
-from app.core.config import settings
+from app.routers.pinecone import router as pinecone_router
 
 app = FastAPI(title="Luxia Worker Service", version="1.0.0")
-
-@app.get("/health")
-async def health():
-    return {"status": "worker running", "service": "Luxia worker"}
+app.include_router(pinecone_router, prefix="/worker", tags=["Pinecone"])

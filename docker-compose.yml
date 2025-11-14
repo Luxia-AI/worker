@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  rag-worker:
+    build: .
+    container_name: rag_worker
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "9000:9000"
