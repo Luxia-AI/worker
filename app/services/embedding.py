@@ -2,6 +2,7 @@ import numpy as np
 
 EMBEDDING_DIM = 1536  # Match Pinecone index dimension
 
+
 def _pad_embedding(embedding):
     """Pad embedding to match Pinecone index dimension."""
     emb_array = np.array(embedding)

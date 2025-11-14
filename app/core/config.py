@@ -1,6 +1,8 @@
-from pydantic_settings import BaseSettings
-from pydantic import ConfigDict
 from typing import Optional
+
+from pydantic import ConfigDict
+from pydantic_settings import BaseSettings
+
 
 class Settings(BaseSettings):
     pinecone_api_key: Optional[str] = None
@@ -12,5 +14,6 @@ class Settings(BaseSettings):
     pinecone_project_id: Optional[str] = None
 
     model_config = ConfigDict(env_file=".env", extra="ignore")
+
 
 settings = Settings()

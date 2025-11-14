@@ -1,8 +1,7 @@
 from pinecone import Pinecone, ServerlessSpec
-from app.core.config import settings
 
-from app.services.llm import _get_model
-from app.services.embedding import _pad_embedding, EMBEDDING_DIM
+from app.core.config import settings
+from app.services.embedding import EMBEDDING_DIM
 
 INDEX_NAME = settings.pinecone_index_name or "rag-research-index-test"  # Default index name
 
@@ -10,12 +9,14 @@ INDEX_NAME = settings.pinecone_index_name or "rag-research-index-test"  # Defaul
 _pc = None
 _index = None
 
+
 def _get_pinecone_client():
     global _pc
     if _pc is None:
         api_key = settings.pinecone_api_key
         _pc = Pinecone(api_key=api_key)
     return _pc
+
 
 def _get_index():
     global _index
