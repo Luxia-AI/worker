@@ -6,7 +6,8 @@ import numpy as np
 # Add parent directory to path so we can import app module
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from app.services.vector_db import insert_dummy_data, retrieve_similar
+from app.services.upsert import insert_dummy_data
+from app.services.retrieval import retrieve_similar
 
 def test_dummy_vector_flow():
     # Mock the Pinecone client and SentenceTransformer
