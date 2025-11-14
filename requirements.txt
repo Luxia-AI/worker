@@ -1,3 +1,4 @@
 pinecone
 sentence_transformers
 pydantic
+pydantic_settings
