@@ -1,0 +1,2 @@
+pinecone
+sentence_transformers
