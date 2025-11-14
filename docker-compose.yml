@@ -1,9 +1,9 @@
 version: "3.9"
 
 services:
-  rag-worker:
+  worker:
     build: .
-    container_name: rag_worker
+    container_name: worker
     restart: always
     env_file:
       - .env
