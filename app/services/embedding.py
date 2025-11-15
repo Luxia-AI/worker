@@ -5,7 +5,7 @@ import numpy as np
 EMBEDDING_DIM: int = 1536  # Match Pinecone index dimension
 
 
-def _pad_embedding(embedding: Any) -> List[float]:
+def _pad_embedding(embedding: Any) -> List[Any]:
     """Pad embedding to match Pinecone index dimension."""
     emb_array = np.array(embedding)
     if len(emb_array) < EMBEDDING_DIM:
