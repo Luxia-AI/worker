@@ -1,4 +1,4 @@
-from typing import Any, List, cast
+from typing import Any, List
 
 import numpy as np
 
@@ -11,4 +11,4 @@ def _pad_embedding(embedding: Any) -> List[Any]:
     if len(emb_array) < EMBEDDING_DIM:
         padding = np.zeros(EMBEDDING_DIM - len(emb_array))
         emb_array = np.concatenate([emb_array, padding])
-    return cast(List[Any], emb_array[:EMBEDDING_DIM].tolist())
+    return emb_array[:EMBEDDING_DIM].tolist()  # type: ignore[no-any-return]
