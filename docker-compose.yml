@@ -1,0 +1,11 @@
+version: "3.9"
+
+services:
+  worker:
+    build: .
+    container_name: worker
+    restart: always
+    env_file:
+      - .env
+    ports:
+      - "9000:9000"
