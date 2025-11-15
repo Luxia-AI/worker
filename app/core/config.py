@@ -1,14 +1,14 @@
-from typing import Optional
+from typing import ClassVar, Optional
 
-from pydantic import ConfigDict, Field
-from pydantic_settings import BaseSettings
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
     pinecone_api_key: Optional[str] = Field(default=None)
     pinecone_index_name: Optional[str] = Field(default=None)
 
-    model_config = ConfigDict(env_file=".env", extra="ignore")
+    model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 settings = Settings()

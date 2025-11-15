@@ -1,9 +1,11 @@
+from typing import Any, Dict, List
+
 from app.services.embedding import _pad_embedding
 from app.services.llm import _get_model
 from app.services.vector_db import _get_index
 
 
-def retrieve_similar(query: str, top_k: int = 3):
+def retrieve_similar(query: str, top_k: int = 3) -> List[Dict[str, Any]]:
     model = _get_model()
     query_embedding = model.encode([query])
     padded_embedding = _pad_embedding(query_embedding[0])

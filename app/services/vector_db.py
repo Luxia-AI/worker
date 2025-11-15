@@ -1,16 +1,18 @@
-from pinecone import Pinecone, ServerlessSpec
+from typing import Optional
+
+from pinecone import Index, Pinecone, ServerlessSpec
 
 from app.core.config import settings
 from app.services.embedding import EMBEDDING_DIM
 
-INDEX_NAME = settings.pinecone_index_name or "rag-research-index-test"  # Default index name
+INDEX_NAME: str = settings.pinecone_index_name or "rag-research-index-test"  # Default index name
 
 # Lazy initialization - only initialize when needed
-_pc = None
-_index = None
+_pc: Optional[Pinecone] = None
+_index: Optional[Index] = None
 
 
-def _get_pinecone_client():
+def _get_pinecone_client() -> Pinecone:
     global _pc
     if _pc is None:
         api_key = settings.pinecone_api_key
@@ -18,7 +20,7 @@ def _get_pinecone_client():
     return _pc
 
 
-def _get_index():
+def _get_index() -> Index:
     global _index
     if _index is None:
         pc = _get_pinecone_client()
