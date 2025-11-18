@@ -2,13 +2,13 @@
 fastapi
 uvicorn[standard]
 pydantic
-pinecone-client
 sentence-transformers
 pytest
 pytest-asyncio
 requests
 python-dotenv
 loguru
+aiohttp
 black
 isort
 pre-commit
