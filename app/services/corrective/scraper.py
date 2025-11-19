@@ -34,7 +34,7 @@ class Scraper:
             async with session.get(url, timeout=self.timeout) as resp:
                 if resp.status != 200:
                     logger.warning(f"[Scraper] Non-200 status: {url} — {resp.status}")
-                    return None
+                    return (None, resp.status)
 
                 html = await resp.text()
                 return html
@@ -96,11 +96,14 @@ class Scraper:
         html = await self.fetch_html(session, url)
 
         # If HTML missing → Playwright fallback
-        if not html:
+        if type(html) is not str and html[0] is None and html[1] < 400:
             logger.info(f"[Scraper] Falling back to Playwright: {url}")
             html = await self.playwright_fallback(url)
+        elif type(html) is tuple and html[1] >= 400:
+            logger.warning(f"[Scraper] Skipping Playwright fallback due to HTTP error: {url}")
 
-        if not html:
+        if type(html) is not str or not html:
+            logger.warning(f"[Scraper] No HTML content for {url}")
             return {"url": url, "content": None, "source": None, "published_at": None}
 
         # Step 2: Extract text (Trafilatura)

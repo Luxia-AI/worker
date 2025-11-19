@@ -1,6 +1,6 @@
 import pytest
 
-from app.services.llms.fact_extracting_llm import FactExtractingLLM
+from app.services.corrective.fact_extractor import FactExtractingLLM
 
 
 @pytest.mark.asyncio
