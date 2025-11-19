@@ -1,7 +1,9 @@
 pinecone
-torch==2.9.1 --index-url https://download.pytorch.org/whl/cpu
+--index-url https://download.pytorch.org/whl/cpu
+torch==2.9.1
 sentence_transformers
 pydantic
 pydantic_settings
 trafilatura
 playwright
+groq

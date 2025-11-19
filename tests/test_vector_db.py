@@ -15,7 +15,7 @@ def test_dummy_vector_flow():
     # Mock the Pinecone client and SentenceTransformer
     with (
         patch("app.services.vector_db._get_pinecone_client") as mock_pc,
-        patch("app.services.llm._get_model") as mock_model,
+        patch("app.services.llms.embedding_llm._get_model") as mock_model,
     ):
 
         # Setup mock model

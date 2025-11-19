@@ -1,7 +1,7 @@
 from typing import Any, Dict, List
 
 from app.services.embedding import _pad_embedding
-from app.services.llm import _get_model
+from app.services.llms.embedding_llm import _get_model
 from app.services.vector_db import _get_index
 
 
