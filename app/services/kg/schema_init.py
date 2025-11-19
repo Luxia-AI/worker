@@ -7,7 +7,6 @@ logger = get_logger(__name__)
 
 
 class KGSchemaInitializer:
-
     def __init__(self):
         self.client = Neo4jClient()
 

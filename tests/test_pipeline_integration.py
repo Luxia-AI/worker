@@ -159,6 +159,7 @@ async def test_pipeline_hybrid_ranking_integration():
 
     # Mock all steps except ranking
     pipeline.search_agent.run = AsyncMock(return_value=["https://example.com"])
+    pipeline.search_agent.reformulate_queries = AsyncMock(return_value=["Test query"])
     pipeline.scraper.scrape_all = AsyncMock(
         return_value=[
             {
