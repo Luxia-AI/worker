@@ -88,8 +88,9 @@ def _credibility_score_from_meta(meta: Dict[str, Any]) -> float:
     if c is not None:
         try:
             return float(c)
-        except Exception:
-            pass
+        except (ValueError, TypeError):
+            # If credibility is not convertible to float, fall through to domain heuristics
+            logger.debug(f"[hybrid_rank] Invalid credibility value: {c}, using domain heuristics")
 
     # domain heuristics
     domain = (meta.get("source_url") or meta.get("source") or "").lower()
