@@ -5,6 +5,7 @@ import aiohttp
 
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.services.llms.groq_service import GroqService
 
 logger = get_logger(__name__)
 
@@ -21,6 +22,28 @@ TRUSTED_DOMAINS = {
     "livescience.com",
     "medicalnewstoday.com",
 }
+
+QUERY_REFORMULATION_PROMPT = """
+You are a query reformulation agent specialized in retrieving
+high-quality medical evidence from trusted sources (CDC, NIH, WHO, Mayo Clinic, Harvard Health).
+
+Given a social media post and optional failed biomedical entities:
+
+1. Extract the medically relevant keywords.
+2. Generate 5-8 optimized Google search queries.
+3. Each query must be:
+   - short (3-7 words)
+   - keyword dense
+   - objective
+   - medically oriented
+   - suitable for evidence gathering
+4. Avoid question-like queries. Focus on **search-efficient** queries.
+
+Return ONLY this JSON structure:
+{
+  "queries": ["...", "...", "..."]
+}
+"""
 
 
 class TrustedSearch:
@@ -46,31 +69,52 @@ class TrustedSearch:
             logger.error("Google Search API or CSE ID missing from environment")
             raise RuntimeError("Missing GOOGLE_API_KEY or GOOGLE_CSE_ID")
 
-    # ---------------------------------------------------------------------
-    # Query Reformulation (Light Agent)
-    # ---------------------------------------------------------------------
-    def reformulate_queries(self, text: str, failed_entities: List[str]) -> List[str]:
-        """
-        Lightweight heuristic query reformulation.
-        LLM-based reformulation will come later, but this is good for stage 1.
+        self.groq_client = GroqService()
 
-        Generates 4–6 angle-shifted search queries.
+    # ---------------------------------------------------------------------
+    # Query Reformulation
+    # ---------------------------------------------------------------------
+    async def reformulate_queries(self, text: str, failed_entities: List[str]) -> List[str]:
         """
+        LLM-powered search query reformulation.
+        Produces highly optimized evidence retrieval phrases.
+        """
+        prompt = f"""
+{QUERY_REFORMULATION_PROMPT}
+
+POST TEXT:
+{text}
+
+FAILED ENTITIES:
+{failed_entities}
+"""
+
+        try:
+            result = await self.groq_client.ainvoke(prompt, response_format="json")
+            queries = result.get("queries", [])
+            cleaned = [q.strip().lower() for q in queries if isinstance(q, str)]
+            return list(dict.fromkeys(cleaned))  # dedupe but preserve order
+
+        except Exception as e:
+            logger.error(f"[TrustedSearch] LLM query reformulation failed: {e}")
+            # fallback → old heuristic
+            return self._fallback_queries(text, failed_entities)
+
+    def _fallback_queries(self, text: str, failed_entities: List[str]) -> List[str]:
         base = text.lower()
-
         queries = [
             f"{base} medical evidence",
             f"{base} scientific research",
             f"{base} clinical verification",
-            f"{base} is it true? health facts",
+            f"{base} factual analysis",
         ]
 
-        if failed_entities:
-            for ent in failed_entities:
-                queries.append(f"{ent} evidence medical study")
-                queries.append(f"{ent} health facts scientific")
+        for ent in failed_entities or []:
+            queries.append(f"{ent} medical evidence")
+            queries.append(f"{ent} health research")
+            queries.append(f"{ent} scientific facts")
 
-        return list(set(queries))  # remove duplicates
+        return list(dict.fromkeys(queries))
 
     # ---------------------------------------------------------------------
     # Single Query Search
@@ -125,7 +169,7 @@ class TrustedSearch:
         """
         Executes reformulation → parallelized Google CSE queries → URL dedupe.
         """
-        queries = self.reformulate_queries(post_text, failed_entities)
+        queries = await self.reformulate_queries(post_text, failed_entities)
         logger.info(f"[TrustedSearch] Reformulated queries: {queries}")
 
         async with aiohttp.ClientSession() as session:
