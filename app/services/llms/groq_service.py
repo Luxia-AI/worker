@@ -11,7 +11,7 @@ logger = get_logger(__name__)
 
 class GroqService:
     def __init__(self) -> None:
-        api_key = settings.groq_api_key
+        api_key = settings.GROQ_API_KEY
         if not api_key:
             raise RuntimeError("Missing GROQ_API_KEY")
 

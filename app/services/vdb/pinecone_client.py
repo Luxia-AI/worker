@@ -12,7 +12,7 @@ _index = None
 def get_pinecone_client() -> Pinecone:
     global _pc
     if _pc is None:
-        _pc = Pinecone(api_key=settings.pinecone_api_key)
+        _pc = Pinecone(api_key=settings.PINECONE_API_KEY)
     return _pc
 
 
@@ -26,7 +26,7 @@ def get_pinecone_index():
     dimension = model.get_sentence_embedding_dimension()
 
     pc = get_pinecone_client()
-    index_name = settings.pinecone_index_name
+    index_name = settings.PINECONE_INDEX_NAME
 
     existing = [idx.name for idx in pc.list_indexes()]
     if index_name not in existing:

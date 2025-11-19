@@ -58,8 +58,8 @@ class TrustedSearch:
         - structured return format
     """
 
-    GOOGLE_API_KEY = settings.google_api_key
-    GOOGLE_CSE_ID = settings.google_cse_id
+    GOOGLE_API_KEY = settings.GOOGLE_API_KEY
+    GOOGLE_CSE_ID = settings.GOOGLE_CSE_ID
     MAX_RESULTS_PER_QUERY = 6
 
     SEARCH_URL = "https://www.googleapis.com/customsearch/v1?" "key={key}&cx={cse}&q={query}"
