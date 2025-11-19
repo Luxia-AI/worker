@@ -10,18 +10,18 @@ jobs:
   test-and-quality:
     runs-on: ubuntu-latest
 
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12"]
-
+    # Ensures vars are loaded BEFORE Python imports settings
     env:
-      # automatically available to all steps
       PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
       PINECONE_INDEX_NAME: ${{ vars.PINECONE_INDEX_NAME }}
       GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
       GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
       GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
 
     steps:
       - name: Checkout Repo
@@ -47,13 +47,18 @@ jobs:
       - name: Install Playwright Browsers
         run: playwright install chromium
 
-      - name: Install Groq SDK manually
+      - name: Install Groq SDK
         run: pip install groq
 
+      # ===================
+      #     TESTING
+      # ===================
       - name: Run Unit Tests
         run: pytest -v --disable-warnings
 
-      # --- Static Analysis Tools ---
+      # ===================
+      #     LINTING
+      # ===================
       - name: Ruff Linter
         run: ruff check .
 
@@ -66,6 +71,9 @@ jobs:
       - name: Flake8
         run: flake8 app tests
 
+      # ===================
+      #   SECURITY & TYPES
+      # ===================
       - name: Bandit Security Scan
         run: bandit -r app
 
