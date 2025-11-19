@@ -64,7 +64,7 @@ class TrustedSearch:
 
     SEARCH_URL = "https://www.googleapis.com/customsearch/v1?" "key={key}&cx={cse}&q={query}"
 
-    def __init__(self):
+    def __init__(self) -> None:
         if not self.GOOGLE_API_KEY or not self.GOOGLE_CSE_ID:
             logger.error("Google Search API or CSE ID missing from environment")
             raise RuntimeError("Missing GOOGLE_API_KEY or GOOGLE_CSE_ID")

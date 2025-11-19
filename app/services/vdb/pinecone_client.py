@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Any, Optional
 
 from pinecone import Pinecone, ServerlessSpec
 
@@ -16,7 +16,7 @@ def get_pinecone_client() -> Pinecone:
     return _pc
 
 
-def get_pinecone_index():
+def get_pinecone_index() -> Any:
     global _index
     if _index:
         return _index
@@ -27,6 +27,7 @@ def get_pinecone_index():
 
     pc = get_pinecone_client()
     index_name = settings.PINECONE_INDEX_NAME
+    assert index_name is not None, "PINECONE_INDEX_NAME must be set"  # nosec B101
 
     existing = [idx.name for idx in pc.list_indexes()]
     if index_name not in existing:

@@ -148,7 +148,7 @@ class RelationExtractor:
 
         # Flatten results and deduplicate identical triples (subject, relation, object, source)
         all_triples = [t for sub in results for t in sub]
-        unique = {}
+        unique: Dict[tuple[str, str, str, str | None], Dict[str, Any]] = {}
         for t in all_triples:
             key = (t["subject"].lower(), t["relation"].lower(), t["object"].lower(), t.get("source_url"))
             if key not in unique or unique[key]["confidence"] < t["confidence"]:

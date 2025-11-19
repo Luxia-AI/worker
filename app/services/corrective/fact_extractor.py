@@ -39,7 +39,8 @@ class FactExtractingLLM:
             # JSON response
             if response_format == "json":
                 if msg.content:
-                    return json.loads(msg.content)
+                    result: Dict[str, Any] = json.loads(msg.content)
+                    return result
                 return {}
 
             # Text response

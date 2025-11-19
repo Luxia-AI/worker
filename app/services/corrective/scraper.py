@@ -1,5 +1,4 @@
 import asyncio
-from datetime import datetime
 from typing import Any, Dict, List
 
 import aiohttp
@@ -34,7 +33,7 @@ class Scraper:
             async with session.get(url, timeout=self.timeout) as resp:
                 if resp.status != 200:
                     logger.warning(f"[Scraper] Non-200 status: {url} — {resp.status}")
-                    return (None, resp.status)
+                    return None
 
                 html = await resp.text()
                 return html
@@ -49,8 +48,9 @@ class Scraper:
     def extract_text(self, html: str) -> str | None:
         try:
             text = trafilatura.extract(html, include_comments=False)
-            if text:
-                return text.strip()
+            if text is not None:
+                result: str = str(text).strip()
+                return result
             return None
         except Exception as e:
             logger.error(f"[Scraper] Trafilatura extraction failed: {e}")
@@ -78,7 +78,7 @@ class Scraper:
                 await page.goto(url, timeout=self.playwright_timeout)
                 await page.wait_for_load_state("domcontentloaded")
 
-                html = await page.content()
+                html: str = await page.content()
                 await browser.close()
                 return html
 
@@ -96,13 +96,11 @@ class Scraper:
         html = await self.fetch_html(session, url)
 
         # If HTML missing → Playwright fallback
-        if type(html) is not str and html[0] is None and html[1] < 400:
+        if html is None:
             logger.info(f"[Scraper] Falling back to Playwright: {url}")
             html = await self.playwright_fallback(url)
-        elif type(html) is tuple and html[1] >= 400:
-            logger.warning(f"[Scraper] Skipping Playwright fallback due to HTTP error: {url}")
 
-        if type(html) is not str or not html:
+        if not isinstance(html, str) or not html:
             logger.warning(f"[Scraper] No HTML content for {url}")
             return {"url": url, "content": None, "source": None, "published_at": None}
 
@@ -142,7 +140,7 @@ class Scraper:
     # Helpers
     # ---------------------------------------------------------------------
     @staticmethod
-    def _extract_domain(url: str) -> str:
+    def _extract_domain(url: str) -> str | None:
         try:
             return url.split("/")[2]
         except Exception:
@@ -155,6 +153,7 @@ class Scraper:
         More advanced logic can be added later.
         """
         import re
+        from datetime import datetime
 
         # Common patterns in medical articles
         patterns = [

@@ -5,7 +5,7 @@ from app.services.vdb.pinecone_client import get_pinecone_index
 
 
 class VDBRetrieval:
-    def __init__(self, namespace="health"):
+    def __init__(self, namespace: str = "health") -> None:
         self.index = get_pinecone_index()
         self.namespace = namespace
 

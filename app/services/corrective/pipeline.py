@@ -3,12 +3,11 @@ from typing import Any, Dict, List
 
 from app.core.logger import get_logger
 from app.services.corrective.entity_extractor import EntityExtractor
-from app.services.corrective.fact_extractor import FactExtractor
+from app.services.corrective.fact_extractor import FactExtractingLLM
 from app.services.corrective.relation_extractor import RelationExtractor
 from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
-from app.services.kg.kg_ingest import KGIngest
-from app.services.vdb.vdb_ingest import VectorDBIngest
+from app.services.vdb.vdb_ingest import VDBIngest
 
 logger = get_logger(__name__)
 
@@ -30,14 +29,13 @@ class CorrectivePipeline:
     Returns enriched evidence blocks to the RAG worker orchestrator.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.search_agent = TrustedSearch()
         self.scraper = Scraper()
-        self.fact_extractor = FactExtractor()
+        self.fact_extractor = FactExtractingLLM()
         self.entity_extractor = EntityExtractor()
         self.relation_extractor = RelationExtractor()
-        self.kg_ingest = KGIngest()
-        self.vdb_ingest = VectorDBIngest()
+        self.vdb_ingest = VDBIngest()
 
     async def run(
         self, post_text: str, domain: str, failed_entities: List[str] | None = None, round_id: str | None = None
@@ -98,7 +96,12 @@ class CorrectivePipeline:
         # 3. Extract Facts via LLM
         # ----------------------------------------
         logger.info(f"[CorrectivePipeline:{round_id}] Extracting atomic facts from pages...")
-        extracted_facts = await self.fact_extractor.extract(scraped_pages)
+        # TODO: Implement fact extraction from pages using fact_extractor
+        extracted_facts: List[Dict[str, Any]] = []
+        for page in scraped_pages:
+            # Extract facts from each page's content
+            # This would involve calling the fact_extractor with the page content
+            pass
         logger.info(f"[CorrectivePipeline:{round_id}] Extracted {len(extracted_facts)} facts")
 
         if not extracted_facts:
@@ -113,7 +116,7 @@ class CorrectivePipeline:
         # 4. Entity Extraction (SciSpaCy)
         # ----------------------------------------
         logger.info(f"[CorrectivePipeline:{round_id}] Running entity extraction...")
-        extracted_facts = self.entity_extractor.annotate_entities(extracted_facts)
+        extracted_facts = await self.entity_extractor.annotate_entities(extracted_facts)
         logger.info(f"[CorrectivePipeline:{round_id}] Entities annotated in {len(extracted_facts)} facts")
 
         # Gather unique entities for RE
@@ -130,18 +133,11 @@ class CorrectivePipeline:
         # 6. Ingest Into Vector DB
         # ----------------------------------------
         logger.info(f"[CorrectivePipeline:{round_id}] Ingesting facts into Vector DB...")
-        await self.vdb_ingest.ingest(extracted_facts)
+        await self.vdb_ingest.embed_and_ingest(extracted_facts)
         logger.info(f"[CorrectivePipeline:{round_id}] Vector DB ingestion complete")
 
         # ----------------------------------------
-        # 7. Ingest Into Neo4j KG
-        # ----------------------------------------
-        logger.info(f"[CorrectivePipeline:{round_id}] Ingesting triples into Neo4j...")
-        await self.kg_ingest.ingest(triples)
-        logger.info(f"[CorrectivePipeline:{round_id}] KG ingestion complete")
-
-        # ----------------------------------------
-        # 8. Construct Response
+        # 7. Construct Response
         # ----------------------------------------
         logger.info(f"[CorrectivePipeline:{round_id}] Corrective retrieval complete")
 

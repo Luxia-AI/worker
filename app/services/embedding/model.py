@@ -44,7 +44,7 @@ async def embed_async(sentences: List[str]) -> List[List[float]]:
     loop = asyncio.get_event_loop()
     model = get_embedding_model()
 
-    def _encode():
+    def _encode() -> List[List[float]]:
         embeddings = model.encode(sentences, convert_to_tensor=True)
         # Convert tensors to lists of floats
         return [embedding.tolist() for embedding in embeddings]
