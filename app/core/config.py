@@ -13,6 +13,10 @@ class Settings(BaseSettings):
 
     GROQ_API_KEY: Optional[str] = Field(default=None)
 
+    NEO4J_URI: Optional[str] = Field(default=None)
+    NEO4J_USER: Optional[str] = Field(default=None)
+    NEO4J_PASSWORD: Optional[str] = Field(default=None)
+
     model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

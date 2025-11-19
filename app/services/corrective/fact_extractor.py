@@ -7,7 +7,7 @@ from app.services.llms.groq_service import GroqService
 logger = get_logger(__name__)
 
 
-class FactExtractingLLM:
+class FactExtractor:
     """
     Async wrapper for Groq API using MoonshotAI's kimi-k2-instruct model.
     Uses OpenAI-compatible Chat Completions API.
@@ -47,5 +47,5 @@ class FactExtractingLLM:
             return {"text": msg.content}
 
         except Exception as e:
-            logger.error(f"[FactExtractingLLM] Groq call failed: {e}")
+            logger.error(f"[FactExtractor] Groq call failed: {e}")
             raise

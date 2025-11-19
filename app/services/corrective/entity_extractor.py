@@ -1,7 +1,7 @@
 from typing import Any, Dict, List
 
 from app.core.logger import get_logger
-from app.services.corrective.fact_extractor import FactExtractingLLM
+from app.services.corrective.fact_extractor import FactExtractor
 
 logger = get_logger(__name__)
 
@@ -35,7 +35,7 @@ class EntityExtractor:
     """
 
     def __init__(self) -> None:
-        self.llm = FactExtractingLLM()
+        self.llm = FactExtractor()
 
     async def extract_entities(self, statement: str) -> List[str]:
         prompt = f"{BIOMED_NER_PROMPT}\n\nFACT:\n{statement}"

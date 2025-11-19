@@ -6,3 +6,4 @@ pydantic_settings
 trafilatura
 playwright
 groq
+neo4j
