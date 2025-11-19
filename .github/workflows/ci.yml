@@ -2,46 +2,76 @@ name: RAG Worker CI
 
 on:
   push:
-    branches: [ main, dev ]
+    branches: [main, dev]
   pull_request:
-    branches: [ main, dev ]
+    branches: [main, dev]
 
 jobs:
   test-and-quality:
     runs-on: ubuntu-latest
+    environment: Actions
+
+    # Ensures vars are loaded BEFORE Python imports settings
     env:
-      PINECONE_API_KEY: ${{ secrets.pinecone_api_key }}
+      PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+      PINECONE_INDEX_NAME: ${{ vars.PINECONE_INDEX_NAME }}
+      GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
+      GOOGLE_CSE_ID: ${{ secrets.GOOGLE_CSE_ID }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
 
     steps:
-    - name: Checkout Repo
-      uses: actions/checkout@v3
+      - name: Checkout Repo
+        uses: actions/checkout@v4
 
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.10"
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
 
-    - name: Install Dependencies
-      run: |
-        pip install -r requirements-dev.txt
+      - name: Cache Playwright Browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('**/requirements-dev.txt') }}
 
-    - name: Run Unit Tests
-      run: pytest -v
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-dev.txt
 
-    - name: Run Ruff Linter
-      run: ruff check .
+      - name: Install Playwright Browsers
+        run: playwright install chromium
 
-    - name: Run Black (check mode)
-      run: black --check app tests
+      - name: Install Groq SDK
+        run: pip install groq
 
-    - name: Run isort (check mode)
-      run: isort --check-only app tests
+      # ===================
+      #     TESTING
+      # ===================
+      - name: Run Unit Tests
+        run: pytest -v --disable-warnings
 
-    - name: Run Flake8
-      run: flake8 app tests
+      # ===================
+      #     LINTING
+      # ===================
+      - name: Ruff Linter
+        run: ruff check .
 
-    - name: Run Bandit (security scan)
-      run: bandit -r app
+      - name: Black (check mode)
+        run: black --check app tests
 
-    - name: Run mypy (type checking)
-      run: mypy app
+      - name: isort (check)
+        run: isort --check-only app tests
+
+      - name: Flake8
+        run: flake8 app tests
+
+      # ===================
+      #   SECURITY & TYPES
+      # ===================
+      - name: Bandit Security Scan
+        run: bandit -r app
+
+      - name: mypy (type checking)
+        run: mypy app

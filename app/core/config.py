@@ -5,8 +5,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    pinecone_api_key: Optional[str] = Field(default=None)
-    pinecone_index_name: Optional[str] = Field(default=None)
+    PINECONE_API_KEY: Optional[str] = Field(default=None)
+    PINECONE_INDEX_NAME: Optional[str] = Field(default=None)
+
+    GOOGLE_API_KEY: Optional[str] = Field(default=None)
+    GOOGLE_CSE_ID: Optional[str] = Field(default=None)
+
+    GROQ_API_KEY: Optional[str] = Field(default=None)
 
     model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(env_file=".env", extra="ignore")
 
