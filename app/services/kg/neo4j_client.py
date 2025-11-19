@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from typing import Any
 
 from neo4j import AsyncGraphDatabase
 
@@ -22,17 +23,17 @@ class Neo4jClient:
 
     _driver = None
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.uri = settings.NEO4J_URI
         self.user = settings.NEO4J_USER
         self.password = settings.NEO4J_PASSWORD
 
-    async def _ensure_driver(self):
+    async def _ensure_driver(self) -> Any:
         if self._driver is None:
             try:
                 self._driver = AsyncGraphDatabase.driver(
-                    self.uri,
-                    auth=(self.user, self.password),
+                    str(self.uri),
+                    auth=(str(self.user), str(self.password)),
                     max_connection_lifetime=3600,
                 )
                 # Test connection
@@ -46,7 +47,7 @@ class Neo4jClient:
         return self._driver
 
     @asynccontextmanager
-    async def session(self):
+    async def session(self) -> Any:
         """
         Async context manager returning a Neo4j session.
         Ensures driver initialized; handles session cleanup.
@@ -58,7 +59,7 @@ class Neo4jClient:
         finally:
             await session.close()
 
-    async def close(self):
+    async def close(self) -> None:
         """
         Cleanly close the global Neo4j driver.
         """

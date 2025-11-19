@@ -7,10 +7,10 @@ logger = get_logger(__name__)
 
 
 class KGSchemaInitializer:
-    def __init__(self):
+    def __init__(self) -> None:
         self.client = Neo4jClient()
 
-    async def initialize(self):
+    async def initialize(self) -> None:
         constraints = [
             """
             CREATE CONSTRAINT entity_name_unique IF NOT EXISTS

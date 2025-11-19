@@ -156,7 +156,7 @@ def hybrid_rank(
     kg_scores = []
 
     # Normalize input fields
-    def _add_candidate(src_type: str, item: Dict[str, Any]):
+    def _add_candidate(src_type: str, item: Dict[str, Any]) -> None:
         stmt = (item.get("statement") or "").strip()
         source_url = item.get("source_url") or item.get("source")
         # canonical key

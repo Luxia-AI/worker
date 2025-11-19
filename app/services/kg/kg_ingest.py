@@ -20,7 +20,7 @@ class KGIngest:
         - logs every action
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.client = Neo4jClient()
 
     async def ingest_triples(self, triples: List[Dict[str, Any]]) -> int:

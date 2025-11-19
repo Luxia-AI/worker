@@ -18,7 +18,7 @@ class KGRetrieval:
     - de-duplication
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.client = Neo4jClient()
 
     async def retrieve(self, entities: List[str], top_k: int = 20) -> List[Dict[str, Any]]:
