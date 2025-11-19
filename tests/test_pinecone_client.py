@@ -17,19 +17,13 @@ def test_pinecone_client_init(mock_pc):
     assert client == mock_instance  # nosec
 
 
-@patch("app.services.vdb.pinecone_client.get_embedding_model")
 @patch("app.services.vdb.pinecone_client.Pinecone")
-def test_pinecone_get_index(mock_pc, mock_get_model):
+def test_pinecone_get_index(mock_pc):
     # Reset global state to avoid caching issues
     import app.services.vdb.pinecone_client as pc_module
 
     pc_module._index = None
     pc_module._pc = None
-
-    # Mock the embedding model to avoid downloading it
-    mock_model = MagicMock()
-    mock_model.get_sentence_embedding_dimension.return_value = 1024
-    mock_get_model.return_value = mock_model
 
     mock_client = MagicMock()
     mock_pc.return_value = mock_client
