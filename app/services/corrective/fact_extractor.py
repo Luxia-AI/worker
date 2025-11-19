@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from app.core.logger import get_logger
 from app.services.llms.groq_service import GroqService
@@ -49,3 +49,57 @@ class FactExtractor:
         except Exception as e:
             logger.error(f"[FactExtractor] Groq call failed: {e}")
             raise
+
+    async def extract(self, scraped_pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Extract facts from scraped web pages using Groq LLM.
+
+        Args:
+            scraped_pages: List of dicts with 'content', 'source', 'url', 'published_at'
+
+        Returns:
+            List of extracted facts with statement, confidence, source info
+        """
+        if not scraped_pages:
+            return []
+
+        facts: List[Dict[str, Any]] = []
+
+        for page in scraped_pages:
+            content = page.get("content", "")
+            if not content or len(content) < 10:
+                continue
+
+            # Truncate long content to avoid token limits
+            content_chunk = content[:2000]
+
+            prompt = f"""Extract key factual statements from this content.
+Return ONLY valid JSON with this structure:
+{{
+    "facts": [
+        {{"statement": "...", "confidence": 0.85}},
+        {{"statement": "...", "confidence": 0.90}}
+    ]
+}}
+
+Content:
+{content_chunk}"""
+
+            try:
+                result = await self.ainvoke(prompt, response_format="json")
+                extracted = result.get("facts", [])
+
+                # Enrich with source information
+                for fact in extracted:
+                    fact["source_url"] = page.get("url", "")
+                    fact["source"] = page.get("source", "")
+                    fact["published_at"] = page.get("published_at", "")
+                    fact["fact_id"] = f"f_{len(facts)}"
+
+                facts.extend(extracted)
+            except Exception as e:
+                logger.warning(f"[FactExtractor] Failed to extract from {page.get('url')}: {e}")
+                continue
+
+        logger.info(f"[FactExtractor] Extracted {len(facts)} facts from {len(scraped_pages)} pages")
+        return facts

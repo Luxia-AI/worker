@@ -16,3 +16,4 @@ ruff
 flake8
 bandit
 mypy
+pypdf

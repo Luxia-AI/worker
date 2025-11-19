@@ -8,7 +8,8 @@ from app.services.corrective.fact_extractor import FactExtractor
 from app.services.corrective.relation_extractor import RelationExtractor
 from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
-from app.services.kg.kg_ingest import KGIngest  # for compatibility / later use
+from app.services.kg.kg_ingest import KGIngest
+from app.services.kg.kg_retrieval import KGRetrieval
 from app.services.kg.neo4j_client import Neo4jClient
 from app.services.ranking.hybrid_ranker import hybrid_rank
 from app.services.vdb.vdb_ingest import VDBIngest
@@ -45,69 +46,7 @@ class CorrectivePipeline:
         self.vdb_retriever = VDBRetrieval()  # retrieval for semantic candidates
         self.kg_client = Neo4jClient()  # used for lightweight KG retrieval
         self.kg_ingest = KGIngest()  # available if you want to ingest triples here
-
-    # ----------------------
-    # Minimal KG retrieval helper
-    # ----------------------
-    async def kg_retrieve(self, entities: List[str], top_k: int = 10) -> List[Dict[str, Any]]:
-        """
-        Query the KG for triples related to the provided entities.
-        Returns a list of dicts:
-            { "statement", "score", "entities", "source_url", "published_at", "credibility" }
-        This is intentionally conservative: if you have an advanced kg query module,
-        replace this method with it.
-        """
-        if not entities:
-            return []
-
-        # Simple Cypher: find triples where subject or object matches any entity (case-insensitive)
-        # and return a constructed statement + simple score (count matches)
-        cypher = """
-        UNWIND $ents AS ent
-        MATCH (s:Entity)-[r:RELATION]->(o:Entity)
-        WHERE toLower(s.name) = toLower(ent) OR toLower(o.name) = toLower(ent)
-        RETURN s.name AS subject, r.relation AS relation, o.name AS object,
-               r.confidence AS confidence, r.source_url AS source_url
-        LIMIT $limit
-        """
-
-        results = []
-        try:
-            async with self.kg_client.session() as session:
-                cursor = await session.run(cypher, ents=entities, limit=top_k * 2)
-                records = await cursor.values()  # expect list of rows
-        except Exception as e:
-            logger.warning(f"[CorrectivePipeline] KG retrieval failed: {e}")
-            return []
-
-        # Build result dicts
-        for row in records:
-            # row is usually a list/tuple of returned fields: subject, relation, object, confidence, source_url
-            try:
-                subj, rel, obj, conf, src = row
-            except Exception:
-                continue
-            statement = f"{subj} {rel} {obj}"
-            results.append(
-                {
-                    "statement": statement,
-                    "score": float(conf or 0.0),  # use stored confidence as KG score
-                    "entities": [subj, obj],
-                    "source_url": src,
-                    "published_at": None,
-                    "credibility": (
-                        0.5
-                        if not src
-                        else (
-                            0.95
-                            if any(d in (src or "").lower() for d in ("who.int", "cdc.gov", "nih.gov", "fda.gov"))
-                            else 0.5
-                        )
-                    ),
-                }
-            )
-
-        return results
+        self.kg_retriever = KGRetrieval()
 
     # ----------------------
     # Orchestrator run
@@ -198,7 +137,11 @@ class CorrectivePipeline:
                 dedup_sem.append(s)
 
         # 8) KG candidates from KG retrieval using entities
-        kg_candidates = await self.kg_retrieve(all_entities, top_k=top_k)
+        try:
+            kg_candidates = await self.kg_retriever.retrieve(all_entities, top_k=top_k)
+        except Exception as e:
+            logger.warning(f"[CorrectivePipeline:{round_id}] KG retrieval failed: {e}")
+            kg_candidates = []
 
         # 9) Hybrid ranking
         ranked = hybrid_rank(dedup_sem, kg_candidates, query_entities=all_entities)
