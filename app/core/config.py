@@ -13,7 +13,11 @@ class Settings(BaseSettings):
 
     groq_api_key: Optional[str] = Field(default=None)
 
-    model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+        case_sensitive=False,
+    )
 
 
 settings = Settings()
