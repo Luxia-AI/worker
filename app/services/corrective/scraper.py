@@ -169,7 +169,7 @@ class Scraper:
                 try:
                     dt = datetime.fromisoformat(match.group(1).replace("Z", ""))
                     return dt.isoformat()
-                except Exception:
+                except Exception:  # nosec B112
                     continue
 
         return None
