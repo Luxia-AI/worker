@@ -2,6 +2,18 @@
 #source .venv/Scripts/activate
 #uvicorn app.main:app --host 0.0.0.0 --port 9000 --reload
 
+# Function to play a sound using PowerShell
+# This is compatible with Git Bash on Windows
+function play_windows_sound() {
+    local sound_file=$1
+    if [[ -z "$sound_file" ]]; then
+        # Default to a system sound if none is specified
+        sound_file="C:/Windows/Media/Ring06.wav"
+    fi
+    # The `&` at the end makes the command run in the background, so the script can continue immediately
+    powershell.exe -c "(New-Object Media.SoundPlayer '$sound_file').PlaySync();" &
+}
+
 # Define a function to run a single check and report its status
 run_check() {
     local check_name=$1
@@ -62,8 +74,10 @@ echo ""
 echo "--- Summary ---"
 if $all_passed; then
     echo "🎉 All selected checks passed successfully!"
+    play_windows_sound
     exit 0
 else
     echo "🛑 Some checks failed. Please review the output above."
+    play_windows_sound "C:/Windows/Media/Ring02.wav"
     exit 1
 fi
