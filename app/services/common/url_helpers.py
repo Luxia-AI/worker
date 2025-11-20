@@ -6,6 +6,10 @@ import re
 from typing import List, Optional
 from urllib.parse import parse_qs, urlparse
 
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 def normalize_url(url: str) -> str:
     """

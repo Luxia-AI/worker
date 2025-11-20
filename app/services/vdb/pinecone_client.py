@@ -3,7 +3,10 @@ from typing import Any, Optional
 from pinecone import Pinecone, ServerlessSpec
 
 from app.core.config import settings
+from app.core.logger import get_logger
 from app.services.embedding.model import get_embedding_model
+
+logger = get_logger(__name__)
 
 _pc: Optional[Pinecone] = None
 _index = None
