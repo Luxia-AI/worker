@@ -1,8 +1,10 @@
 import asyncio
-from typing import List
+import json
+from typing import Any, Dict, List
 
 import aiohttp
 
+from app.constants.llm_prompts import QUERY_REFORMULATION_PROMPT, REINFORCEMENT_QUERY_PROMPT
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.llms.groq_service import GroqService
@@ -23,28 +25,6 @@ TRUSTED_DOMAINS = {
     "medicalnewstoday.com",
 }
 
-QUERY_REFORMULATION_PROMPT = """
-You are a query reformulation agent specialized in retrieving
-high-quality medical evidence from trusted sources (CDC, NIH, WHO, Mayo Clinic, Harvard Health).
-
-Given a social media post and optional failed biomedical entities:
-
-1. Extract the medically relevant keywords.
-2. Generate 5-8 optimized Google search queries.
-3. Each query must be:
-   - short (3-7 words)
-   - keyword dense
-   - objective
-   - medically oriented
-   - suitable for evidence gathering
-4. Avoid question-like queries. Focus on **search-efficient** queries.
-
-Return ONLY this JSON structure:
-{
-  "queries": ["...", "...", "..."]
-}
-"""
-
 
 class TrustedSearch:
     """
@@ -60,7 +40,6 @@ class TrustedSearch:
 
     GOOGLE_API_KEY = settings.GOOGLE_API_KEY
     GOOGLE_CSE_ID = settings.GOOGLE_CSE_ID
-    MAX_RESULTS_PER_QUERY = 6
 
     SEARCH_URL = "https://www.googleapis.com/customsearch/v1?" "key={key}&cx={cse}&q={query}"
 
@@ -100,6 +79,9 @@ FAILED ENTITIES:
             # fallback → old heuristic
             return self._fallback_queries(text, failed_entities)
 
+    # ---------------------------------------------------------------------
+    # Fallback Query Generation
+    # ---------------------------------------------------------------------
     def _fallback_queries(self, text: str, failed_entities: List[str]) -> List[str]:
         base = text.lower()
         queries = [
@@ -181,3 +163,91 @@ FAILED ENTITIES:
 
         logger.info(f"[TrustedSearch] Found {len(urls)} trusted URLs")
         return list(urls)
+
+    async def google_search(self, post_text: str, failed_entities: List[str] = None) -> List[str]:
+        """
+        Alias for run() - performs Google CSE search with query reformulation.
+        """
+        if failed_entities is None:
+            failed_entities = []
+        return await self.run(post_text, failed_entities)
+
+    # ---------------------------------------------------------------------
+    # LLM-powered Reinforced Query Generation
+    # ---------------------------------------------------------------------
+    async def llm_reformulate_for_reinforcement(
+        self,
+        low_conf_items: List[Dict[str, Any]],
+        failed_entities: List[str],
+    ) -> List[str]:
+        """
+        Uses Groq LLM to generate highly optimized reinforcement search queries.
+        Much better than heuristic string concatenation.
+        """
+
+        base_statements = [item.get("statement", "") for item in low_conf_items]
+        base_entities = failed_entities or []
+
+        prompt = REINFORCEMENT_QUERY_PROMPT.format(statements=base_statements, entities=base_entities)
+
+        try:
+            resp = self.groq_client.chat.completions.create(
+                model="moonshotai/kimi-k2-instruct",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=300,
+            )
+
+            raw = resp.choices[0].message.content
+            queries = json.loads(raw)
+
+            # safety: ensure list[str]
+            return [q for q in queries if isinstance(q, str) and q.strip()]
+
+        except Exception as e:
+            logger.warning(f"[TrustedSearch] LLM reinforcement query generation failed: {e}")
+
+            # fallback to simple heuristics
+            fallback = []
+            for stmt in base_statements:
+                fallback.append(f"{stmt} peer reviewed research")
+                fallback.append(f"{stmt} scientific study NIH CDC")
+
+            for ent in base_entities:
+                fallback.append(f"{ent} medical research")
+                fallback.append(f"{ent} clinical facts verified")
+
+            return list(dict.fromkeys(fallback))
+
+    # ---------------------------------------------------------------------
+    # Reinforced Search for Low Confidence Cases
+    # ---------------------------------------------------------------------
+    async def reinforce_search(
+        self,
+        low_conf_items: List[Dict],
+        failed_entities: List[str],
+        max_queries: int = 8,
+    ) -> List[str]:
+        """
+        LLM-powered reinforcement search using Kimi/Groq.
+        Calls Google CSE on the generated queries.
+        """
+
+        # 1) Generate smarter queries
+        queries = await self.llm_reformulate_for_reinforcement(low_conf_items, failed_entities)
+        queries = queries[:max_queries]  # cap
+
+        logger.info(f"[TrustedSearch] Reinforcement queries: {queries}")
+
+        # 2) Perform Google CSE search
+        all_urls = []
+        async with aiohttp.ClientSession() as session:
+            for q in queries:
+                try:
+                    urls = await self.search_query(session, q)
+                    all_urls.extend(urls)
+                except Exception as e:
+                    logger.warning(f"[TrustedSearch] Reinforcement search failed for '{q}': {e}")
+
+        # 3) Deduplicate
+        return list(dict.fromkeys(all_urls))

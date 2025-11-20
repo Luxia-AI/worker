@@ -1,6 +1,7 @@
 import json
 from typing import Any, Dict, List
 
+from app.constants.llm_prompts import FACT_EXTRACTION_PROMPT
 from app.core.logger import get_logger
 from app.services.llms.groq_service import GroqService
 
@@ -73,17 +74,7 @@ class FactExtractor:
             # Truncate long content to avoid token limits
             content_chunk = content[:2000]
 
-            prompt = f"""Extract key factual statements from this content.
-Return ONLY valid JSON with this structure:
-{{
-    "facts": [
-        {{"statement": "...", "confidence": 0.85}},
-        {{"statement": "...", "confidence": 0.90}}
-    ]
-}}
-
-Content:
-{content_chunk}"""
+            prompt = FACT_EXTRACTION_PROMPT.format(content=content_chunk)
 
             try:
                 result = await self.ainvoke(prompt, response_format="json")

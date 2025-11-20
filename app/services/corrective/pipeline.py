@@ -36,6 +36,10 @@ class CorrectivePipeline:
         9. Hybrid rank candidates and return top-K evidence
     """
 
+    MAX_ROUNDS = 3
+    CONF_THRESHOLD = 0.70  # if top evidence < 0.70; reinforce
+    MIN_NEW_URLS = 2
+
     def __init__(self) -> None:
         self.search_agent = TrustedSearch()
         self.scraper = Scraper()
@@ -146,6 +150,87 @@ class CorrectivePipeline:
         # 9) Hybrid ranking
         ranked = hybrid_rank(dedup_sem, kg_candidates, query_entities=all_entities)
         top_ranked = ranked[:top_k]
+
+        # 10) Reinforcement loop if needed
+        for round_count in range(1, self.MAX_ROUNDS + 1):
+            score_str = top_ranked[0]["final_score"] if top_ranked else "N/A"
+            logger.info(f"[CorrectivePipeline:{round_id}] Ranking round {round_count}, top score={score_str}")
+
+            # If score meets threshold → stop reinforcement
+            if top_ranked and top_ranked[0]["final_score"] >= self.CONF_THRESHOLD:
+                logger.info(f"[CorrectivePipeline:{round_id}] Confidence threshold met. Stopping reinforcement.")
+                break
+
+            # Determine which items are weak
+            low_conf_items = [r for r in ranked if r["final_score"] < self.CONF_THRESHOLD]
+            if not low_conf_items:
+                break
+
+            # Reinforcement search
+            new_urls = await self.search_agent.reinforce_search(low_conf_items, failed_entities)
+            new_urls = [u for u in new_urls if u not in search_urls]
+
+            if len(new_urls) < self.MIN_NEW_URLS:
+                logger.info(f"[CorrectivePipeline:{round_id}] Not enough new URLs for reinforcement. Stopping.")
+                break
+
+            logger.info(f"[CorrectivePipeline:{round_id}] Reinforcement fetched {len(new_urls)} new URLs")
+
+            search_urls.extend(new_urls)
+
+            # Scrape new pages
+            new_pages = await self.scraper.scrape_all(new_urls)
+            new_pages = [p for p in new_pages if p.get("content")]
+
+            # Extract new facts
+            new_facts = await self.fact_extractor.extract(new_pages)
+            if new_facts:
+                new_facts = await self.entity_extractor.annotate_entities(new_facts)
+                extracted_facts.extend(new_facts)
+
+                # Extract triples from new facts
+                new_triples = await self.relation_extractor.extract_relations(new_facts, all_entities)
+                triples.extend(new_triples)
+
+                # Ingest new facts
+                try:
+                    await self.vdb_ingest.embed_and_ingest(new_facts)
+                except Exception:
+                    pass
+                try:
+                    await self.kg_ingest.ingest_triples(new_triples)
+                except Exception:
+                    pass
+
+            # Retrieve semantic again using new queries
+            semantic_candidates = []
+            for q in queries:
+                try:
+                    sem_res = await self.vdb_retriever.search(q, top_k=top_k)
+                    semantic_candidates.extend(sem_res or [])
+                except Exception:
+                    pass
+
+            # Deduplicate
+            seen = set()
+            dedup_sem = []
+            for s in semantic_candidates:
+                key = (s.get("statement"), s.get("source_url"))
+                if key not in seen:
+                    seen.add(key)
+                    dedup_sem.append(s)
+
+            # KG again
+            try:
+                kg_candidates = await self.kg_retriever.retrieve(all_entities, top_k=top_k)
+            except Exception:
+                kg_candidates = []
+
+            # Re-rank
+            ranked = hybrid_rank(dedup_sem, kg_candidates, query_entities=all_entities)
+            top_ranked = ranked[:top_k]
+
+            self.CONF_THRESHOLD -= round_count * 0.05
 
         logger.info(f"[CorrectivePipeline:{round_id}] Ranking produced {len(top_ranked)} top candidates")
 

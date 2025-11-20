@@ -1,31 +1,10 @@
 from typing import Any, Dict, List
 
+from app.constants.llm_prompts import BIOMED_NER_PROMPT
 from app.core.logger import get_logger
 from app.services.corrective.fact_extractor import FactExtractor
 
 logger = get_logger(__name__)
-
-
-BIOMED_NER_PROMPT = """
-You are a biomedical Named Entity Recognition (NER) model.
-
-Extract ALL medically relevant entities from the following fact.
-Entities should include:
-- diseases
-- conditions
-- symptoms
-- chemicals
-- nutrients
-- organs
-- viruses
-- medication names
-- biological processes
-
-Return ONLY this JSON format:
-{
-  "entities": ["entity1", "entity2", ...]
-}
-"""
 
 
 class EntityExtractor:

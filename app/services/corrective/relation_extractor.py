@@ -2,50 +2,11 @@ import asyncio
 import uuid
 from typing import Any, Dict, Iterable, List
 
+from app.constants.llm_prompts import TRIPLE_EXTRACTION_PROMPT
 from app.core.logger import get_logger
 from app.services.llms.groq_service import GroqService
 
 logger = get_logger(__name__)
-
-# Prompt to instruct the LLM to extract triples in strict JSON
-TRIPLE_EXTRACTION_PROMPT = """
-You are a relation extraction agent specialized in biomedical / health facts.
-Given a short factual statement and a list of entities detected in that statement,
-return ALL valid entity-relation-entity triples implied by the statement.
-
-Requirements:
-- Only return JSON in this exact format (no extra text):
-{
-  "triples": [
-    {
-      "subject": "string",
-      "relation": "string",
-      "object": "string",
-      "confidence": 0.0-1.0
-    },
-    ...
-  ]
-}
-- Subject and object should be entity strings (prefer values from the provided entities list).
-- Relation should be a concise verb or phrase (e.g., "causes", "reduces risk of", "is a treatment for").
-- Confidence should be a float between 0 and 1 indicating how strongly the triple is supported by the statement.
-- If no triples can be extracted, return {"triples": []}.
-- Do not output any explanation or any fields other than the JSON above.
-
-Example:
-STATEMENT:
-"COVID-19 vaccines reduce hospitalization."
-
-ENTITIES:
-["covid-19", "vaccines", "hospitalization"]
-
-OUTPUT:
-{
-  "triples": [
-    {"subject":"vaccines", "relation":"reduce risk of", "object":"hospitalization", "confidence":0.92}
-  ]
-}
-"""
 
 
 class RelationExtractor:

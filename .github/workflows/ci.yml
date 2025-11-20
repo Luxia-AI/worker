@@ -53,7 +53,7 @@ jobs:
       #     TESTING
       # ===================
       - name: Run Unit Tests
-        run: pytest -v --disable-warnings
+        run: pytest -v -q -s --disable-warnings
 
       # ===================
       #     LINTING
