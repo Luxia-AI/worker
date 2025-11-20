@@ -36,7 +36,7 @@ class CorrectivePipeline:
         9. Hybrid rank candidates and return top-K evidence
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.search_agent = TrustedSearch()
         self.scraper = Scraper()
         self.fact_extractor = FactExtractor()
