@@ -1,49 +1,18 @@
 import asyncio
-from typing import List
+from typing import Any, Dict, List
 
 import aiohttp
 
+from app.constants.config import GOOGLE_CSE_SEARCH_URL, GOOGLE_CSE_TIMEOUT, TRUSTED_DOMAINS
+from app.constants.llm_prompts import QUERY_REFORMULATION_PROMPT, REINFORCEMENT_QUERY_PROMPT
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.core.rate_limit import throttled
+from app.services.common.list_ops import dedupe_list
+from app.services.common.url_helpers import dedup_urls, is_accessible_url
 from app.services.llms.groq_service import GroqService
 
 logger = get_logger(__name__)
-
-# Trusted medical domains
-TRUSTED_DOMAINS = {
-    "who.int",
-    "cdc.gov",
-    "nih.gov",
-    "fda.gov",
-    "nhs.uk",
-    "mayoclinic.org",
-    "health.harvard.edu",
-    "medlineplus.gov",
-    "livescience.com",
-    "medicalnewstoday.com",
-}
-
-QUERY_REFORMULATION_PROMPT = """
-You are a query reformulation agent specialized in retrieving
-high-quality medical evidence from trusted sources (CDC, NIH, WHO, Mayo Clinic, Harvard Health).
-
-Given a social media post and optional failed biomedical entities:
-
-1. Extract the medically relevant keywords.
-2. Generate 5-8 optimized Google search queries.
-3. Each query must be:
-   - short (3-7 words)
-   - keyword dense
-   - objective
-   - medically oriented
-   - suitable for evidence gathering
-4. Avoid question-like queries. Focus on **search-efficient** queries.
-
-Return ONLY this JSON structure:
-{
-  "queries": ["...", "...", "..."]
-}
-"""
 
 
 class TrustedSearch:
@@ -60,9 +29,8 @@ class TrustedSearch:
 
     GOOGLE_API_KEY = settings.GOOGLE_API_KEY
     GOOGLE_CSE_ID = settings.GOOGLE_CSE_ID
-    MAX_RESULTS_PER_QUERY = 6
 
-    SEARCH_URL = "https://www.googleapis.com/customsearch/v1?" "key={key}&cx={cse}&q={query}"
+    SEARCH_URL = GOOGLE_CSE_SEARCH_URL
 
     def __init__(self) -> None:
         if not self.GOOGLE_API_KEY or not self.GOOGLE_CSE_ID:
@@ -93,13 +61,16 @@ FAILED ENTITIES:
             result = await self.groq_client.ainvoke(prompt, response_format="json")
             queries = result.get("queries", [])
             cleaned = [q.strip().lower() for q in queries if isinstance(q, str)]
-            return list(dict.fromkeys(cleaned))  # dedupe but preserve order
+            return dedupe_list(cleaned)  # dedupe but preserve order
 
         except Exception as e:
             logger.error(f"[TrustedSearch] LLM query reformulation failed: {e}")
             # fallback → old heuristic
             return self._fallback_queries(text, failed_entities)
 
+    # ---------------------------------------------------------------------
+    # Fallback Query Generation
+    # ---------------------------------------------------------------------
     def _fallback_queries(self, text: str, failed_entities: List[str]) -> List[str]:
         base = text.lower()
         queries = [
@@ -114,11 +85,12 @@ FAILED ENTITIES:
             queries.append(f"{ent} health research")
             queries.append(f"{ent} scientific facts")
 
-        return list(dict.fromkeys(queries))
+        return dedupe_list(queries)
 
     # ---------------------------------------------------------------------
     # Single Query Search
     # ---------------------------------------------------------------------
+    @throttled(limit=100, period=60.0, name="google_cse")
     async def search_query(self, session: aiohttp.ClientSession, query: str) -> List[str]:
         """
         Runs a single Google CSE request and returns trusted URLs.
@@ -131,7 +103,7 @@ FAILED ENTITIES:
         )
 
         try:
-            async with session.get(url, timeout=12) as resp:
+            async with session.get(url, timeout=GOOGLE_CSE_TIMEOUT) as resp:
                 data = await resp.json()
 
                 if "items" not in data:
@@ -154,8 +126,10 @@ FAILED ENTITIES:
     # ---------------------------------------------------------------------
     def is_trusted(self, url: str) -> bool:
         """
-        Returns True only if domain is in trusted domain list.
+        Returns True only if domain is in trusted domain list and accessible.
         """
+        if not is_accessible_url(url):
+            return False
         try:
             domain = url.split("/")[2]
             return domain in TRUSTED_DOMAINS
@@ -177,7 +151,88 @@ FAILED ENTITIES:
             results = await asyncio.gather(*tasks)
 
         # Flatten & dedupe
-        urls = {url for sublist in results for url in sublist}
+        urls = dedup_urls(list({url for sublist in results for url in sublist}))
 
         logger.info(f"[TrustedSearch] Found {len(urls)} trusted URLs")
         return list(urls)
+
+    async def google_search(self, post_text: str, failed_entities: List[str] | None = None) -> List[str]:
+        """
+        Alias for run() - performs Google CSE search with query reformulation.
+        """
+        if failed_entities is None:
+            failed_entities = []
+        return await self.run(post_text, failed_entities)
+
+    # ---------------------------------------------------------------------
+    # LLM-powered Reinforced Query Generation
+    # ---------------------------------------------------------------------
+    async def llm_reformulate_for_reinforcement(
+        self,
+        low_conf_items: List[Dict[str, Any]],
+        failed_entities: List[str],
+    ) -> List[str]:
+        """
+        Uses Groq LLM to generate highly optimized reinforcement search queries.
+        Much better than heuristic string concatenation.
+        """
+
+        base_statements = [item.get("statement", "") for item in low_conf_items]
+        base_entities = failed_entities or []
+
+        prompt = REINFORCEMENT_QUERY_PROMPT.format(statements=base_statements, entities=base_entities)
+
+        try:
+            result = await self.groq_client.ainvoke(prompt, response_format="json")
+            queries = result.get("queries", [])
+
+            # safety: ensure list[str]
+            return [q for q in queries if isinstance(q, str) and q.strip()]
+
+        except Exception as e:
+            logger.warning(f"[TrustedSearch] LLM reinforcement query generation failed: {e}")
+
+            # fallback to simple heuristics
+            fallback = []
+            for stmt in base_statements:
+                fallback.append(f"{stmt} peer reviewed research")
+                fallback.append(f"{stmt} scientific study NIH CDC")
+
+            for ent in base_entities:
+                fallback.append(f"{ent} medical research")
+                fallback.append(f"{ent} clinical facts verified")
+
+            return dedupe_list(fallback)
+
+    # ---------------------------------------------------------------------
+    # Reinforced Search for Low Confidence Cases
+    # ---------------------------------------------------------------------
+    async def reinforce_search(
+        self,
+        low_conf_items: List[Dict[str, Any]],
+        failed_entities: List[str],
+        max_queries: int = 8,
+    ) -> List[str]:
+        """
+        LLM-powered reinforcement search using Kimi/Groq.
+        Calls Google CSE on the generated queries.
+        """
+
+        # 1) Generate smarter queries
+        queries = await self.llm_reformulate_for_reinforcement(low_conf_items, failed_entities)
+        queries = queries[:max_queries]  # cap
+
+        logger.info(f"[TrustedSearch] Reinforcement queries: {queries}")
+
+        # 2) Perform Google CSE search
+        all_urls = []
+        async with aiohttp.ClientSession() as session:
+            for q in queries:
+                try:
+                    urls = await self.search_query(session, q)
+                    all_urls.extend(urls)
+                except Exception as e:
+                    logger.warning(f"[TrustedSearch] Reinforcement search failed for '{q}': {e}")
+
+        # 3) Deduplicate
+        return dedup_urls(all_urls)

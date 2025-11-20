@@ -4,11 +4,7 @@ from typing import List
 
 from sentence_transformers import SentenceTransformer
 
-# Production model: recommended for RAG search -- strong performance
-EMBEDDING_MODEL_NAME_PROD = "sentence-transformers/multilingual-e5-large"
-
-# Test model: lightweight, fast downloads for testing
-EMBEDDING_MODEL_NAME_TEST = "sentence-transformers/all-MiniLM-L6-v2"
+from app.constants.config import EMBEDDING_MODEL_NAME_PROD, EMBEDDING_MODEL_NAME_TEST
 
 _model = None
 
