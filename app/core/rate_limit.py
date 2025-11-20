@@ -1,9 +1,7 @@
 import asyncio
 import functools
 import time
-from typing import Any, Callable, Dict, Optional, TypeVar
-
-F = TypeVar("F", bound=Callable[..., Any])
+from typing import Any, Callable, Dict, Optional
 
 
 class AsyncRateLimiter:
@@ -52,7 +50,7 @@ def throttled(
     limit: int,
     period: float,
     name: Optional[str] = None,
-) -> Callable[[F], F]:
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """
     Decorator for async throttling.
 
@@ -67,7 +65,7 @@ def throttled(
             ...
     """
 
-    def decorator(func: F) -> F:
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
         limiter_name = name or func.__name__
         if limiter_name not in _rate_limiters:
             _rate_limiters[limiter_name] = AsyncRateLimiter(limit, period)
@@ -79,6 +77,6 @@ def throttled(
             await limiter.acquire()
             return await func(*args, **kwargs)
 
-        return wrapper  # type: ignore[return-value]
+        return wrapper
 
     return decorator
