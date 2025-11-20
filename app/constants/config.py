@@ -125,3 +125,24 @@ RANKING_MIN_SCORE_FLOOR = 0.2
 
 # Minimum credibility threshold to trigger min score floor
 RANKING_MIN_CREDIBILITY_THRESHOLD = 0.9
+
+# ============================================================================
+# TRUST-RANKING GRADE THRESHOLDS
+# ============================================================================
+
+# Grade boundaries (final_score ranges for letter grades A+ through F)
+# Based on: semantic similarity + credibility + entity overlap + recency
+GRADE_THRESHOLDS = {
+    "A_PLUS": 0.90,  # Excellent: High similarity, high credibility, entity match
+    "A": 0.80,  # Very Good
+    "B": 0.70,  # Good
+    "C": 0.60,  # Fair
+    "D": 0.50,  # Poor
+    "F": 0.0,  # Fail (below 0.50)
+}
+
+# Semantic similarity thresholds for confidence filtering
+SEMANTIC_THRESHOLD_HIGH = 0.90  # A+ candidate
+SEMANTIC_THRESHOLD_GOOD = 0.75  # A/B candidate
+SEMANTIC_THRESHOLD_FAIR = 0.60  # C/D candidate
+SEMANTIC_THRESHOLD_MIN = 0.40  # Minimum acceptable (below = no grade)
