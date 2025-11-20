@@ -3,8 +3,10 @@ from typing import Any, Dict
 
 from groq import AsyncGroq
 
+from app.constants.config import LLM_MODEL_NAME, LLM_TEMPERATURE
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.core.rate_limit import throttled
 
 logger = get_logger(__name__)
 
@@ -18,8 +20,9 @@ class GroqService:
         self.client = AsyncGroq(api_key=api_key)
 
         # MoonshotAI model
-        self.model = "moonshotai/kimi-k2-instruct"
+        self.model = LLM_MODEL_NAME
 
+    @throttled(limit=10, period=60.0, name="groq_api")
     async def ainvoke(self, prompt: str, response_format: str = "text") -> Dict[str, Any]:
         """
         Calls Groq async chat completion endpoint.
@@ -28,7 +31,7 @@ class GroqService:
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
+            "temperature": LLM_TEMPERATURE,
         }
 
         # Use Groq-supported JSON response format

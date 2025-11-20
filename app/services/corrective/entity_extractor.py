@@ -1,31 +1,11 @@
 from typing import Any, Dict, List
 
+from app.constants.llm_prompts import BIOMED_NER_PROMPT
 from app.core.logger import get_logger
-from app.services.corrective.fact_extractor import FactExtractingLLM
+from app.services.common.list_ops import dedupe_list
+from app.services.corrective.fact_extractor import FactExtractor
 
 logger = get_logger(__name__)
-
-
-BIOMED_NER_PROMPT = """
-You are a biomedical Named Entity Recognition (NER) model.
-
-Extract ALL medically relevant entities from the following fact.
-Entities should include:
-- diseases
-- conditions
-- symptoms
-- chemicals
-- nutrients
-- organs
-- viruses
-- medication names
-- biological processes
-
-Return ONLY this JSON format:
-{
-  "entities": ["entity1", "entity2", ...]
-}
-"""
 
 
 class EntityExtractor:
@@ -35,7 +15,7 @@ class EntityExtractor:
     """
 
     def __init__(self) -> None:
-        self.llm = FactExtractingLLM()
+        self.llm = FactExtractor()
 
     async def extract_entities(self, statement: str) -> List[str]:
         prompt = f"{BIOMED_NER_PROMPT}\n\nFACT:\n{statement}"
@@ -44,7 +24,7 @@ class EntityExtractor:
             result = await self.llm.ainvoke(prompt, response_format="json")
             ents = result.get("entities", [])
             cleaned = [e.lower().strip() for e in ents if isinstance(e, str)]
-            return list(dict.fromkeys(cleaned))  # dedupe
+            return dedupe_list(cleaned)
         except Exception as e:
             logger.error(f"[EntityExtractor] Failed extraction: {e}")
             return []

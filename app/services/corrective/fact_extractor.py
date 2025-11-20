@@ -1,13 +1,15 @@
 import json
-from typing import Any, Dict
+from typing import Any, Dict, List
 
+from app.constants.llm_prompts import FACT_EXTRACTION_PROMPT
 from app.core.logger import get_logger
+from app.services.common.text_cleaner import clean_statement, truncate_content
 from app.services.llms.groq_service import GroqService
 
 logger = get_logger(__name__)
 
 
-class FactExtractingLLM:
+class FactExtractor:
     """
     Async wrapper for Groq API using MoonshotAI's kimi-k2-instruct model.
     Uses OpenAI-compatible Chat Completions API.
@@ -39,13 +41,69 @@ class FactExtractingLLM:
             # JSON response
             if response_format == "json":
                 if msg.content:
-                    result: Dict[str, Any] = json.loads(msg.content)
-                    return result
+                    try:
+                        result: Dict[str, Any] = json.loads(msg.content)
+                        return result
+                    except json.JSONDecodeError as je:
+                        logger.error(f"[FactExtractor] JSON decode error: {je}. Content: {msg.content[:200]}")
+                        return {}
                 return {}
 
             # Text response
             return {"text": msg.content}
 
         except Exception as e:
-            logger.error(f"[FactExtractingLLM] Groq call failed: {e}")
+            logger.error(f"[FactExtractor] Groq call failed: {e}")
             raise
+
+    async def extract(self, scraped_pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Extract facts from scraped web pages using Groq LLM.
+
+        Args:
+            scraped_pages: List of dicts with 'content', 'source', 'url', 'published_at'
+
+        Returns:
+            List of extracted facts with statement, confidence, source info
+        """
+        if not scraped_pages:
+            return []
+
+        facts: List[Dict[str, Any]] = []
+
+        for page in scraped_pages:
+            content = page.get("content", "")
+            if not content or len(content) < 10:
+                continue
+
+            # Truncate long content to avoid token limits
+            content_chunk = truncate_content(content, max_length=2000)
+
+            prompt = FACT_EXTRACTION_PROMPT.format(content=content_chunk)
+
+            try:
+                result = await self.ainvoke(prompt, response_format="json")
+                extracted = result.get("facts", [])
+
+                # Validate extracted is a list
+                if not isinstance(extracted, list):
+                    logger.warning(f"[FactExtractor] Expected list of facts, got {type(extracted)}")
+                    continue
+
+                # Enrich with source information and clean statements
+                for fact in extracted:
+                    if not isinstance(fact, dict):
+                        continue
+                    fact["statement"] = clean_statement(fact.get("statement", ""))
+                    fact["source_url"] = page.get("url", "")
+                    fact["source"] = page.get("source", "")
+                    fact["published_at"] = page.get("published_at", "")
+                    fact["fact_id"] = f"f_{len(facts)}"
+
+                facts.extend(extracted)
+            except (KeyError, json.JSONDecodeError, TypeError) as e:
+                logger.warning(f"[FactExtractor] Failed to extract from {page.get('url')}: {e}")
+                continue
+
+        logger.info(f"[FactExtractor] Extracted {len(facts)} facts from {len(scraped_pages)} pages")
+        return facts

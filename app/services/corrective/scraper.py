@@ -5,6 +5,7 @@ import aiohttp
 import trafilatura
 
 from app.core.logger import get_logger
+from app.core.rate_limit import throttled
 
 logger = get_logger(__name__)
 
@@ -28,6 +29,7 @@ class Scraper:
     # ---------------------------------------------------------------------
     # Primary HTTP Fetcher
     # ---------------------------------------------------------------------
+    @throttled(limit=30, period=60.0, name="web_scraper")
     async def fetch_html(self, session: aiohttp.ClientSession, url: str) -> str | None:
         try:
             async with session.get(url, timeout=self.timeout) as resp:

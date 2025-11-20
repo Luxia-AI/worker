@@ -1,11 +1,11 @@
 import pytest
 
-from app.services.corrective.fact_extractor import FactExtractingLLM
+from app.services.corrective.fact_extractor import FactExtractor
 
 
 @pytest.mark.asyncio
 async def test_fact_extracting():
-    llm = FactExtractingLLM()
+    llm = FactExtractor()
     print("Testing text mode:")
     r1 = await llm.ainvoke("Say hello briefly", response_format="text")
     print(r1)
