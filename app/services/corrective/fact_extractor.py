@@ -41,8 +41,12 @@ class FactExtractor:
             # JSON response
             if response_format == "json":
                 if msg.content:
-                    result: Dict[str, Any] = json.loads(msg.content)
-                    return result
+                    try:
+                        result: Dict[str, Any] = json.loads(msg.content)
+                        return result
+                    except json.JSONDecodeError as je:
+                        logger.error(f"[FactExtractor] JSON decode error: {je}. Content: {msg.content[:200]}")
+                        return {}
                 return {}
 
             # Text response
@@ -81,8 +85,15 @@ class FactExtractor:
                 result = await self.ainvoke(prompt, response_format="json")
                 extracted = result.get("facts", [])
 
+                # Validate extracted is a list
+                if not isinstance(extracted, list):
+                    logger.warning(f"[FactExtractor] Expected list of facts, got {type(extracted)}")
+                    continue
+
                 # Enrich with source information and clean statements
                 for fact in extracted:
+                    if not isinstance(fact, dict):
+                        continue
                     fact["statement"] = clean_statement(fact.get("statement", ""))
                     fact["source_url"] = page.get("url", "")
                     fact["source"] = page.get("source", "")
@@ -90,7 +101,7 @@ class FactExtractor:
                     fact["fact_id"] = f"f_{len(facts)}"
 
                 facts.extend(extracted)
-            except Exception as e:
+            except (KeyError, json.JSONDecodeError, TypeError) as e:
                 logger.warning(f"[FactExtractor] Failed to extract from {page.get('url')}: {e}")
                 continue
 
