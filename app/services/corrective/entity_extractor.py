@@ -2,6 +2,7 @@ from typing import Any, Dict, List
 
 from app.constants.llm_prompts import BIOMED_NER_PROMPT
 from app.core.logger import get_logger
+from app.services.common.list_ops import dedupe_list
 from app.services.corrective.fact_extractor import FactExtractor
 
 logger = get_logger(__name__)
@@ -23,7 +24,7 @@ class EntityExtractor:
             result = await self.llm.ainvoke(prompt, response_format="json")
             ents = result.get("entities", [])
             cleaned = [e.lower().strip() for e in ents if isinstance(e, str)]
-            return list(dict.fromkeys(cleaned))  # dedupe
+            return dedupe_list(cleaned)
         except Exception as e:
             logger.error(f"[EntityExtractor] Failed extraction: {e}")
             return []

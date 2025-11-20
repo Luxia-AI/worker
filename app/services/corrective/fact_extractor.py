@@ -3,6 +3,7 @@ from typing import Any, Dict, List
 
 from app.constants.llm_prompts import FACT_EXTRACTION_PROMPT
 from app.core.logger import get_logger
+from app.services.common.text_cleaner import clean_statement, truncate_content
 from app.services.llms.groq_service import GroqService
 
 logger = get_logger(__name__)
@@ -72,7 +73,7 @@ class FactExtractor:
                 continue
 
             # Truncate long content to avoid token limits
-            content_chunk = content[:2000]
+            content_chunk = truncate_content(content, max_length=2000)
 
             prompt = FACT_EXTRACTION_PROMPT.format(content=content_chunk)
 
@@ -80,8 +81,9 @@ class FactExtractor:
                 result = await self.ainvoke(prompt, response_format="json")
                 extracted = result.get("facts", [])
 
-                # Enrich with source information
+                # Enrich with source information and clean statements
                 for fact in extracted:
+                    fact["statement"] = clean_statement(fact.get("statement", ""))
                     fact["source_url"] = page.get("url", "")
                     fact["source"] = page.get("source", "")
                     fact["published_at"] = page.get("published_at", "")

@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 from app.constants.config import PIPELINE_CONF_THRESHOLD, PIPELINE_MAX_ROUNDS, PIPELINE_MIN_NEW_URLS
 from app.core.logger import get_logger
+from app.services.common.dedup import dedup_candidates_by_score
 from app.services.corrective.entity_extractor import EntityExtractor
 from app.services.corrective.fact_extractor import FactExtractor
 from app.services.corrective.relation_extractor import RelationExtractor
@@ -132,13 +133,12 @@ class CorrectivePipeline:
                 logger.warning(f"[CorrectivePipeline:{round_id}] VDB retrieval failed for query='{q}': {e}")
 
         # dedupe semantic candidates by statement+source
-        seen = set()
-        dedup_sem = []
-        for s in semantic_candidates:
-            key = (s.get("statement"), s.get("source_url"))
-            if key not in seen:
-                seen.add(key)
-                dedup_sem.append(s)
+        dedup_sem = dedup_candidates_by_score(
+            semantic_candidates,
+            statement_key="statement",
+            source_key="source_url",
+            score_key="score",
+        )
 
         # 8) KG candidates from KG retrieval using entities
         try:
@@ -212,13 +212,12 @@ class CorrectivePipeline:
                     pass
 
             # Deduplicate
-            seen = set()
-            dedup_sem = []
-            for s in semantic_candidates:
-                key = (s.get("statement"), s.get("source_url"))
-                if key not in seen:
-                    seen.add(key)
-                    dedup_sem.append(s)
+            dedup_sem = dedup_candidates_by_score(
+                semantic_candidates,
+                statement_key="statement",
+                source_key="source_url",
+                score_key="score",
+            )
 
             # KG again
             try:

@@ -14,6 +14,8 @@ from app.constants.config import (
 from app.constants.llm_prompts import QUERY_REFORMULATION_PROMPT, REINFORCEMENT_QUERY_PROMPT
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.services.common.list_ops import dedupe_list
+from app.services.common.url_helpers import dedup_urls, is_accessible_url
 from app.services.llms.groq_service import GroqService
 
 logger = get_logger(__name__)
@@ -65,7 +67,7 @@ FAILED ENTITIES:
             result = await self.groq_client.ainvoke(prompt, response_format="json")
             queries = result.get("queries", [])
             cleaned = [q.strip().lower() for q in queries if isinstance(q, str)]
-            return list(dict.fromkeys(cleaned))  # dedupe but preserve order
+            return dedupe_list(cleaned)  # dedupe but preserve order
 
         except Exception as e:
             logger.error(f"[TrustedSearch] LLM query reformulation failed: {e}")
@@ -89,7 +91,7 @@ FAILED ENTITIES:
             queries.append(f"{ent} health research")
             queries.append(f"{ent} scientific facts")
 
-        return list(dict.fromkeys(queries))
+        return dedupe_list(queries)
 
     # ---------------------------------------------------------------------
     # Single Query Search
@@ -129,8 +131,10 @@ FAILED ENTITIES:
     # ---------------------------------------------------------------------
     def is_trusted(self, url: str) -> bool:
         """
-        Returns True only if domain is in trusted domain list.
+        Returns True only if domain is in trusted domain list and accessible.
         """
+        if not is_accessible_url(url):
+            return False
         try:
             domain = url.split("/")[2]
             return domain in TRUSTED_DOMAINS
@@ -152,7 +156,7 @@ FAILED ENTITIES:
             results = await asyncio.gather(*tasks)
 
         # Flatten & dedupe
-        urls = {url for sublist in results for url in sublist}
+        urls = dedup_urls(list({url for sublist in results for url in sublist}))
 
         logger.info(f"[TrustedSearch] Found {len(urls)} trusted URLs")
         return list(urls)
@@ -210,7 +214,7 @@ FAILED ENTITIES:
                 fallback.append(f"{ent} medical research")
                 fallback.append(f"{ent} clinical facts verified")
 
-            return list(dict.fromkeys(fallback))
+            return dedupe_list(fallback)
 
     # ---------------------------------------------------------------------
     # Reinforced Search for Low Confidence Cases
@@ -243,4 +247,4 @@ FAILED ENTITIES:
                     logger.warning(f"[TrustedSearch] Reinforcement search failed for '{q}': {e}")
 
         # 3) Deduplicate
-        return list(dict.fromkeys(all_urls))
+        return dedup_urls(all_urls)

@@ -18,6 +18,7 @@ from app.constants.config import (
     TRUSTED_DOMAINS_NEWS,
 )
 from app.core.logger import get_logger
+from app.services.common.list_ops import dedupe_list
 
 logger = get_logger(__name__)
 
@@ -198,7 +199,7 @@ def hybrid_rank(
 
         # merge entities
         ents = item.get("entities") or []
-        merged = list(dict.fromkeys([e.lower().strip() for e in (candidates_map[key]["entities"] + ents) if e]))
+        merged = dedupe_list([e.lower().strip() for e in (candidates_map[key]["entities"] + ents) if e])
         candidates_map[key]["entities"] = merged
 
     # Add items

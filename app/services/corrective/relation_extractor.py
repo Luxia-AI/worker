@@ -4,6 +4,7 @@ from typing import Any, Dict, Iterable, List
 
 from app.constants.llm_prompts import TRIPLE_EXTRACTION_PROMPT
 from app.core.logger import get_logger
+from app.services.common.dedup import dedup_triples_by_structure
 from app.services.llms.groq_service import GroqService
 
 logger = get_logger(__name__)
@@ -109,13 +110,7 @@ class RelationExtractor:
 
         # Flatten results and deduplicate identical triples (subject, relation, object, source)
         all_triples = [t for sub in results for t in sub]
-        unique: Dict[tuple[str, str, str, str | None], Dict[str, Any]] = {}
-        for t in all_triples:
-            key = (t["subject"].lower(), t["relation"].lower(), t["object"].lower(), t.get("source_url"))
-            if key not in unique or unique[key]["confidence"] < t["confidence"]:
-                unique[key] = t
-
-        deduped = list(unique.values())
+        deduped = dedup_triples_by_structure(all_triples)
         logger.info(f"[RelationExtractor] Extracted {len(deduped)} unique triples")
 
         return deduped
