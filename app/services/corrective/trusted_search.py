@@ -7,6 +7,7 @@ from app.constants.config import GOOGLE_CSE_SEARCH_URL, GOOGLE_CSE_TIMEOUT, TRUS
 from app.constants.llm_prompts import QUERY_REFORMULATION_PROMPT, REINFORCEMENT_QUERY_PROMPT
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.core.rate_limit import throttled
 from app.services.common.list_ops import dedupe_list
 from app.services.common.url_helpers import dedup_urls, is_accessible_url
 from app.services.llms.groq_service import GroqService
@@ -89,6 +90,7 @@ FAILED ENTITIES:
     # ---------------------------------------------------------------------
     # Single Query Search
     # ---------------------------------------------------------------------
+    @throttled(limit=100, period=60.0, name="google_cse")
     async def search_query(self, session: aiohttp.ClientSession, query: str) -> List[str]:
         """
         Runs a single Google CSE request and returns trusted URLs.

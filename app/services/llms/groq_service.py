@@ -6,6 +6,7 @@ from groq import AsyncGroq
 from app.constants.config import LLM_MODEL_NAME, LLM_TEMPERATURE
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.core.rate_limit import throttled
 
 logger = get_logger(__name__)
 
@@ -21,6 +22,7 @@ class GroqService:
         # MoonshotAI model
         self.model = LLM_MODEL_NAME
 
+    @throttled(limit=10, period=60.0, name="groq_api")
     async def ainvoke(self, prompt: str, response_format: str = "text") -> Dict[str, Any]:
         """
         Calls Groq async chat completion endpoint.
