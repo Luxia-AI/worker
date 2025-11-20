@@ -1,7 +1,7 @@
-# app/services/corrective/pipeline.py
 import uuid
 from typing import Any, Dict, List, Optional
 
+from app.constants.config import PIPELINE_CONF_THRESHOLD, PIPELINE_MAX_ROUNDS, PIPELINE_MIN_NEW_URLS
 from app.core.logger import get_logger
 from app.services.corrective.entity_extractor import EntityExtractor
 from app.services.corrective.fact_extractor import FactExtractor
@@ -36,9 +36,9 @@ class CorrectivePipeline:
         9. Hybrid rank candidates and return top-K evidence
     """
 
-    MAX_ROUNDS = 3
-    CONF_THRESHOLD = 0.70  # if top evidence < 0.70; reinforce
-    MIN_NEW_URLS = 2
+    MAX_ROUNDS = PIPELINE_MAX_ROUNDS
+    CONF_THRESHOLD = PIPELINE_CONF_THRESHOLD
+    MIN_NEW_URLS = PIPELINE_MIN_NEW_URLS
 
     def __init__(self) -> None:
         self.search_agent = TrustedSearch()

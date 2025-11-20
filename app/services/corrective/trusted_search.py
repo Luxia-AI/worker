@@ -4,26 +4,19 @@ from typing import Any, Dict, List
 
 import aiohttp
 
+from app.constants.config import (
+    GOOGLE_CSE_SEARCH_URL,
+    GOOGLE_CSE_TIMEOUT,
+    LLM_MAX_TOKENS_REINFORCEMENT,
+    LLM_TEMPERATURE,
+    TRUSTED_DOMAINS,
+)
 from app.constants.llm_prompts import QUERY_REFORMULATION_PROMPT, REINFORCEMENT_QUERY_PROMPT
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.llms.groq_service import GroqService
 
 logger = get_logger(__name__)
-
-# Trusted medical domains
-TRUSTED_DOMAINS = {
-    "who.int",
-    "cdc.gov",
-    "nih.gov",
-    "fda.gov",
-    "nhs.uk",
-    "mayoclinic.org",
-    "health.harvard.edu",
-    "medlineplus.gov",
-    "livescience.com",
-    "medicalnewstoday.com",
-}
 
 
 class TrustedSearch:
@@ -41,7 +34,7 @@ class TrustedSearch:
     GOOGLE_API_KEY = settings.GOOGLE_API_KEY
     GOOGLE_CSE_ID = settings.GOOGLE_CSE_ID
 
-    SEARCH_URL = "https://www.googleapis.com/customsearch/v1?" "key={key}&cx={cse}&q={query}"
+    SEARCH_URL = GOOGLE_CSE_SEARCH_URL
 
     def __init__(self) -> None:
         if not self.GOOGLE_API_KEY or not self.GOOGLE_CSE_ID:
@@ -113,7 +106,7 @@ FAILED ENTITIES:
         )
 
         try:
-            async with session.get(url, timeout=12) as resp:
+            async with session.get(url, timeout=GOOGLE_CSE_TIMEOUT) as resp:
                 data = await resp.json()
 
                 if "items" not in data:
@@ -194,8 +187,8 @@ FAILED ENTITIES:
             resp = self.groq_client.chat.completions.create(
                 model="moonshotai/kimi-k2-instruct",
                 messages=[{"role": "user", "content": prompt}],
-                temperature=0.2,
-                max_tokens=300,
+                temperature=LLM_TEMPERATURE,
+                max_tokens=LLM_MAX_TOKENS_REINFORCEMENT,
             )
 
             raw = resp.choices[0].message.content

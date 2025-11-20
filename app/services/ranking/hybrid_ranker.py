@@ -4,6 +4,19 @@ import math
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.constants.config import (
+    CREDIBILITY_AUTHORITY,
+    CREDIBILITY_DEFAULT,
+    CREDIBILITY_EDU_GOV,
+    CREDIBILITY_NEWS,
+    RANKING_MIN_CREDIBILITY_THRESHOLD,
+    RANKING_MIN_SCORE_FLOOR,
+    RANKING_WEIGHTS,
+    RECENCY_HALF_LIFE_DAYS,
+    TRUSTED_DOMAINS_AUTHORITY,
+    TRUSTED_DOMAINS_EDU_GOV,
+    TRUSTED_DOMAINS_NEWS,
+)
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -51,8 +64,7 @@ def _recency_boost(published_at: Optional[str], now: Optional[datetime] = None) 
             dt = dt.replace(tzinfo=timezone.utc)
         days = (now - dt).days
         # half-life: 365 days -> weight = 0.5 at 1 year
-        half_life_days = 365.0
-        decay = 0.5 ** (days / half_life_days)
+        decay = 0.5 ** (days / RECENCY_HALF_LIFE_DAYS)
         return float(max(0.0, min(decay, 1.0)))
     except Exception:
         return 0.0
@@ -96,17 +108,15 @@ def _credibility_score_from_meta(meta: Dict[str, Any]) -> float:
     domain = (meta.get("source_url") or meta.get("source") or "").lower()
     if domain:
         # very small whitelist (customize per deployment)
-        if any(
-            d in domain for d in ("who.int", "cdc.gov", "nih.gov", "fda.gov", "mayoclinic.org", "harvard.edu", "nhs.uk")
-        ):
-            return 0.95
-        if any(d in domain for d in (".gov", ".edu")):
-            return 0.75
-        if any(d in domain for d in ("news", "press", "blog", "medium.com")):
-            return 0.40
+        if any(d in domain for d in TRUSTED_DOMAINS_AUTHORITY):
+            return CREDIBILITY_AUTHORITY
+        if any(d in domain for d in TRUSTED_DOMAINS_EDU_GOV):
+            return CREDIBILITY_EDU_GOV
+        if any(d in domain for d in TRUSTED_DOMAINS_NEWS):
+            return CREDIBILITY_NEWS
 
     # no source or unknown source
-    return 0.5
+    return CREDIBILITY_DEFAULT
 
 
 def hybrid_rank(
@@ -143,11 +153,11 @@ def hybrid_rank(
     query_entities = query_entities or []
     weights = weights or {}
     # weights defaults
-    w_sem = float(weights.get("w_semantic", 0.08))
-    w_kg = float(weights.get("w_kg", 0.01))
-    w_entity = float(weights.get("w_entity", 0.59))
-    w_recency = float(weights.get("w_recency", 0.02))
-    w_cred = float(weights.get("w_credibility", 0.30))
+    w_sem = float(weights.get("w_semantic", RANKING_WEIGHTS["w_semantic"]))
+    w_kg = float(weights.get("w_kg", RANKING_WEIGHTS["w_kg"]))
+    w_entity = float(weights.get("w_entity", RANKING_WEIGHTS["w_entity"]))
+    w_recency = float(weights.get("w_recency", RANKING_WEIGHTS["w_recency"]))
+    w_cred = float(weights.get("w_credibility", RANKING_WEIGHTS["w_credibility"]))
 
     # Build unified candidate list keyed by (statement, source_url) to merge duplicates
     candidates_map: Dict[Tuple[str, Optional[str]], Dict[str, Any]] = {}
@@ -222,8 +232,8 @@ def hybrid_rank(
         final_score = (w_sem * sem_s) + (w_kg * kg_s) + (w_entity * ent_s) + (w_recency * recency_s) + (w_cred * cred_s)
 
         # small heuristic: if both sem and kg are zero but credibility high, ensure min floor
-        if sem_s == 0.0 and kg_s == 0.0 and cred_s >= 0.9:
-            final_score = max(final_score, 0.2)
+        if sem_s == 0.0 and kg_s == 0.0 and cred_s >= RANKING_MIN_CREDIBILITY_THRESHOLD:
+            final_score = max(final_score, RANKING_MIN_SCORE_FLOOR)
 
         out = {
             "statement": item["statement"],
