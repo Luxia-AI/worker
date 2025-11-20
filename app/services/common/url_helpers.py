@@ -3,7 +3,7 @@ URL validation, parsing, and normalization utilities.
 """
 
 import re
-from typing import Optional
+from typing import List, Optional
 from urllib.parse import parse_qs, urlparse
 
 
@@ -102,7 +102,7 @@ def get_domain_root(url: str) -> Optional[str]:
     return domain
 
 
-def is_domain_in_list(url: str, domain_list: list) -> bool:
+def is_domain_in_list(url: str, domain_list: List[str]) -> bool:
     """
     Check if URL's domain is in allowed domain list.
 
@@ -203,7 +203,7 @@ def is_accessible_url(url: str) -> bool:
     return True
 
 
-def dedup_urls(urls: list) -> list:
+def dedup_urls(urls: List[str]) -> List[str]:
     """
     Deduplicate URLs after normalization.
 

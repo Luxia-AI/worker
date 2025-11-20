@@ -1,16 +1,9 @@
 import asyncio
-import json
 from typing import Any, Dict, List
 
 import aiohttp
 
-from app.constants.config import (
-    GOOGLE_CSE_SEARCH_URL,
-    GOOGLE_CSE_TIMEOUT,
-    LLM_MAX_TOKENS_REINFORCEMENT,
-    LLM_TEMPERATURE,
-    TRUSTED_DOMAINS,
-)
+from app.constants.config import GOOGLE_CSE_SEARCH_URL, GOOGLE_CSE_TIMEOUT, TRUSTED_DOMAINS
 from app.constants.llm_prompts import QUERY_REFORMULATION_PROMPT, REINFORCEMENT_QUERY_PROMPT
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -161,7 +154,7 @@ FAILED ENTITIES:
         logger.info(f"[TrustedSearch] Found {len(urls)} trusted URLs")
         return list(urls)
 
-    async def google_search(self, post_text: str, failed_entities: List[str] = None) -> List[str]:
+    async def google_search(self, post_text: str, failed_entities: List[str] | None = None) -> List[str]:
         """
         Alias for run() - performs Google CSE search with query reformulation.
         """
@@ -188,15 +181,8 @@ FAILED ENTITIES:
         prompt = REINFORCEMENT_QUERY_PROMPT.format(statements=base_statements, entities=base_entities)
 
         try:
-            resp = self.groq_client.chat.completions.create(
-                model="moonshotai/kimi-k2-instruct",
-                messages=[{"role": "user", "content": prompt}],
-                temperature=LLM_TEMPERATURE,
-                max_tokens=LLM_MAX_TOKENS_REINFORCEMENT,
-            )
-
-            raw = resp.choices[0].message.content
-            queries = json.loads(raw)
+            result = await self.groq_client.ainvoke(prompt, response_format="json")
+            queries = result.get("queries", [])
 
             # safety: ensure list[str]
             return [q for q in queries if isinstance(q, str) and q.strip()]
@@ -221,7 +207,7 @@ FAILED ENTITIES:
     # ---------------------------------------------------------------------
     async def reinforce_search(
         self,
-        low_conf_items: List[Dict],
+        low_conf_items: List[Dict[str, Any]],
         failed_entities: List[str],
         max_queries: int = 8,
     ) -> List[str]:

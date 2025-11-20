@@ -1,4 +1,5 @@
 import asyncio
+import json
 import uuid
 from typing import Any, Dict, Iterable, List
 
@@ -36,6 +37,9 @@ class RelationExtractor:
             try:
                 # request JSON output from the model
                 res = await self.groq_service.ainvoke(prompt, response_format="json")
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.error(f"[RelationExtractor] JSON parsing failed for fact_id={fact.get('fact_id')}: {e}")
+                return []
             except Exception as e:
                 logger.error(f"[RelationExtractor] LLM call failed for fact_id={fact.get('fact_id')}: {e}")
                 return []

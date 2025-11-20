@@ -108,7 +108,7 @@ def chunk_list(items: List[Any], chunk_size: int) -> List[List[Any]]:
     return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
-def merge_dicts_in_list(dicts: List[Dict[str, Any]], key: str, merge_fn=None) -> List[Dict[str, Any]]:
+def merge_dicts_in_list(dicts: List[Dict[str, Any]], key: str, merge_fn: Any = None) -> List[Dict[str, Any]]:
     """
     Merge dicts with the same key value.
 
@@ -121,7 +121,7 @@ def merge_dicts_in_list(dicts: List[Dict[str, Any]], key: str, merge_fn=None) ->
         List with merged dicts
     """
 
-    def default_merge(v1, v2):
+    def default_merge(v1: Any, v2: Any) -> Any:
         """Default merge function that concatenates lists."""
         return (v1 if isinstance(v1, list) else [v1]) + (v2 if isinstance(v2, list) else [v2])
 
