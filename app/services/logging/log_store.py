@@ -168,13 +168,13 @@ class LogStore:
                 params.append(end_time)
 
             where_clause = " AND ".join(conditions) if conditions else "1=1"
-            query_sql = f"""  # nosec B608
+            query_sql = f"""
                 SELECT id, level, message, module, timestamp, request_id, round_id, session_id, context
                 FROM logs
                 WHERE {where_clause}
                 ORDER BY timestamp DESC
                 LIMIT ? OFFSET ?
-            """
+            """  # nosec B608
             params.extend([limit, offset])  # type: ignore[list-item]
 
             with sqlite3.connect(self.db_path) as conn:
@@ -218,7 +218,7 @@ class LogStore:
             params = [request_id] if request_id else []
 
             with sqlite3.connect(self.db_path) as conn:
-                query_sql = f"""  # nosec B608
+                query_sql = f"""
                     SELECT
                         COUNT(*) as total_logs,
                         SUM(CASE WHEN level = 'ERROR' THEN 1 ELSE 0 END) as error_count,
@@ -227,7 +227,7 @@ class LogStore:
                         SUM(CASE WHEN level = 'DEBUG' THEN 1 ELSE 0 END) as debug_count
                     FROM logs
                     {where_clause}
-                """
+                """  # nosec B608
                 cursor = conn.execute(query_sql, params)
                 row = cursor.fetchone()
 

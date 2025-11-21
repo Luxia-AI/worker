@@ -13,11 +13,11 @@ RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
 # Upgrade pip first (cached layer)
-RUN pip install --no-cache-dir --upgrade pip
+RUN pip install --upgrade pip
 
 # Install dependencies (Docker caches this layer unless requirements change)
 COPY requirements-docker.txt .
-RUN pip install --no-cache-dir -r requirements-docker.txt
+RUN pip install -r requirements-docker.txt
 
 # Clean up in separate layer (only runs if above changes)
 RUN rm -rf /root/.cache/pip /tmp/* && \
