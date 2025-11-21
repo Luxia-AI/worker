@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     NEO4J_USER: Optional[str] = Field(default=None)
     NEO4J_PASSWORD: Optional[str] = Field(default=None)
 
+    # Logging system (Redis + SQLite)
+    REDIS_URL: str = Field(default="redis://localhost:6379", description="Redis connection URL")
+    LOG_DB_PATH: str = Field(default="logs.db", description="SQLite database path for persistent logs")
+
     model_config: ClassVar[SettingsConfigDict] = SettingsConfigDict(env_file=".env", extra="ignore")
 
 

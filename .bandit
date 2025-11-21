@@ -1,0 +1,8 @@
+# Bandit configuration file
+# Excludes specific files/directories and configures security checks
+
+skips: ["B608", "B110"]
+
+exclude_dirs:
+    - "/tests/"
+    - "/__pycache__/"

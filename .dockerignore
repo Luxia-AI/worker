@@ -48,6 +48,37 @@ ENV/
 .coverage
 htmlcov/
 .tox/
+*.test
+tests/
+test_*.py
+
+# Documentation
+*.md
+docs/
+*.txt.bak
+
+# Logs and databases (mount as volumes instead)
+*.log
+*.db
+*.db-journal
+logs/
+
+# CI/CD
+.github/
+.gitlab-ci.yml
+.circleci/
+
+# Docker
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+
+# Misc
+*.pyc
+*.pyo
+*.pyd
+.cache/
+model_cache/
 .hypothesis/
 
 # Documentation
