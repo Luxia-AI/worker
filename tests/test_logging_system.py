@@ -126,6 +126,7 @@ async def test_log_manager_subscribe():
 
 
 @pytest.mark.asyncio
+@pytest.mark.redis_required
 async def test_log_manager_batch_processing():
     """Test log batching and persistence."""
     # Use temporary database file
@@ -166,8 +167,9 @@ async def test_log_manager_batch_processing():
 
 
 @pytest.mark.asyncio
+@pytest.mark.redis_required
 async def test_log_manager_get_logs():
-    """Test retrieving logs from SQLite."""
+    """Test retrieving logs from storage."""
     # Use temporary database file
     with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
         db_path = tmp.name
@@ -204,6 +206,7 @@ async def test_log_manager_get_logs():
 
 
 @pytest.mark.asyncio
+@pytest.mark.redis_required
 async def test_log_manager_stats():
     """Test log statistics aggregation."""
     # Use temporary database file
@@ -285,6 +288,7 @@ async def test_broadcast_to_subscribers():
 
 
 @pytest.mark.asyncio
+@pytest.mark.redis_required
 async def test_clear_old_logs():
     """Test log cleanup."""
     # Use temporary database file

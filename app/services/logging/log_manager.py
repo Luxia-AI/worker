@@ -299,7 +299,7 @@ class LogManager:
         Returns:
             Queue that will receive LogRecord objects
         """
-        queue = asyncio.Queue()
+        queue: asyncio.Queue[LogRecord] = asyncio.Queue()
         self.subscribers[session_id] = queue
         logger.info(f"[LogManager] Session {session_id} subscribed to log stream")
         return queue

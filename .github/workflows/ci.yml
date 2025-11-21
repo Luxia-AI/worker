@@ -13,6 +13,7 @@ jobs:
 
         # Ensures vars are loaded BEFORE Python imports settings
         env:
+            CI: "true"
             PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
             PINECONE_INDEX_NAME: ${{ vars.PINECONE_INDEX_NAME }}
             GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
@@ -54,8 +55,8 @@ jobs:
             # ===================
             #     TESTING
             # ===================
-            - name: Run Unit Tests
-              run: pytest -q --disable-warnings
+            - name: Run Unit Tests (skip Redis/E2E tests in CI)
+              run: pytest -q --disable-warnings -m "not redis_required and not e2e" --ignore=test_load.py
 
             # ===================
             #     LINTING

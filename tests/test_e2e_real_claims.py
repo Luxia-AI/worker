@@ -100,6 +100,8 @@ async def pipeline():
 
 
 @pytest.mark.asyncio
+@pytest.mark.e2e
+@pytest.mark.redis_required
 @pytest.mark.skipif(not ALL_SERVICES_AVAILABLE, reason="Requires all external services (LLM, VDB, KG, Google CSE)")
 async def test_e2e_single_claim_high_confidence(pipeline: CorrectivePipeline, log_manager: LogManager):
     """
@@ -165,6 +167,8 @@ async def test_e2e_single_claim_high_confidence(pipeline: CorrectivePipeline, lo
 
 
 @pytest.mark.asyncio
+@pytest.mark.e2e
+@pytest.mark.redis_required
 @pytest.mark.skipif(not ALL_SERVICES_AVAILABLE, reason="Requires all external services")
 async def test_e2e_claim_with_reinforcement(pipeline: CorrectivePipeline, log_manager: LogManager):
     """
@@ -217,6 +221,8 @@ async def test_e2e_claim_with_reinforcement(pipeline: CorrectivePipeline, log_ma
 
 
 @pytest.mark.asyncio
+@pytest.mark.e2e
+@pytest.mark.redis_required
 @pytest.mark.skipif(not ALL_SERVICES_AVAILABLE, reason="Requires all external services")
 async def test_e2e_multiple_claims_batch(pipeline: CorrectivePipeline, log_manager: LogManager):
     """
@@ -269,6 +275,8 @@ async def test_e2e_multiple_claims_batch(pipeline: CorrectivePipeline, log_manag
 
 
 @pytest.mark.asyncio
+@pytest.mark.e2e
+@pytest.mark.redis_required
 @pytest.mark.skipif(not ALL_SERVICES_AVAILABLE, reason="Requires all external services")
 async def test_e2e_log_statistics(pipeline: CorrectivePipeline, log_manager: LogManager):
     """
@@ -342,6 +350,8 @@ async def test_e2e_log_statistics(pipeline: CorrectivePipeline, log_manager: Log
 
 
 @pytest.mark.asyncio
+@pytest.mark.e2e
+@pytest.mark.redis_required
 @pytest.mark.skipif(not ALL_SERVICES_AVAILABLE, reason="Requires all external services")
 async def test_e2e_error_handling(pipeline: CorrectivePipeline, log_manager: LogManager):
     """
