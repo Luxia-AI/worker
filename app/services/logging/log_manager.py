@@ -99,6 +99,7 @@ class LogManager:
         self.processing = False
         self._batch_size = 10
         self._batch_timeout = 5  # seconds
+        self.subscribers: Dict[str, asyncio.Queue] = {}  # session_id -> queue
 
     async def start(self) -> None:
         """Start the logging system."""
@@ -166,6 +167,9 @@ class LogManager:
 
                 # Publish to Redis immediately for realtime
                 await self._publish_to_redis(record)
+
+                # Also broadcast to local subscribers
+                await self._broadcast_to_subscribers(record)
 
                 # Flush if batch full
                 if len(batch) >= self._batch_size:
@@ -262,19 +266,20 @@ class LogManager:
             logger.error(f"[LogManager] Failed to get log stats: {e}")
             return {}
 
-    async def clear_old_logs(self, hours: int = 168) -> int:
+    async def clear_old_logs(self, days: int = 7) -> int:
         """
-        Clean up logs older than N hours (maintenance task).
+        Clean up logs older than N days (maintenance task).
 
         Args:
-            hours: Delete logs older than this many hours (default: 7 days)
+            days: Delete logs older than this many days (default: 7 days)
 
         Returns:
             Number of logs deleted
         """
         try:
+            hours = days * 24
             deleted = await self.log_store.delete_old_logs(hours=hours)
-            logger.info(f"[LogManager] Cleaned up {deleted} logs older than {hours} hours")
+            logger.info(f"[LogManager] Cleaned up {deleted} logs older than {days} days")
             return deleted
         except Exception as e:
             logger.error(f"[LogManager] Failed to clean up old logs: {e}")
@@ -283,3 +288,72 @@ class LogManager:
     async def get_active_subscribers(self) -> int:
         """Get count of active Redis subscribers (for monitoring)."""
         return await self.redis_broadcaster.get_active_channels()
+
+    async def subscribe(self, session_id: str) -> asyncio.Queue:
+        """
+        Subscribe to log stream for a specific session.
+
+        Args:
+            session_id: Unique session identifier
+
+        Returns:
+            Queue that will receive LogRecord objects
+        """
+        queue = asyncio.Queue()
+        self.subscribers[session_id] = queue
+        logger.info(f"[LogManager] Session {session_id} subscribed to log stream")
+        return queue
+
+    async def unsubscribe(self, session_id: str) -> None:
+        """
+        Unsubscribe from log stream.
+
+        Args:
+            session_id: Session identifier to unsubscribe
+        """
+        if session_id in self.subscribers:
+            del self.subscribers[session_id]
+            logger.info(f"[LogManager] Session {session_id} unsubscribed from log stream")
+
+    async def _broadcast_to_subscribers(self, record: LogRecord) -> None:
+        """
+        Broadcast log record to all subscribed sessions.
+
+        Args:
+            record: LogRecord to broadcast
+        """
+        for session_id, queue in list(self.subscribers.items()):
+            try:
+                queue.put_nowait(record)
+            except asyncio.QueueFull:
+                logger.warning(f"[LogManager] Queue full for session {session_id}, dropping log")
+            except Exception as e:
+                logger.error(f"[LogManager] Failed to broadcast to session {session_id}: {e}")
+
+    async def get_log_statistics(
+        self,
+        request_id: Optional[str] = None,
+        level: Optional[str] = None,
+        module: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Get statistics about logs.
+
+        Args:
+            request_id: Filter by request ID
+            level: Filter by log level
+            module: Filter by module
+
+        Returns:
+            Statistics dict with total, by_level, by_module counts
+        """
+        try:
+            stats = await self.log_store.get_statistics(
+                request_id=request_id,
+                level=level,
+                module=module,
+            )
+            return stats
+        except Exception as e:
+            logger.error(f"[LogManager] Failed to get log statistics: {e}")
+            return {"total": 0, "by_level": {}, "by_module": {}}

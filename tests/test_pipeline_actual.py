@@ -211,3 +211,8 @@ async def test_pipeline_actual():
     # Print structured output
     print("\n=== PIPELINE OUTPUT ===")
     print(json.dumps(out, indent=2, ensure_ascii=False))
+
+    # Validate output structure
+    assert "status" in out, "Output should have status field"
+    assert "facts" in out, "Output should have facts field"
+    assert isinstance(out["facts"], list), "facts should be a list"

@@ -2,11 +2,12 @@
 Retrieval Phase: Retrieve semantic and KG candidates.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.core.logger import get_logger
 from app.services.common.dedup import dedup_candidates_by_score
 from app.services.kg.kg_retrieval import KGRetrieval
+from app.services.logging.log_manager import LogManager
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 
 logger = get_logger(__name__)
@@ -19,6 +20,7 @@ async def retrieve_candidates(
     all_entities: List[str],
     top_k: int,
     round_id: str,
+    log_manager: Optional[LogManager] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Retrieve semantic and KG candidates.
@@ -43,6 +45,16 @@ async def retrieve_candidates(
         except Exception as e:
             logger.warning(f"[RetrievalPhase:{round_id}] VDB retrieval failed for query='{q}': {e}")
 
+            if log_manager:
+                await log_manager.add_log(
+                    level="WARNING",
+                    message=f"VDB retrieval failed for query: {q}",
+                    module=__name__,
+                    request_id=f"claim-{round_id}",
+                    round_id=round_id,
+                    context={"query": q, "error": str(e)},
+                )
+
     # Deduplicate semantic candidates
     dedup_sem = dedup_candidates_by_score(
         semantic_candidates,
@@ -54,6 +66,16 @@ async def retrieve_candidates(
         f"[RetrievalPhase:{round_id}] Retrieved {len(dedup_sem)} semantic candidates "
         f"(from {len(semantic_candidates)} raw)"
     )
+
+    if log_manager:
+        await log_manager.add_log(
+            level="INFO",
+            message=f"Semantic retrieval completed: {len(dedup_sem)} candidates",
+            module=__name__,
+            request_id=f"claim-{round_id}",
+            round_id=round_id,
+            context={"dedup_candidates": len(dedup_sem), "raw_candidates": len(semantic_candidates)},
+        )
 
     # KG retrieval
     kg_candidates = []

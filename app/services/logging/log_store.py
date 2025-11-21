@@ -248,6 +248,82 @@ class LogStore:
                 "debug_count": 0,
             }
 
+    async def get_statistics(
+        self,
+        request_id: Optional[str] = None,
+        level: Optional[str] = None,
+        module: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Get detailed statistics about logs.
+
+        Args:
+            request_id: Filter by request ID
+            level: Filter by log level
+            module: Filter by module
+
+        Returns:
+            Statistics dict with total, by_level, by_module counts
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+
+                # Build WHERE clause
+                where_parts = []
+                params = []
+
+                if request_id:
+                    where_parts.append("request_id = ?")
+                    params.append(request_id)
+                if level:
+                    where_parts.append("level = ?")
+                    params.append(level)
+                if module:
+                    where_parts.append("module = ?")
+                    params.append(module)
+
+                where_clause = " AND ".join(where_parts) if where_parts else "1=1"
+
+                # Get total count
+                cursor = conn.execute(f"SELECT COUNT(*) as total FROM logs WHERE {where_clause}", params)
+                total = cursor.fetchone()["total"]
+
+                # Get counts by level
+                cursor = conn.execute(
+                    f"""
+                    SELECT level, COUNT(*) as count
+                    FROM logs
+                    WHERE {where_clause}
+                    GROUP BY level
+                    """,
+                    params,
+                )
+                by_level = {row["level"]: row["count"] for row in cursor.fetchall()}
+
+                # Get counts by module
+                cursor = conn.execute(
+                    f"""
+                    SELECT module, COUNT(*) as count
+                    FROM logs
+                    WHERE {where_clause}
+                    GROUP BY module
+                    ORDER BY count DESC
+                    LIMIT 20
+                    """,
+                    params,
+                )
+                by_module = {row["module"]: row["count"] for row in cursor.fetchall()}
+
+                return {
+                    "total": total,
+                    "by_level": by_level,
+                    "by_module": by_module,
+                }
+        except Exception as e:
+            logger.error(f"[LogStore] Failed to get statistics: {e}")
+            return {"total": 0, "by_level": {}, "by_module": {}}
+
     async def delete_old_logs(self, hours: int = 168) -> int:
         """
         Delete logs older than N hours (maintenance task).

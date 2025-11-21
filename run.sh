@@ -41,12 +41,12 @@ read -p "Enter the checks you want to run (e.g., 'pytest ruff black isort flake8
 
 # An associative array to map check names to their commands
 declare -A checks
-checks[pytest]="pytest -q --disable-warnings"
 checks[ruff]="ruff check . && ruff . --fix --exit-zero"
 checks[black]="black --check app tests"
 checks[isort]="isort --check-only app tests"
 checks[flake8]="flake8 app tests"
 checks[bandit]="bandit -r app -c .bandit"
+checks[pytest]="pytest -q --disable-warnings"
 checks[mypy]="mypy app"
 
 # If the user enters 'all', use all available checks. Otherwise, parse their input.

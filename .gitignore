@@ -208,4 +208,6 @@ __marimo__/
 
 
 .vscode
-copilot-instructions.md
+*.md
+.env.*
+validate_deployment.sh
