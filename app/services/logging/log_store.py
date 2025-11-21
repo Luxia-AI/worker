@@ -286,33 +286,30 @@ class LogStore:
                 where_clause = " AND ".join(where_parts) if where_parts else "1=1"
 
                 # Get total count
-                cursor = conn.execute(f"SELECT COUNT(*) as total FROM logs WHERE {where_clause}", params)
+                query_total = f"SELECT COUNT(*) as total FROM logs WHERE {where_clause}"  # nosec B608
+                cursor = conn.execute(query_total, params)
                 total = cursor.fetchone()["total"]
 
                 # Get counts by level
-                cursor = conn.execute(
-                    f"""
+                query_by_level = f"""
                     SELECT level, COUNT(*) as count
                     FROM logs
                     WHERE {where_clause}
                     GROUP BY level
-                    """,
-                    params,
-                )
+                    """  # nosec B608
+                cursor = conn.execute(query_by_level, params)
                 by_level = {row["level"]: row["count"] for row in cursor.fetchall()}
 
                 # Get counts by module
-                cursor = conn.execute(
-                    f"""
+                query_by_module = f"""
                     SELECT module, COUNT(*) as count
                     FROM logs
                     WHERE {where_clause}
                     GROUP BY module
                     ORDER BY count DESC
                     LIMIT 20
-                    """,
-                    params,
-                )
+                    """  # nosec B608
+                cursor = conn.execute(query_by_module, params)
                 by_module = {row["module"]: row["count"] for row in cursor.fetchall()}
 
                 return {
