@@ -1,28 +1,72 @@
 from typing import Any, Dict, List
 
+from app.core.logger import get_logger
 from app.services.embedding.model import embed_async
 from app.services.vdb.pinecone_client import get_pinecone_index
 
+logger = get_logger(__name__)
+
 
 class VDBRetrieval:
+    """
+    Semantic retrieval from Pinecone vector database.
+    Returns facts with full metadata for hybrid ranking.
+    """
+
     def __init__(self, namespace: str = "health") -> None:
         self.index = get_pinecone_index()
         self.namespace = namespace
 
     async def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        embedding = await embed_async([query])
-        vector = embedding[0]
+        """
+        Search vector DB for semantically similar facts.
 
-        response = self.index.query(vector=vector, top_k=top_k, namespace=self.namespace, include_metadata=True)
+        Args:
+            query: Search query text
+            top_k: Number of top results to return
+
+        Returns:
+            List of fact dicts with keys:
+                - score: float (cosine similarity [0, 1])
+                - statement: str (fact claim)
+                - entities: List[str] (extracted entities)
+                - source_url: str
+                - published_at: Optional[str] (ISO format)
+                - credibility: float [0, 1] (if available in metadata)
+                - source: Optional[str] (alternative to source_url)
+        """
+        try:
+            embedding = await embed_async([query])
+            vector = embedding[0]
+        except Exception as e:
+            logger.error(f"[VDBRetrieval] Embedding generation failed: {e}")
+            return []
+
+        try:
+            response = self.index.query(vector=vector, top_k=top_k, namespace=self.namespace, include_metadata=True)
+        except Exception as e:
+            logger.error(f"[VDBRetrieval] Pinecone query failed: {e}")
+            return []
 
         matches = response.get("matches") or []
 
-        return [
-            {
-                "score": m["score"],
-                "statement": m["metadata"]["statement"],
-                "entities": m["metadata"]["entities"],
-                "source_url": m["metadata"]["source_url"],
+        results = []
+        for m in matches:
+            metadata = m.get("metadata", {})
+            result = {
+                "score": float(m.get("score", 0.0)),
+                "statement": metadata.get("statement", ""),
+                "entities": metadata.get("entities", []) or [],
+                "source_url": metadata.get("source_url") or metadata.get("source", ""),
+                "published_at": metadata.get("published_at"),
+                "credibility": metadata.get("credibility"),
+                "source": metadata.get("source"),
             }
-            for m in matches
-        ]
+            if result["statement"]:  # Only include non-empty statements
+                results.append(result)
+
+        top_score = f"{results[0]['score']:.3f}" if results else "N/A"
+        logger.debug(
+            f"[VDBRetrieval] Query='{query[:50]}...' returned {len(results)} matches " f"(top score: {top_score})"
+        )
+        return results
