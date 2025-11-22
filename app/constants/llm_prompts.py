@@ -22,7 +22,7 @@ Fact: {statement}"""
 
 FACT_EXTRACTION_PROMPT = """Extract key factual statements from this content.
 Return ONLY valid JSON with this exact structure (no extra text, no markdown):
-{"facts": [{"statement": "...", "confidence": 0.85}, {"statement": "...", "confidence": 0.90}]}
+{{"facts": [{{"statement": "...", "confidence": 0.85}}, {{"statement": "...", "confidence": 0.90}}]}}
 
 Content:
 {content}"""
@@ -39,13 +39,13 @@ Requirements:
 - Subject/object must be entity strings from provided list
 - Relation should be concise (e.g., "causes", "reduces risk of", "is treatment for")
 - Confidence: float 0-1 indicating support strength
-- If no triples found: {"triples": []}
+- If no triples found: {{"triples": []}}
 
 Example:
 Statement: "COVID-19 vaccines reduce hospitalization."
 Entities: ["covid-19", "vaccines", "hospitalization"]
-Output: {"triples": [{"subject":"vaccines", "relation":"reduce",
-"object":"hospitalization", "confidence":0.92}]}
+Output: {{"triples": [{{"subject":"vaccines", "relation":"reduce",
+"object":"hospitalization", "confidence":0.92}}]}}
 
 Statement: {statement}
 Entities: {entities}"""
@@ -62,7 +62,7 @@ Given a social media post, extract medically relevant keywords and generate
 keyword dense, objective, medically oriented, suitable for evidence gathering.
 
 Return ONLY valid JSON (no markdown, no explanation):
-{"queries": ["query1", "query2", "query3"]}
+{{"queries": ["query1", "query2", "query3"]}}
 
 Post: {post}"""
 
@@ -80,4 +80,4 @@ Requirements: Queries must be highly targeted, focused on scientific/medical/
 factual verification, prefer NIH/WHO/CDC/Mayo Clinic/PubMed.
 
 Return ONLY valid JSON (no markdown):
-{{"queries": ["query1", "query2", "query3"]}}"""
+{{{{"queries": ["query1", "query2", "query3"]}}}}"""

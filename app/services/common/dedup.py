@@ -4,6 +4,10 @@ Advanced deduplication strategies for facts, statements, and candidates.
 
 from typing import Any, Dict, List, Tuple
 
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 def dedup_by_semantic_similarity(
     items: List[Dict[str, Any]], text_key: str, similarity_threshold: float = 0.95

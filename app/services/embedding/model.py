@@ -5,6 +5,9 @@ from typing import List
 from sentence_transformers import SentenceTransformer
 
 from app.constants.config import EMBEDDING_MODEL_NAME_PROD, EMBEDDING_MODEL_NAME_TEST
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
 
 _model = None
 
@@ -27,7 +30,9 @@ def get_embedding_model() -> SentenceTransformer:
     if _model is None:
         # Use test model if pytest is loaded, production model otherwise
         model_name = EMBEDDING_MODEL_NAME_TEST if _is_test_environment() else EMBEDDING_MODEL_NAME_PROD
+        logger.info(f"Loading embedding model: {model_name}")
         _model = SentenceTransformer(model_name)
+        logger.info("Embedding model loaded successfully")
     return _model
 
 

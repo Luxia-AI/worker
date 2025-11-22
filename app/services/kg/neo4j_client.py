@@ -59,6 +59,22 @@ class Neo4jClient:
         finally:
             await session.close()
 
+    async def execute(self, query: str, params: dict | None = None) -> list[dict[str, Any]]:
+        """
+        Execute a Cypher query and return results as list of dicts.
+
+        Args:
+            query: Cypher query string
+            params: Query parameters dict
+
+        Returns:
+            List of result records as dictionaries
+        """
+        async with self.session() as session:
+            result = await session.run(query, params or {})
+            records = await result.data()
+            return records
+
     async def close(self) -> None:
         """
         Cleanly close the global Neo4j driver.

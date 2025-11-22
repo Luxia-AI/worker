@@ -7,3 +7,4 @@ trafilatura
 playwright
 groq
 neo4j
+redis

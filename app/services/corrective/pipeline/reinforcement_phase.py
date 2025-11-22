@@ -2,7 +2,7 @@
 Reinforcement Phase: Low-confidence reinforcement search loop.
 """
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.core.logger import get_logger
 from app.services.corrective.entity_extractor import EntityExtractor
@@ -15,6 +15,7 @@ from app.services.corrective.relation_extractor import RelationExtractor
 from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
 from app.services.kg.kg_ingest import KGIngest
+from app.services.logging.log_manager import LogManager
 from app.services.vdb.vdb_ingest import VDBIngest
 
 logger = get_logger(__name__)
@@ -43,6 +44,7 @@ async def reinforcement_loop(
     conf_threshold: float,
     min_new_urls: int,
     round_id: str,
+    log_manager: Optional[LogManager] = None,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Execute reinforcement loop for low-confidence results.
@@ -80,9 +82,29 @@ async def reinforcement_loop(
         score_str = top_ranked[0]["final_score"] if top_ranked else "N/A"
         logger.info(f"[ReinforcementPhase:{round_id}] Round {round_count}, top score={score_str}")
 
+        if log_manager:
+            await log_manager.add_log(
+                level="INFO",
+                message=f"Reinforcement round {round_count}: top score={score_str}",
+                module=__name__,
+                request_id=f"claim-{round_id}",
+                round_id=round_id,
+                context={"round": round_count, "top_score": score_str},
+            )
+
         # If score meets threshold → stop reinforcement
         if top_ranked and top_ranked[0]["final_score"] >= conf_threshold:
             logger.info(f"[ReinforcementPhase:{round_id}] Confidence threshold met. Stopping reinforcement.")
+
+            if log_manager:
+                await log_manager.add_log(
+                    level="INFO",
+                    message="Reinforcement stopped: confidence threshold met",
+                    module=__name__,
+                    request_id=f"claim-{round_id}",
+                    round_id=round_id,
+                    context={"final_score": top_ranked[0]["final_score"], "threshold": conf_threshold},
+                )
             break
 
         # Determine which items are weak
@@ -98,16 +120,36 @@ async def reinforcement_loop(
             logger.info(
                 f"[ReinforcementPhase:{round_id}] Not enough new URLs " f"({len(new_urls)} < {min_new_urls}). Stopping."
             )
+
+            if log_manager:
+                await log_manager.add_log(
+                    level="INFO",
+                    message=f"Reinforcement stopped: insufficient new URLs ({len(new_urls)} < {min_new_urls})",
+                    module=__name__,
+                    request_id=f"claim-{round_id}",
+                    round_id=round_id,
+                    context={"new_urls": len(new_urls), "min_required": min_new_urls},
+                )
             break
 
         logger.info(f"[ReinforcementPhase:{round_id}] Fetched {len(new_urls)} new URLs")
+
+        if log_manager:
+            await log_manager.add_log(
+                level="INFO",
+                message=f"Reinforcement: fetched {len(new_urls)} new URLs",
+                module=__name__,
+                request_id=f"claim-{round_id}",
+                round_id=round_id,
+                context={"new_urls_count": len(new_urls), "round": round_count},
+            )
         search_urls.extend(new_urls)
 
         # Scrape and extract from new pages
-        new_pages = await scrape_pages(scraper, new_urls, round_id)
+        new_pages = await scrape_pages(scraper, new_urls, round_id, log_manager)
         if new_pages:
             new_facts, _, new_triples = await extract_all(
-                fact_extractor, entity_extractor, relation_extractor, new_pages, round_id
+                fact_extractor, entity_extractor, relation_extractor, new_pages, round_id, log_manager
             )
 
             if new_facts:
@@ -115,13 +157,13 @@ async def reinforcement_loop(
                 triples.extend(new_triples)
 
                 # Ingest new data
-                await ingest_facts_and_triples(vdb_ingest, kg_ingest, new_facts, new_triples, round_id)
+                await ingest_facts_and_triples(vdb_ingest, kg_ingest, new_facts, new_triples, round_id, log_manager)
 
         # Retrieve and re-rank
         dedup_sem, kg_candidates = await retrieve_candidates(
-            vdb_retriever, kg_retriever, queries, all_entities, top_k, round_id
+            vdb_retriever, kg_retriever, queries, all_entities, top_k, round_id, log_manager
         )
-        top_ranked = await rank_candidates(dedup_sem, kg_candidates, all_entities, top_k, round_id)
+        top_ranked = await rank_candidates(dedup_sem, kg_candidates, all_entities, top_k, round_id, log_manager)
 
         # Decay confidence threshold
         conf_threshold -= round_count * 0.05
