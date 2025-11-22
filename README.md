@@ -6,24 +6,24 @@ A sophisticated AI-powered fact-checking system that verifies medical and scient
 
 **Luxia Worker** implements an advanced information retrieval and verification system designed for biomedical fact-checking (extensible to other domains). The system:
 
-- 🔍 Searches trusted medical/scientific domains (WHO, CDC, NIH, PubMed, etc.)
-- 📄 Extracts facts, entities, and relationships using LLM-powered NLP
-- 📊 Stores findings in dual storage systems (Pinecone vector DB + Neo4j knowledge graph)
-- ⭐ Ranks evidence using 5-signal hybrid scoring (recency, credibility, semantic similarity, entity match, KG score)
-- 🔄 Reinforces low-confidence results through iterative search loops with failed entity targeting
+-   🔍 Searches trusted medical/scientific domains (WHO, CDC, NIH, PubMed, etc.)
+-   📄 Extracts facts, entities, and relationships using LLM-powered NLP
+-   📊 Stores findings in dual storage systems (Pinecone vector DB + Neo4j knowledge graph)
+-   ⭐ Ranks evidence using 5-signal hybrid scoring (recency, credibility, semantic similarity, entity match, KG score)
+-   🔄 Reinforces low-confidence results through iterative search loops with failed entity targeting
 
 ## 📋 Table of Contents
 
-- [Quick Start](#-quick-start)
-- [Architecture](#-architecture)
-- [Installation](#-installation)
-- [Configuration](#-configuration)
-- [API Endpoints](#-api-endpoints)
-- [Pipeline Phases](#-pipeline-phases)
-- [Development](#-development)
-- [Testing](#-testing)
-- [Deployment](#-deployment)
-- [Troubleshooting](#-troubleshooting)
+-   [Quick Start](#-quick-start)
+-   [Architecture](#-architecture)
+-   [Installation](#-installation)
+-   [Configuration](#-configuration)
+-   [API Endpoints](#-api-endpoints)
+-   [Pipeline Phases](#-pipeline-phases)
+-   [Development](#-development)
+-   [Testing](#-testing)
+-   [Deployment](#-deployment)
+-   [Troubleshooting](#-troubleshooting)
 
 ## 🚀 Quick Start
 
@@ -213,33 +213,36 @@ app/
 
 ### Requirements
 
-- **Python**: 3.13+
-- **External Services**:
-  - Pinecone (vector database)
-  - Neo4j (knowledge graph)
-  - Redis (logging & caching)
-  - Google Custom Search Engine (CSE)
-  - Groq or OpenAI (LLM API)
+-   **Python**: 3.13+
+-   **External Services**:
+    -   Pinecone (vector database)
+    -   Neo4j (knowledge graph)
+    -   Redis (logging & caching)
+    -   Google Custom Search Engine (CSE)
+    -   Groq or OpenAI (LLM API)
 
 ### Setup
 
 1. **Clone Repository**
-   ```bash
-   git clone https://github.com/Luxia-AI/worker.git
-   cd worker
-   ```
+
+    ```bash
+    git clone https://github.com/Luxia-AI/worker.git
+    cd worker
+    ```
 
 2. **Create Virtual Environment**
-   ```bash
-   python -m venv .venv
-   source .venv/Scripts/activate  # Windows
-   ```
+
+    ```bash
+    python -m venv .venv
+    source .venv/Scripts/activate  # Windows
+    ```
 
 3. **Install Dependencies**
-   ```bash
-   pip install -r requirements.txt
-   pip install -r requirements-dev.txt  # For development
-   ```
+
+    ```bash
+    pip install -r requirements.txt
+    pip install -r requirements-dev.txt  # For development
+    ```
 
 4. **Configure Environment** (see [Configuration](#-configuration))
 
@@ -322,27 +325,30 @@ TRUSTED_DOMAINS_EDU_GOV = {'*.edu', '*.gov'}
 **Endpoint**: `GET /worker/search`
 
 **Query Parameters**:
-- `query` (string, required): Medical claim or question to verify
+
+-   `query` (string, required): Medical claim or question to verify
 
 **Response**:
+
 ```json
 {
-  "query": "Does vitamin C prevent colds?",
-  "results": [
-    {
-      "statement": "Vitamin C does not prevent common cold infections...",
-      "confidence": 0.85,
-      "source_url": "https://example.com/article",
-      "source": "NIH",
-      "published_at": "2023-06-15",
-      "entities": ["vitamin C", "common cold"],
-      "evidence_score": 0.87
-    }
-  ]
+	"query": "Does vitamin C prevent colds?",
+	"results": [
+		{
+			"statement": "Vitamin C does not prevent common cold infections...",
+			"confidence": 0.85,
+			"source_url": "https://example.com/article",
+			"source": "NIH",
+			"published_at": "2023-06-15",
+			"entities": ["vitamin C", "common cold"],
+			"evidence_score": 0.87
+		}
+	]
 }
 ```
 
 **Example**:
+
 ```bash
 curl "http://localhost:9000/worker/search?query=WHO+guidelines+for+COVID-19+vaccination"
 ```
@@ -352,28 +358,30 @@ curl "http://localhost:9000/worker/search?query=WHO+guidelines+for+COVID-19+vacc
 **Endpoint**: `GET /admin/logs`
 
 **Query Parameters**:
-- `skip` (int): Number of logs to skip (pagination)
-- `limit` (int): Number of logs to return
-- `request_id` (string, optional): Filter by request ID
-- `level` (string, optional): Filter by log level (DEBUG, INFO, WARNING, ERROR)
-- `module` (string, optional): Filter by module name
+
+-   `skip` (int): Number of logs to skip (pagination)
+-   `limit` (int): Number of logs to return
+-   `request_id` (string, optional): Filter by request ID
+-   `level` (string, optional): Filter by log level (DEBUG, INFO, WARNING, ERROR)
+-   `module` (string, optional): Filter by module name
 
 **Response**:
+
 ```json
 {
-  "logs": [
-    {
-      "id": "550e8400-e29b-41d4-a716-446655440000",
-      "timestamp": "2025-11-22T10:30:00Z",
-      "level": "INFO",
-      "message": "[SearchPhase:uuid] Found 5 trusted sources",
-      "module": "search_phase",
-      "request_id": "req-123"
-    }
-  ],
-  "total": 1250,
-  "page": 1,
-  "per_page": 10
+	"logs": [
+		{
+			"id": "550e8400-e29b-41d4-a716-446655440000",
+			"timestamp": "2025-11-22T10:30:00Z",
+			"level": "INFO",
+			"message": "[SearchPhase:uuid] Found 5 trusted sources",
+			"module": "search_phase",
+			"request_id": "req-123"
+		}
+	],
+	"total": 1250,
+	"page": 1,
+	"per_page": 10
 }
 ```
 
@@ -382,11 +390,13 @@ curl "http://localhost:9000/worker/search?query=WHO+guidelines+for+COVID-19+vacc
 **Endpoint**: `GET /admin/logs/stats`
 
 **Query Parameters**:
-- `request_id` (string, optional): Filter by request ID
-- `level` (string, optional): Filter by log level
-- `module` (string, optional): Filter by module
+
+-   `request_id` (string, optional): Filter by request ID
+-   `level` (string, optional): Filter by log level
+-   `module` (string, optional): Filter by module
 
 **Response**:
+
 ```json
 {
   "total": 1250,
@@ -412,6 +422,7 @@ curl "http://localhost:9000/worker/search?query=WHO+guidelines+for+COVID-19+vacc
 **File**: `app/services/corrective/pipeline/search_phase.py`
 
 **Process**:
+
 1. Reformulate input query using LLM (improves search results)
 2. Filter Google CSE results to trusted domains only
 3. Return top-N URLs from authoritative sources
@@ -419,13 +430,15 @@ curl "http://localhost:9000/worker/search?query=WHO+guidelines+for+COVID-19+vacc
 **Key Function**: `do_search(claim: str) -> List[str]`
 
 **Outputs**:
-- `search_urls`: List of URLs from trusted domains
+
+-   `search_urls`: List of URLs from trusted domains
 
 ### Phase 2: Scraping
 
 **File**: `app/services/corrective/pipeline/extraction_phase.py:scrape_pages()`
 
 **Process**:
+
 1. Fetch HTML from URLs using HTTP client
 2. Convert HTML to plain text using Trafilatura
 3. Clean and normalize text
@@ -434,30 +447,35 @@ curl "http://localhost:9000/worker/search?query=WHO+guidelines+for+COVID-19+vacc
 **Key Function**: `scrape_pages(search_urls: List[str]) -> List[str]`
 
 **Outputs**:
-- `scraped_content`: List of plain-text webpage content
+
+-   `scraped_content`: List of plain-text webpage content
 
 ### Phase 3: Extraction
 
 **File**: `app/services/corrective/pipeline/extraction_phase.py:extract_all()`
 
 **Process**:
+
 1. **Fact Extraction**: LLM extracts claims/statements from content
 2. **Entity Extraction**: LLM identifies medical/scientific entities
 3. **Relation Extraction**: LLM identifies relationships between entities
 
 **Key Functions**:
-- `extract_all(content: List[str]) -> Tuple[List[Dict], List[str], List[Dict]]`
+
+-   `extract_all(content: List[str]) -> Tuple[List[Dict], List[str], List[Dict]]`
 
 **Outputs**:
-- `facts`: List of fact dicts with statement, confidence, source, published_at
-- `entities`: List of extracted entities
-- `triples`: List of relationship triples (subject-relation-object)
+
+-   `facts`: List of fact dicts with statement, confidence, source, published_at
+-   `entities`: List of extracted entities
+-   `triples`: List of relationship triples (subject-relation-object)
 
 ### Phase 4: Ingestion
 
 **File**: `app/services/corrective/pipeline/ingestion_phase.py`
 
 **Process**:
+
 1. Embed facts using sentence transformer
 2. Store embeddings in Pinecone (VDB)
 3. Store facts as nodes/relationships in Neo4j (KG)
@@ -465,14 +483,16 @@ curl "http://localhost:9000/worker/search?query=WHO+guidelines+for+COVID-19+vacc
 **Key Function**: `ingest_facts_and_triples(facts, triples) -> Tuple[int, int]`
 
 **Outputs**:
-- Facts stored in Pinecone
-- Relationships stored in Neo4j
+
+-   Facts stored in Pinecone
+-   Relationships stored in Neo4j
 
 ### Phase 5: Retrieval
 
 **File**: `app/services/corrective/pipeline/retrieval_phase.py`
 
 **Process**:
+
 1. **Semantic Search**: Query Pinecone for similar facts
 2. **Structural Search**: Query Neo4j for related entities/relationships
 3. Combine and deduplicate candidates
@@ -480,7 +500,8 @@ curl "http://localhost:9000/worker/search?query=WHO+guidelines+for+COVID-19+vacc
 **Key Function**: `retrieve_candidates(claim: str) -> List[Dict]`
 
 **Outputs**:
-- `candidates`: List of retrieved fact/relationship candidates
+
+-   `candidates`: List of retrieved fact/relationship candidates
 
 ### Phase 6: Ranking
 
@@ -490,47 +511,54 @@ curl "http://localhost:9000/worker/search?query=WHO+guidelines+for+COVID-19+vacc
 Compute 5-signal hybrid score:
 
 1. **Credibility** (0.25 weight)
-   - Domain authority mapping (WHO > CDC > Academic > News)
-   - Normalized to [0, 1]
+
+    - Domain authority mapping (WHO > CDC > Academic > News)
+    - Normalized to [0, 1]
 
 2. **Recency** (0.25 weight)
-   - Exponential decay: exp(-age_days / HALF_LIFE)
-   - Recent sources weighted higher
+
+    - Exponential decay: exp(-age_days / HALF_LIFE)
+    - Recent sources weighted higher
 
 3. **Semantic Similarity** (0.25 weight)
-   - Cosine similarity between claim and fact embeddings
-   - VDB embedding match score
+
+    - Cosine similarity between claim and fact embeddings
+    - VDB embedding match score
 
 4. **Entity Match** (0.15 weight)
-   - % of extracted entities found in candidate
-   - Bonus for exact entity matches
+
+    - % of extracted entities found in candidate
+    - Bonus for exact entity matches
 
 5. **KG Structural Score** (0.10 weight)
-   - Confidence of relationships in knowledge graph
-   - Path strength in entity networks
+    - Confidence of relationships in knowledge graph
+    - Path strength in entity networks
 
 **Final Score**: Weighted sum of normalized signals
 
 **Key Function**: `rank_candidates(candidates: List[Dict]) -> List[Dict]`
 
 **Outputs**:
-- `ranked_candidates`: Sorted by final_score (descending)
+
+-   `ranked_candidates`: Sorted by final_score (descending)
 
 ### Phase 7: Reinforcement
 
 **File**: `app/services/corrective/pipeline/reinforcement_phase.py`
 
 **Process**:
+
 1. Check if max(ranked_candidates).final_score < CONF_THRESHOLD
 2. If yes and round < MAX_ROUNDS:
-   - Collect entities from low-scoring candidates
-   - Re-search with entity-focused queries (Phase 1)
-   - Repeat phases 2-6
+    - Collect entities from low-scoring candidates
+    - Re-search with entity-focused queries (Phase 1)
+    - Repeat phases 2-6
 3. Return final ranked results
 
 **Key Function**: `reinforcement_loop(candidate_results, round) -> List[Dict]`
 
 **Logic**:
+
 ```
 while round < MAX_ROUNDS and max_confidence < THRESHOLD:
     failed_entities = collect_low_confidence_entities(candidates)
@@ -616,6 +644,7 @@ Tests with Redis/E2E markers are auto-skipped in CI environment.
 ### Code Organization
 
 **Constants** (never hardcode):
+
 ```python
 # app/constants/config.py
 PIPELINE_MAX_ROUNDS = 3
@@ -625,6 +654,7 @@ TRUSTED_DOMAINS_AUTHORITY = {...}
 ```
 
 **Logging** (structured with round_id):
+
 ```python
 from app.core.logger import get_logger
 logger = get_logger(__name__)
@@ -632,6 +662,7 @@ logger.info(f"[PhaseX:round_id] Message", extra={"round_id": round_id})
 ```
 
 **Async** (async-first design):
+
 ```python
 async def extract_facts(content: List[str]) -> List[Dict]:
     tasks = [extractor.extract(c) for c in content]
@@ -652,22 +683,24 @@ async def extract_facts(content: List[str]) -> List[Dict]:
 
 ### Code Style
 
-- **Black**: Line length = 120
-- **isort**: Black profile
-- **Type hints**: mypy (lenient, some ignores for framework code)
-- **Linting**: Ruff, Flake8
-- **Security**: Bandit
+-   **Black**: Line length = 120
+-   **isort**: Black profile
+-   **Type hints**: mypy (lenient, some ignores for framework code)
+-   **Linting**: Ruff, Flake8
+-   **Security**: Bandit
 
 ## 🐳 Deployment
 
 ### Docker
 
 **Build**:
+
 ```bash
 docker build -t luxia-worker:latest .
 ```
 
 **Run**:
+
 ```bash
 docker run -p 9000:9000 \
   -e PINECONE_API_KEY=xxx \
@@ -678,6 +711,7 @@ docker run -p 9000:9000 \
 ```
 
 **Docker Compose** (recommended):
+
 ```bash
 docker-compose up --build
 ```
@@ -716,35 +750,44 @@ docker logs worker
 ### Common Issues
 
 **Redis Connection Failed**
+
 ```
 Error: Connection refused (redis://localhost:6379)
 ```
-- Ensure Redis is running: `docker run -p 6379:6379 redis`
-- Check REDIS_URL in .env
+
+-   Ensure Redis is running: `docker run -p 6379:6379 redis`
+-   Check REDIS_URL in .env
 
 **Pinecone Not Found**
+
 ```
 Error: Index not found: worker-index
 ```
-- Create index in Pinecone dashboard
-- Verify PINECONE_INDEX_NAME and PINECONE_API_KEY
+
+-   Create index in Pinecone dashboard
+-   Verify PINECONE_INDEX_NAME and PINECONE_API_KEY
 
 **Neo4j Connection Issues**
+
 ```
 Error: Could not connect to bolt://localhost:7687
 ```
-- Ensure Neo4j is running: `docker run -p 7687:7687 neo4j`
-- Check credentials: NEO4J_USER, NEO4J_PASSWORD
+
+-   Ensure Neo4j is running: `docker run -p 7687:7687 neo4j`
+-   Check credentials: NEO4J_USER, NEO4J_PASSWORD
 
 **LLM API Errors**
+
 ```
 Error: Groq API rate limit exceeded
 ```
-- Check GROQ_API_KEY
-- Reduce rate limits or use fallback OpenAI
-- Check OPENAI_API_KEY
+
+-   Check GROQ_API_KEY
+-   Reduce rate limits or use fallback OpenAI
+-   Check OPENAI_API_KEY
 
 **Tests Failing with "Redis not available"**
+
 ```bash
 # Expected in CI (tests auto-skip)
 # For local testing, ensure Redis is running or skip:
@@ -754,12 +797,14 @@ pytest -m "not redis_required"
 ### Debug Logging
 
 Enable detailed logging:
+
 ```python
 # .env
 LOG_LEVEL=DEBUG
 ```
 
 View logs:
+
 ```bash
 curl http://localhost:9000/admin/logs?level=DEBUG&limit=50
 ```
@@ -775,20 +820,20 @@ curl http://localhost:9000/admin/logs?level=DEBUG&limit=50
 
 ### Pipeline Performance
 
-- **Search Phase**: ~2-3 seconds per claim
-- **Scraping**: ~5-10 seconds (5-20 URLs)
-- **Extraction**: ~8-12 seconds (3x LLM calls)
-- **Retrieval**: ~1-2 seconds (VDB + KG queries)
-- **Ranking**: ~0.5 seconds (hybrid scoring)
-- **Total (single round)**: ~20-30 seconds
-- **With Reinforcement**: 20-90 seconds (up to 3 rounds)
+-   **Search Phase**: ~2-3 seconds per claim
+-   **Scraping**: ~5-10 seconds (5-20 URLs)
+-   **Extraction**: ~8-12 seconds (3x LLM calls)
+-   **Retrieval**: ~1-2 seconds (VDB + KG queries)
+-   **Ranking**: ~0.5 seconds (hybrid scoring)
+-   **Total (single round)**: ~20-30 seconds
+-   **With Reinforcement**: 20-90 seconds (up to 3 rounds)
 
 ### Test Coverage
 
-- Unit Tests: 81+ passing
-- Integration Tests: 12+ tests
-- E2E Tests: 5+ real claim scenarios
-- Code Quality: 100% (Black, isort, mypy, ruff, flake8, bandit)
+-   Unit Tests: 81+ passing
+-   Integration Tests: 12+ tests
+-   E2E Tests: 5+ real claim scenarios
+-   Code Quality: 100% (Black, isort, mypy, ruff, flake8, bandit)
 
 ## 🤝 Contributing
 
@@ -804,8 +849,8 @@ See LICENSE file in repository.
 
 ## 📞 Support
 
-- **Issues**: GitHub Issues
-- **Questions**: GitHub Discussions
+-   **Issues**: GitHub Issues
+-   **Questions**: GitHub Discussions
 
 ---
 
