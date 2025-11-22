@@ -4,6 +4,10 @@ List operations for deduplication and filtering.
 
 from typing import Any, Dict, List, Set, Tuple
 
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 def dedupe_list(items: List[Any]) -> List[Any]:
     """

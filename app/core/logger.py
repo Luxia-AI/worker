@@ -8,6 +8,11 @@ def get_logger(name: str) -> logging.Logger:
 
     Usage:
         logger = get_logger(__name__)
+
+    Features:
+    - Logs to stdout with formatted timestamp
+    - Integrated with LogManager for realtime streaming and Neo4j persistence
+    - Supports extra context (request_id, round_id, session_id)
     """
     logger = logging.getLogger(name)
 
@@ -23,5 +28,15 @@ def get_logger(name: str) -> logging.Logger:
 
         logger.addHandler(handler)
         logger.propagate = False
+
+        # Add LogManagerHandler (will be initialized after app startup)
+        try:
+            from app.services.logging.log_handler import LogManagerHandler
+
+            log_manager_handler = LogManagerHandler()
+            logger.addHandler(log_manager_handler)
+        except ImportError:
+            # LogManager not available yet; will be added at startup
+            pass
 
     return logger

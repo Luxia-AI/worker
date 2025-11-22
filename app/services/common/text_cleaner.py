@@ -5,6 +5,10 @@ Text cleaning and normalization utilities for fact extraction and entity process
 import re
 from typing import List
 
+from app.core.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 def normalize_text(text: str) -> str:
     """

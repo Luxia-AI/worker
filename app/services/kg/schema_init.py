@@ -27,6 +27,21 @@ class KGSchemaInitializer:
             FOR (e:Entity)
             ON (e.name)
             """,
+            """
+            CREATE INDEX log_timestamp_idx IF NOT EXISTS
+            FOR (log:Log)
+            ON (log.timestamp)
+            """,
+            """
+            CREATE INDEX log_request_id_idx IF NOT EXISTS
+            FOR (log:Log)
+            ON (log.request_id)
+            """,
+            """
+            CREATE INDEX log_level_idx IF NOT EXISTS
+            FOR (log:Log)
+            ON (log.level)
+            """,
         ]
 
         async with self.client.session() as session:
