@@ -211,3 +211,4 @@ __marimo__/
 *.md
 .env.*
 validate_deployment.sh
+!README.md
