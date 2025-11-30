@@ -106,14 +106,25 @@ FAILED ENTITIES:
             async with session.get(url, timeout=GOOGLE_CSE_TIMEOUT) as resp:
                 data = await resp.json()
 
+                if "error" in data:
+                    logger.error(f"[TrustedSearch] Google API error: {data['error']}")
+                    return []
+
                 if "items" not in data:
+                    logger.warning(f"[TrustedSearch] No items in response for query='{query}'")
                     return []
 
                 urls = []
+                all_links = [item.get("link") for item in data["items"] if item.get("link")]
+                logger.debug(f"[TrustedSearch] Raw URLs from Google for '{query}': {all_links[:5]}")
+
                 for item in data["items"]:
                     link = item.get("link")
                     if link and self.is_trusted(link):
                         urls.append(link)
+                    elif link:
+                        domain = link.split("/")[2] if len(link.split("/")) > 2 else "unknown"
+                        logger.debug(f"[TrustedSearch] Rejected non-trusted URL: {domain}")
 
                 return urls
 
@@ -131,8 +142,10 @@ FAILED ENTITIES:
         if not is_accessible_url(url):
             return False
         try:
-            domain = url.split("/")[2]
-            return domain in TRUSTED_DOMAINS
+            domain = url.split("/")[2].lower()
+            # Check if any trusted domain is contained in the URL domain
+            # This handles subdomains like www.cdc.gov matching cdc.gov
+            return any(trusted in domain for trusted in TRUSTED_DOMAINS)
         except Exception:
             return False
 

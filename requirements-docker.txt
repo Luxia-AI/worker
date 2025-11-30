@@ -17,4 +17,8 @@ websockets
 redis
 aiofiles
 httpx
+aiohttp
+aiokafka
+python-multipart
 python-dotenv
+aiokafka

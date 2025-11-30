@@ -8,3 +8,10 @@ playwright
 groq
 neo4j
 redis
+aiokafka
+aiohttp
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+requests

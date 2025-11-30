@@ -2,6 +2,7 @@ from fastapi import FastAPI
 
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.kafka import cleanup_kafka_services, init_kafka_services, start_consumer_loop
 from app.routers.admin import router as admin_router
 from app.routers.admin import set_log_manager
 from app.routers.pinecone import router as pinecone_router
@@ -15,7 +16,7 @@ _log_manager: LogManager | None = None
 
 
 async def startup_event() -> None:
-    """Initialize logging system on app startup."""
+    """Initialize logging system and Kafka services on app startup."""
     global _log_manager  # noqa: F841
 
     try:
@@ -37,9 +38,25 @@ async def startup_event() -> None:
     except Exception as e:
         logger.error(f"[Main] Failed to initialize LogManager: {e}")
 
+    # Initialize Kafka services
+    try:
+        await init_kafka_services()
+        await start_consumer_loop()
+        logger.info("[Main] Kafka services initialized and consumer loop started")
+    except Exception as e:
+        logger.error(f"[Main] Failed to initialize Kafka services: {e}")
+        # Don't raise - allow app to start even if Kafka fails (graceful degradation)
+
 
 async def shutdown_event() -> None:
     """Cleanup on app shutdown."""
+    # Cleanup Kafka services
+    try:
+        await cleanup_kafka_services()
+        logger.info("[Main] Kafka services cleaned up")
+    except Exception as e:
+        logger.warning(f"[Main] Error during Kafka cleanup: {e}")
+
     if _log_manager:
         await _log_manager.stop()
         logger.info("[Main] LogManager stopped")

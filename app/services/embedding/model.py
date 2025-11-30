@@ -1,4 +1,5 @@
 import asyncio
+import os
 import sys
 from typing import List
 
@@ -25,14 +26,18 @@ def get_embedding_model() -> SentenceTransformer:
     Lazy init the embedding model.
     Loads once and reuses for all workers.
     Uses lightweight model for testing, production model otherwise.
+    Can be overridden with EMBEDDING_MODEL environment variable.
     """
     global _model
     if _model is None:
-        # Use test model if pytest is loaded, production model otherwise
-        model_name = EMBEDDING_MODEL_NAME_TEST if _is_test_environment() else EMBEDDING_MODEL_NAME_PROD
+        # Allow environment override, otherwise use test/prod logic
+        model_name = os.environ.get("EMBEDDING_MODEL")
+        if not model_name:
+            model_name = EMBEDDING_MODEL_NAME_TEST if _is_test_environment() else EMBEDDING_MODEL_NAME_PROD
         logger.info(f"Loading embedding model: {model_name}")
         _model = SentenceTransformer(model_name)
         logger.info("Embedding model loaded successfully")
+    return _model
     return _model
 
 
