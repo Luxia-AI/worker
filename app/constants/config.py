@@ -3,6 +3,29 @@ Application configuration constants.
 Centralized settings for models, domains, API endpoints, and pipeline thresholds.
 """
 
+from enum import Enum
+
+# ============================================================================
+# VALIDATION & VERDICT STATE ENUMS
+# ============================================================================
+
+
+class ValidationState(Enum):
+    """Evidence validation state for domain trust resolution."""
+
+    TRUSTED = "trusted"
+    UNTRUSTED = "untrusted"
+    PENDING_DOMAIN_TRUST = "pending_domain_trust"
+
+
+class VerdictState(Enum):
+    """Verdict state: confirms confidence level and domain trust timing."""
+
+    CONFIRMED = "confirmed"  # Domain was trusted at verdict time
+    PROVISIONAL = "provisional"  # Domain approval pending; verdict may change
+    REVOKED = "revoked"  # Domain trust was removed after verdict
+
+
 # ============================================================================
 # PIPELINE THRESHOLDS & SETTINGS
 # ============================================================================

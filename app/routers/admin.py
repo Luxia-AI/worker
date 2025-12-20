@@ -1,11 +1,14 @@
 """
-Admin API routes for log management and monitoring.
+Admin API routes for log management, monitoring, and domain trust management.
 
 Endpoints:
   GET /admin/logs - Retrieve logs with filters
   GET /admin/logs/{request_id} - Get all logs for a specific request
   GET /admin/logs/stats/{request_id} - Get log statistics
   WS  /admin/logs/stream - WebSocket for realtime log streaming
+  POST /admin/domains/approve - Approve a domain for trust
+  POST /admin/domains/reject - Reject a domain
+  GET /admin/domains/status - Get domain trust status
 """
 
 from datetime import datetime
@@ -15,6 +18,7 @@ from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from app.core.logger import get_logger
+from app.services.domain_trust import get_domain_trust_store
 from app.services.logging.log_manager import LogManager
 
 logger = get_logger(__name__)
@@ -215,3 +219,164 @@ async def websocket_log_stream(websocket: WebSocket) -> None:
             await websocket.close(code=1011, reason=f"Internal error: {e}")
         except Exception:  # nosec
             pass  # WebSocket may already be closed
+
+
+# ============================================================================
+# DOMAIN TRUST MANAGEMENT ENDPOINTS
+# ============================================================================
+
+
+@router.post("/admin/domains/approve", tags=["Admin", "Domain Trust"])
+async def approve_domain(
+    domain: str = Query(..., description="Domain to approve (e.g., example.com)"),
+    reason: Optional[str] = Query(None, description="Optional reason for approval"),
+    approved_by: str = Query("admin", description="Username of approving admin"),
+):
+    """
+    Admin approves a domain for trust.
+
+    When a domain is approved, evidence previously marked PENDING_DOMAIN_TRUST
+    for that domain can be revalidated and their verdicts updated.
+
+    Example:
+        POST /admin/domains/approve?domain=example.com&approved_by=alice&reason=Verified+source
+
+    Returns:
+        {
+            "status": "approved",
+            "domain": "example.com",
+            "approved_at": "2025-12-20T15:30:45.123456",
+            "approved_by": "alice",
+            "reason": "Verified source",
+            "message": "Domain approved. Revalidation of pending evidence recommended."
+        }
+    """
+    try:
+        domain_trust = get_domain_trust_store()
+        record = await domain_trust.approve_domain(domain, approved_by, reason)
+
+        logger.info(f"[AdminAPI] Domain '{domain}' approved by {approved_by}")
+
+        return {
+            "status": "approved",
+            "domain": domain,
+            "approved_at": record.approved_at.isoformat(),
+            "approved_by": record.approved_by,
+            "reason": record.reason,
+            "message": "Domain approved. Revalidation of pending evidence recommended.",
+        }
+    except Exception as e:
+        logger.error(f"[AdminAPI] Error approving domain {domain}: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.post("/admin/domains/reject", tags=["Admin", "Domain Trust"])
+async def reject_domain(
+    domain: str = Query(..., description="Domain to reject"),
+    reason: Optional[str] = Query(None, description="Optional reason for rejection"),
+    approved_by: str = Query("admin", description="Username of approving admin"),
+):
+    """
+    Admin rejects a domain for trust.
+
+    When a domain is rejected, evidence from that domain is marked REVOKED
+    and should not be trusted even if previously marked as PENDING_DOMAIN_TRUST.
+
+    Example:
+        POST /admin/domains/reject?domain=untrusted.com&approved_by=alice&reason=Misinformation+source
+
+    Returns:
+        {
+            "status": "rejected",
+            "domain": "untrusted.com",
+            "rejected_at": "2025-12-20T15:30:45.123456",
+            "rejected_by": "alice",
+            "reason": "Misinformation source"
+        }
+    """
+    try:
+        domain_trust = get_domain_trust_store()
+        record = await domain_trust.reject_domain(domain, approved_by, reason)
+
+        logger.info(f"[AdminAPI] Domain '{domain}' rejected by {approved_by}")
+
+        return {
+            "status": "rejected",
+            "domain": domain,
+            "rejected_at": record.approved_at.isoformat(),
+            "rejected_by": record.approved_by,
+            "reason": record.reason,
+        }
+    except Exception as e:
+        logger.error(f"[AdminAPI] Error rejecting domain {domain}: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@router.get("/admin/domains/status", tags=["Admin", "Domain Trust"])
+async def get_domain_trust_status(
+    domain: Optional[str] = Query(None, description="Specific domain to check (optional)"),
+):
+    """
+    Get domain trust status.
+
+    If domain is provided, returns status for that specific domain.
+    Otherwise, returns aggregated trust status for all approved/rejected domains.
+
+    Example:
+        GET /admin/domains/status?domain=example.com
+        GET /admin/domains/status  # Get all approved/rejected domains
+
+    Returns:
+        {
+            "timestamp": "2025-12-20T15:30:45.123456",
+            "domain_specific": {...} or null,
+            "approved_count": 5,
+            "rejected_count": 2,
+            "approved_domains": ["example.com", "trusted.org", ...],
+            "rejected_domains": ["bad.com", ...],
+        }
+    """
+    try:
+        domain_trust = get_domain_trust_store()
+
+        response = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "domain_specific": None,
+            "approved_count": 0,
+            "rejected_count": 0,
+            "approved_domains": [],
+            "rejected_domains": [],
+        }
+
+        if domain:
+            # Get specific domain status
+            record = domain_trust.get_record(domain)
+            if record:
+                response["domain_specific"] = {
+                    "domain": domain,
+                    "is_trusted": record.is_trusted,
+                    "approved_at": record.approved_at.isoformat(),
+                    "approved_by": record.approved_by,
+                    "reason": record.reason,
+                }
+            else:
+                response["domain_specific"] = {
+                    "domain": domain,
+                    "status": "no_admin_decision",
+                    "message": "Domain has no admin approval/rejection; may be PENDING_DOMAIN_TRUST",
+                }
+        else:
+            # Get aggregate status
+            approved = domain_trust.get_approved_domains()
+            rejected = domain_trust.get_rejected_domains()
+
+            response["approved_count"] = len(approved)
+            response["rejected_count"] = len(rejected)
+            response["approved_domains"] = sorted(approved)
+            response["rejected_domains"] = sorted(rejected)
+
+        return response
+
+    except Exception as e:
+        logger.error(f"[AdminAPI] Error getting domain trust status: {e}")
+        return JSONResponse({"error": str(e)}, status_code=500)
