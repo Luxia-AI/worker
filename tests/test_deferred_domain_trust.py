@@ -133,7 +133,7 @@ class TestDeferredDomainTrustResolution:
         assert record.reason is not None
 
     @pytest.mark.asyncio
-    async def test_revalidation_after_domain_approval(self, domain_trust_store, sample_fact_untrusted_domain):
+    async def test_revalidation_after_domain_approval(self, mocker, domain_trust_store, sample_fact_untrusted_domain):
         """
         After admin approves a domain, evidence with PENDING_DOMAIN_TRUST
         for that domain should be revalidated to TRUSTED.
@@ -141,6 +141,7 @@ class TestDeferredDomainTrustResolution:
         domain = "untrusted-blog.example.com"
 
         # Enrich fact before approval
+        mocker.patch("app.services.evidence_validator.get_domain_trust_store", return_value=domain_trust_store)
         fact = EvidenceValidator.enrich_evidence_with_validation(sample_fact_untrusted_domain)
         assert fact["validation_state"] == ValidationState.PENDING_DOMAIN_TRUST.value
         assert fact["verdict_state"] == VerdictState.PROVISIONAL.value
@@ -171,7 +172,7 @@ class TestDeferredDomainTrustResolution:
         assert event.approved_by == "alice"
 
     @pytest.mark.asyncio
-    async def test_multiple_facts_revalidated_for_same_domain(self, domain_trust_store):
+    async def test_multiple_facts_revalidated_for_same_domain(self, mocker, domain_trust_store):
         """
         When a domain is approved, ALL facts with PENDING_DOMAIN_TRUST
         for that domain should be revalidated in batch.
@@ -323,7 +324,7 @@ class TestDeferredDomainTrustResolution:
 
 
 @pytest.mark.asyncio
-async def test_e2e_deferred_trust_workflow(tmp_path):
+async def test_e2e_deferred_trust_workflow(tmp_path, mocker):
     """
     End-to-end test: evidence with untrusted domain → provisional verdict
     → admin approval → revalidation → confirmed verdict.
@@ -332,6 +333,7 @@ async def test_e2e_deferred_trust_workflow(tmp_path):
     """
     # Setup
     domain_trust = DomainTrustStore(persist_path=str(tmp_path / "e2e_trust.json"))
+    mocker.patch("app.services.evidence_validator.get_domain_trust_store", return_value=domain_trust)
 
     # Step 1: User submits evidence from untrusted domain
     evidence = {

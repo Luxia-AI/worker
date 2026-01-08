@@ -339,7 +339,7 @@ async def get_domain_trust_status(
     try:
         domain_trust = get_domain_trust_store()
 
-        response = {
+        response: dict = {
             "timestamp": datetime.utcnow().isoformat(),
             "domain_specific": None,
             "approved_count": 0,

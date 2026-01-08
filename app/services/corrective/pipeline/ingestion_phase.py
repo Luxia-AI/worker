@@ -50,7 +50,7 @@ async def ingest_facts_and_triples(
             EvidenceValidator.enrich_evidence_with_validation(fact)
 
         # Log validation state distribution
-        validation_states = {}
+        validation_states: dict[str, int] = {}
         for fact in facts:
             state = fact.get("validation_state", "unknown")
             validation_states[state] = validation_states.get(state, 0) + 1

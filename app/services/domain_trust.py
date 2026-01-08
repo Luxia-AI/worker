@@ -50,7 +50,7 @@ class DomainTrustStore:
         Args:
             persist_path: Optional JSON file path for persistence
         """
-        self.persist_path = Path(persist_path) if persist_path else Path("/tmp/domain_trust.json")
+        self.persist_path = Path(persist_path) if persist_path else Path("/tmp/domain_trust.json")  # nosec B108
         self._lock = asyncio.Lock()
 
         # In-memory store: domain -> DomainTrustRecord
@@ -213,5 +213,5 @@ def get_domain_trust_store() -> DomainTrustStore:
     """Get or create the global domain trust store."""
     global _domain_trust_store
     if _domain_trust_store is None:
-        _domain_trust_store = DomainTrustStore(persist_path="/tmp/luxia_domain_trust.json")
+        _domain_trust_store = DomainTrustStore(persist_path="/tmp/luxia_domain_trust.json")  # nosec B108
     return _domain_trust_store

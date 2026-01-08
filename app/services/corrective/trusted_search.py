@@ -10,7 +10,7 @@ from app.core.logger import get_logger
 from app.core.rate_limit import throttled
 from app.services.common.list_ops import dedupe_list
 from app.services.common.url_helpers import dedup_urls, is_accessible_url
-from app.services.llms.groq_service import GroqService
+from app.services.llms.hybrid_service import HybridLLMService
 
 logger = get_logger(__name__)
 
@@ -37,7 +37,7 @@ class TrustedSearch:
             logger.error("Google Search API or CSE ID missing from environment")
             raise RuntimeError("Missing GOOGLE_API_KEY or GOOGLE_CSE_ID")
 
-        self.groq_client = GroqService()
+        self.llm_client = HybridLLMService()
 
     # ---------------------------------------------------------------------
     # Query Reformulation
@@ -58,7 +58,7 @@ FAILED ENTITIES:
 """
 
         try:
-            result = await self.groq_client.ainvoke(prompt, response_format="json")
+            result = await self.llm_client.ainvoke(prompt, response_format="json")
             queries = result.get("queries", [])
             cleaned = [q.strip().lower() for q in queries if isinstance(q, str)]
             return dedupe_list(cleaned)  # dedupe but preserve order
@@ -173,7 +173,7 @@ FAILED ENTITIES:
         failed_entities: List[str],
     ) -> List[str]:
         """
-        Uses Groq LLM to generate highly optimized reinforcement search queries.
+        Uses LLM (Groq with Ollama fallback) to generate highly optimized reinforcement search queries.
         Much better than heuristic string concatenation.
         """
 
@@ -183,7 +183,7 @@ FAILED ENTITIES:
         prompt = REINFORCEMENT_QUERY_PROMPT.format(statements=base_statements, entities=base_entities)
 
         try:
-            result = await self.groq_client.ainvoke(prompt, response_format="json")
+            result = await self.llm_client.ainvoke(prompt, response_format="json")
             queries = result.get("queries", [])
 
             # safety: ensure list[str]
