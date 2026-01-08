@@ -179,6 +179,8 @@ class TestDeferredDomainTrustResolution:
         """
         domain = "new-trusted.example.com"
 
+        mocker.patch("app.services.evidence_validator.get_domain_trust_store", return_value=domain_trust_store)
+
         # Create multiple facts from the same untrusted domain
         facts = []
         for i in range(3):
