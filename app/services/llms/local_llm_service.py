@@ -126,16 +126,20 @@ class LocalLLMService:
                         if json_start >= 0 and json_end > json_start:
                             json_str = text[json_start:json_end]
                             return json.loads(json_str)
-                        # Try array format
+                        # Try array format - if it's a list with one dict, unwrap it
                         json_start = text.find("[")
                         json_end = text.rfind("]") + 1
                         if json_start >= 0 and json_end > json_start:
                             json_str = text[json_start:json_end]
-                            return json.loads(json_str)
+                            parsed = json.loads(json_str)
+                            # If it's a list with a single dict, return the dict
+                            if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+                                return parsed[0]
+                            return parsed
                         # Try parsing as-is
                         return json.loads(text)
                     except json.JSONDecodeError:
-                        logger.warning(f"[LocalLLMService] Failed to parse JSON: {text[:100]}...")
+                        logger.warning(f"[LocalLLMService] Failed to parse JSON: {text[:200]}")
                         return {}
                 return {}
 

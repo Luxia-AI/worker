@@ -27,13 +27,28 @@ def get_pinecone_index() -> Any:
     # Get actual embedding dimension from ST model
     model = get_embedding_model()
     dimension = model.get_sentence_embedding_dimension()
+    logger.info(f"[Pinecone] Embedding model dimension: {dimension}")
 
     pc = get_pinecone_client()
     index_name = settings.PINECONE_INDEX_NAME
     assert index_name is not None, "PINECONE_INDEX_NAME must be set"  # nosec B101
 
-    existing = [idx.name for idx in pc.list_indexes()]
-    if index_name not in existing:
+    existing_indexes = pc.list_indexes()
+    existing_names = [idx.name for idx in existing_indexes]
+
+    if index_name in existing_names:
+        # Check if existing index has correct dimension
+        index_info = next((idx for idx in existing_indexes if idx.name == index_name), None)
+        if index_info and index_info.dimension != dimension:
+            logger.warning(
+                f"[Pinecone] Index '{index_name}' has dimension {index_info.dimension}, "
+                f"but model has {dimension}. Deleting and recreating index..."
+            )
+            pc.delete_index(index_name)
+            existing_names.remove(index_name)
+
+    if index_name not in existing_names:
+        logger.info(f"[Pinecone] Creating index '{index_name}' with dimension {dimension}")
         pc.create_index(
             name=index_name, dimension=dimension, metric="cosine", spec=ServerlessSpec(cloud="aws", region="us-east-1")
         )

@@ -56,8 +56,12 @@ LLM_MAX_TOKENS_REINFORCEMENT = 300
 # EMBEDDING MODEL SETTINGS
 # ============================================================================
 
-# Production embedding model: recommended for RAG search -- strong performance
-EMBEDDING_MODEL_NAME_PROD = "sentence-transformers/multilingual-e5-large"
+# Production embedding model: MUST match Pinecone index dimension
+# Current Pinecone index: 1536 dimensions
+# Option 1: text-embedding-3-small (OpenAI) - 1536 dims - requires API
+# Option 2: Recreate Pinecone index with new dimension
+# For now, using all-MiniLM-L6-v2 (384 dims) - REQUIRES PINECONE INDEX RECREATION
+EMBEDDING_MODEL_NAME_PROD = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Test embedding model: lightweight, fast downloads for testing
 EMBEDDING_MODEL_NAME_TEST = "sentence-transformers/all-MiniLM-L6-v2"
