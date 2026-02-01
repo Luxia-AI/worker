@@ -156,8 +156,8 @@ class HybridLLMService:
 
     async def _call_free_llm(self, prompt: str, response_format: str) -> Dict[str, Any]:
         """
-        Call free LLM service.
-        Priority: Local LLM (in-container) > Ollama (external)
+        Call free LLM service with Groq as final fallback.
+        Priority: Local LLM (in-container) > Ollama (external) > Groq (paid, last resort)
         """
         # Try local in-container LLM first
         if self.local_llm_available and self.local_llm_service:
@@ -177,7 +177,22 @@ class HybridLLMService:
                 logger.info("[HybridLLMService] Ollama succeeded")
                 return result
             except Exception as e:
-                logger.error(f"[HybridLLMService] Ollama failed: {e}")
+                logger.warning(f"[HybridLLMService] Ollama failed: {e}")
+
+        # Final fallback: Use Groq even for LOW priority if no free options work
+        # This ensures the pipeline completes rather than failing
+        if self.groq_available and self.groq_service:
+            try:
+                call_num = _increment_groq_counter()
+                logger.warning(
+                    f"[HybridLLMService] No free LLM available, using Groq as last resort "
+                    f"(call {call_num}/{MAX_GROQ_CALLS_PER_REQUEST})"
+                )
+                result = await self.groq_service.ainvoke(prompt, response_format, max_retries=2)
+                logger.info("[HybridLLMService] Groq fallback succeeded")
+                return result
+            except Exception as e:
+                logger.error(f"[HybridLLMService] Groq fallback also failed: {e}")
                 raise
 
-        raise RuntimeError("No free LLM service available (Local LLM or Ollama)")
+        raise RuntimeError("No LLM service available (Local LLM, Ollama, or Groq)")
