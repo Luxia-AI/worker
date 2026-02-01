@@ -29,6 +29,7 @@ from app.services.corrective.trusted_search import TrustedSearch
 from app.services.kg.kg_ingest import KGIngest
 from app.services.kg.kg_retrieval import KGRetrieval
 from app.services.kg.neo4j_client import Neo4jClient
+from app.services.llms.hybrid_service import reset_groq_counter
 from app.services.logging.log_handler import LogManagerHandler
 from app.services.vdb.vdb_ingest import VDBIngest
 from app.services.vdb.vdb_retrieval import VDBRetrieval
@@ -98,6 +99,9 @@ class CorrectivePipeline:
         """
         round_id = round_id or str(uuid.uuid4())
         failed_entities = failed_entities or []
+
+        # Reset Groq call counter for this new request (max 3 Groq calls, then Ollama)
+        reset_groq_counter()
 
         logger.info(f"[CorrectivePipeline:{round_id}] Start for post: {post_text}")
 
