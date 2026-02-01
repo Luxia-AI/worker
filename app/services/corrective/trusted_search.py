@@ -10,7 +10,7 @@ from app.core.logger import get_logger
 from app.core.rate_limit import throttled
 from app.services.common.list_ops import dedupe_list
 from app.services.common.url_helpers import dedup_urls, is_accessible_url
-from app.services.llms.hybrid_service import HybridLLMService
+from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 
 logger = get_logger(__name__)
 
@@ -58,7 +58,8 @@ FAILED ENTITIES:
 """
 
         try:
-            result = await self.llm_client.ainvoke(prompt, response_format="json")
+            # HIGH priority: Query reformulation is crucial for good search results
+            result = await self.llm_client.ainvoke(prompt, response_format="json", priority=LLMPriority.HIGH)
             queries = result.get("queries", [])
             cleaned = [q.strip().lower() for q in queries if isinstance(q, str)]
             return dedupe_list(cleaned)  # dedupe but preserve order
@@ -183,7 +184,8 @@ FAILED ENTITIES:
         prompt = REINFORCEMENT_QUERY_PROMPT.format(statements=base_statements, entities=base_entities)
 
         try:
-            result = await self.llm_client.ainvoke(prompt, response_format="json")
+            # HIGH priority: Reinforcement query generation is crucial for finding evidence
+            result = await self.llm_client.ainvoke(prompt, response_format="json", priority=LLMPriority.HIGH)
             queries = result.get("queries", [])
 
             # safety: ensure list[str]

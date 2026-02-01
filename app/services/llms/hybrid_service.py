@@ -1,12 +1,14 @@
 """
-Hybrid LLM Service - Groq with Local LLM fallback
+Hybrid LLM Service - Groq for critical tasks, Local LLM for others
 
-Implements a cost-conscious strategy:
-- Groq (fast, paid): Limited to MAX_GROQ_CALLS_PER_REQUEST per job/request
-- Local LLM (free, in-container): Used for remaining calls after Groq quota exhausted
+Cost-conscious strategy with priority-based routing:
+- HIGH priority tasks: Use Groq (fast, paid) - limited to MAX_GROQ_CALLS_PER_REQUEST
+- LOW priority tasks: Use Local LLM directly (free, in-container)
+- Fallback: If Groq fails, always fall back to Local LLM
 """
 
 import contextvars
+from enum import Enum
 from typing import Any, Dict, Optional
 
 from app.core.logger import get_logger
@@ -16,11 +18,19 @@ from app.services.llms.ollama_service import OllamaService
 
 logger = get_logger(__name__)
 
+
+class LLMPriority(Enum):
+    """Priority levels for LLM calls."""
+
+    HIGH = "high"  # Use Groq (critical tasks: query reformulation, initial fact extraction)
+    LOW = "low"  # Use Local LLM (entity extraction, relation extraction, etc.)
+
+
 # Context variable to track Groq calls per request/job
 _groq_call_count: contextvars.ContextVar[int] = contextvars.ContextVar("groq_call_count", default=0)
 
-# Maximum Groq calls allowed per request before falling back to local LLM
-MAX_GROQ_CALLS_PER_REQUEST = 3
+# Maximum Groq calls allowed per request (for HIGH priority tasks)
+MAX_GROQ_CALLS_PER_REQUEST = 5
 
 
 def reset_groq_counter() -> None:
@@ -44,14 +54,12 @@ def _increment_groq_counter() -> int:
 
 class HybridLLMService:
     """
-    Hybrid LLM service that uses Groq (fast) with Local LLM (free) fallback.
+    Hybrid LLM service with priority-based routing.
 
-    Cost-saving strategy:
-    - First N calls (MAX_GROQ_CALLS_PER_REQUEST) use Groq for speed
-    - Subsequent calls use local in-container LLM (free)
-    - Falls back on Groq errors (rate limit, API errors)
-
-    Fallback priority: LocalLLMService (in-container) > OllamaService (external)
+    Strategy:
+    - HIGH priority: Use Groq (limited to 5 calls per request)
+    - LOW priority: Use Local LLM directly (unlimited, free)
+    - On Groq failure: Always fall back to Local LLM
 
     Call reset_groq_counter() at the start of each new job/request.
     """
@@ -61,27 +69,28 @@ class HybridLLMService:
     ollama_service: Optional[OllamaService]
 
     def __init__(self) -> None:
-        # Primary: Groq (fast, paid)
+        # Primary: Groq (fast, paid) - for HIGH priority tasks
         try:
             self.groq_service = GroqService()
             self.groq_available = True
+            logger.info("[HybridLLMService] Groq service available (for high-priority tasks)")
         except Exception as e:
             logger.warning(f"[HybridLLMService] Groq service unavailable: {e}")
             self.groq_service = None
             self.groq_available = False
 
-        # Fallback 1: Local in-container LLM (free, no network)
+        # Fallback 1: Local in-container LLM (free) - for LOW priority & fallback
         try:
             self.local_llm_service = LocalLLMService()
             self.local_llm_available = self.local_llm_service.is_available()
             if self.local_llm_available:
-                logger.info("[HybridLLMService] Local LLM available (in-container)")
+                logger.info("[HybridLLMService] Local LLM available (for low-priority & fallback)")
         except Exception as e:
             logger.warning(f"[HybridLLMService] Local LLM service unavailable: {e}")
             self.local_llm_service = None
             self.local_llm_available = False
 
-        # Fallback 2: Ollama (external service)
+        # Fallback 2: Ollama (external service) - last resort
         try:
             self.ollama_service = OllamaService()
             self.ollama_available = True
@@ -93,61 +102,56 @@ class HybridLLMService:
         if not self.groq_available and not self.local_llm_available and not self.ollama_available:
             raise RuntimeError("No LLM services available (Groq, LocalLLM, or Ollama)")
 
-    async def ainvoke(self, prompt: str, response_format: str = "text", force_local: bool = False) -> Dict[str, Any]:
+    async def ainvoke(
+        self,
+        prompt: str,
+        response_format: str = "text",
+        priority: LLMPriority = LLMPriority.HIGH,
+    ) -> Dict[str, Any]:
         """
-        Calls LLM with automatic fallback and cost management.
+        Calls LLM with priority-based routing and automatic fallback.
 
         Args:
             prompt: The prompt to send to the LLM
             response_format: "text" or "json"
-            force_local: If True, skip Groq and use local LLM directly
+            priority: HIGH = use Groq (if quota available), LOW = use Local LLM directly
 
         Strategy:
-        1. If Groq quota not exhausted (< MAX_GROQ_CALLS_PER_REQUEST), try Groq
-        2. If Groq fails or quota exhausted, use Local LLM (in-container)
-        3. If Local LLM unavailable, try Ollama (external service)
+        - LOW priority: Always use Local LLM (free, no API costs)
+        - HIGH priority: Use Groq if quota available, else Local LLM
+        - On any Groq failure: Fall back to Local LLM
         """
-        current_groq_calls = get_groq_call_count()
-
-        # Check if we should skip Groq due to quota
-        if force_local or current_groq_calls >= MAX_GROQ_CALLS_PER_REQUEST:
-            if current_groq_calls >= MAX_GROQ_CALLS_PER_REQUEST:
-                logger.info(
-                    f"[HybridLLMService] Groq quota exhausted "
-                    f"({current_groq_calls}/{MAX_GROQ_CALLS_PER_REQUEST}), using free LLM"
-                )
+        # LOW priority tasks always use Local LLM
+        if priority == LLMPriority.LOW:
+            logger.debug("[HybridLLMService] LOW priority task -> using Local LLM")
             return await self._call_free_llm(prompt, response_format)
 
-        # Try Groq (with retries on rate limit)
-        if self.groq_available and self.groq_service:
-            for attempt in range(3):
-                try:
-                    call_num = _increment_groq_counter()
-                    logger.debug(
-                        f"[HybridLLMService] Groq call {call_num}/{MAX_GROQ_CALLS_PER_REQUEST} "
-                        f"(attempt {attempt + 1}/3)"
-                    )
-                    result = await self.groq_service.ainvoke(prompt, response_format, max_retries=1)
-                    logger.debug(f"[HybridLLMService] Groq succeeded (call {call_num})")
-                    return result
-                except RateLimitError as e:
-                    if attempt < 2:
-                        logger.warning(
-                            f"[HybridLLMService] Groq rate limited (attempt {attempt + 1}/3): {e}. Retrying..."
-                        )
-                        continue
-                    else:
-                        logger.warning("[HybridLLMService] Groq rate limited after 3 attempts. Using free LLM...")
-                        break
-                except Exception as e:
-                    logger.warning(f"[HybridLLMService] Groq failed (attempt {attempt + 1}/3): {e}")
-                    if attempt < 2:
-                        continue
-                    else:
-                        logger.warning("[HybridLLMService] Groq failed after 3 attempts. Using free LLM...")
-                        break
+        # HIGH priority tasks use Groq (if available and quota not exhausted)
+        current_groq_calls = get_groq_call_count()
 
-        # Fallback to free LLM
+        if current_groq_calls >= MAX_GROQ_CALLS_PER_REQUEST:
+            logger.info(
+                f"[HybridLLMService] Groq quota exhausted "
+                f"({current_groq_calls}/{MAX_GROQ_CALLS_PER_REQUEST}), using Local LLM"
+            )
+            return await self._call_free_llm(prompt, response_format)
+
+        # Try Groq for HIGH priority (with fallback on failure)
+        if self.groq_available and self.groq_service:
+            try:
+                call_num = _increment_groq_counter()
+                logger.info(
+                    f"[HybridLLMService] HIGH priority -> Groq " f"(call {call_num}/{MAX_GROQ_CALLS_PER_REQUEST})"
+                )
+                result = await self.groq_service.ainvoke(prompt, response_format, max_retries=2)
+                logger.debug(f"[HybridLLMService] Groq succeeded (call {call_num})")
+                return result
+            except RateLimitError as e:
+                logger.warning(f"[HybridLLMService] Groq rate limited: {e}. Falling back to Local LLM...")
+            except Exception as e:
+                logger.warning(f"[HybridLLMService] Groq failed: {e}. Falling back to Local LLM...")
+
+        # Fallback to Local LLM on any Groq failure
         return await self._call_free_llm(prompt, response_format)
 
     async def _call_free_llm(self, prompt: str, response_format: str) -> Dict[str, Any]:
@@ -158,9 +162,9 @@ class HybridLLMService:
         # Try local in-container LLM first
         if self.local_llm_available and self.local_llm_service:
             try:
-                logger.info("[HybridLLMService] Using Local LLM (in-container, free)...")
+                logger.debug("[HybridLLMService] Using Local LLM (in-container, free)...")
                 result = await self.local_llm_service.ainvoke(prompt, response_format)
-                logger.info("[HybridLLMService] Local LLM succeeded")
+                logger.debug("[HybridLLMService] Local LLM succeeded")
                 return result
             except Exception as e:
                 logger.warning(f"[HybridLLMService] Local LLM failed: {e}, trying Ollama...")

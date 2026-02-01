@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List
 from app.constants.llm_prompts import TRIPLE_EXTRACTION_PROMPT
 from app.core.logger import get_logger
 from app.services.common.dedup import dedup_triples_by_structure
-from app.services.llms.hybrid_service import HybridLLMService
+from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 
 logger = get_logger(__name__)
 
@@ -35,8 +35,8 @@ class RelationExtractor:
 
         async with self._sem:
             try:
-                # request JSON output from the model
-                res = await self.llm_service.ainvoke(prompt, response_format="json")
+                # LOW priority: Relation extraction is bulk work, use Local LLM
+                res = await self.llm_service.ainvoke(prompt, response_format="json", priority=LLMPriority.LOW)
             except (json.JSONDecodeError, ValueError) as e:
                 logger.error(f"[RelationExtractor] JSON parsing failed for fact_id={fact.get('fact_id')}: {e}")
                 return []

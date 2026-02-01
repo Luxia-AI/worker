@@ -4,7 +4,7 @@ from typing import Any, Dict, List
 from app.constants.llm_prompts import FACT_EXTRACTION_PROMPT
 from app.core.logger import get_logger
 from app.services.common.text_cleaner import clean_statement, truncate_content
-from app.services.llms.hybrid_service import HybridLLMService
+from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 
 logger = get_logger(__name__)
 
@@ -20,11 +20,12 @@ class FactExtractor:
 
     async def ainvoke(self, prompt: str, response_format: str = "text") -> Dict[str, Any]:
         """
-        Calls LLM (Groq with Ollama fallback).
+        Calls LLM (Local LLM for bulk extraction, saves Groq quota).
         Supports JSON or text output.
         """
         try:
-            result = await self.llm_service.ainvoke(prompt, response_format)
+            # LOW priority: Fact extraction is bulk work, use Local LLM
+            result = await self.llm_service.ainvoke(prompt, response_format, priority=LLMPriority.LOW)
             return result
 
         except Exception as e:
