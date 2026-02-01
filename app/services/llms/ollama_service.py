@@ -27,9 +27,12 @@ class OllamaService:
         """
         Calls Ollama local LLM.
         Supports JSON or text output.
+        Short timeout to fail fast if Ollama is not available.
         """
         try:
-            async with httpx.AsyncClient(timeout=60.0) as client:
+            # Short timeout: 5s connect, 30s read - fail fast if Ollama not available
+            timeout = httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
+            async with httpx.AsyncClient(timeout=timeout) as client:
                 response = await client.post(
                     f"{self.base_url}/api/generate",
                     json={

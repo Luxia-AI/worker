@@ -8,6 +8,7 @@ Cost-conscious strategy with priority-based routing:
 """
 
 import contextvars
+import os
 from enum import Enum
 from typing import Any, Dict, Optional
 
@@ -85,19 +86,30 @@ class HybridLLMService:
             self.local_llm_available = self.local_llm_service.is_available()
             if self.local_llm_available:
                 logger.info("[HybridLLMService] Local LLM available (for low-priority & fallback)")
+            else:
+                logger.warning("[HybridLLMService] Local LLM model not found (will use Groq for all tasks)")
         except Exception as e:
             logger.warning(f"[HybridLLMService] Local LLM service unavailable: {e}")
             self.local_llm_service = None
             self.local_llm_available = False
 
-        # Fallback 2: Ollama (external service) - last resort
-        try:
-            self.ollama_service = OllamaService()
-            self.ollama_available = True
-        except Exception as e:
-            logger.warning(f"[HybridLLMService] Ollama service unavailable: {e}")
+        # Fallback 2: Ollama (external service) - disabled by default in Azure
+        # Only enable if OLLAMA_HOST is explicitly set to something other than 'ollama'
+        ollama_host = os.getenv("OLLAMA_HOST", "ollama")
+        if ollama_host == "ollama":
+            # Default value means Ollama is not configured - skip it
+            logger.info("[HybridLLMService] Ollama not configured (OLLAMA_HOST=ollama), skipping")
             self.ollama_service = None
             self.ollama_available = False
+        else:
+            try:
+                self.ollama_service = OllamaService()
+                self.ollama_available = True
+                logger.info(f"[HybridLLMService] Ollama configured at {ollama_host}")
+            except Exception as e:
+                logger.warning(f"[HybridLLMService] Ollama service unavailable: {e}")
+                self.ollama_service = None
+                self.ollama_available = False
 
         if not self.groq_available and not self.local_llm_available and not self.ollama_available:
             raise RuntimeError("No LLM services available (Groq, LocalLLM, or Ollama)")
