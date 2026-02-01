@@ -54,9 +54,6 @@ class RedisLogBroadcaster:
         except Exception as e:
             logger.error(f"[RedisLogBroadcaster] Failed to connect to Redis: {e}")
             raise
-        except Exception as e:
-            logger.error(f"[RedisLogBroadcaster] Failed to connect to Redis: {e}")
-            raise
 
     async def disconnect(self) -> None:
         """Disconnect from Redis."""
