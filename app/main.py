@@ -31,13 +31,21 @@ async def process_jobs():
         async for message in _kafka_consumer:
             job_data = message.value
             job_id = job_data.get("job_id")
-            logger.info(f"Received job: {job_id}")
 
-            # Send started update
+            # Extract post data from the job envelope (sent by dispatcher)
+            post_data = job_data.get("post", {})
+            post_id = post_data.get("post_id")
+            room_id = post_data.get("room_id")
+
+            logger.info(f"Received job: {job_id} (post={post_id}, room={room_id})")
+
+            # Send started update (include post_id and room_id for socket routing)
             await _kafka_producer.send(
                 "jobs.results",
                 {
                     "job_id": job_id,
+                    "post_id": post_id,
+                    "room_id": room_id,
                     "status": "processing",
                     "timestamp": asyncio.get_event_loop().time(),
                 },
@@ -46,11 +54,13 @@ async def process_jobs():
             # Simulate processing (replace with actual processing)
             await asyncio.sleep(5)  # Simulate work
 
-            # Send completed update
+            # Send completed update (include post_id and room_id for socket routing)
             await _kafka_producer.send(
                 "jobs.results",
                 {
                     "job_id": job_id,
+                    "post_id": post_id,
+                    "room_id": room_id,
                     "status": "completed",
                     "results": {"message": "Job completed"},
                     "timestamp": asyncio.get_event_loop().time(),
