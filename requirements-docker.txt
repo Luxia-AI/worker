@@ -19,3 +19,6 @@ aiofiles
 httpx
 python-dotenv
 aiokafka
+
+# Local LLM support (CPU-only, for fallback after Groq quota)
+llama-cpp-python
