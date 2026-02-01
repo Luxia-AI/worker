@@ -27,15 +27,33 @@ class RedisLogBroadcaster:
     async def connect(self) -> None:
         """Connect to Redis."""
         try:
-            self.redis_client = await redis.from_url(
-                self.redis_url,
-                encoding="utf8",
-                decode_responses=True,
-            )
+            # Azure Redis requires SSL (rediss:// or port 6380)
+            ssl_enabled = self.redis_url.startswith("rediss://") or ":6380" in self.redis_url
+
+            if ssl_enabled:
+                # Azure Redis with SSL - use ssl_cert_reqs for rediss:// URLs
+                self.redis_client = await redis.from_url(
+                    self.redis_url,
+                    encoding="utf8",
+                    decode_responses=True,
+                    ssl_cert_reqs=None,  # Disable cert verification for Azure
+                    socket_timeout=30.0,
+                    socket_connect_timeout=30.0,
+                )
+            else:
+                self.redis_client = await redis.from_url(
+                    self.redis_url,
+                    encoding="utf8",
+                    decode_responses=True,
+                )
+
             ping_result = self.redis_client.ping()  # type: ignore
             if hasattr(ping_result, "__await__"):
                 await ping_result
-            logger.info(f"[RedisLogBroadcaster] Connected to Redis at {self.redis_url}")
+            logger.info(f"[RedisLogBroadcaster] Connected to Redis (ssl={ssl_enabled})")
+        except Exception as e:
+            logger.error(f"[RedisLogBroadcaster] Failed to connect to Redis: {e}")
+            raise
         except Exception as e:
             logger.error(f"[RedisLogBroadcaster] Failed to connect to Redis: {e}")
             raise
