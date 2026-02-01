@@ -9,6 +9,7 @@ from app.core.logger import get_logger
 from app.routers.admin import router as admin_router
 from app.routers.admin import set_log_manager
 from app.routers.pinecone import router as pinecone_router
+from app.services.corrective.pipeline import CorrectivePipeline
 from app.services.logging import LogManager
 from app.services.logging.log_handler import LogManagerHandler
 
@@ -18,14 +19,23 @@ logger = get_logger(__name__)
 _log_manager: LogManager | None = None
 _kafka_consumer: AIOKafkaConsumer | None = None
 _kafka_producer: AIOKafkaProducer | None = None
+_pipeline: CorrectivePipeline | None = None
 
 
 async def process_jobs():
     """Background task to process jobs from Kafka."""
-    global _kafka_consumer, _kafka_producer
+    global _kafka_consumer, _kafka_producer, _pipeline
     if not _kafka_consumer or not _kafka_producer:
         logger.error("Kafka consumer or producer not initialized")
         return
+
+    # Initialize the RAG pipeline
+    try:
+        _pipeline = CorrectivePipeline()
+        logger.info("[Main] CorrectivePipeline initialized")
+    except Exception as e:
+        logger.warning(f"[Main] CorrectivePipeline init failed (will use fallback): {e}")
+        _pipeline = None
 
     try:
         async for message in _kafka_consumer:
@@ -36,8 +46,11 @@ async def process_jobs():
             post_data = job_data.get("post", {})
             post_id = post_data.get("post_id")
             room_id = post_data.get("room_id")
+            claim_text = post_data.get("text", "")
+            domain = job_data.get("assigned_worker_group", "general")
 
             logger.info(f"Received job: {job_id} (post={post_id}, room={room_id})")
+            logger.info(f"Claim to verify: {claim_text[:100]}...")
 
             # Send started update (include post_id and room_id for socket routing)
             await _kafka_producer.send(
@@ -47,25 +60,81 @@ async def process_jobs():
                     "post_id": post_id,
                     "room_id": room_id,
                     "status": "processing",
+                    "message": "Starting RAG pipeline...",
                     "timestamp": asyncio.get_event_loop().time(),
                 },
             )
 
-            # Simulate processing (replace with actual processing)
-            await asyncio.sleep(5)  # Simulate work
+            # Run the actual RAG pipeline
+            try:
+                if _pipeline and claim_text:
+                    logger.info(f"[Job {job_id}] Running CorrectivePipeline...")
+                    result = await _pipeline.run(
+                        post_text=claim_text,
+                        domain=domain,
+                        round_id=job_id,
+                        top_k=5,
+                    )
 
-            # Send completed update (include post_id and room_id for socket routing)
-            await _kafka_producer.send(
-                "jobs.results",
-                {
+                    # Extract key results
+                    ranked_evidence = result.get("ranked", [])
+                    facts_count = len(result.get("facts", []))
+                    status = result.get("status", "completed")
+
+                    # Build response with evidence
+                    response = {
+                        "job_id": job_id,
+                        "post_id": post_id,
+                        "room_id": room_id,
+                        "status": "completed",
+                        "pipeline_status": status,
+                        "claim": claim_text,
+                        "evidence_count": len(ranked_evidence),
+                        "facts_extracted": facts_count,
+                        "evidence": [
+                            {
+                                "statement": e.get("statement", ""),
+                                "source_url": e.get("source_url", ""),
+                                "score": round(e.get("final_score", 0), 3),
+                                "credibility": e.get("credibility"),
+                            }
+                            for e in ranked_evidence[:5]  # Top 5 evidence
+                        ],
+                        "top_score": round(ranked_evidence[0]["final_score"], 3) if ranked_evidence else 0,
+                        "timestamp": asyncio.get_event_loop().time(),
+                    }
+
+                    logger.info(f"[Job {job_id}] Pipeline completed: {len(ranked_evidence)} evidence found")
+
+                else:
+                    # Fallback if pipeline not available
+                    logger.warning(f"[Job {job_id}] Pipeline not available, using fallback")
+                    response = {
+                        "job_id": job_id,
+                        "post_id": post_id,
+                        "room_id": room_id,
+                        "status": "completed",
+                        "pipeline_status": "fallback",
+                        "claim": claim_text,
+                        "evidence_count": 0,
+                        "message": "RAG pipeline not available - claim not verified",
+                        "timestamp": asyncio.get_event_loop().time(),
+                    }
+
+            except Exception as e:
+                logger.error(f"[Job {job_id}] Pipeline error: {e}")
+                response = {
                     "job_id": job_id,
                     "post_id": post_id,
                     "room_id": room_id,
-                    "status": "completed",
-                    "results": {"message": "Job completed"},
+                    "status": "error",
+                    "error": str(e),
+                    "claim": claim_text,
                     "timestamp": asyncio.get_event_loop().time(),
-                },
-            )
+                }
+
+            # Send result
+            await _kafka_producer.send("jobs.results", response)
             logger.info(f"Completed job: {job_id}")
 
     except Exception as e:
