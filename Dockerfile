@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
     cmake \
+    make \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies to a virtual environment
@@ -19,6 +20,10 @@ RUN pip install --upgrade pip
 
 # Install dependencies (Docker caches this layer unless requirements change)
 COPY requirements-docker.txt .
+
+# Set environment variables for llama-cpp-python CPU build
+ENV CMAKE_ARGS="-DGGML_BLAS=OFF -DGGML_CUDA=OFF"
+
 RUN pip install -r requirements-docker.txt
 
 # Clean up in separate layer (only runs if above changes)
