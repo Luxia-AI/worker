@@ -7,4 +7,6 @@ trafilatura
 playwright
 groq
 neo4j
-redishttpx>=0.24.0
+redis
+httpx>=0.24.0
+aiokafka
