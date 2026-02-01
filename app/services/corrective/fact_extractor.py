@@ -4,56 +4,31 @@ from typing import Any, Dict, List
 from app.constants.llm_prompts import FACT_EXTRACTION_PROMPT
 from app.core.logger import get_logger
 from app.services.common.text_cleaner import clean_statement, truncate_content
-from app.services.llms.groq_service import GroqService
+from app.services.llms.hybrid_service import HybridLLMService
 
 logger = get_logger(__name__)
 
 
 class FactExtractor:
     """
-    Async wrapper for Groq API using MoonshotAI's kimi-k2-instruct model.
-    Uses OpenAI-compatible Chat Completions API.
+    Async wrapper for Groq API (with Ollama fallback).
+    Uses hybrid LLM service for fact extraction.
     """
 
     def __init__(self) -> None:
-        self.groq_service = GroqService()
+        self.llm_service = HybridLLMService()
 
     async def ainvoke(self, prompt: str, response_format: str = "text") -> Dict[str, Any]:
         """
-        Calls Groq async chat completion endpoint.
+        Calls LLM (Groq with Ollama fallback).
         Supports JSON or text output.
         """
-
-        kwargs: Dict[str, Any] = {
-            "model": self.groq_service.model,
-            "messages": [{"role": "user", "content": prompt}],
-            "temperature": 0.2,
-        }
-
-        # Use Groq-supported JSON response format
-        if response_format == "json":
-            kwargs["response_format"] = {"type": "json_object"}
-
         try:
-            response = await self.groq_service.client.chat.completions.create(**kwargs)
-            msg = response.choices[0].message
-
-            # JSON response
-            if response_format == "json":
-                if msg.content:
-                    try:
-                        result: Dict[str, Any] = json.loads(msg.content)
-                        return result
-                    except json.JSONDecodeError as je:
-                        logger.error(f"[FactExtractor] JSON decode error: {je}. Content: {msg.content[:200]}")
-                        return {}
-                return {}
-
-            # Text response
-            return {"text": msg.content}
+            result = await self.llm_service.ainvoke(prompt, response_format)
+            return result
 
         except Exception as e:
-            logger.error(f"[FactExtractor] Groq call failed: {e}")
+            logger.error(f"[FactExtractor] LLM call failed: {e}")
             raise
 
     async def extract(self, scraped_pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

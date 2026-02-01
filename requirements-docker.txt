@@ -18,3 +18,4 @@ redis
 aiofiles
 httpx
 python-dotenv
+aiokafka

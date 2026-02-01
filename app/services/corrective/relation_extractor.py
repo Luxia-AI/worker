@@ -6,7 +6,7 @@ from typing import Any, Dict, Iterable, List
 from app.constants.llm_prompts import TRIPLE_EXTRACTION_PROMPT
 from app.core.logger import get_logger
 from app.services.common.dedup import dedup_triples_by_structure
-from app.services.llms.groq_service import GroqService
+from app.services.llms.hybrid_service import HybridLLMService
 
 logger = get_logger(__name__)
 
@@ -20,7 +20,7 @@ class RelationExtractor:
     """
 
     def __init__(self, max_concurrent: int = 6):
-        self.groq_service = GroqService()
+        self.llm_service = HybridLLMService()
         # concurrency guard when calling the LLM in parallel
         self._sem = asyncio.Semaphore(max_concurrent)
 
@@ -36,7 +36,7 @@ class RelationExtractor:
         async with self._sem:
             try:
                 # request JSON output from the model
-                res = await self.groq_service.ainvoke(prompt, response_format="json")
+                res = await self.llm_service.ainvoke(prompt, response_format="json")
             except (json.JSONDecodeError, ValueError) as e:
                 logger.error(f"[RelationExtractor] JSON parsing failed for fact_id={fact.get('fact_id')}: {e}")
                 return []

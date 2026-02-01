@@ -32,7 +32,7 @@ class RedisLogBroadcaster:
                 encoding="utf8",
                 decode_responses=True,
             )
-            ping_result = self.redis_client.ping()
+            ping_result = self.redis_client.ping()  # type: ignore
             if hasattr(ping_result, "__await__"):
                 await ping_result
             logger.info(f"[RedisLogBroadcaster] Connected to Redis at {self.redis_url}")
