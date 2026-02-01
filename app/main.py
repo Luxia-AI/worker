@@ -94,7 +94,7 @@ async def startup_event() -> None:
 
         # Initialize Kafka consumer for jobs
         _kafka_consumer = AIOKafkaConsumer(
-            "jobs.general",  # For now, consume from general
+            "jobs.to_worker",  # Topic from dispatcher
             **kafka_config,
             group_id="worker-general-group",
             auto_offset_reset="latest",
