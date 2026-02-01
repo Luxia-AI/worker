@@ -68,13 +68,18 @@ EMBEDDING_MODEL_NAME_TEST = "sentence-transformers/all-MiniLM-L6-v2"
 
 # High-authority medical and government domains
 TRUSTED_DOMAINS_AUTHORITY = {
-    "who.int",
-    "cdc.gov",
-    "nih.gov",
-    "fda.gov",
-    "mayoclinic.org",
-    "harvard.edu",
-    "nhs.uk",
+    "www.who.int",
+    "www.nih.gov",
+    "www.nlm.nih.gov",
+    "pubmed.ncbi.nlm.nih.gov",
+    "clinicaltrials.gov",
+    "www.cdc.gov",
+    "www.fda.gov",
+    "www.hhs.gov",
+    "www.health.gov",
+    "www.nhs.uk",
+    "www.nice.org.uk",
+    "www.cochranelibrary.com",
 }
 
 # Government and educational domains
@@ -85,16 +90,37 @@ TRUSTED_DOMAINS_NEWS = {"news", "press", "blog", "medium.com"}
 
 # Complete set of trusted domains for CSE filtering
 TRUSTED_DOMAINS = {
-    "who.int",
-    "cdc.gov",
-    "nih.gov",
-    "fda.gov",
-    "nhs.uk",
-    "mayoclinic.org",
-    "health.harvard.edu",
-    "medlineplus.gov",
-    "livescience.com",
-    "medicalnewstoday.com",
+    # World Health Organization
+    "www.who.int",
+    # US Health Organizations
+    "www.nih.gov",
+    "www.nlm.nih.gov",
+    "pubmed.ncbi.nlm.nih.gov",
+    "clinicaltrials.gov",
+    "www.cdc.gov",
+    "www.fda.gov",
+    "www.hhs.gov",
+    "www.health.gov",
+    # UK Health Organizations
+    "www.nhs.uk",
+    "www.nice.org.uk",
+    "www.gov.uk",
+    # European Health Organizations
+    "www.ecdc.europa.eu",
+    "www.ema.europa.eu",
+    # Australia Health Organizations
+    "www.tga.gov.au",
+    "www.health.gov.au",
+    "www.healthdirect.gov.au",
+    # Canada Health Organizations
+    "www.canada.ca",
+    # Singapore Health Organizations
+    "www.moh.gov.sg",
+    "www.healthhub.sg",
+    # Sri Lanka Health Organizations
+    "www.health.gov.lk",
+    # Academic/Research
+    "www.cochranelibrary.com",
 }
 
 # ============================================================================
