@@ -66,23 +66,19 @@ async def startup_event() -> None:
     """Initialize logging system and Kafka consumer on app startup."""
     global _log_manager, _kafka_consumer, _kafka_producer
 
+    # Try to initialize LogManager (Redis + SQLite) - optional, pipeline works without it
     try:
-        # Create LogManager with Redis + SQLite
-        # Redis for realtime streaming, SQLite for persistence
         _log_manager = LogManager(redis_url=settings.REDIS_URL, db_path=settings.LOG_DB_PATH)
-
-        # Register with logging handler
         LogManagerHandler.set_log_manager(_log_manager)
-
-        # Register with admin router
         set_log_manager(_log_manager)
-
-        # Start background log processor
         await _log_manager.start()
-
         logger.info(f"[Main] LogManager initialized with Redis={settings.REDIS_URL}, DB={settings.LOG_DB_PATH}")
+    except Exception as e:
+        logger.warning(f"[Main] LogManager failed (non-fatal, pipeline continues): {e}")
+        _log_manager = None
 
-        # Get Kafka configuration (supports SASL/SSL for Azure Event Hubs)
+    # Initialize Kafka - this is required for the pipeline
+    try:
         kafka_config = settings.get_kafka_config()
 
         # Initialize Kafka producer
@@ -91,6 +87,7 @@ async def startup_event() -> None:
             value_serializer=lambda v: json.dumps(v).encode("utf-8"),
         )
         await _kafka_producer.start()
+        logger.info(f"[Main] Kafka producer started (bootstrap={settings.KAFKA_BOOTSTRAP})")
 
         # Initialize Kafka consumer for jobs
         _kafka_consumer = AIOKafkaConsumer(
@@ -101,14 +98,14 @@ async def startup_event() -> None:
             value_deserializer=lambda v: json.loads(v.decode("utf-8")),
         )
         await _kafka_consumer.start()
+        logger.info("[Main] Kafka consumer started (topic=jobs.to_worker)")
 
         # Start background job processor
         asyncio.create_task(process_jobs())
-
-        logger.info(f"[Main] Kafka producer and consumer started (bootstrap={settings.KAFKA_BOOTSTRAP})")
+        logger.info("[Main] Job processor task started")
 
     except Exception as e:
-        logger.error(f"[Main] Failed to initialize: {e}")
+        logger.error(f"[Main] Kafka initialization failed: {e}")
 
 
 async def shutdown_event() -> None:
