@@ -3,7 +3,7 @@ from typing import Any, Dict, List
 from app.constants.llm_prompts import BIOMED_NER_PROMPT
 from app.core.logger import get_logger
 from app.services.common.list_ops import dedupe_list
-from app.services.corrective.fact_extractor import FactExtractor
+from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 
 logger = get_logger(__name__)
 
@@ -12,16 +12,18 @@ class EntityExtractor:
     """
     Biomedical entity extraction powered by Groq LLM.
     More portable than SciSpaCy and works on all platforms.
+    Uses HIGH priority (Groq) because it's in the critical request path.
     """
 
     def __init__(self) -> None:
-        self.llm = FactExtractor()
+        self.llm = HybridLLMService()
 
     async def extract_entities(self, statement: str) -> List[str]:
         prompt = f"{BIOMED_NER_PROMPT}\n\nFACT:\n{statement}"
 
         try:
-            result = await self.llm.ainvoke(prompt, response_format="json")
+            # HIGH priority: Entity extraction is in critical path, needs to be fast
+            result = await self.llm.ainvoke(prompt, response_format="json", priority=LLMPriority.HIGH)
             ents = result.get("entities", [])
             cleaned = [e.lower().strip() for e in ents if isinstance(e, str)]
             return dedupe_list(cleaned)

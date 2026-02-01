@@ -5,14 +5,22 @@ Runs a lightweight model (e.g., Qwen2-0.5B, TinyLlama) directly in the worker co
 No external service required - model runs in-process.
 """
 
+import asyncio
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Optional
 
 from app.constants.config import LLM_TEMPERATURE
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
+
+# Timeout for local LLM generation (seconds) - CPU inference can be slow
+LOCAL_LLM_TIMEOUT = int(os.getenv("LOCAL_LLM_TIMEOUT", "60"))
+
+# Thread pool for running blocking LLM inference
+_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="local_llm")
 
 # Lazy-loaded model instance
 _llm_instance: Optional[Any] = None
@@ -85,7 +93,7 @@ class LocalLLMService:
 
     async def ainvoke(self, prompt: str, response_format: str = "text") -> Dict[str, Any]:
         """
-        Generate text using the local LLM.
+        Generate text using the local LLM with timeout protection.
 
         Args:
             prompt: The prompt to send to the model
@@ -93,58 +101,73 @@ class LocalLLMService:
 
         Returns:
             Dict with generated text or parsed JSON
+
+        Raises:
+            asyncio.TimeoutError: If generation takes longer than LOCAL_LLM_TIMEOUT
         """
         try:
-            llm = _get_model()
-
-            # For JSON output, add instruction to the prompt
-            if response_format == "json":
-                prompt = f"{prompt}\n\nRespond with valid JSON only, no explanation."
-
-            logger.debug(f"[LocalLLMService] Generating response (max_tokens={self.max_tokens})...")
-
-            # Generate response
-            output = llm(
-                prompt,
-                max_tokens=self.max_tokens,
-                temperature=LLM_TEMPERATURE,
-                stop=["</s>", "<|endoftext|>", "<|im_end|>"],
-                echo=False,
+            # Run blocking LLM inference in thread pool with timeout
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(_executor, self._generate_sync, prompt, response_format),
+                timeout=LOCAL_LLM_TIMEOUT,
             )
+            return result
 
-            text = output["choices"][0]["text"].strip()
-            logger.debug(f"[LocalLLMService] Generated {len(text)} chars")
-
-            # Parse JSON if requested
-            if response_format == "json":
-                if text:
-                    try:
-                        # Try to extract JSON from the response
-                        # Sometimes models add extra text before/after JSON
-                        json_start = text.find("{")
-                        json_end = text.rfind("}") + 1
-                        if json_start >= 0 and json_end > json_start:
-                            json_str = text[json_start:json_end]
-                            return json.loads(json_str)
-                        # Try array format - if it's a list with one dict, unwrap it
-                        json_start = text.find("[")
-                        json_end = text.rfind("]") + 1
-                        if json_start >= 0 and json_end > json_start:
-                            json_str = text[json_start:json_end]
-                            parsed = json.loads(json_str)
-                            # If it's a list with a single dict, return the dict
-                            if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
-                                return parsed[0]
-                            return parsed
-                        # Try parsing as-is
-                        return json.loads(text)
-                    except json.JSONDecodeError:
-                        logger.warning(f"[LocalLLMService] Failed to parse JSON: {text[:200]}")
-                        return {}
-                return {}
-
-            return {"text": text}
-
+        except asyncio.TimeoutError:
+            logger.warning(f"[LocalLLMService] Generation timed out after {LOCAL_LLM_TIMEOUT}s")
+            raise
         except Exception as e:
             logger.error(f"[LocalLLMService] Generation failed: {e}")
             raise
+
+    def _generate_sync(self, prompt: str, response_format: str) -> Dict[str, Any]:
+        """Synchronous generation - runs in thread pool."""
+        llm = _get_model()
+
+        # For JSON output, add instruction to the prompt
+        if response_format == "json":
+            prompt = f"{prompt}\n\nRespond with valid JSON only, no explanation."
+
+        logger.debug(f"[LocalLLMService] Generating response (max_tokens={self.max_tokens})...")
+
+        # Generate response
+        output = llm(
+            prompt,
+            max_tokens=self.max_tokens,
+            temperature=LLM_TEMPERATURE,
+            stop=["</s>", "<|endoftext|>", "<|im_end|>"],
+            echo=False,
+        )
+
+        text = output["choices"][0]["text"].strip()
+        logger.debug(f"[LocalLLMService] Generated {len(text)} chars")
+
+        # Parse JSON if requested
+        if response_format == "json":
+            if text:
+                try:
+                    # Try to extract JSON from the response
+                    # Sometimes models add extra text before/after JSON
+                    json_start = text.find("{")
+                    json_end = text.rfind("}") + 1
+                    if json_start >= 0 and json_end > json_start:
+                        json_str = text[json_start:json_end]
+                        return json.loads(json_str)
+                    # Try array format - if it's a list with one dict, unwrap it
+                    json_start = text.find("[")
+                    json_end = text.rfind("]") + 1
+                    if json_start >= 0 and json_end > json_start:
+                        json_str = text[json_start:json_end]
+                        parsed = json.loads(json_str)
+                        # If it's a list with a single dict, return the dict
+                        if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+                            return parsed[0]
+                        return parsed
+                    # Try parsing as-is
+                    return json.loads(text)
+                except json.JSONDecodeError:
+                    logger.warning(f"[LocalLLMService] Failed to parse JSON: {text[:200]}")
+                    return {}
+            return {}
+
+        return {"text": text}
