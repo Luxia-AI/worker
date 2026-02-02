@@ -1,4 +1,4 @@
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from app.constants.config import ValidationState
 from app.core.logger import get_logger
@@ -13,6 +13,45 @@ class VDBIngest:
     def __init__(self, namespace: str = "health"):
         self.index = get_pinecone_index()
         self.namespace = namespace
+
+    def get_processed_urls(self) -> Set[str]:
+        """
+        Get set of URLs that have already been processed and ingested to VDB.
+
+        Uses Pinecone's list operation to get vector IDs and extracts unique source URLs.
+
+        Returns:
+            Set of source URLs that exist in the VDB namespace
+        """
+        try:
+            # Get all vector IDs in namespace using pagination
+            processed_urls: Set[str] = set()
+
+            # Pinecone's list returns an iterator
+            for ids_batch in self.index.list(namespace=self.namespace):
+                if not ids_batch:
+                    continue
+
+                # Fetch metadata for these IDs
+                try:
+                    fetch_response = self.index.fetch(ids=ids_batch, namespace=self.namespace)
+                    vectors = fetch_response.get("vectors", {})
+
+                    for vec_id, vec_data in vectors.items():
+                        metadata = vec_data.get("metadata", {})
+                        source_url = metadata.get("source_url", "")
+                        if source_url:
+                            processed_urls.add(source_url)
+                except Exception as e:
+                    logger.warning(f"[VDBIngest] Failed to fetch metadata for batch: {e}")
+                    continue
+
+            logger.info(f"[VDBIngest] Found {len(processed_urls)} unique processed URLs in VDB")
+            return processed_urls
+
+        except Exception as e:
+            logger.warning(f"[VDBIngest] Failed to get processed URLs: {e}")
+            return set()
 
     async def embed_and_ingest(self, facts: List[Dict[str, Any]]) -> List[str]:
         """

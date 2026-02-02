@@ -2,11 +2,39 @@
 Advanced deduplication strategies for facts, statements, and candidates.
 """
 
+import hashlib
 from typing import Any, Dict, List, Tuple
 
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+def generate_fact_id(statement: str, source_url: str) -> str:
+    """
+    Generate a deterministic fact ID based on content hash.
+
+    This ensures that the same fact from the same source always gets
+    the same ID, preventing duplicate ingestion to VDB/KG.
+
+    Args:
+        statement: The fact statement text
+        source_url: The source URL
+
+    Returns:
+        Deterministic fact ID in format 'f_<hash[:16]>'
+    """
+    # Normalize statement for consistent hashing
+    normalized_statement = " ".join(statement.lower().strip().split())
+
+    # Normalize URL (remove trailing slashes, lowercase)
+    normalized_url = source_url.lower().rstrip("/") if source_url else ""
+
+    # Create hash from combination
+    content = f"{normalized_url}|{normalized_statement}"
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()[:16]
+
+    return f"f_{content_hash}"
 
 
 def dedup_by_semantic_similarity(

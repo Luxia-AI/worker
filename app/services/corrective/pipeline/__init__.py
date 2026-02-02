@@ -206,11 +206,18 @@ class CorrectivePipeline:
                 "search_api_calls": 0,
             }
 
+        # Get already-processed URLs from VDB to avoid re-scraping
+        already_processed_urls = self.vdb_ingest.get_processed_urls()
+        logger.info(
+            f"[CorrectivePipeline:{round_id}] Found {len(already_processed_urls)} " "already-processed URLs in VDB"
+        )
+
         # Process ONE QUERY AT A TIME for maximum quota efficiency
         all_facts: List[Dict[str, Any]] = []
         all_triples: List[Dict[str, Any]] = []
         all_entities = list(claim_entities)
         processed_urls: List[str] = []
+        skipped_urls: List[str] = []
         search_api_calls = 0
         queries_executed: List[str] = []
 
@@ -231,9 +238,29 @@ class CorrectivePipeline:
 
             logger.info(f"[CorrectivePipeline:{round_id}] Query {query_idx + 1} returned " f"{len(query_urls)} URLs")
 
-            # Step 2: Scrape URLs from this query
-            scraped_pages = await scrape_pages(self.scraper, query_urls, round_id, self.log_manager)
-            processed_urls.extend(query_urls)
+            # Filter out already-processed URLs to avoid re-scraping
+            new_urls = [url for url in query_urls if url not in already_processed_urls and url not in processed_urls]
+            skipped_this_query = len(query_urls) - len(new_urls)
+
+            if skipped_this_query > 0:
+                skipped_urls.extend([url for url in query_urls if url in already_processed_urls])
+                logger.info(
+                    f"[CorrectivePipeline:{round_id}] Filtered {skipped_this_query} already-processed URLs, "
+                    f"{len(new_urls)} new URLs to scrape"
+                )
+
+            if not new_urls:
+                logger.info(
+                    f"[CorrectivePipeline:{round_id}] All URLs from query {query_idx + 1} already processed, "
+                    "trying next query..."
+                )
+                continue
+
+            # Step 2: Scrape only NEW URLs from this query
+            scraped_pages = await scrape_pages(self.scraper, new_urls, round_id, self.log_manager)
+            processed_urls.extend(new_urls)
+            # Add to already_processed set to avoid re-scraping in subsequent queries
+            already_processed_urls.update(new_urls)
 
             if not scraped_pages:
                 logger.info(f"[CorrectivePipeline:{round_id}] No content scraped from query {query_idx + 1}")
@@ -315,7 +342,7 @@ class CorrectivePipeline:
         logger.info(
             f"[CorrectivePipeline:{round_id}] Completed: {len(all_facts)} facts, "
             f"{len(top_ranked)} ranked, {search_api_calls}/{len(queries)} queries used, "
-            f"{len(processed_urls)} URLs processed"
+            f"{len(processed_urls)} URLs processed, {len(skipped_urls)} URLs skipped (already processed)"
         )
 
         if self.log_manager:
@@ -331,6 +358,7 @@ class CorrectivePipeline:
                     "ranked_count": len(top_ranked),
                     "top_score": top_ranked[0]["final_score"] if top_ranked else 0.0,
                     "urls_processed": len(processed_urls),
+                    "urls_skipped": len(skipped_urls),
                     "search_api_calls": search_api_calls,
                     "queries_total": len(queries),
                     "queries_saved": len(queries) - search_api_calls,
@@ -358,6 +386,7 @@ class CorrectivePipeline:
             "search_api_calls": search_api_calls,
             "search_api_calls_saved": len(queries) - search_api_calls,
             "urls_processed": len(processed_urls),
+            "urls_skipped_already_processed": len(skipped_urls),
         }
 
     async def _extract_claim_entities(self, claim: str, round_id: str) -> List[str]:

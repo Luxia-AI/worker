@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional
 
 from app.constants.llm_prompts import FACT_EXTRACTION_PROMPT
 from app.core.logger import get_logger
+from app.services.common.dedup import generate_fact_id
 from app.services.common.text_cleaner import clean_statement, truncate_content
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 
@@ -169,7 +170,8 @@ class FactExtractor:
                     fact["source_url"] = page.get("url", "")
                     fact["source"] = page.get("source", "")
                     fact["published_at"] = page.get("published_at", "")
-                    fact["fact_id"] = f"f_{len(facts)}"
+                    # Use deterministic fact_id based on content hash (prevents duplicates)
+                    fact["fact_id"] = generate_fact_id(fact["statement"], fact["source_url"])
                     facts.append(fact)
 
             logger.info(f"[FactExtractor] Extracted {len(facts)} facts from {len(valid_pages)} pages (batched)")
@@ -199,7 +201,8 @@ class FactExtractor:
                     fact["source_url"] = page.get("url", "")
                     fact["source"] = page.get("source", "")
                     fact["published_at"] = page.get("published_at", "")
-                    fact["fact_id"] = f"f_{len(facts)}"
+                    # Use deterministic fact_id based on content hash (prevents duplicates)
+                    fact["fact_id"] = generate_fact_id(fact["statement"], fact["source_url"])
                     facts.append(fact)
             except Exception as e:
                 logger.warning(f"[FactExtractor] Failed to extract from {page.get('url')}: {e}")
