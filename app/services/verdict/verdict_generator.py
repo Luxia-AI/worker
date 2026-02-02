@@ -38,10 +38,11 @@ RETRIEVED EVIDENCE (ranked by relevance and credibility):
 {evidence_text}
 
 INSTRUCTIONS:
-1. Analyze each piece of evidence for relevance to the claim
-2. Determine if evidence supports, contradicts, or is neutral to the claim
-3. Consider source credibility (scores provided)
-4. Generate a final verdict
+1. Break down the claim into verifiable segments/statements
+2. Analyze each piece of evidence for relevance to the claim segments
+3. For each segment, determine its status based on the evidence
+4. Consider source credibility (scores provided)
+5. Generate a final verdict
 
 VERDICT OPTIONS:
 - TRUE: Evidence strongly supports the claim (multiple credible sources agree)
@@ -49,11 +50,26 @@ VERDICT OPTIONS:
 - PARTIALLY_TRUE: Some aspects are supported, others are not or lack evidence
 - UNVERIFIABLE: Insufficient evidence to make a determination
 
+CLAIM SEGMENT STATUS OPTIONS:
+- VALID: Evidence confirms this part of the claim
+- INVALID: Evidence contradicts this part of the claim
+- PARTIALLY_VALID: Some evidence supports, but with caveats
+- PARTIALLY_INVALID: Some evidence contradicts, but not completely
+- UNKNOWN: Insufficient evidence to determine
+
 Return ONLY valid JSON (no markdown, no extra text):
 {{
     "verdict": "TRUE|FALSE|PARTIALLY_TRUE|UNVERIFIABLE",
     "confidence": 0.85,
     "rationale": "Brief explanation of why this verdict was reached",
+    "claim_breakdown": [
+        {{
+            "claim_segment": "The specific part of the claim being evaluated",
+            "status": "VALID|INVALID|PARTIALLY_VALID|PARTIALLY_INVALID|UNKNOWN",
+            "supporting_fact": "The fact from evidence that supports or contradicts this segment",
+            "source_url": "https://source.url.of.the.fact"
+        }}
+    ],
     "evidence_map": [
         {{
             "evidence_id": 0,
@@ -183,10 +199,14 @@ class VerdictGenerator:
         # Extract key findings
         key_findings = llm_result.get("key_findings", [])
 
+        # Extract claim breakdown for client display
+        claim_breakdown = llm_result.get("claim_breakdown", [])
+
         return {
             "verdict": verdict_str,
             "confidence": confidence,
             "rationale": rationale,
+            "claim_breakdown": claim_breakdown,
             "evidence_map": evidence_map,
             "key_findings": key_findings,
             "claim": claim,
@@ -214,6 +234,7 @@ class VerdictGenerator:
             "verdict": Verdict.UNVERIFIABLE.value,
             "confidence": 0.0,
             "rationale": reason,
+            "claim_breakdown": [],
             "evidence_map": [],
             "key_findings": [],
             "claim": claim,

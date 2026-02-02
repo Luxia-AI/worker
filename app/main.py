@@ -97,6 +97,7 @@ async def process_jobs():
                         "verdict_confidence": verdict_result.get("confidence", 0.0),
                         "verdict_rationale": verdict_result.get("rationale", ""),
                         "key_findings": verdict_result.get("key_findings", []),
+                        "claim_breakdown": verdict_result.get("claim_breakdown", []),
                         # Evidence details
                         "evidence_count": len(ranked_evidence),
                         "facts_extracted": facts_count,
@@ -290,6 +291,7 @@ async def verify_claim(request: ClaimRequest):
             "verdict_confidence": verdict_result.get("confidence", 0.0),
             "verdict_rationale": verdict_result.get("rationale", ""),
             "key_findings": verdict_result.get("key_findings", []),
+            "claim_breakdown": verdict_result.get("claim_breakdown", []),
             # Evidence details
             "evidence_count": len(ranked_evidence),
             "facts_extracted": facts_count,
