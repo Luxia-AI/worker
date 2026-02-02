@@ -59,10 +59,8 @@ class EntityExtractor:
             logger.error(f"[EntityExtractor] Failed extraction: {e}")
             return []
 
-    async def _parse_llm_response(
-        self, result: Any, original_prompt: str, required_format: str, max_retries: int = 1
-    ) -> Optional[Dict[str, Any]]:
-        """Parse LLM response, retry if non-dict returned."""
+    def _try_parse_result(self, result: Any) -> Optional[Dict[str, Any]]:
+        """Try to parse LLM result into expected format. No retries, just parsing."""
         # If already a valid dict with results, return it
         if isinstance(result, dict) and "results" in result:
             return result
@@ -73,6 +71,7 @@ class EntityExtractor:
             if "entities" in result:
                 return {"results": [{"index": 0, "entities": result["entities"]}]}
             logger.warning(f"[EntityExtractor] Dict missing 'results' key: {list(result.keys())}")
+            return None
 
         # If string, try to parse as JSON
         if isinstance(result, str):
@@ -86,18 +85,33 @@ class EntityExtractor:
             except json.JSONDecodeError:
                 pass
 
-        # Retry with explicit JSON request
-        if max_retries > 0:
-            logger.warning("[EntityExtractor] Non-dict response, retrying with JSON prompt...")
+        return None
+
+    async def _parse_llm_response(
+        self, result: Any, original_prompt: str, required_format: str, max_retries: int = 1
+    ) -> Optional[Dict[str, Any]]:
+        """Parse LLM response with limited retries. NO RECURSION - uses iterative loop."""
+        # First attempt: try to parse the original result
+        parsed = self._try_parse_result(result)
+        if parsed is not None:
+            return parsed
+
+        # Retry loop (no recursion)
+        for attempt in range(max_retries):
+            logger.warning(f"[EntityExtractor] Retry {attempt + 1}/{max_retries}: asking LLM for valid JSON...")
             retry_prompt = RETRY_JSON_PROMPT.format(
-                required_format=required_format, original_prompt=original_prompt[:500]  # Truncate to save tokens
+                required_format=required_format, original_prompt=original_prompt[:500]
             )
             try:
                 retry_result = await self.llm.ainvoke(retry_prompt, response_format="json", priority=LLMPriority.HIGH)
-                return await self._parse_llm_response(retry_result, original_prompt, required_format, max_retries - 1)
+                parsed = self._try_parse_result(retry_result)
+                if parsed is not None:
+                    logger.info(f"[EntityExtractor] Retry {attempt + 1} succeeded")
+                    return parsed
             except Exception as e:
-                logger.warning(f"[EntityExtractor] Retry failed: {e}")
+                logger.warning(f"[EntityExtractor] Retry {attempt + 1} failed: {e}")
 
+        logger.warning("[EntityExtractor] All retries exhausted, returning None")
         return None
 
     async def annotate_entities(self, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
