@@ -78,15 +78,17 @@ class LocalLLMService:
         self._available: Optional[bool] = None
 
     def is_available(self) -> bool:
-        """Check if the local LLM is available."""
+        """Check if the local LLM is available (without loading the model)."""
         if self._available is not None:
             return self._available
 
-        try:
-            _get_model()
+        # Just check if the model file exists - don't load it yet
+        # Model will be loaded lazily on first actual use
+        if os.path.exists(self.model_path):
             self._available = True
-        except Exception as e:
-            logger.warning(f"[LocalLLMService] Not available: {e}")
+            logger.info(f"[LocalLLMService] Model file found: {self.model_path}")
+        else:
+            logger.warning(f"[LocalLLMService] Model file not found: {self.model_path}")
             self._available = False
 
         return self._available
