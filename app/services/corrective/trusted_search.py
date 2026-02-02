@@ -1,5 +1,5 @@
 import asyncio
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Tuple
 
 import aiohttp
 
@@ -15,27 +15,50 @@ from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 logger = get_logger(__name__)
 
 
+class QuotaExceededError(Exception):
+    """Raised when search API quota is exceeded."""
+
+    pass
+
+
 class TrustedSearch:
     """
     Google Custom Search (CSE) integration for trusted domain retrieval.
+    Falls back to Serper.dev if Google quota is exceeded.
 
     Provides:
         - automated query reformulation
         - domain-filtered search results
         - async network requests
         - configurable CSE and API keys
+        - Serper.dev fallback for quota issues
         - structured return format
     """
 
     GOOGLE_API_KEY = settings.GOOGLE_API_KEY
     GOOGLE_CSE_ID = settings.GOOGLE_CSE_ID
+    SERPER_API_KEY = settings.SERPER_API_KEY
 
     SEARCH_URL = GOOGLE_CSE_SEARCH_URL
+    SERPER_URL = "https://google.serper.dev/search"
 
     def __init__(self) -> None:
-        if not self.GOOGLE_API_KEY or not self.GOOGLE_CSE_ID:
-            logger.error("Google Search API or CSE ID missing from environment")
-            raise RuntimeError("Missing GOOGLE_API_KEY or GOOGLE_CSE_ID")
+        # Allow initialization even without Google API if Serper is available
+        has_google = self.GOOGLE_API_KEY and self.GOOGLE_CSE_ID
+        has_serper = bool(self.SERPER_API_KEY)
+
+        if not has_google and not has_serper:
+            logger.error("No search API configured (need GOOGLE_API_KEY+CSE_ID or SERPER_API_KEY)")
+            raise RuntimeError("Missing search API credentials")
+
+        self.google_available = has_google
+        self.serper_available = has_serper
+        self.google_quota_exceeded = False
+
+        if has_google:
+            logger.info("[TrustedSearch] Google CSE configured")
+        if has_serper:
+            logger.info("[TrustedSearch] Serper.dev fallback configured")
 
         self.llm_client = HybridLLMService()
 
@@ -89,16 +112,16 @@ FAILED ENTITIES:
         return dedupe_list(queries)
 
     # ---------------------------------------------------------------------
-    # Single Query Search
+    # Single Query Search (Google CSE)
     # ---------------------------------------------------------------------
     @throttled(limit=100, period=60.0, name="google_cse")
-    async def search_query(self, session: aiohttp.ClientSession, query: str) -> List[str]:
+    async def search_query_google(self, session: aiohttp.ClientSession, query: str) -> Tuple[List[str], bool]:
         """
         Runs a single Google CSE request and returns trusted URLs.
+        Returns (urls, quota_exceeded) tuple.
         """
         import urllib.parse
 
-        # Properly encode the query
         encoded_query = urllib.parse.quote_plus(query)
 
         url = self.SEARCH_URL.format(
@@ -111,44 +134,140 @@ FAILED ENTITIES:
             async with session.get(url, timeout=GOOGLE_CSE_TIMEOUT) as resp:
                 data = await resp.json()
 
-                # Log full response for debugging
                 if "error" in data:
-                    logger.error(
-                        f"[TrustedSearch] Google API error for '{query}': "
-                        f"{data['error'].get('message', data['error'])}"
-                    )
-                    return []
+                    error_msg = data["error"].get("message", str(data["error"]))
+                    logger.error(f"[TrustedSearch:Google] API error: {error_msg}")
+
+                    # Detect quota exceeded
+                    if "quota" in error_msg.lower() or "limit" in error_msg.lower():
+                        return [], True  # Signal quota exceeded
+
+                    return [], False
 
                 if "items" not in data:
-                    # Log search info if available
                     search_info = data.get("searchInformation", {})
-                    total_results = search_info.get("totalResults", "0")
-                    logger.warning(f"[TrustedSearch] No items for query='{query}' " f"(totalResults={total_results})")
-                    return []
+                    total = search_info.get("totalResults", "0")
+                    logger.warning(f"[TrustedSearch:Google] No items for '{query}' (total={total})")
+                    return [], False
 
-                # Log all returned URLs for debugging
                 all_urls = [item.get("link", "N/A") for item in data["items"]]
-                logger.info(f"[TrustedSearch] Query '{query}' raw results: {all_urls[:5]}...")
+                logger.info(f"[TrustedSearch:Google] '{query}' raw: {all_urls[:3]}...")
 
                 urls = []
                 for item in data["items"]:
                     link = item.get("link")
-                    if link:
-                        if self.is_trusted(link):
-                            urls.append(link)
-                            logger.info(f"[TrustedSearch] ✓ Accepted: {link}")
-                        else:
-                            logger.debug(f"[TrustedSearch] ✗ Filtered: {link}")
+                    if link and self.is_trusted(link):
+                        urls.append(link)
+                        logger.info(f"[TrustedSearch] ✓ {link}")
 
-                logger.info(f"[TrustedSearch] Query '{query}' -> " f"{len(urls)}/{len(data['items'])} trusted URLs")
+                logger.info(f"[TrustedSearch:Google] '{query}' -> {len(urls)}/{len(data['items'])} trusted")
+                return urls, False
+
+        except asyncio.TimeoutError:
+            logger.error(f"[TrustedSearch:Google] Timeout for '{query}'")
+            return [], False
+        except Exception as e:
+            logger.error(f"[TrustedSearch:Google] Failed for '{query}': {e}")
+            return [], False
+
+    # ---------------------------------------------------------------------
+    # Single Query Search (Serper.dev fallback)
+    # ---------------------------------------------------------------------
+    async def search_query_serper(self, session: aiohttp.ClientSession, query: str) -> List[str]:
+        """
+        Runs a single Serper.dev search request and returns trusted URLs.
+        Serper provides 2,500 free searches/month.
+        """
+        if not self.SERPER_API_KEY:
+            return []
+
+        headers = {
+            "X-API-KEY": self.SERPER_API_KEY,
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "q": query,
+            "num": 10,  # Get 10 results
+        }
+
+        try:
+            async with session.post(
+                self.SERPER_URL,
+                headers=headers,
+                json=payload,
+                timeout=GOOGLE_CSE_TIMEOUT,
+            ) as resp:
+                if resp.status != 200:
+                    error_text = await resp.text()
+                    logger.error(f"[TrustedSearch:Serper] HTTP {resp.status}: {error_text[:200]}")
+                    return []
+
+                data = await resp.json()
+
+                # Serper returns results in "organic" array
+                organic = data.get("organic", [])
+                if not organic:
+                    logger.warning(f"[TrustedSearch:Serper] No results for '{query}'")
+                    return []
+
+                all_urls = [r.get("link", "N/A") for r in organic]
+                logger.info(f"[TrustedSearch:Serper] '{query}' raw: {all_urls[:3]}...")
+
+                urls = []
+                for result in organic:
+                    link = result.get("link")
+                    if link and self.is_trusted(link):
+                        urls.append(link)
+                        logger.info(f"[TrustedSearch] ✓ {link}")
+
+                logger.info(f"[TrustedSearch:Serper] '{query}' -> {len(urls)}/{len(organic)} trusted")
                 return urls
 
         except asyncio.TimeoutError:
-            logger.error(f"[TrustedSearch] Timeout for query='{query}'")
+            logger.error(f"[TrustedSearch:Serper] Timeout for '{query}'")
             return []
         except Exception as e:
-            logger.error(f"[TrustedSearch] Search failed for query='{query}': {e}")
+            logger.error(f"[TrustedSearch:Serper] Failed for '{query}': {e}")
             return []
+
+    # ---------------------------------------------------------------------
+    # Unified Search (with fallback)
+    # ---------------------------------------------------------------------
+    async def search_query(self, session: aiohttp.ClientSession, query: str) -> List[str]:
+        """
+        Search with automatic fallback: Google CSE -> Serper.dev
+        """
+        # If Google quota already exceeded, go straight to Serper
+        if self.google_quota_exceeded:
+            if self.serper_available:
+                return await self.search_query_serper(session, query)
+            return []
+
+        # Try Google first
+        if self.google_available:
+            urls, quota_exceeded = await self.search_query_google(session, query)
+
+            if quota_exceeded:
+                self.google_quota_exceeded = True
+                logger.warning("[TrustedSearch] Google CSE quota exceeded! " "Switching to Serper.dev fallback...")
+
+                if self.serper_available:
+                    return await self.search_query_serper(session, query)
+                else:
+                    logger.error(
+                        "[TrustedSearch] No SERPER_API_KEY configured. "
+                        "Set SERPER_API_KEY env var for fallback search."
+                    )
+                    return []
+
+            return urls
+
+        # No Google, try Serper directly
+        if self.serper_available:
+            return await self.search_query_serper(session, query)
+
+        return []
 
     # ---------------------------------------------------------------------
     # Domain Whitelisting

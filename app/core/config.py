@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     GOOGLE_API_KEY: Optional[str] = Field(default=None)
     GOOGLE_CSE_ID: Optional[str] = Field(default=None)
 
+    # Serper.dev API for fallback search (2500 free/month)
+    SERPER_API_KEY: Optional[str] = Field(default=None)
+
     GROQ_API_KEY: Optional[str] = Field(default=None)
 
     NEO4J_URI: Optional[str] = Field(default=None)
