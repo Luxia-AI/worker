@@ -73,7 +73,7 @@ class KGRetrieval:
         RETURN e1.name AS subject,
                r1.relation AS relation,
                m.name AS object,
-               greatest(r1.confidence, r2.confidence) AS confidence,
+               CASE WHEN r1.confidence > r2.confidence THEN r1.confidence ELSE r2.confidence END AS confidence,
                hop,
                COALESCE(r1.source_url, r2.source_url) AS source_url
         LIMIT $limit
