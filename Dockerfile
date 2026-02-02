@@ -58,9 +58,10 @@ ENV PATH="/opt/venv/bin:$PATH" \
     TRANSFORMERS_CACHE=/app/model_cache \
     SENTENCE_TRANSFORMERS_HOME=/app/model_cache \
     LOCAL_LLM_MODEL_PATH=/app/models/qwen2-0_5b-instruct-q4_k_m.gguf \
-    LOCAL_LLM_CONTEXT_SIZE=2048 \
-    LOCAL_LLM_THREADS=4 \
-    LOCAL_LLM_MAX_TOKENS=512
+    LOCAL_LLM_CONTEXT_SIZE=512 \
+    LOCAL_LLM_THREADS=2 \
+    LOCAL_LLM_MAX_TOKENS=256 \
+    LOCAL_LLM_TIMEOUT=15
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

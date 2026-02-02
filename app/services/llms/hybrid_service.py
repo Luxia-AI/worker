@@ -186,7 +186,14 @@ class HybridLLMService:
                 logger.debug("[HybridLLMService] Local LLM succeeded")
                 return result
             except Exception as e:
+                error_str = str(e)
                 logger.warning(f"[HybridLLMService] Local LLM failed: {e}, trying Ollama...")
+
+                # If Local LLM is permanently unavailable, mark it so
+                if "permanently unavailable" in error_str or hasattr(self.local_llm_service, "_permanently_failed"):
+                    if getattr(self.local_llm_service, "_permanently_failed", False):
+                        self.local_llm_available = False
+                        logger.warning("[HybridLLMService] Local LLM marked as permanently unavailable")
 
         # Fallback to Ollama
         if self.ollama_available and self.ollama_service:
