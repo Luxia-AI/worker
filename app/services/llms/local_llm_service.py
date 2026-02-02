@@ -16,8 +16,9 @@ from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Timeout for local LLM generation (seconds) - CPU inference can be slow
-LOCAL_LLM_TIMEOUT = int(os.getenv("LOCAL_LLM_TIMEOUT", "60"))
+# Timeout for local LLM generation (seconds)
+# Reduced to 10s to fail fast - if model is slow/crashing, fallback to Groq quickly
+LOCAL_LLM_TIMEOUT = int(os.getenv("LOCAL_LLM_TIMEOUT", "10"))
 
 # Thread pool for running blocking LLM inference
 _executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="local_llm")

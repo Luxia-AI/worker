@@ -81,17 +81,24 @@ class HybridLLMService:
             self.groq_available = False
 
         # Fallback 1: Local in-container LLM (free) - for LOW priority & fallback
-        try:
-            self.local_llm_service = LocalLLMService()
-            self.local_llm_available = self.local_llm_service.is_available()
-            if self.local_llm_available:
-                logger.info("[HybridLLMService] Local LLM available (for low-priority & fallback)")
-            else:
-                logger.warning("[HybridLLMService] Local LLM model not found (will use Groq for all tasks)")
-        except Exception as e:
-            logger.warning(f"[HybridLLMService] Local LLM service unavailable: {e}")
+        # Can be disabled with LOCAL_LLM_ENABLED=false if model is crashing
+        local_llm_enabled = os.getenv("LOCAL_LLM_ENABLED", "true").lower() == "true"
+        if not local_llm_enabled:
+            logger.info("[HybridLLMService] Local LLM disabled via LOCAL_LLM_ENABLED=false")
             self.local_llm_service = None
             self.local_llm_available = False
+        else:
+            try:
+                self.local_llm_service = LocalLLMService()
+                self.local_llm_available = self.local_llm_service.is_available()
+                if self.local_llm_available:
+                    logger.info("[HybridLLMService] Local LLM available (for low-priority & fallback)")
+                else:
+                    logger.warning("[HybridLLMService] Local LLM model not found (will use Groq for all tasks)")
+            except Exception as e:
+                logger.warning(f"[HybridLLMService] Local LLM service unavailable: {e}")
+                self.local_llm_service = None
+                self.local_llm_available = False
 
         # Fallback 2: Ollama (external service) - disabled by default in Azure
         # Only enable if OLLAMA_HOST is explicitly set to something other than 'ollama'
