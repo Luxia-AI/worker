@@ -4,6 +4,7 @@ import traceback
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from fastapi import FastAPI
+from pydantic import BaseModel
 
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -226,5 +227,104 @@ app.add_event_handler("shutdown", shutdown_event)
 # Include routers
 app.include_router(pinecone_router, prefix="/worker", tags=["Pinecone"])
 app.include_router(admin_router, tags=["Admin"])
+
+
+# HTTP endpoint for direct claim verification (fallback when Kafka is unavailable)
+
+
+class ClaimRequest(BaseModel):
+    claim: str
+    post_id: str | None = None
+    room_id: str | None = None
+    domain: str = "general"
+
+
+@app.post("/worker/verify", tags=["Pipeline"])
+async def verify_claim(request: ClaimRequest):
+    """
+    Verify a claim directly via HTTP (used when Kafka is unavailable).
+    Returns the full verdict result.
+    """
+    global _pipeline
+
+    # Initialize pipeline if not already done
+    if _pipeline is None:
+        try:
+            _pipeline = CorrectivePipeline()
+            logger.info("[HTTP] CorrectivePipeline initialized for HTTP request")
+        except Exception as e:
+            logger.error(f"[HTTP] Failed to initialize pipeline: {e}")
+            return {
+                "status": "error",
+                "error": f"Pipeline initialization failed: {e}",
+                "claim": request.claim,
+            }
+
+    job_id = request.post_id or f"http-{asyncio.get_event_loop().time()}"
+
+    try:
+        logger.info(f"[HTTP] Processing claim: {request.claim[:100]}...")
+
+        result = await _pipeline.run(
+            post_text=request.claim,
+            domain=request.domain,
+            round_id=job_id,
+            top_k=5,
+        )
+
+        # Extract key results
+        ranked_evidence = result.get("ranked", [])
+        facts_count = len(result.get("facts", []))
+        status = result.get("status", "completed")
+        verdict_result = result.get("verdict", {})
+
+        response = {
+            "job_id": job_id,
+            "post_id": request.post_id,
+            "room_id": request.room_id,
+            "status": "completed",
+            "pipeline_status": status,
+            "claim": request.claim,
+            # Verdict (RAG Generation result)
+            "verdict": verdict_result.get("verdict", "UNVERIFIABLE"),
+            "verdict_confidence": verdict_result.get("confidence", 0.0),
+            "verdict_rationale": verdict_result.get("rationale", ""),
+            "key_findings": verdict_result.get("key_findings", []),
+            # Evidence details
+            "evidence_count": len(ranked_evidence),
+            "facts_extracted": facts_count,
+            "evidence": [
+                {
+                    "statement": e.get("statement", ""),
+                    "source_url": e.get("source_url", ""),
+                    "score": round(e.get("final_score", 0), 3),
+                    "credibility": e.get("credibility"),
+                    "grade": e.get("grade", "N/A"),
+                }
+                for e in ranked_evidence[:5]
+            ],
+            "evidence_map": verdict_result.get("evidence_map", []),
+            "top_score": round(ranked_evidence[0]["final_score"], 3) if ranked_evidence else 0,
+        }
+
+        logger.info(
+            f"[HTTP] Completed: verdict={verdict_result.get('verdict', 'N/A')}, "
+            f"{len(ranked_evidence)} evidence found"
+        )
+
+        return response
+
+    except Exception as e:
+        logger.error(f"[HTTP] Pipeline error: {e}")
+        logger.error(f"[HTTP] Full traceback:\n{traceback.format_exc()}")
+        return {
+            "job_id": job_id,
+            "post_id": request.post_id,
+            "room_id": request.room_id,
+            "status": "error",
+            "error": str(e),
+            "claim": request.claim,
+        }
+
 
 logger.info("Luxia Worker Service initialized")
