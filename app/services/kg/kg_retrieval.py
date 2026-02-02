@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List
 
 from app.core.logger import get_logger
 from app.services.kg.neo4j_client import Neo4jClient
 
 logger = get_logger(__name__)
+
+# Timeout for KG retrieval operations
+KG_RETRIEVAL_TIMEOUT = 15  # seconds
 
 
 class KGRetrieval:
@@ -15,6 +19,7 @@ class KGRetrieval:
     - Path quality scoring (relation confidence + hop penalty)
     - Credibility inference from source domain authority
     - Structured triple format (subject, relation, object)
+    - Graceful timeout handling when Neo4j is unavailable
     """
 
     def __init__(self) -> None:
@@ -45,6 +50,21 @@ class KGRetrieval:
         if not entities:
             return []
 
+        # Wrap in timeout to prevent blocking when Neo4j is unavailable
+        try:
+            return await asyncio.wait_for(self._do_retrieve(entities, top_k), timeout=KG_RETRIEVAL_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(f"[KGRetrieval] Timeout ({KG_RETRIEVAL_TIMEOUT}s), returning empty results")
+            return []
+        except ConnectionError as e:
+            logger.warning(f"[KGRetrieval] Neo4j unavailable: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"[KGRetrieval] Unexpected error: {e}")
+            return []
+
+    async def _do_retrieve(self, entities: List[str], top_k: int) -> List[Dict[str, Any]]:
+        """Internal method that performs the actual retrieval."""
         cypher = """
         UNWIND $ents AS e
 

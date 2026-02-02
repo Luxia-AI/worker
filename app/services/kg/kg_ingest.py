@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List
 
 from app.core.logger import get_logger
-from app.services.kg.neo4j_client import Neo4jClient
+from app.services.kg.neo4j_client import NEO4J_QUERY_TIMEOUT, Neo4jClient
 
 logger = get_logger(__name__)
+
+# Overall timeout for the entire ingest operation
+KG_INGEST_TIMEOUT = 30  # seconds
 
 
 class KGIngest:
@@ -18,6 +22,7 @@ class KGIngest:
         - nodes are merged (idempotent)
         - relations upserted with confidence + metadata
         - logs every action
+        - fails gracefully with timeout if Neo4j is unavailable
     """
 
     def __init__(self) -> None:
@@ -27,6 +32,21 @@ class KGIngest:
         if not triples:
             return 0
 
+        # Wrap entire operation in timeout to prevent blocking
+        try:
+            return await asyncio.wait_for(self._do_ingest(triples), timeout=KG_INGEST_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(f"[KGIngest] Overall timeout ({KG_INGEST_TIMEOUT}s), skipping KG ingestion")
+            return 0
+        except ConnectionError as e:
+            logger.warning(f"[KGIngest] Neo4j unavailable, skipping: {e}")
+            return 0
+        except Exception as e:
+            logger.error(f"[KGIngest] Unexpected error, skipping: {e}")
+            return 0
+
+    async def _do_ingest(self, triples: List[Dict[str, Any]]) -> int:
+        """Internal method that performs the actual ingestion."""
         cypher = """
         MERGE (s:Entity {name: $subject})
         MERGE (o:Entity {name: $object})
@@ -61,11 +81,18 @@ class KGIngest:
                     }
 
                     try:
-                        await session.run(cypher, **params)
+                        # Add per-query timeout
+                        await asyncio.wait_for(session.run(cypher, **params), timeout=NEO4J_QUERY_TIMEOUT)
                         count += 1
+                    except asyncio.TimeoutError:
+                        logger.warning(f"[KGIngest] Query timeout for triple: {subj}->{rel}->{obj}")
+                        # Continue with other triples
                     except Exception as e:
                         logger.error(f"[KGIngest] Failed ingest triple {triple}: {e}")
 
+        except ConnectionError as e:
+            logger.warning(f"[KGIngest] Connection failed: {e}")
+            raise
         except Exception as e:
             logger.error(f"[KGIngest] Session failed: {e}")
 
