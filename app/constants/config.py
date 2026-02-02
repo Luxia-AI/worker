@@ -76,6 +76,9 @@ TRUSTED_DOMAINS_AUTHORITY = {
     "www.nih.gov",
     "www.nlm.nih.gov",
     "pubmed.ncbi.nlm.nih.gov",
+    "pmc.ncbi.nlm.nih.gov",
+    "ncbi.nlm.nih.gov",
+    "www.ncbi.nlm.nih.gov",
     "clinicaltrials.gov",
     "www.cdc.gov",
     "www.fda.gov",
@@ -84,6 +87,7 @@ TRUSTED_DOMAINS_AUTHORITY = {
     "www.nhs.uk",
     "www.nice.org.uk",
     "www.cochranelibrary.com",
+    "www.health.harvard.edu",
 }
 
 # Government and educational domains
@@ -100,6 +104,9 @@ TRUSTED_DOMAINS = {
     "www.nih.gov",
     "www.nlm.nih.gov",
     "pubmed.ncbi.nlm.nih.gov",
+    "pmc.ncbi.nlm.nih.gov",
+    "ncbi.nlm.nih.gov",
+    "www.ncbi.nlm.nih.gov",
     "clinicaltrials.gov",
     "www.cdc.gov",
     "www.fda.gov",
@@ -125,6 +132,7 @@ TRUSTED_DOMAINS = {
     "www.health.gov.lk",
     # Academic/Research
     "www.cochranelibrary.com",
+    "www.health.harvard.edu",
 }
 
 # ============================================================================

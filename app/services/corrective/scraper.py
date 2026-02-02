@@ -30,19 +30,31 @@ class Scraper:
     # Primary HTTP Fetcher
     # ---------------------------------------------------------------------
     @throttled(limit=30, period=60.0, name="web_scraper")
-    async def fetch_html(self, session: aiohttp.ClientSession, url: str) -> str | None:
+    async def fetch_html(self, session: aiohttp.ClientSession, url: str) -> tuple[str | None, bool]:
+        """
+        Fetch HTML content from URL.
+
+        Returns:
+            tuple: (html_content, should_fallback)
+            - html_content: The HTML string or None if fetch failed
+            - should_fallback: True if Playwright fallback might help, False if not
+              (e.g., 403/404 errors should NOT trigger fallback)
+        """
         try:
             async with session.get(url, timeout=self.timeout) as resp:
                 if resp.status != 200:
                     logger.warning(f"[Scraper] Non-200 status: {url} — {resp.status}")
-                    return None
+                    # 4xx client errors (403, 404, etc.) won't be fixed by Playwright
+                    # Only network issues or empty content should trigger fallback
+                    should_fallback = resp.status >= 500  # Only server errors
+                    return None, should_fallback
 
                 html = await resp.text()
-                return html
+                return html, True  # Success, but fallback OK if extraction fails
 
         except Exception as e:
             logger.error(f"[Scraper] HTTP fetch failed for {url}: {e}")
-            return None
+            return None, True  # Network error - Playwright might help
 
     # ---------------------------------------------------------------------
     # Trafilatura Extraction
@@ -95,12 +107,15 @@ class Scraper:
         logger.info(f"[Scraper] Scraping URL: {url}")
 
         # Step 1: Try normal HTTP fetch
-        html = await self.fetch_html(session, url)
+        html, should_fallback = await self.fetch_html(session, url)
 
-        # If HTML missing → Playwright fallback
-        if html is None:
+        # If HTML missing and fallback is appropriate → Playwright fallback
+        # Do NOT fallback for 4xx errors (403, 404, etc.) - they won't be fixed by JS rendering
+        if html is None and should_fallback:
             logger.info(f"[Scraper] Falling back to Playwright: {url}")
             html = await self.playwright_fallback(url)
+        elif html is None:
+            logger.info(f"[Scraper] Skipping Playwright fallback (client error): {url}")
 
         if not isinstance(html, str) or not html:
             logger.warning(f"[Scraper] No HTML content for {url}")

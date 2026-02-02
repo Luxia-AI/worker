@@ -9,7 +9,7 @@ Supports deferred domain trust resolution:
 
 from typing import Any, Dict
 
-from app.constants.config import TRUSTED_DOMAINS, ValidationState, VerdictState
+from app.constants.config import TRUSTED_DOMAINS, TRUSTED_DOMAINS_EDU_GOV, ValidationState, VerdictState
 from app.core.logger import get_logger
 from app.services.common.url_helpers import extract_domain
 from app.services.domain_trust import get_domain_trust_store
@@ -41,6 +41,7 @@ class EvidenceValidator:
 
         Logic:
         - If domain in TRUSTED_DOMAINS config → TRUSTED
+        - If domain ends with .gov or .edu (TRUSTED_DOMAINS_EDU_GOV) → TRUSTED
         - Else if domain approved by admin → TRUSTED
         - Else if domain rejected by admin → UNTRUSTED
         - Else → PENDING_DOMAIN_TRUST (allow processing, await admin decision)
@@ -50,8 +51,14 @@ class EvidenceValidator:
             logger.warning(f"[EvidenceValidator] Could not extract domain from {source_url}")
             return ValidationState.UNTRUSTED
 
-        # Check hardcoded trusted domains
+        # Check hardcoded trusted domains (exact match)
         if domain in TRUSTED_DOMAINS:
+            return ValidationState.TRUSTED
+
+        # Check .gov/.edu suffix matching (e.g., medlineplus.gov, pmc.ncbi.nlm.nih.gov)
+        if any(domain.endswith(suffix) for suffix in TRUSTED_DOMAINS_EDU_GOV):
+            logger.debug(f"[EvidenceValidator] Domain {domain} trusted via .gov/.edu suffix")
+            return ValidationState.TRUSTED
             return ValidationState.TRUSTED
 
         # Check dynamic admin approvals
