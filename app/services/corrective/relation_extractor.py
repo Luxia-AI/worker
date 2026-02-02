@@ -63,8 +63,13 @@ class RelationExtractor:
             # Single batched LLM call for ALL facts
             result = await self.llm_service.ainvoke(prompt, response_format="json", priority=LLMPriority.LOW)
 
-            # Parse batch results
+            # Parse batch results - handle case where LLM returns string or malformed response
             all_triples: List[Dict[str, Any]] = []
+
+            if not isinstance(result, dict):
+                logger.warning(f"[RelationExtractor] LLM returned non-dict: {type(result)}")
+                return []
+
             results_list = result.get("results", [])
 
             for item in results_list:

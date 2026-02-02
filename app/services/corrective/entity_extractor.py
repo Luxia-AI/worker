@@ -60,6 +60,14 @@ class EntityExtractor:
         try:
             # Single LLM call for all facts
             result = await self.llm.ainvoke(prompt, response_format="json", priority=LLMPriority.HIGH)
+
+            # Handle case where LLM returns string or malformed response
+            if not isinstance(result, dict):
+                logger.warning(f"[EntityExtractor] LLM returned non-dict: {type(result)}")
+                for fact in facts:
+                    fact["entities"] = []
+                return facts
+
             logger.info(f"[EntityExtractor] Batch LLM returned results for {len(result.get('results', []))} facts")
 
             # Map results back to facts
