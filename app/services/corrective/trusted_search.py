@@ -322,7 +322,71 @@ FAILED ENTITIES:
         return site_queries
 
     # ---------------------------------------------------------------------
-    # Main Search Handler
+    # Generate All Queries (without executing search)
+    # ---------------------------------------------------------------------
+    async def generate_search_queries(
+        self,
+        post_text: str,
+        failed_entities: List[str],
+        max_queries: int = 12,
+    ) -> List[str]:
+        """
+        Generate all search queries upfront without executing any search API calls.
+        This allows the pipeline to control query execution one-by-one for quota optimization.
+
+        Returns:
+            List of search queries (LLM-reformulated + site-specific)
+        """
+        # 1) Generate reformulated queries (1 LLM call)
+        queries = await self.reformulate_queries(post_text, failed_entities)
+        logger.info(f"[TrustedSearch] Reformulated queries: {queries}")
+
+        if not queries:
+            # Fallback to basic query
+            queries = [post_text[:100]]
+
+        # 2) Generate site-specific queries for better targeting
+        site_queries = self._generate_site_queries(queries[0])
+
+        # 3) Interleave: original, site-specific, original, site-specific...
+        all_queries = []
+        for i, q in enumerate(queries):
+            all_queries.append(q)
+            if i < len(site_queries):
+                all_queries.append(site_queries[i])
+        # Add remaining site queries
+        all_queries.extend(site_queries[len(queries) :])
+
+        # Limit total queries
+        all_queries = all_queries[:max_queries]
+        logger.info(f"[TrustedSearch] Generated {len(all_queries)} queries for quota-optimized search")
+
+        return all_queries
+
+    # ---------------------------------------------------------------------
+    # Execute Single Query (quota-optimized)
+    # ---------------------------------------------------------------------
+    async def execute_single_query(self, query: str) -> List[str]:
+        """
+        Execute a single search query and return trusted URLs.
+        This is the quota-optimized method - call only when needed.
+
+        Returns:
+            List of trusted URLs from this single query
+        """
+        logger.info(f"[TrustedSearch] Executing single query: '{query}'")
+
+        async with aiohttp.ClientSession() as session:
+            try:
+                urls = await self.search_query(session, query)
+                logger.info(f"[TrustedSearch] Single query returned {len(urls)} trusted URLs")
+                return urls
+            except Exception as e:
+                logger.error(f"[TrustedSearch] Single query failed: {e}")
+                return []
+
+    # ---------------------------------------------------------------------
+    # Main Search Handler (legacy - runs all queries)
     # ---------------------------------------------------------------------
     async def run(
         self,

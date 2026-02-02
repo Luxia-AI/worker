@@ -1,20 +1,27 @@
 """
 Corrective Retrieval Pipeline: Main orchestrator.
 
-OPTIMIZED ARCHITECTURE (Retrieval-First):
+QUOTA-OPTIMIZED ARCHITECTURE (One Query at a Time):
     1. Embedding: Embed claim and extract entities
     2. Retrieval: Check VDB + KG for existing evidence FIRST
     3. Ranking: If trust score >= threshold, DONE (no web search needed)
-    4. Corrective Search: Only if rank < threshold, search incrementally
-    5. Extraction: Extract facts from search results (batched)
-    6. Ingestion: Store new evidence to VDB + KG for future use
-    7. Re-rank: Combine new + existing evidence, check threshold again
+    4. Query Generation: Generate search queries (1 LLM call)
+    5. Incremental Search: For each query (one at a time):
+       a. Execute single search API call
+       b. Scrape URLs from that query
+       c. Extract facts (LLM call)
+       d. Ingest to VDB + KG
+       e. Re-rank with new evidence
+       f. If threshold met → STOP (save remaining quota)
+       g. If not → continue to next query
+    6. Return results
 
-This approach minimizes LLM calls by:
-    - Using cached evidence when available
-    - Processing search results in small batches (3-5 pages)
-    - Batching fact extraction to reduce per-page LLM calls
-    - Early termination when threshold reached
+This approach MAXIMIZES quota efficiency by:
+    - Using cached evidence when available (no API calls)
+    - Running ONE search query at a time
+    - Processing each query's results completely before deciding to continue
+    - Stopping immediately when threshold is reached
+    - Never wasting API calls on unused queries
 """
 
 import uuid
@@ -28,7 +35,6 @@ from app.services.corrective.pipeline.extraction_phase import extract_all, scrap
 from app.services.corrective.pipeline.ingestion_phase import ingest_facts_and_triples
 from app.services.corrective.pipeline.ranking_phase import rank_candidates
 from app.services.corrective.pipeline.retrieval_phase import retrieve_candidates
-from app.services.corrective.pipeline.search_phase import do_search
 from app.services.corrective.relation_extractor import RelationExtractor
 from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
@@ -41,9 +47,6 @@ from app.services.vdb.vdb_ingest import VDBIngest
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 
 logger = get_logger(__name__)
-
-# Batch size for incremental web search processing
-SEARCH_BATCH_SIZE = 5
 
 
 class CorrectivePipeline:
@@ -178,56 +181,66 @@ class CorrectivePipeline:
             }
 
         # ====================================================================
-        # PHASE 4: Corrective Search (incremental, batched)
+        # PHASE 4: Quota-Optimized Incremental Search (ONE QUERY AT A TIME)
         # ====================================================================
         logger.info(
-            f"[CorrectivePipeline:{round_id}] Trust score too low ({top_score:.3f}), triggering corrective search..."
+            f"[CorrectivePipeline:{round_id}] Trust score too low ({top_score:.3f}), "
+            "starting quota-optimized search..."
         )
 
-        # Get search URLs
-        search_urls, queries = await do_search(
-            self.search_agent, post_text, failed_entities, round_id, self.log_manager
-        )
+        # Generate all search queries upfront (1 LLM call only)
+        queries = await self.search_agent.generate_search_queries(post_text, failed_entities)
 
-        if not search_urls:
-            logger.warning(f"[CorrectivePipeline:{round_id}] No search results found")
+        if not queries:
+            logger.warning(f"[CorrectivePipeline:{round_id}] No search queries generated")
             return {
                 "round_id": round_id,
-                "status": "no_search_results",
+                "status": "no_queries_generated",
                 "facts": [],
                 "triples": [],
-                "queries": queries,
+                "queries": [],
                 "semantic_candidates_count": len(dedup_sem),
                 "kg_candidates_count": len(kg_candidates),
                 "ranked": top_ranked,
-                "used_web_search": True,
+                "used_web_search": False,
+                "search_api_calls": 0,
             }
 
-        # Process search results in batches
+        # Process ONE QUERY AT A TIME for maximum quota efficiency
         all_facts: List[Dict[str, Any]] = []
         all_triples: List[Dict[str, Any]] = []
         all_entities = list(claim_entities)
         processed_urls: List[str] = []
+        search_api_calls = 0
+        queries_executed: List[str] = []
 
-        for batch_idx in range(0, len(search_urls), SEARCH_BATCH_SIZE):
-            batch_urls = search_urls[batch_idx : batch_idx + SEARCH_BATCH_SIZE]
-            batch_num = batch_idx // SEARCH_BATCH_SIZE + 1
-            total_batches = (len(search_urls) + SEARCH_BATCH_SIZE - 1) // SEARCH_BATCH_SIZE
+        for query_idx, query in enumerate(queries):
+            logger.info(f"[CorrectivePipeline:{round_id}] === Query {query_idx + 1}/{len(queries)} ===")
+            logger.info(f"[CorrectivePipeline:{round_id}] Executing: '{query}'")
 
-            logger.info(
-                f"[CorrectivePipeline:{round_id}] Processing batch {batch_num}/{total_batches} "
-                f"({len(batch_urls)} URLs)"
-            )
+            # Step 1: Execute SINGLE search API call
+            search_api_calls += 1
+            query_urls = await self.search_agent.execute_single_query(query)
+            queries_executed.append(query)
 
-            # Scrape batch
-            scraped_pages = await scrape_pages(self.scraper, batch_urls, round_id, self.log_manager)
-            processed_urls.extend(batch_urls)
-
-            if not scraped_pages:
+            if not query_urls:
+                logger.info(
+                    f"[CorrectivePipeline:{round_id}] Query {query_idx + 1} returned no URLs, " "trying next query..."
+                )
                 continue
 
-            # Extract facts, entities, relations from batch
-            batch_facts, batch_entities, batch_triples = await extract_all(
+            logger.info(f"[CorrectivePipeline:{round_id}] Query {query_idx + 1} returned " f"{len(query_urls)} URLs")
+
+            # Step 2: Scrape URLs from this query
+            scraped_pages = await scrape_pages(self.scraper, query_urls, round_id, self.log_manager)
+            processed_urls.extend(query_urls)
+
+            if not scraped_pages:
+                logger.info(f"[CorrectivePipeline:{round_id}] No content scraped from query {query_idx + 1}")
+                continue
+
+            # Step 3: Extract facts, entities, relations
+            query_facts, query_entities, query_triples = await extract_all(
                 self.fact_extractor,
                 self.entity_extractor,
                 self.relation_extractor,
@@ -236,54 +249,79 @@ class CorrectivePipeline:
                 self.log_manager,
             )
 
-            if batch_facts:
-                all_facts.extend(batch_facts)
-                all_entities.extend(batch_entities)
-                all_triples.extend(batch_triples)
+            if not query_facts:
+                logger.info(f"[CorrectivePipeline:{round_id}] No facts extracted from query {query_idx + 1}")
+                continue
 
-                # Ingest to VDB and KG immediately
-                await ingest_facts_and_triples(
-                    self.vdb_ingest, self.kg_ingest, batch_facts, batch_triples, round_id, self.log_manager
-                )
+            # Accumulate results
+            all_facts.extend(query_facts)
+            all_entities.extend(query_entities)
+            all_triples.extend(query_triples)
 
-                # Re-retrieve and re-rank with new evidence
-                dedup_sem, kg_candidates = await retrieve_candidates(
-                    self.vdb_retriever,
-                    self.kg_retriever,
-                    queries,
-                    list(set(all_entities)),
-                    top_k * 2,
-                    round_id,
-                    self.log_manager,
-                )
+            logger.info(
+                f"[CorrectivePipeline:{round_id}] Query {query_idx + 1} extracted "
+                f"{len(query_facts)} facts, {len(query_triples)} triples"
+            )
 
-                top_ranked = await rank_candidates(
-                    dedup_sem, kg_candidates, list(set(all_entities)), top_k, round_id, self.log_manager
-                )
+            # Step 4: Ingest to VDB and KG immediately
+            await ingest_facts_and_triples(
+                self.vdb_ingest,
+                self.kg_ingest,
+                query_facts,
+                query_triples,
+                round_id,
+                self.log_manager,
+            )
 
-                top_score = top_ranked[0]["final_score"] if top_ranked else 0.0
+            # Step 5: Re-retrieve and re-rank with new evidence
+            dedup_sem, kg_candidates = await retrieve_candidates(
+                self.vdb_retriever,
+                self.kg_retriever,
+                queries_executed,
+                list(set(all_entities)),
+                top_k * 2,
+                round_id,
+                self.log_manager,
+            )
+
+            top_ranked = await rank_candidates(
+                dedup_sem,
+                kg_candidates,
+                list(set(all_entities)),
+                top_k,
+                round_id,
+                self.log_manager,
+            )
+
+            top_score = top_ranked[0]["final_score"] if top_ranked else 0.0
+
+            logger.info(
+                f"[CorrectivePipeline:{round_id}] After query {query_idx + 1}: "
+                f"top_score={top_score:.3f}, total_facts={len(all_facts)}, "
+                f"search_calls={search_api_calls}"
+            )
+
+            # Step 6: Check if threshold reached - STOP to save quota!
+            if top_score >= self.CONF_THRESHOLD:
+                remaining_queries = len(queries) - query_idx - 1
                 logger.info(
-                    f"[CorrectivePipeline:{round_id}] After batch {batch_num}: "
-                    f"top_score={top_score:.3f}, facts={len(all_facts)}"
+                    f"[CorrectivePipeline:{round_id}] ✅ THRESHOLD MET after query {query_idx + 1}! "
+                    f"({top_score:.3f} >= {self.CONF_THRESHOLD}) "
+                    f"Saved {remaining_queries} search API calls!"
                 )
+                break
 
-                # Check if threshold reached
-                if top_score >= self.CONF_THRESHOLD:
-                    logger.info(
-                        f"[CorrectivePipeline:{round_id}] Trust threshold met after batch {batch_num}! "
-                        f"({top_score:.3f} >= {self.CONF_THRESHOLD})"
-                    )
-                    break
-
+        # Log final statistics
         logger.info(
             f"[CorrectivePipeline:{round_id}] Completed: {len(all_facts)} facts, "
-            f"{len(top_ranked)} ranked, processed {len(processed_urls)}/{len(search_urls)} URLs"
+            f"{len(top_ranked)} ranked, {search_api_calls}/{len(queries)} queries used, "
+            f"{len(processed_urls)} URLs processed"
         )
 
         if self.log_manager:
             await self.log_manager.add_log(
                 level="INFO",
-                message=f"Pipeline completed: {len(all_facts)} facts, {len(top_ranked)} ranked",
+                message=f"Pipeline completed: {len(all_facts)} facts, {search_api_calls} API calls",
                 module=__name__,
                 request_id=f"claim-{round_id}",
                 round_id=round_id,
@@ -293,20 +331,32 @@ class CorrectivePipeline:
                     "ranked_count": len(top_ranked),
                     "top_score": top_ranked[0]["final_score"] if top_ranked else 0.0,
                     "urls_processed": len(processed_urls),
-                    "urls_total": len(search_urls),
+                    "search_api_calls": search_api_calls,
+                    "queries_total": len(queries),
+                    "queries_saved": len(queries) - search_api_calls,
                 },
             )
 
+        # Determine final status
+        final_status = "completed"
+        if not all_facts and search_api_calls > 0:
+            final_status = "no_facts_extracted"
+        elif search_api_calls == 0:
+            final_status = "no_search_results"
+
         return {
             "round_id": round_id,
-            "status": "completed",
+            "status": final_status,
             "facts": all_facts,
             "triples": all_triples,
-            "queries": queries,
+            "queries": queries_executed,
+            "queries_total": len(queries),
             "semantic_candidates_count": len(dedup_sem),
             "kg_candidates_count": len(kg_candidates),
             "ranked": top_ranked,
-            "used_web_search": True,
+            "used_web_search": search_api_calls > 0,
+            "search_api_calls": search_api_calls,
+            "search_api_calls_saved": len(queries) - search_api_calls,
             "urls_processed": len(processed_urls),
         }
 
