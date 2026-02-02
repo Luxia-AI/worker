@@ -170,7 +170,9 @@ class LocalLLMService:
                     return json.loads(text)
                 except json.JSONDecodeError:
                     logger.warning(f"[LocalLLMService] Failed to parse JSON: {text[:200]}")
-                    return {}
-            return {}
+                    # Return error indicator instead of empty dict so callers know parsing failed
+                    return {"_llm_error": "json_parse_failed", "raw_text": text[:500]}
+            # Empty text
+            return {"_llm_error": "empty_response"}
 
         return {"text": text}

@@ -42,6 +42,10 @@ class FactExtractor:
 
     def _try_parse_result(self, result: Any) -> Optional[Dict[str, Any]]:
         """Try to parse LLM result into expected format. No retries, just parsing."""
+        # Reject None, empty dict, or error indicators
+        if result is None or result == {} or (isinstance(result, dict) and "_llm_error" in result):
+            return None
+
         # If already a valid dict with results, return it
         if isinstance(result, dict) and "results" in result:
             return result
