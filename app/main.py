@@ -1,5 +1,6 @@
 import asyncio
 import json
+import traceback
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from fastapi import FastAPI
@@ -122,7 +123,9 @@ async def process_jobs():
                     }
 
             except Exception as e:
+                # Log full traceback to identify exact source of error
                 logger.error(f"[Job {job_id}] Pipeline error: {e}")
+                logger.error(f"[Job {job_id}] Full traceback:\n{traceback.format_exc()}")
                 response = {
                     "job_id": job_id,
                     "post_id": post_id,
