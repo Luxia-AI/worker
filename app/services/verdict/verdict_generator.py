@@ -188,11 +188,15 @@ class VerdictGenerator:
         """Format evidence list into readable text for the LLM prompt."""
         lines = []
         for i, ev in enumerate(evidence):
-            statement = ev.get("statement", "")
-            source_url = ev.get("source_url", "Unknown")
-            score = ev.get("final_score", ev.get("score", 0))
-            credibility = ev.get("credibility", 0.5)
-            grade = ev.get("grade", "N/A")
+            statement = ev.get("statement") or ev.get("text") or "[No statement]"
+            source_url = ev.get("source_url") or ev.get("source") or "Unknown"
+            score = ev.get("final_score") or ev.get("score") or 0
+            credibility = ev.get("credibility") or 0.5
+            grade = ev.get("grade") or "N/A"
+
+            # Skip items without valid statement
+            if not statement or statement == "[No statement]":
+                continue
 
             lines.append(
                 f"[{i}] Statement: {statement}\n"
@@ -359,12 +363,14 @@ class VerdictGenerator:
 
         Ranked evidence comes first (already ranked by relevance).
         Segment evidence is appended if not already present.
+        Filters out items with None/empty statements.
         """
-        merged: List[Dict[str, Any]] = list(ranked_evidence)
-        seen_statements: set = {ev.get("statement", "") for ev in ranked_evidence}
+        # Filter ranked evidence - keep only items with valid statements
+        merged: List[Dict[str, Any]] = [ev for ev in ranked_evidence if ev.get("statement") or ev.get("text")]
+        seen_statements: set = {ev.get("statement") or ev.get("text", "") for ev in merged}
 
         for seg_ev in segment_evidence:
-            stmt = seg_ev.get("statement", "")
+            stmt = seg_ev.get("statement") or seg_ev.get("text", "")
             if stmt and stmt not in seen_statements:
                 seen_statements.add(stmt)
                 merged.append(seg_ev)
