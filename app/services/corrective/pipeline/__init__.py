@@ -45,6 +45,7 @@ from app.services.llms.hybrid_service import reset_groq_counter
 from app.services.logging.log_handler import LogManagerHandler
 from app.services.vdb.vdb_ingest import VDBIngest
 from app.services.vdb.vdb_retrieval import VDBRetrieval
+from app.services.verdict.verdict_generator import VerdictGenerator
 
 logger = get_logger(__name__)
 
@@ -84,6 +85,9 @@ class CorrectivePipeline:
         self.kg_client = Neo4jClient()
         self.kg_ingest = KGIngest()
         self.kg_retriever = KGRetrieval()
+
+        # Verdict generation (RAG phase)
+        self.verdict_generator = VerdictGenerator()
 
         # Logging system
         self.log_manager = LogManagerHandler._log_manager
@@ -168,6 +172,18 @@ class CorrectivePipeline:
                 f"[CorrectivePipeline:{round_id}] Trust threshold met ({top_score:.3f} >= {self.CONF_THRESHOLD}). "
                 "Skipping web search - using cached evidence!"
             )
+
+            # Generate verdict using RAG
+            verdict_result = await self.verdict_generator.generate_verdict(
+                claim=post_text,
+                ranked_evidence=top_ranked,
+                top_k=top_k,
+            )
+            logger.info(
+                f"[CorrectivePipeline:{round_id}] Verdict: {verdict_result['verdict']} "
+                f"(confidence: {verdict_result['confidence']:.2f})"
+            )
+
             return {
                 "round_id": round_id,
                 "status": "completed_from_cache",
@@ -178,6 +194,7 @@ class CorrectivePipeline:
                 "kg_candidates_count": len(kg_candidates),
                 "ranked": top_ranked,
                 "used_web_search": False,
+                "verdict": verdict_result,
             }
 
         # ====================================================================
@@ -193,6 +210,14 @@ class CorrectivePipeline:
 
         if not queries:
             logger.warning(f"[CorrectivePipeline:{round_id}] No search queries generated")
+
+            # Generate verdict with whatever evidence we have
+            verdict_result = await self.verdict_generator.generate_verdict(
+                claim=post_text,
+                ranked_evidence=top_ranked,
+                top_k=top_k,
+            )
+
             return {
                 "round_id": round_id,
                 "status": "no_queries_generated",
@@ -204,6 +229,7 @@ class CorrectivePipeline:
                 "ranked": top_ranked,
                 "used_web_search": False,
                 "search_api_calls": 0,
+                "verdict": verdict_result,
             }
 
         # Get already-processed URLs from VDB to avoid re-scraping
@@ -372,6 +398,36 @@ class CorrectivePipeline:
         elif search_api_calls == 0:
             final_status = "no_search_results"
 
+        # ====================================================================
+        # PHASE 7: RAG Generation - Generate Final Verdict
+        # ====================================================================
+        logger.info(f"[CorrectivePipeline:{round_id}] Generating verdict with RAG...")
+
+        verdict_result = await self.verdict_generator.generate_verdict(
+            claim=post_text,
+            ranked_evidence=top_ranked,
+            top_k=top_k,
+        )
+
+        logger.info(
+            f"[CorrectivePipeline:{round_id}] Final verdict: {verdict_result['verdict']} "
+            f"(confidence: {verdict_result['confidence']:.2f})"
+        )
+
+        if self.log_manager:
+            await self.log_manager.add_log(
+                level="INFO",
+                message=f"Verdict generated: {verdict_result['verdict']}",
+                module=__name__,
+                request_id=f"claim-{round_id}",
+                round_id=round_id,
+                context={
+                    "verdict": verdict_result["verdict"],
+                    "confidence": verdict_result["confidence"],
+                    "rationale": verdict_result.get("rationale", ""),
+                },
+            )
+
         return {
             "round_id": round_id,
             "status": final_status,
@@ -387,6 +443,7 @@ class CorrectivePipeline:
             "search_api_calls_saved": len(queries) - search_api_calls,
             "urls_processed": len(processed_urls),
             "urls_skipped_already_processed": len(skipped_urls),
+            "verdict": verdict_result,
         }
 
     async def _extract_claim_entities(self, claim: str, round_id: str) -> List[str]:

@@ -81,8 +81,9 @@ async def process_jobs():
                     ranked_evidence = result.get("ranked", [])
                     facts_count = len(result.get("facts", []))
                     status = result.get("status", "completed")
+                    verdict_result = result.get("verdict", {})
 
-                    # Build response with evidence
+                    # Build response with evidence and verdict
                     response = {
                         "job_id": job_id,
                         "post_id": post_id,
@@ -90,6 +91,12 @@ async def process_jobs():
                         "status": "completed",
                         "pipeline_status": status,
                         "claim": claim_text,
+                        # Verdict (RAG Generation result)
+                        "verdict": verdict_result.get("verdict", "UNVERIFIABLE"),
+                        "verdict_confidence": verdict_result.get("confidence", 0.0),
+                        "verdict_rationale": verdict_result.get("rationale", ""),
+                        "key_findings": verdict_result.get("key_findings", []),
+                        # Evidence details
                         "evidence_count": len(ranked_evidence),
                         "facts_extracted": facts_count,
                         "evidence": [
@@ -98,14 +105,19 @@ async def process_jobs():
                                 "source_url": e.get("source_url", ""),
                                 "score": round(e.get("final_score", 0), 3),
                                 "credibility": e.get("credibility"),
+                                "grade": e.get("grade", "N/A"),
                             }
                             for e in ranked_evidence[:5]  # Top 5 evidence
                         ],
+                        "evidence_map": verdict_result.get("evidence_map", []),
                         "top_score": round(ranked_evidence[0]["final_score"], 3) if ranked_evidence else 0,
                         "timestamp": asyncio.get_event_loop().time(),
                     }
 
-                    logger.info(f"[Job {job_id}] Pipeline completed: {len(ranked_evidence)} evidence found")
+                    logger.info(
+                        f"[Job {job_id}] Pipeline completed: verdict={verdict_result.get('verdict', 'N/A')}, "
+                        f"{len(ranked_evidence)} evidence found"
+                    )
 
                 else:
                     # Fallback if pipeline not available
