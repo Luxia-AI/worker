@@ -7,13 +7,21 @@ Produces:
 - Confidence: 0.0 - 1.0
 - Evidence Map: List of supporting/contradicting evidence with relevance
 - Rationale: Human-readable explanation
+
+CLAIM-SEGMENT RETRIEVAL:
+Before generating verdict, splits claim into segments and retrieves
+evidence for each segment independently from VDB. This ensures that
+previously-ingested facts are found even when full-claim semantic
+similarity favors other topics.
 """
 
+import re
 from enum import Enum
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.core.logger import get_logger
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
+from app.services.vdb.vdb_retrieval import VDBRetrieval
 
 logger = get_logger(__name__)
 
@@ -92,10 +100,18 @@ class VerdictGenerator:
     - Confidence score
     - Evidence map showing how each piece of evidence relates to the claim
     - Human-readable rationale
+
+    CLAIM-SEGMENT RETRIEVAL:
+    Before generating verdict, splits the claim into logical segments
+    and queries VDB for each segment independently. This ensures facts
+    ingested in previous runs are found even when full-claim similarity
+    favors other topics (e.g., "vitamin D sunlight" overshadowing
+    "vitamin K gut bacteria" facts).
     """
 
-    def __init__(self) -> None:
+    def __init__(self, vdb_retriever: Optional[VDBRetrieval] = None) -> None:
         self.llm_service = HybridLLMService()
+        self.vdb_retriever = vdb_retriever or VDBRetrieval()
 
     async def generate_verdict(
         self,
@@ -105,6 +121,9 @@ class VerdictGenerator:
     ) -> Dict[str, Any]:
         """
         Generate a verdict for the claim based on ranked evidence.
+
+        ENHANCED: Now performs claim-segment-specific retrieval before
+        generating verdict to ensure all relevant facts are found.
 
         Args:
             claim: The claim/statement to verify
@@ -123,8 +142,23 @@ class VerdictGenerator:
             logger.warning("[VerdictGenerator] No evidence provided, returning UNVERIFIABLE")
             return self._unverifiable_result(claim, "No evidence retrieved")
 
-        # Take top-k evidence for RAG prompt
-        top_evidence = ranked_evidence[:top_k]
+        # ================================================================
+        # CLAIM-SEGMENT RETRIEVAL: Query VDB for each claim segment
+        # ================================================================
+        segment_evidence = await self._retrieve_segment_evidence(claim, top_k=3)
+
+        # Merge segment evidence with ranked evidence (dedup by statement)
+        enriched_evidence = self._merge_evidence(ranked_evidence, segment_evidence)
+
+        logger.info(
+            f"[VerdictGenerator] Evidence: {len(ranked_evidence)} ranked + "
+            f"{len(segment_evidence)} segment-specific = {len(enriched_evidence)} total"
+        )
+
+        # Take more evidence to include segment-specific facts
+        # Use top_k + segment evidence count, capped at 10 to avoid prompt bloat
+        evidence_limit = min(len(enriched_evidence), max(top_k, len(ranked_evidence) + len(segment_evidence)), 10)
+        top_evidence = enriched_evidence[:evidence_limit]
 
         # Format evidence for prompt
         evidence_text = self._format_evidence_for_prompt(top_evidence)
@@ -240,6 +274,102 @@ class VerdictGenerator:
             "claim": claim,
             "evidence_count": 0,
         }
+
+    # ================================================================
+    # CLAIM-SEGMENT RETRIEVAL METHODS
+    # ================================================================
+
+    def _split_claim_into_segments(self, claim: str) -> List[str]:
+        """
+        Split claim into logical segments for independent retrieval.
+
+        Uses sentence boundaries and common connectors to split.
+        Each segment should be a complete, verifiable statement.
+        """
+        # Split on sentence boundaries and common connectors
+        delimiters = [
+            r"\. ",  # Period followed by space
+            r"; ",  # Semicolon
+            r"\. However,",  # Common transition
+            r", however,",
+            r"\. Additionally,",
+            r", and ",  # Compound statements
+            r", but ",
+        ]
+
+        # Join delimiters into regex pattern
+        pattern = "|".join(delimiters)
+
+        # Split and clean
+        raw_segments = re.split(pattern, claim, flags=re.IGNORECASE)
+
+        # Clean up segments
+        segments = []
+        for seg in raw_segments:
+            seg = seg.strip()
+            # Skip very short segments (likely incomplete)
+            if len(seg) > 20:
+                segments.append(seg)
+
+        # If splitting produced no good segments, use full claim
+        if not segments:
+            segments = [claim]
+
+        logger.debug(f"[VerdictGenerator] Split claim into {len(segments)} segments")
+        return segments
+
+    async def _retrieve_segment_evidence(self, claim: str, top_k: int = 3) -> List[Dict[str, Any]]:
+        """
+        Query VDB for each claim segment independently.
+
+        This ensures that facts ingested in previous runs are found
+        even when full-claim semantic similarity favors other topics.
+        """
+        segments = self._split_claim_into_segments(claim)
+        all_segment_evidence: List[Dict[str, Any]] = []
+        seen_statements: set = set()
+
+        for segment in segments:
+            try:
+                results = await self.vdb_retriever.search(segment, top_k=top_k)
+                for result in results:
+                    stmt = result.get("statement", "")
+                    # Deduplicate by statement
+                    if stmt and stmt not in seen_statements:
+                        seen_statements.add(stmt)
+                        # Mark as segment-retrieved for debugging
+                        result["_segment_query"] = segment[:50]
+                        all_segment_evidence.append(result)
+            except Exception as e:
+                logger.warning(f"[VerdictGenerator] Segment retrieval failed for '{segment[:30]}...': {e}")
+
+        logger.info(
+            f"[VerdictGenerator] Segment retrieval: {len(segments)} segments -> "
+            f"{len(all_segment_evidence)} unique facts"
+        )
+        return all_segment_evidence
+
+    def _merge_evidence(
+        self,
+        ranked_evidence: List[Dict[str, Any]],
+        segment_evidence: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """
+        Merge ranked evidence with segment-specific evidence.
+
+        Ranked evidence comes first (already ranked by relevance).
+        Segment evidence is appended if not already present.
+        """
+        merged: List[Dict[str, Any]] = list(ranked_evidence)
+        seen_statements: set = {ev.get("statement", "") for ev in ranked_evidence}
+
+        for seg_ev in segment_evidence:
+            stmt = seg_ev.get("statement", "")
+            if stmt and stmt not in seen_statements:
+                seen_statements.add(stmt)
+                merged.append(seg_ev)
+
+        return merged
 
 
 __all__ = ["VerdictGenerator", "Verdict"]
