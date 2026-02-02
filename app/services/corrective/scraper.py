@@ -1,4 +1,5 @@
 import asyncio
+import random
 from typing import Any, Dict, List
 
 import aiohttp
@@ -8,6 +9,38 @@ from app.core.logger import get_logger
 from app.core.rate_limit import throttled
 
 logger = get_logger(__name__)
+
+# Browser-like User-Agent strings to avoid 403 blocks from academic sites
+USER_AGENTS = [
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) " "Gecko/20100101 Firefox/121.0"),
+    (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15"
+    ),
+]
+
+# Standard browser headers to mimic real browser requests
+DEFAULT_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
 
 
 class Scraper:
@@ -26,6 +59,12 @@ class Scraper:
         self.timeout = timeout
         self.playwright_timeout = playwright_timeout
 
+    def _get_headers(self) -> Dict[str, str]:
+        """Get browser-like headers with random User-Agent."""
+        headers = DEFAULT_HEADERS.copy()
+        headers["User-Agent"] = random.choice(USER_AGENTS)
+        return headers
+
     # ---------------------------------------------------------------------
     # Primary HTTP Fetcher
     # ---------------------------------------------------------------------
@@ -41,7 +80,8 @@ class Scraper:
               (e.g., 403/404 errors should NOT trigger fallback)
         """
         try:
-            async with session.get(url, timeout=self.timeout) as resp:
+            headers = self._get_headers()
+            async with session.get(url, timeout=self.timeout, headers=headers) as resp:
                 if resp.status != 200:
                     logger.warning(f"[Scraper] Non-200 status: {url} — {resp.status}")
                     # 4xx client errors (403, 404, etc.) won't be fixed by Playwright
@@ -87,12 +127,19 @@ class Scraper:
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True)
-                page = await browser.new_page()
+                # Set browser-like context to avoid detection
+                context = await browser.new_context(
+                    user_agent=random.choice(USER_AGENTS),
+                    viewport={"width": 1920, "height": 1080},
+                    locale="en-US",
+                )
+                page = await context.new_page()
 
                 await page.goto(url, timeout=self.playwright_timeout)
                 await page.wait_for_load_state("domcontentloaded")
 
                 html: str = await page.content()
+                await context.close()
                 await browser.close()
                 return html
 
