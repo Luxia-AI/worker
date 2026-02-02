@@ -14,7 +14,7 @@ For each fact, identify: genes, proteins, diseases, drugs, chemicals, biological
 
 IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
 Respond with JSON in this exact format:
-{"results": [{"index": 0, "entities": ["entity1", "entity2"]}, {"index": 1, "entities": [...]}]}
+{{"results": [{{"index": 0, "entities": ["entity1", "entity2"]}}, {{"index": 1, "entities": [...]}}]}}
 
 FACTS:
 """

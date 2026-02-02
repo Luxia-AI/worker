@@ -19,7 +19,8 @@ Requirements:
 
 IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
 Return ONLY valid JSON:
-{"results": [{"index": 0, "triples": [{"subject": "...", "relation": "...", "object": "...", "confidence": 0.9}]}]}
+{{"results": [{{"index": 0, "triples": [{{"subject": "...", "relation": "...", "object": "...",
+"confidence": 0.9}}]}}]}}
 
 ENTITIES PROVIDED: {entities}
 

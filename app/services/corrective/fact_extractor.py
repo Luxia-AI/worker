@@ -14,7 +14,7 @@ For each section, return the facts found.
 
 IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
 Return ONLY valid JSON with this exact structure:
-{"results": [{"index": 0, "facts": [{"statement": "...", "confidence": 0.85}]}, {"index": 1, "facts": [...]}]}
+{{"results": [{{"index": 0, "facts": [{{"statement": "...", "confidence": 0.85}}]}}, {{"index": 1, "facts": [...]}}]}}
 
 SECTIONS:
 """
