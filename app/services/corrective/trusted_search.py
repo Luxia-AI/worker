@@ -108,14 +108,24 @@ FAILED ENTITIES:
                 data = await resp.json()
 
                 if "items" not in data:
+                    logger.debug(
+                        f"[TrustedSearch] No items in response for query='{query}': {data.get('error', 'no items')}"
+                    )
                     return []
 
                 urls = []
                 for item in data["items"]:
                     link = item.get("link")
-                    if link and self.is_trusted(link):
-                        urls.append(link)
+                    if link:
+                        if self.is_trusted(link):
+                            urls.append(link)
+                        else:
+                            logger.debug(f"[TrustedSearch] Filtered out (not trusted): {link}")
 
+                logger.debug(
+                    f"[TrustedSearch] Query '{query}' returned {len(urls)} "
+                    f"trusted URLs from {len(data['items'])} results"
+                )
                 return urls
 
         except Exception as e:
@@ -127,13 +137,27 @@ FAILED ENTITIES:
     # ---------------------------------------------------------------------
     def is_trusted(self, url: str) -> bool:
         """
-        Returns True only if domain is in trusted domain list and accessible.
+        Returns True if domain is in trusted domain list or is a .gov/.edu domain.
         """
         if not is_accessible_url(url):
             return False
         try:
-            domain = url.split("/")[2]
-            return domain in TRUSTED_DOMAINS
+            domain = url.split("/")[2].lower()
+
+            # Check exact domain match
+            if domain in TRUSTED_DOMAINS:
+                return True
+
+            # Check if any trusted domain is a suffix (handles subdomains)
+            for trusted in TRUSTED_DOMAINS:
+                if domain.endswith(trusted) or domain.endswith("." + trusted):
+                    return True
+
+            # Accept any .gov or .edu domain (very trustworthy)
+            if domain.endswith(".gov") or domain.endswith(".edu"):
+                return True
+
+            return False
         except Exception:
             return False
 
