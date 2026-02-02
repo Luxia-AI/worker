@@ -1,6 +1,6 @@
 import json
 import uuid
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.core.logger import get_logger
 from app.services.common.dedup import dedup_triples_by_structure
@@ -17,12 +17,24 @@ Requirements:
 - Relation should be concise (e.g., "causes", "reduces risk of", "is treatment for")
 - Confidence: float 0-1 indicating support strength
 
-Return ONLY valid JSON (no markdown):
-{"results": [{"index": 0, "triples": [{"subject": "...", "relation": "...", "object": "..."}]}]}
+IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
+Return ONLY valid JSON:
+{"results": [{"index": 0, "triples": [{"subject": "...", "relation": "...", "object": "...", "confidence": 0.9}]}]}
 
 ENTITIES PROVIDED: {entities}
 
 FACTS:
+"""
+
+# Retry prompt when LLM returns non-dict
+RETRY_JSON_PROMPT = """Your previous response was not valid JSON. Please respond ONLY with valid JSON.
+No markdown code blocks, no explanations, just the JSON object.
+
+Required format:
+{required_format}
+
+Original request:
+{original_prompt}
 """
 
 
@@ -37,6 +49,49 @@ class RelationExtractor:
 
     def __init__(self) -> None:
         self.llm_service = HybridLLMService()
+
+    async def _parse_llm_response(
+        self, result: Any, original_prompt: str, required_format: str, max_retries: int = 1
+    ) -> Optional[Dict[str, Any]]:
+        """Parse LLM response, retry if non-dict returned."""
+        # If already a valid dict with results, return it
+        if isinstance(result, dict) and "results" in result:
+            return result
+
+        # If dict but missing results key, try to extract
+        if isinstance(result, dict):
+            # Maybe LLM returned {"triples": [...]} for single fact
+            if "triples" in result:
+                return {"results": [{"index": 0, "triples": result["triples"]}]}
+            logger.warning(f"[RelationExtractor] Dict missing 'results' key: {list(result.keys())}")
+
+        # If string, try to parse as JSON
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+                if isinstance(parsed, dict):
+                    if "results" in parsed:
+                        return parsed
+                    if "triples" in parsed:
+                        return {"results": [{"index": 0, "triples": parsed["triples"]}]}
+            except json.JSONDecodeError:
+                pass
+
+        # Retry with explicit JSON request
+        if max_retries > 0:
+            logger.warning("[RelationExtractor] Non-dict response, retrying with JSON prompt...")
+            retry_prompt = RETRY_JSON_PROMPT.format(
+                required_format=required_format, original_prompt=original_prompt[:500]  # Truncate to save tokens
+            )
+            try:
+                retry_result = await self.llm_service.ainvoke(
+                    retry_prompt, response_format="json", priority=LLMPriority.LOW
+                )
+                return await self._parse_llm_response(retry_result, original_prompt, required_format, max_retries - 1)
+            except Exception as e:
+                logger.warning(f"[RelationExtractor] Retry failed: {e}")
+
+        return None
 
     async def extract_relations(self, facts: List[Dict[str, Any]], entities: List[str]) -> List[Dict[str, Any]]:
         """
@@ -59,18 +114,24 @@ class RelationExtractor:
         entities_str = ", ".join(entities[:50])  # Limit entities to avoid token overflow
         prompt = BATCH_TRIPLE_PROMPT.format(entities=entities_str) + facts_text
 
+        required_format = (
+            '{"results": [{"index": 0, "triples": '
+            '[{"subject": "...", "relation": "...", "object": "...", "confidence": 0.9}]}]}'
+        )
+
         try:
             # Single batched LLM call for ALL facts
             result = await self.llm_service.ainvoke(prompt, response_format="json", priority=LLMPriority.LOW)
 
-            # Parse batch results - handle case where LLM returns string or malformed response
-            all_triples: List[Dict[str, Any]] = []
+            # Parse with retry logic
+            parsed = await self._parse_llm_response(result, prompt, required_format)
 
-            if not isinstance(result, dict):
-                logger.warning(f"[RelationExtractor] LLM returned non-dict: {type(result)}")
+            if parsed is None:
+                logger.warning("[RelationExtractor] Could not parse LLM response after retries")
                 return []
 
-            results_list = result.get("results", [])
+            all_triples: List[Dict[str, Any]] = []
+            results_list = parsed.get("results", [])
 
             for item in results_list:
                 idx = item.get("index", -1)

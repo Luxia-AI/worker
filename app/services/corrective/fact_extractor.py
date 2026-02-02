@@ -1,5 +1,5 @@
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from app.constants.llm_prompts import FACT_EXTRACTION_PROMPT
 from app.core.logger import get_logger
@@ -12,10 +12,22 @@ logger = get_logger(__name__)
 BATCH_FACT_PROMPT = """Extract key factual statements from each content section below.
 For each section, return the facts found.
 
-Return ONLY valid JSON with this exact structure (no extra text, no markdown):
+IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
+Return ONLY valid JSON with this exact structure:
 {"results": [{"index": 0, "facts": [{"statement": "...", "confidence": 0.85}]}, {"index": 1, "facts": [...]}]}
 
 SECTIONS:
+"""
+
+# Retry prompt when LLM returns non-dict
+RETRY_JSON_PROMPT = """Your previous response was not valid JSON. Please respond ONLY with valid JSON.
+No markdown code blocks, no explanations, just the JSON object.
+
+Required format:
+{required_format}
+
+Original request:
+{original_prompt}
 """
 
 
@@ -27,6 +39,49 @@ class FactExtractor:
 
     def __init__(self) -> None:
         self.llm_service = HybridLLMService()
+
+    async def _parse_llm_response(
+        self, result: Any, original_prompt: str, required_format: str, max_retries: int = 1
+    ) -> Optional[Dict[str, Any]]:
+        """Parse LLM response, retry if non-dict returned."""
+        # If already a valid dict with results, return it
+        if isinstance(result, dict) and "results" in result:
+            return result
+
+        # If dict but missing results key, try to extract
+        if isinstance(result, dict):
+            # Maybe LLM returned {"facts": [...]} for single page
+            if "facts" in result:
+                return {"results": [{"index": 0, "facts": result["facts"]}]}
+            logger.warning(f"[FactExtractor] Dict missing 'results' key: {list(result.keys())}")
+
+        # If string, try to parse as JSON
+        if isinstance(result, str):
+            try:
+                parsed = json.loads(result)
+                if isinstance(parsed, dict):
+                    if "results" in parsed:
+                        return parsed
+                    if "facts" in parsed:
+                        return {"results": [{"index": 0, "facts": parsed["facts"]}]}
+            except json.JSONDecodeError:
+                pass
+
+        # Retry with explicit JSON request
+        if max_retries > 0:
+            logger.warning("[FactExtractor] Non-dict response, retrying with JSON prompt...")
+            retry_prompt = RETRY_JSON_PROMPT.format(
+                required_format=required_format, original_prompt=original_prompt[:500]  # Truncate to save tokens
+            )
+            try:
+                retry_result = await self.llm_service.ainvoke(
+                    retry_prompt, response_format="json", priority=LLMPriority.LOW
+                )
+                return await self._parse_llm_response(retry_result, original_prompt, required_format, max_retries - 1)
+            except Exception as e:
+                logger.warning(f"[FactExtractor] Retry failed: {e}")
+
+        return None
 
     async def extract(self, scraped_pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -64,18 +119,21 @@ class FactExtractor:
         batch_content = "\n\n".join(sections)
         prompt = f"{BATCH_FACT_PROMPT}{batch_content}"
 
+        required_format = '{"results": [{"index": 0, "facts": [{"statement": "...", "confidence": 0.85}]}]}'
+
         try:
             # Single batched LLM call for ALL pages
             result = await self.llm_service.ainvoke(prompt, response_format="json", priority=LLMPriority.LOW)
 
-            # Parse batch results - handle case where LLM returns string or malformed response
-            facts: List[Dict[str, Any]] = []
+            # Parse with retry logic
+            parsed = await self._parse_llm_response(result, prompt, required_format)
 
-            if not isinstance(result, dict):
-                logger.warning(f"[FactExtractor] LLM returned non-dict: {type(result)}, using fallback")
+            if parsed is None:
+                logger.warning("[FactExtractor] Could not parse LLM response after retries, using fallback")
                 return await self._extract_per_page_fallback(valid_pages)
 
-            results_list = result.get("results", [])
+            facts: List[Dict[str, Any]] = []
+            results_list = parsed.get("results", [])
 
             for item in results_list:
                 idx = item.get("index", -1)
