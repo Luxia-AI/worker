@@ -54,15 +54,28 @@ Entities: {entities}"""
 # QUERY REFORMULATION PROMPTS
 # ============================================================================
 
-QUERY_REFORMULATION_PROMPT = """You are a query reformulation agent for retrieving medical
-evidence from trusted sources (CDC, NIH, WHO, Mayo Clinic, Harvard Health).
+QUERY_REFORMULATION_PROMPT = """You are a search query optimizer for medical fact-checking.
+Generate 5-8 Google search queries to find authoritative medical evidence.
 
-Given a social media post, extract medically relevant keywords and generate
-5-8 optimized Google search queries. Each query must be: short (3-7 words),
-keyword dense, objective, medically oriented, suitable for evidence gathering.
+RULES:
+1. Each query must be 3-6 words (short and specific)
+2. Use medical/scientific terminology
+3. Include key substances, conditions, or mechanisms
+4. Avoid vague terms like "evidence" or "research" - be specific
+5. Target verifiable claims (e.g., "vitamin C collagen synthesis" not "vitamin C benefits")
 
-Return ONLY valid JSON (no markdown, no explanation):
-{{"queries": ["query1", "query2", "query3"]}}
+GOOD EXAMPLES:
+- "vitamin C hydroxylation collagen"
+- "selenium glutathione peroxidase mechanism"
+- "vitamin E lipid peroxidation"
+
+BAD EXAMPLES (avoid):
+- "is vitamin C good for skin" (too vague)
+- "vitamin C medical evidence" (not specific)
+- "health benefits of selenium" (promotional language)
+
+Return ONLY valid JSON (no markdown):
+{{"queries": ["query1", "query2", "query3", "query4", "query5"]}}
 
 Post: {post}"""
 

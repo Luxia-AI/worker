@@ -96,22 +96,39 @@ FAILED ENTITIES:
         """
         Runs a single Google CSE request and returns trusted URLs.
         """
+        import urllib.parse
+
+        # Properly encode the query
+        encoded_query = urllib.parse.quote_plus(query)
 
         url = self.SEARCH_URL.format(
             key=self.GOOGLE_API_KEY,
             cse=self.GOOGLE_CSE_ID,
-            query=query.replace(" ", "+"),
+            query=encoded_query,
         )
 
         try:
             async with session.get(url, timeout=GOOGLE_CSE_TIMEOUT) as resp:
                 data = await resp.json()
 
-                if "items" not in data:
-                    logger.debug(
-                        f"[TrustedSearch] No items in response for query='{query}': {data.get('error', 'no items')}"
+                # Log full response for debugging
+                if "error" in data:
+                    logger.error(
+                        f"[TrustedSearch] Google API error for '{query}': "
+                        f"{data['error'].get('message', data['error'])}"
                     )
                     return []
+
+                if "items" not in data:
+                    # Log search info if available
+                    search_info = data.get("searchInformation", {})
+                    total_results = search_info.get("totalResults", "0")
+                    logger.warning(f"[TrustedSearch] No items for query='{query}' " f"(totalResults={total_results})")
+                    return []
+
+                # Log all returned URLs for debugging
+                all_urls = [item.get("link", "N/A") for item in data["items"]]
+                logger.info(f"[TrustedSearch] Query '{query}' raw results: {all_urls[:5]}...")
 
                 urls = []
                 for item in data["items"]:
@@ -119,17 +136,18 @@ FAILED ENTITIES:
                     if link:
                         if self.is_trusted(link):
                             urls.append(link)
+                            logger.info(f"[TrustedSearch] ✓ Accepted: {link}")
                         else:
-                            logger.debug(f"[TrustedSearch] Filtered out (not trusted): {link}")
+                            logger.debug(f"[TrustedSearch] ✗ Filtered: {link}")
 
-                logger.debug(
-                    f"[TrustedSearch] Query '{query}' returned {len(urls)} "
-                    f"trusted URLs from {len(data['items'])} results"
-                )
+                logger.info(f"[TrustedSearch] Query '{query}' -> " f"{len(urls)}/{len(data['items'])} trusted URLs")
                 return urls
 
+        except asyncio.TimeoutError:
+            logger.error(f"[TrustedSearch] Timeout for query='{query}'")
+            return []
         except Exception as e:
-            logger.error(f"[TrustedSearch] Google search failed for query='{query}': {e}")
+            logger.error(f"[TrustedSearch] Search failed for query='{query}': {e}")
             return []
 
     # ---------------------------------------------------------------------
@@ -162,23 +180,93 @@ FAILED ENTITIES:
             return False
 
     # ---------------------------------------------------------------------
+    # Site-Specific Query Generation
+    # ---------------------------------------------------------------------
+    def _generate_site_queries(self, base_query: str) -> List[str]:
+        """
+        Generate queries with site: operator for trusted domains.
+        This ensures Google returns results from authoritative sources.
+        """
+        priority_sites = [
+            "nih.gov",
+            "cdc.gov",
+            "who.int",
+            "mayoclinic.org",
+            "pubmed.ncbi.nlm.nih.gov",
+            "health.harvard.edu",
+        ]
+
+        site_queries = []
+        for site in priority_sites:
+            site_queries.append(f"site:{site} {base_query}")
+
+        return site_queries
+
+    # ---------------------------------------------------------------------
     # Main Search Handler
     # ---------------------------------------------------------------------
-    async def run(self, post_text: str, failed_entities: List[str]) -> List[str]:
+    async def run(
+        self,
+        post_text: str,
+        failed_entities: List[str],
+        min_urls: int = 3,
+        max_queries: int = 15,
+    ) -> List[str]:
         """
-        Executes reformulation → parallelized Google CSE queries → URL dedupe.
+        Executes reformulation → sequential Google CSE queries → URL dedupe.
+        Stops early once min_urls threshold is reached.
         """
+        # 1) Generate reformulated queries
         queries = await self.reformulate_queries(post_text, failed_entities)
         logger.info(f"[TrustedSearch] Reformulated queries: {queries}")
 
+        # 2) Also generate site-specific queries for better targeting
+        if queries:
+            # Use first query as base for site-specific searches
+            site_queries = self._generate_site_queries(queries[0])
+            # Interleave: original, site-specific, original, site-specific...
+            all_queries = []
+            for i, q in enumerate(queries):
+                all_queries.append(q)
+                if i < len(site_queries):
+                    all_queries.append(site_queries[i])
+            # Add remaining site queries
+            all_queries.extend(site_queries[len(queries) :])
+        else:
+            all_queries = queries
+
+        # Limit total queries
+        all_queries = all_queries[:max_queries]
+        logger.info(f"[TrustedSearch] Total queries to try: {len(all_queries)}")
+
+        # 3) Execute queries sequentially until we have enough URLs
+        collected_urls: set[str] = set()
+
         async with aiohttp.ClientSession() as session:
-            tasks = [self.search_query(session, q) for q in queries]
-            results = await asyncio.gather(*tasks)
+            for i, query in enumerate(all_queries):
+                logger.info(f"[TrustedSearch] Executing query {i + 1}/{len(all_queries)}: '{query}'")
 
-        # Flatten & dedupe
-        urls = dedup_urls(list({url for sublist in results for url in sublist}))
+                try:
+                    urls = await self.search_query(session, query)
+                    collected_urls.update(urls)
 
-        logger.info(f"[TrustedSearch] Found {len(urls)} trusted URLs")
+                    logger.info(f"[TrustedSearch] Progress: {len(collected_urls)} URLs " f"(need {min_urls})")
+
+                    # Early exit if we have enough
+                    if len(collected_urls) >= min_urls:
+                        logger.info(
+                            f"[TrustedSearch] Threshold reached ({len(collected_urls)} >= "
+                            f"{min_urls}), stopping search"
+                        )
+                        break
+
+                except Exception as e:
+                    logger.warning(f"[TrustedSearch] Query '{query}' failed: {e}")
+                    continue
+
+        # 4) Dedupe and return
+        urls = dedup_urls(list(collected_urls))
+        logger.info(f"[TrustedSearch] Final result: {len(urls)} trusted URLs")
         return list(urls)
 
     async def google_search(self, post_text: str, failed_entities: List[str] | None = None) -> List[str]:
