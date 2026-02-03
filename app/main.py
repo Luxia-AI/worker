@@ -124,6 +124,11 @@ async def process_jobs():
                             if ranked_evidence
                             else 0
                         ),
+                        # Trust threshold info (VDB/KG cache vs external search)
+                        "trust_threshold": result.get("trust_threshold", 0.70),
+                        "trust_threshold_met": result.get("trust_threshold_met", False),
+                        "used_web_search": result.get("used_web_search", False),
+                        "data_source": "cache" if not result.get("used_web_search", False) else "web_search",
                         "timestamp": asyncio.get_event_loop().time(),
                     }
 

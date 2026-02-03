@@ -200,6 +200,9 @@ class CorrectivePipeline:
                 "kg_candidates_count": len(kg_candidates),
                 "ranked": top_ranked,
                 "used_web_search": False,
+                "trust_threshold": self.CONF_THRESHOLD,
+                "trust_threshold_met": True,
+                "initial_top_score": top_score,
                 "verdict": verdict_result,
             }
 
@@ -235,6 +238,9 @@ class CorrectivePipeline:
                 "ranked": top_ranked,
                 "used_web_search": False,
                 "search_api_calls": 0,
+                "trust_threshold": self.CONF_THRESHOLD,
+                "trust_threshold_met": False,
+                "initial_top_score": top_score,
                 "verdict": verdict_result,
             }
 
@@ -457,6 +463,9 @@ class CorrectivePipeline:
             "search_api_calls_saved": len(queries) - search_api_calls,
             "urls_processed": len(processed_urls),
             "urls_skipped_already_processed": len(skipped_urls),
+            "trust_threshold": self.CONF_THRESHOLD,
+            "trust_threshold_met": top_ranked[0]["final_score"] >= self.CONF_THRESHOLD if top_ranked else False,
+            "initial_top_score": top_score,
             "verdict": verdict_result,
         }
 

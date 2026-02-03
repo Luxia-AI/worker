@@ -3,6 +3,7 @@ import os
 import sys
 from typing import List
 
+import torch
 from sentence_transformers import SentenceTransformer
 
 from app.constants.config import EMBEDDING_MODEL_NAME_PROD, EMBEDDING_MODEL_NAME_TEST
@@ -14,6 +15,14 @@ _model = None
 
 # Fallback model if primary fails (smaller, more reliable)
 EMBEDDING_MODEL_FALLBACK = "sentence-transformers/all-MiniLM-L6-v2"
+
+# Set deterministic mode for reproducible embeddings
+torch.set_num_threads(1)  # Single thread for consistent results
+if hasattr(torch, "use_deterministic_algorithms"):
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except Exception:
+        pass  # Some operations don't support deterministic mode
 
 
 def _is_test_environment() -> bool:
