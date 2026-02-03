@@ -143,7 +143,9 @@ class KGRetrieval:
             }
             results.append(result)
 
-        sorted_results = sorted(results, key=lambda x: -x["score"])[:top_k]
+        # DETERMINISTIC ORDERING: Sort by score DESC, then statement ASC for consistent results
+        # This ensures identical queries return identical ordering even when scores are equal
+        sorted_results = sorted(results, key=lambda x: (-x["score"], x["statement"]))[:top_k]
         logger.info(
             f"[KGRetrieval] Retrieved {len(sorted_results)} relations from {len(entities)} entities "
             f"(raw matches: {len(results)})"

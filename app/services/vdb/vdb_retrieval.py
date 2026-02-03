@@ -65,6 +65,10 @@ class VDBRetrieval:
             if result["statement"]:  # Only include non-empty statements
                 results.append(result)
 
+        # DETERMINISTIC ORDERING: Sort by score DESC, then statement ASC for consistent results
+        # This ensures identical queries return identical ordering even when scores are equal
+        results.sort(key=lambda r: (-r["score"], r["statement"]))
+
         top_score = f"{results[0]['score']:.3f}" if results else "N/A"
         logger.debug(
             f"[VDBRetrieval] Query='{query[:50]}...' returned {len(results)} matches " f"(top score: {top_score})"

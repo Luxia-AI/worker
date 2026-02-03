@@ -113,7 +113,17 @@ async def process_jobs():
                             for e in ranked_evidence[:5]  # Top 5 evidence
                         ],
                         "evidence_map": verdict_result.get("evidence_map", []),
-                        "top_score": round(ranked_evidence[0]["final_score"], 3) if ranked_evidence else 0,
+                        # Ranking metrics for debugging/display
+                        "top_ranking_score": round(ranked_evidence[0]["final_score"], 3) if ranked_evidence else 0,
+                        "avg_ranking_score": (
+                            round(
+                                sum(e.get("final_score", 0) for e in ranked_evidence[:5])
+                                / min(len(ranked_evidence), 5),
+                                3,
+                            )
+                            if ranked_evidence
+                            else 0
+                        ),
                         "timestamp": asyncio.get_event_loop().time(),
                     }
 
