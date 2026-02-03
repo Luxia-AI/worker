@@ -95,6 +95,7 @@ async def process_jobs():
                         # Verdict (RAG Generation result)
                         "verdict": verdict_result.get("verdict", "UNVERIFIABLE"),
                         "verdict_confidence": verdict_result.get("confidence", 0.0),
+                        "truthfulness_percent": verdict_result.get("truthfulness_percent", 0.0),
                         "verdict_rationale": verdict_result.get("rationale", ""),
                         "key_findings": verdict_result.get("key_findings", []),
                         "claim_breakdown": verdict_result.get("claim_breakdown", []),
@@ -118,6 +119,8 @@ async def process_jobs():
 
                     logger.info(
                         f"[Job {job_id}] Pipeline completed: verdict={verdict_result.get('verdict', 'N/A')}, "
+                        f"truthfulness={verdict_result.get('truthfulness_percent', 0)}%, "
+                        f"confidence={verdict_result.get('confidence', 0):.2f}, "
                         f"{len(ranked_evidence)} evidence found"
                     )
 
@@ -289,6 +292,7 @@ async def verify_claim(request: ClaimRequest):
             # Verdict (RAG Generation result)
             "verdict": verdict_result.get("verdict", "UNVERIFIABLE"),
             "verdict_confidence": verdict_result.get("confidence", 0.0),
+            "truthfulness_percent": verdict_result.get("truthfulness_percent", 0.0),
             "verdict_rationale": verdict_result.get("rationale", ""),
             "key_findings": verdict_result.get("key_findings", []),
             "claim_breakdown": verdict_result.get("claim_breakdown", []),
@@ -311,6 +315,8 @@ async def verify_claim(request: ClaimRequest):
 
         logger.info(
             f"[HTTP] Completed: verdict={verdict_result.get('verdict', 'N/A')}, "
+            f"truthfulness={verdict_result.get('truthfulness_percent', 0)}%, "
+            f"confidence={verdict_result.get('confidence', 0):.2f}, "
             f"{len(ranked_evidence)} evidence found"
         )
 

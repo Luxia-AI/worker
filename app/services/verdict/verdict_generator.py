@@ -156,21 +156,30 @@ class VerdictGenerator:
             return self._unverifiable_result(claim, "No evidence retrieved")
 
         # ================================================================
-        # CLAIM-SEGMENT RETRIEVAL: Query VDB for each claim segment
+        # CLAIM-SEGMENT RETRIEVAL: Only if ranked evidence is insufficient
+        # OPTIMIZATION: Skip segment retrieval if we already have good evidence
         # ================================================================
-        segment_evidence = await self._retrieve_segment_evidence(claim, top_k=3)
+        segment_evidence: List[Dict[str, Any]] = []
+
+        # Only do segment retrieval if ranked evidence is sparse (<3 items)
+        # This avoids unnecessary VDB queries when we already have enough evidence
+        if len(ranked_evidence) < 3:
+            segment_evidence = await self._retrieve_segment_evidence(claim, top_k=2)
 
         # Merge segment evidence with ranked evidence (dedup by statement)
         enriched_evidence = self._merge_evidence(ranked_evidence, segment_evidence)
 
-        logger.info(
-            f"[VerdictGenerator] Evidence: {len(ranked_evidence)} ranked + "
-            f"{len(segment_evidence)} segment-specific = {len(enriched_evidence)} total"
-        )
+        if segment_evidence:
+            logger.info(
+                f"[VerdictGenerator] Evidence: {len(ranked_evidence)} ranked + "
+                f"{len(segment_evidence)} segment-specific = {len(enriched_evidence)} total"
+            )
+        else:
+            logger.info(f"[VerdictGenerator] Using {len(ranked_evidence)} ranked evidence (segment retrieval skipped)")
 
-        # Take more evidence to include segment-specific facts
-        # Use top_k + segment evidence count, capped at 10 to avoid prompt bloat
-        evidence_limit = min(len(enriched_evidence), max(top_k, len(ranked_evidence) + len(segment_evidence)), 10)
+        # OPTIMIZATION: Use exactly top_k evidence, capped at 6 to reduce prompt size
+        # More evidence doesn't improve accuracy but increases latency and LLM cost
+        evidence_limit = min(len(enriched_evidence), top_k, 6)
         top_evidence = enriched_evidence[:evidence_limit]
 
         # Format evidence for prompt
@@ -376,14 +385,18 @@ class VerdictGenerator:
         logger.debug(f"[VerdictGenerator] Split claim into {len(segments)} segments")
         return segments
 
-    async def _retrieve_segment_evidence(self, claim: str, top_k: int = 3) -> List[Dict[str, Any]]:
+    async def _retrieve_segment_evidence(self, claim: str, top_k: int = 2) -> List[Dict[str, Any]]:
         """
         Query VDB for each claim segment independently.
 
-        This ensures that facts ingested in previous runs are found
-        even when full-claim semantic similarity favors other topics.
+        OPTIMIZATION: Reduced top_k from 3 to 2 per segment.
+        Uses max 3 segments to limit VDB queries.
         """
         segments = self._split_claim_into_segments(claim)
+
+        # OPTIMIZATION: Limit to max 3 segments to control VDB query count
+        segments = segments[:3]
+
         all_segment_evidence: List[Dict[str, Any]] = []
         seen_statements: set = set()
 

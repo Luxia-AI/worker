@@ -33,12 +33,17 @@ class VerdictState(Enum):
 # Maximum reinforcement rounds in corrective pipeline
 PIPELINE_MAX_ROUNDS = 3
 
-# Confidence threshold for reinforcement: if top evidence < this, trigger reinforcement
-# Set to 0.65 to allow cached evidence with good entity overlap to pass
-PIPELINE_CONF_THRESHOLD = 0.65
+# Confidence threshold for stopping search: if top evidence >= this, stop searching
+# OPTIMIZED: Raised from 0.65 to 0.70 to require better evidence but stop sooner
+# when good evidence is found (reduces unnecessary queries)
+PIPELINE_CONF_THRESHOLD = 0.70
 
 # Minimum number of new URLs required to continue reinforcement
 PIPELINE_MIN_NEW_URLS = 2
+
+# Maximum search queries to execute before stopping (even if threshold not met)
+# New setting to prevent runaway searches
+PIPELINE_MAX_SEARCH_QUERIES = 4
 
 # ============================================================================
 # LLM MODEL SETTINGS

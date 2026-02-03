@@ -303,16 +303,14 @@ FAILED ENTITIES:
     # ---------------------------------------------------------------------
     def _generate_site_queries(self, base_query: str) -> List[str]:
         """
-        Generate queries with site: operator for trusted domains.
-        This ensures Google returns results from authoritative sources.
+        Generate queries with site: operator for TOP trusted domains only.
+        Reduced to 3 sites for speed - NIH/WHO/PubMed cover most medical facts.
         """
+        # Only top 3 most comprehensive medical sources
         priority_sites = [
             "nih.gov",
-            "cdc.gov",
             "who.int",
-            "mayoclinic.org",
             "pubmed.ncbi.nlm.nih.gov",
-            "health.harvard.edu",
         ]
 
         site_queries = []
@@ -328,7 +326,7 @@ FAILED ENTITIES:
         self,
         post_text: str,
         failed_entities: List[str],
-        max_queries: int = 12,
+        max_queries: int = 6,
     ) -> List[str]:
         """
         Generate all search queries upfront without executing any search API calls.

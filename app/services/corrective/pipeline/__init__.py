@@ -27,7 +27,12 @@ This approach MAXIMIZES quota efficiency by:
 import uuid
 from typing import Any, Dict, List, Optional
 
-from app.constants.config import PIPELINE_CONF_THRESHOLD, PIPELINE_MAX_ROUNDS, PIPELINE_MIN_NEW_URLS
+from app.constants.config import (
+    PIPELINE_CONF_THRESHOLD,
+    PIPELINE_MAX_ROUNDS,
+    PIPELINE_MAX_SEARCH_QUERIES,
+    PIPELINE_MIN_NEW_URLS,
+)
 from app.core.logger import get_logger
 from app.services.corrective.entity_extractor import EntityExtractor
 from app.services.corrective.fact_extractor import FactExtractor
@@ -68,6 +73,7 @@ class CorrectivePipeline:
     MAX_ROUNDS = PIPELINE_MAX_ROUNDS
     CONF_THRESHOLD = PIPELINE_CONF_THRESHOLD
     MIN_NEW_URLS = PIPELINE_MIN_NEW_URLS
+    MAX_SEARCH_QUERIES = PIPELINE_MAX_SEARCH_QUERIES
 
     def __init__(self) -> None:
         # Search and scraping
@@ -248,6 +254,14 @@ class CorrectivePipeline:
         queries_executed: List[str] = []
 
         for query_idx, query in enumerate(queries):
+            # OPTIMIZATION: Hard limit on search queries to prevent runaway searches
+            if search_api_calls >= self.MAX_SEARCH_QUERIES:
+                logger.info(
+                    f"[CorrectivePipeline:{round_id}] Reached MAX_SEARCH_QUERIES ({self.MAX_SEARCH_QUERIES}), "
+                    f"stopping to conserve quota. {len(queries) - query_idx} queries unused."
+                )
+                break
+
             logger.info(f"[CorrectivePipeline:{round_id}] === Query {query_idx + 1}/{len(queries)} ===")
             logger.info(f"[CorrectivePipeline:{round_id}] Executing: '{query}'")
 

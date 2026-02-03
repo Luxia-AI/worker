@@ -55,27 +55,25 @@ Entities: {entities}"""
 # ============================================================================
 
 QUERY_REFORMULATION_PROMPT = """You are a search query optimizer for medical fact-checking.
-Generate 5-8 Google search queries to find authoritative medical evidence.
+Generate exactly 3-4 highly targeted Google search queries to find authoritative medical evidence.
 
 RULES:
 1. Each query must be 3-6 words (short and specific)
 2. Use medical/scientific terminology
-3. Include key substances, conditions, or mechanisms
-4. Avoid vague terms like "evidence" or "research" - be specific
-5. Target verifiable claims (e.g., "vitamin C collagen synthesis" not "vitamin C benefits")
+3. Focus on the CORE verifiable claims only
+4. Prioritize specificity over quantity - 3 excellent queries beat 8 mediocre ones
+5. Target verifiable mechanisms (e.g., "vitamin C collagen synthesis" not "vitamin C benefits")
 
 GOOD EXAMPLES:
 - "vitamin C hydroxylation collagen"
 - "selenium glutathione peroxidase mechanism"
-- "vitamin E lipid peroxidation"
 
 BAD EXAMPLES (avoid):
 - "is vitamin C good for skin" (too vague)
-- "vitamin C medical evidence" (not specific)
 - "health benefits of selenium" (promotional language)
 
 Return ONLY valid JSON (no markdown):
-{{"queries": ["query1", "query2", "query3", "query4", "query5"]}}
+{{"queries": ["query1", "query2", "query3"]}}
 
 Post: {post}"""
 
