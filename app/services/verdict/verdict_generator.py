@@ -51,7 +51,8 @@ INSTRUCTIONS:
 2. Analyze each piece of evidence for relevance to the claim segments
 3. For each segment, determine its status based on the evidence
 4. Consider source credibility (scores provided)
-5. Generate a final verdict
+5. Calculate overall truthfulness percentage based on segment statuses
+6. Generate a final verdict
 
 VERDICT OPTIONS:
 - TRUE: Evidence strongly supports the claim (multiple credible sources agree)
@@ -66,10 +67,15 @@ CLAIM SEGMENT STATUS OPTIONS:
 - PARTIALLY_INVALID: Some evidence contradicts, but not completely
 - UNKNOWN: Insufficient evidence to determine
 
+TRUTHFULNESS CALCULATION:
+- Count segments: VALID=100%, PARTIALLY_VALID=75%, UNKNOWN=50%, PARTIALLY_INVALID=25%, INVALID=0%
+- truthfulness_percent = calculate overall accuracy of segments
+
 Return ONLY valid JSON (no markdown, no extra text):
 {{
     "verdict": "TRUE|FALSE|PARTIALLY_TRUE|UNVERIFIABLE",
     "confidence": 0.85,
+    "truthfulness_percent": 73.45,
     "rationale": "Brief explanation of why this verdict was reached",
     "claim_breakdown": [
         {{
@@ -244,9 +250,16 @@ class VerdictGenerator:
         # Extract claim breakdown for client display
         claim_breakdown = llm_result.get("claim_breakdown", [])
 
+        # Extract or calculate truthfulness percentage
+        truthfulness_percent = llm_result.get("truthfulness_percent")
+        if truthfulness_percent is None:
+            # Calculate from claim_breakdown if not provided
+            truthfulness_percent = self._calculate_truthfulness_percent(claim_breakdown)
+
         return {
             "verdict": verdict_str,
             "confidence": confidence,
+            "truthfulness_percent": truthfulness_percent,
             "rationale": rationale,
             "claim_breakdown": claim_breakdown,
             "evidence_map": evidence_map,
@@ -254,6 +267,35 @@ class VerdictGenerator:
             "claim": claim,
             "evidence_count": len(evidence),
         }
+
+    def _calculate_truthfulness_percent(self, claim_breakdown: List[Dict[str, Any]]) -> int:
+        """
+        Calculate truthfulness percentage from claim breakdown segment statuses.
+
+        Status weights:
+        - VALID: 100%
+        - PARTIALLY_VALID: 75%
+        - UNKNOWN: 50%
+        - PARTIALLY_INVALID: 25%
+        - INVALID: 0%
+        """
+        if not claim_breakdown:
+            return 50  # Default to 50% when no breakdown available
+
+        status_weights = {
+            "VALID": 100,
+            "PARTIALLY_VALID": 75,
+            "UNKNOWN": 50,
+            "PARTIALLY_INVALID": 25,
+            "INVALID": 0,
+        }
+
+        total = 0
+        for segment in claim_breakdown:
+            status = segment.get("status", "UNKNOWN").upper()
+            total += status_weights.get(status, 50)
+
+        return round(total / len(claim_breakdown))
 
     def _build_default_evidence_map(self, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Build default evidence map when LLM doesn't provide one."""
@@ -275,6 +317,7 @@ class VerdictGenerator:
         return {
             "verdict": Verdict.UNVERIFIABLE.value,
             "confidence": 0.0,
+            "truthfulness_percent": 0,
             "rationale": reason,
             "claim_breakdown": [],
             "evidence_map": [],

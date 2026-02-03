@@ -34,7 +34,8 @@ class VerdictState(Enum):
 PIPELINE_MAX_ROUNDS = 3
 
 # Confidence threshold for reinforcement: if top evidence < this, trigger reinforcement
-PIPELINE_CONF_THRESHOLD = 0.70
+# Set to 0.65 to allow cached evidence with good entity overlap to pass
+PIPELINE_CONF_THRESHOLD = 0.65
 
 # Minimum number of new URLs required to continue reinforcement
 PIPELINE_MIN_NEW_URLS = 2
@@ -177,12 +178,13 @@ RECENCY_HALF_LIFE_DAYS = 365.0
 # ============================================================================
 
 # Default weights for hybrid ranking (must sum to 1.0 for interpretability)
+# Tuned for maximum accuracy with balanced KG contribution
 RANKING_WEIGHTS = {
-    "w_semantic": 0.08,  # semantic similarity score
-    "w_kg": 0.01,  # knowledge graph score
-    "w_entity": 0.59,  # entity overlap with query
-    "w_recency": 0.02,  # publication recency
-    "w_credibility": 0.30,  # source credibility
+    "w_semantic": 0.25,  # semantic similarity score (increased for better matching)
+    "w_kg": 0.15,  # knowledge graph score (increased from 0.01 for relation impact)
+    "w_entity": 0.30,  # entity overlap with query (reduced but still significant)
+    "w_recency": 0.05,  # publication recency (slight boost for fresh evidence)
+    "w_credibility": 0.25,  # source credibility (balanced with semantic)
 }
 
 # Minimum final score floor when both semantic and KG are zero but credibility high
