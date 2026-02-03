@@ -126,6 +126,7 @@ class HybridLLMService:
         prompt: str,
         response_format: str = "text",
         priority: LLMPriority = LLMPriority.HIGH,
+        temperature: float | None = None,
     ) -> Dict[str, Any]:
         """
         Calls LLM with priority-based routing and automatic fallback.
@@ -134,6 +135,7 @@ class HybridLLMService:
             prompt: The prompt to send to the LLM
             response_format: "text" or "json"
             priority: HIGH = use Groq (if quota available), LOW = use Local LLM directly
+            temperature: Override default temperature (0.0-1.0, lower = more deterministic)
 
         Strategy:
         - LOW priority: Always use Local LLM (free, no API costs)
@@ -143,7 +145,7 @@ class HybridLLMService:
         # LOW priority tasks always use Local LLM
         if priority == LLMPriority.LOW:
             logger.debug("[HybridLLMService] LOW priority task -> using Local LLM")
-            return await self._call_free_llm(prompt, response_format)
+            return await self._call_free_llm(prompt, response_format, temperature)
 
         # HIGH priority tasks use Groq (if available and quota not exhausted)
         current_groq_calls = get_groq_call_count()
@@ -153,7 +155,7 @@ class HybridLLMService:
                 f"[HybridLLMService] Groq quota exhausted "
                 f"({current_groq_calls}/{MAX_GROQ_CALLS_PER_REQUEST}), using Local LLM"
             )
-            return await self._call_free_llm(prompt, response_format)
+            return await self._call_free_llm(prompt, response_format, temperature)
 
         # Try Groq for HIGH priority (with fallback on failure)
         if self.groq_available and self.groq_service:
@@ -162,7 +164,9 @@ class HybridLLMService:
                 logger.info(
                     f"[HybridLLMService] HIGH priority -> Groq " f"(call {call_num}/{MAX_GROQ_CALLS_PER_REQUEST})"
                 )
-                result = await self.groq_service.ainvoke(prompt, response_format, max_retries=2)
+                result = await self.groq_service.ainvoke(
+                    prompt, response_format, max_retries=2, temperature=temperature
+                )
                 logger.debug(f"[HybridLLMService] Groq succeeded (call {call_num})")
                 return result
             except RateLimitError as e:
@@ -171,9 +175,11 @@ class HybridLLMService:
                 logger.warning(f"[HybridLLMService] Groq failed: {e}. Falling back to Local LLM...")
 
         # Fallback to Local LLM on any Groq failure
-        return await self._call_free_llm(prompt, response_format)
+        return await self._call_free_llm(prompt, response_format, temperature)
 
-    async def _call_free_llm(self, prompt: str, response_format: str) -> Dict[str, Any]:
+    async def _call_free_llm(
+        self, prompt: str, response_format: str, temperature: float | None = None
+    ) -> Dict[str, Any]:
         """
         Call free LLM service with Groq as final fallback.
         Priority: Local LLM (in-container) > Ollama (external) > Groq (paid, last resort)
@@ -214,7 +220,9 @@ class HybridLLMService:
                     f"[HybridLLMService] No free LLM available, using Groq as last resort "
                     f"(call {call_num}/{MAX_GROQ_CALLS_PER_REQUEST})"
                 )
-                result = await self.groq_service.ainvoke(prompt, response_format, max_retries=2)
+                result = await self.groq_service.ainvoke(
+                    prompt, response_format, max_retries=2, temperature=temperature
+                )
                 logger.info("[HybridLLMService] Groq fallback succeeded")
                 return result
             except Exception as e:

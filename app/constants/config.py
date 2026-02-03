@@ -49,6 +49,10 @@ LLM_MODEL_NAME = "moonshotai/kimi-k2-instruct"
 # Temperature for LLM calls (lower = more deterministic)
 LLM_TEMPERATURE = 0.2
 
+# Temperature for verdict generation (lower for consistent claim breakdown)
+# Set to 0.0 for maximum determinism in claim segmentation
+LLM_TEMPERATURE_VERDICT = 0.0
+
 # Max tokens for reinforcement query generation
 LLM_MAX_TOKENS_REINFORCEMENT = 300
 

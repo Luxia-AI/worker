@@ -29,7 +29,13 @@ class GroqService:
         self.model = LLM_MODEL_NAME
 
     @throttled(limit=10, period=60.0, name="groq_api")
-    async def ainvoke(self, prompt: str, response_format: str = "text", max_retries: int = 1) -> Dict[str, Any]:
+    async def ainvoke(
+        self,
+        prompt: str,
+        response_format: str = "text",
+        max_retries: int = 1,
+        temperature: float | None = None,
+    ) -> Dict[str, Any]:
         """
         Calls Groq async chat completion endpoint with retry logic for rate limits.
         Supports JSON or text output.
@@ -38,6 +44,7 @@ class GroqService:
             prompt: The prompt to send to the LLM
             response_format: "json" or "text" response format
             max_retries: Maximum retry attempts on rate limit (default 1, used by hybrid service)
+            temperature: Override default temperature (0.0-1.0, lower = more deterministic)
 
         Raises:
             RateLimitError: When rate limited after max retries
@@ -46,7 +53,7 @@ class GroqService:
         kwargs: Dict[str, Any] = {
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
-            "temperature": LLM_TEMPERATURE,
+            "temperature": temperature if temperature is not None else LLM_TEMPERATURE,
         }
 
         if response_format == "json":

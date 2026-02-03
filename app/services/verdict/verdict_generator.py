@@ -19,6 +19,7 @@ import re
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
+from app.constants.config import LLM_TEMPERATURE_VERDICT
 from app.core.logger import get_logger
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 from app.services.vdb.vdb_retrieval import VDBRetrieval
@@ -168,7 +169,10 @@ class VerdictGenerator:
 
         try:
             # HIGH priority - verdict generation is critical
-            result = await self.llm_service.ainvoke(prompt, response_format="json", priority=LLMPriority.HIGH)
+            # Use low temperature for consistent claim segmentation/breakdown
+            result = await self.llm_service.ainvoke(
+                prompt, response_format="json", priority=LLMPriority.HIGH, temperature=LLM_TEMPERATURE_VERDICT
+            )
 
             # Validate and parse result
             verdict_result = self._parse_verdict_result(result, claim, top_evidence)
