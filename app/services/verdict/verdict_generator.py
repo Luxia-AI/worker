@@ -47,41 +47,47 @@ RETRIEVED EVIDENCE (ranked by relevance and credibility):
 {evidence_text}
 
 INSTRUCTIONS:
-1. Break down the claim into verifiable segments/statements
-2. Analyze each piece of evidence for relevance to the claim segments
-3. For each segment, determine its status based on the evidence
-4. Consider source credibility (scores provided)
-5. Calculate overall truthfulness percentage based on segment statuses
-6. Generate a final verdict
+1. Extract EXACT text segments from the claim (copy-paste, no paraphrasing)
+2. For each segment, search the evidence for supporting or contradicting facts
+3. Determine each segment's status based on evidence strength and credibility
+4. Calculate truthfulness_percent by comparing claim content against evidence
+
+CRITICAL RULES FOR CLAIM SEGMENTS:
+- claim_segment MUST be an EXACT substring copied directly from the original claim
+- DO NOT paraphrase, summarize, or reword any part of the claim
+- DO NOT add words that don't exist in the original claim
+- Each segment should be a complete verifiable statement from the claim
 
 VERDICT OPTIONS:
-- TRUE: Evidence strongly supports the claim (multiple credible sources agree)
-- FALSE: Evidence contradicts the claim (credible sources disagree with claim)
-- PARTIALLY_TRUE: Some aspects are supported, others are not or lack evidence
-- UNVERIFIABLE: Insufficient evidence to make a determination
+- TRUE: Evidence strongly supports ALL segments (>=90% truthfulness)
+- FALSE: Evidence contradicts the claim (<=30% truthfulness)
+- PARTIALLY_TRUE: Some segments supported, others not (30-90% truthfulness)
+- UNVERIFIABLE: Insufficient evidence to determine
 
-CLAIM SEGMENT STATUS OPTIONS:
-- VALID: Evidence confirms this part of the claim
-- INVALID: Evidence contradicts this part of the claim
-- PARTIALLY_VALID: Some evidence supports, but with caveats
-- PARTIALLY_INVALID: Some evidence contradicts, but not completely
-- UNKNOWN: Insufficient evidence to determine
+SEGMENT STATUS OPTIONS:
+- VALID: Evidence confirms this exact claim segment
+- INVALID: Evidence contradicts this exact claim segment
+- PARTIALLY_VALID: Some evidence supports, with minor caveats
+- PARTIALLY_INVALID: Some evidence contradicts, not completely wrong
+- UNKNOWN: No relevant evidence found for this segment
 
 TRUTHFULNESS CALCULATION:
-- Count segments: VALID=100%, PARTIALLY_VALID=75%, UNKNOWN=50%, PARTIALLY_INVALID=25%, INVALID=0%
-- truthfulness_percent = calculate overall accuracy of segments
+Analyze the entire claim holistically against all evidence:
+- How much of the claim is factually accurate based on evidence?
+- Consider evidence quality, source credibility, and direct relevance
+- Return as a precise percentage (e.g., 73.5, 85.0, 42.3)
 
 Return ONLY valid JSON (no markdown, no extra text):
 {{
     "verdict": "TRUE|FALSE|PARTIALLY_TRUE|UNVERIFIABLE",
     "confidence": 0.85,
-    "truthfulness_percent": 73.45,
+    "truthfulness_percent": 73.5,
     "rationale": "Brief explanation of why this verdict was reached",
     "claim_breakdown": [
         {{
-            "claim_segment": "The specific part of the claim being evaluated",
+            "claim_segment": "EXACT text copied from the claim - no changes allowed",
             "status": "VALID|INVALID|PARTIALLY_VALID|PARTIALLY_INVALID|UNKNOWN",
-            "supporting_fact": "The fact from evidence that supports or contradicts this segment",
+            "supporting_fact": "The evidence fact that supports or contradicts this segment",
             "source_url": "https://source.url.of.the.fact"
         }}
     ],
@@ -268,9 +274,10 @@ class VerdictGenerator:
             "evidence_count": len(evidence),
         }
 
-    def _calculate_truthfulness_percent(self, claim_breakdown: List[Dict[str, Any]]) -> int:
+    def _calculate_truthfulness_percent(self, claim_breakdown: List[Dict[str, Any]]) -> float:
         """
-        Calculate truthfulness percentage from claim breakdown segment statuses.
+        Fallback calculation of truthfulness percentage from claim breakdown.
+        Only used if LLM doesn't provide truthfulness_percent.
 
         Status weights:
         - VALID: 100%
@@ -280,22 +287,22 @@ class VerdictGenerator:
         - INVALID: 0%
         """
         if not claim_breakdown:
-            return 50  # Default to 50% when no breakdown available
+            return 50.0  # Default to 50% when no breakdown available
 
         status_weights = {
-            "VALID": 100,
-            "PARTIALLY_VALID": 75,
-            "UNKNOWN": 50,
-            "PARTIALLY_INVALID": 25,
-            "INVALID": 0,
+            "VALID": 100.0,
+            "PARTIALLY_VALID": 75.0,
+            "UNKNOWN": 50.0,
+            "PARTIALLY_INVALID": 25.0,
+            "INVALID": 0.0,
         }
 
-        total = 0
+        total = 0.0
         for segment in claim_breakdown:
             status = segment.get("status", "UNKNOWN").upper()
-            total += status_weights.get(status, 50)
+            total += status_weights.get(status, 50.0)
 
-        return round(total / len(claim_breakdown))
+        return round(total / len(claim_breakdown), 1)
 
     def _build_default_evidence_map(self, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Build default evidence map when LLM doesn't provide one."""
