@@ -21,6 +21,8 @@ from typing import Any, Dict, List, Optional
 
 from app.constants.config import LLM_TEMPERATURE_VERDICT
 from app.core.logger import get_logger
+from app.services.corrective.fact_extractor import FactExtractor
+from app.services.corrective.trusted_search import TrustedSearch
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 
@@ -131,6 +133,8 @@ class VerdictGenerator:
     def __init__(self, vdb_retriever: Optional[VDBRetrieval] = None) -> None:
         self.llm_service = HybridLLMService()
         self.vdb_retriever = vdb_retriever or VDBRetrieval()
+        self.trusted_search = TrustedSearch()
+        self.fact_extractor = FactExtractor()
 
     async def generate_verdict(
         self,
@@ -208,6 +212,38 @@ class VerdictGenerator:
                 f"[VerdictGenerator] Generated verdict: {verdict_result['verdict']} "
                 f"(confidence: {verdict_result['confidence']:.2f})"
             )
+
+            # Check for UNKNOWN segments and fetch web evidence if needed
+            unknown_segments = self._get_unknown_segments(verdict_result)
+            if unknown_segments:
+                logger.info(
+                    f"[VerdictGenerator] Found {len(unknown_segments)} UNKNOWN segments, fetching web evidence..."
+                )
+                web_evidence = await self._fetch_web_evidence_for_unknown_segments(unknown_segments)
+                if web_evidence:
+                    logger.info(f"[VerdictGenerator] Retrieved {len(web_evidence)} additional facts from web")
+                    # Merge web evidence with existing evidence
+                    enriched_evidence = top_evidence + web_evidence
+                    # Re-run verdict generation with additional evidence
+                    enriched_evidence_text = self._format_evidence_for_prompt(enriched_evidence)
+                    enriched_prompt = VERDICT_GENERATION_PROMPT.format(
+                        claim=claim, evidence_text=enriched_evidence_text
+                    )
+
+                    try:
+                        enriched_result = await self.llm_service.ainvoke(
+                            enriched_prompt,
+                            response_format="json",
+                            priority=LLMPriority.HIGH,
+                            temperature=LLM_TEMPERATURE_VERDICT,
+                        )
+                        verdict_result = self._parse_verdict_result(enriched_result, claim, enriched_evidence)
+                        logger.info(
+                            f"[VerdictGenerator] Re-generated verdict with web evidence: {verdict_result['verdict']} "
+                            f"(confidence: {verdict_result['confidence']:.2f})"
+                        )
+                    except Exception as e:
+                        logger.warning(f"[VerdictGenerator] Failed to re-generate verdict with web evidence: {e}")
 
             return verdict_result
 
@@ -449,6 +485,79 @@ class VerdictGenerator:
                 merged.append(seg_ev)
 
         return merged
+
+    def _get_unknown_segments(self, verdict_result: Dict[str, Any]) -> List[str]:
+        """Extract segments marked as UNKNOWN from the verdict result."""
+        unknown_segments = []
+        claim_breakdown = verdict_result.get("claim_breakdown", [])
+
+        for segment in claim_breakdown:
+            if segment.get("status") == "UNKNOWN":
+                claim_segment = segment.get("claim_segment", "")
+                if claim_segment:
+                    unknown_segments.append(claim_segment)
+
+        return unknown_segments
+
+    async def _fetch_web_evidence_for_unknown_segments(self, unknown_segments: List[str]) -> List[Dict[str, Any]]:
+        """Fetch web evidence for UNKNOWN claim segments."""
+        all_web_evidence = []
+
+        for segment in unknown_segments:
+            try:
+                logger.info(f"[VerdictGenerator] Searching web for UNKNOWN segment: '{segment[:50]}...'")
+
+                # Generate search queries for this segment
+                queries = await self.trusted_search.reformulate_queries(segment, [])
+                if not queries:
+                    logger.warning(f"[VerdictGenerator] No search queries generated for segment: {segment[:30]}...")
+                    continue
+
+                # Use only the first query to avoid excessive API calls
+                query = queries[0]
+                logger.info(f"[VerdictGenerator] Using search query: '{query}'")
+
+                # Perform the search
+                search_results = await self.trusted_search.search(query, max_results=5)
+                if not search_results:
+                    logger.warning(f"[VerdictGenerator] No search results for query: {query}")
+                    continue
+
+                # Extract facts from search results
+                for result in search_results[:3]:  # Limit to 3 URLs per segment
+                    url = result.get("url", "")
+                    if not url:
+                        continue
+
+                    try:
+                        logger.debug(f"[VerdictGenerator] Extracting facts from: {url}")
+                        facts = await self.fact_extractor.extract_facts_from_url(url, segment)
+
+                        for fact in facts:
+                            # Format as evidence dict
+                            evidence_item = {
+                                "statement": fact.get("statement", ""),
+                                "source_url": url,
+                                "final_score": fact.get("confidence", 0.5),
+                                "credibility": 0.7,  # Default credibility for web-extracted facts
+                                "_web_search": True,  # Mark as web-sourced
+                                "_original_query": query,
+                            }
+                            all_web_evidence.append(evidence_item)
+
+                    except Exception as e:
+                        logger.warning(f"[VerdictGenerator] Failed to extract facts from {url}: {e}")
+                        continue
+
+            except Exception as e:
+                logger.warning(f"[VerdictGenerator] Failed to fetch web evidence for segment '{segment[:30]}...': {e}")
+                continue
+
+        logger.info(
+            f"[VerdictGenerator] Retrieved {len(all_web_evidence)} web evidence items "
+            f"for {len(unknown_segments)} UNKNOWN segments"
+        )
+        return all_web_evidence
 
 
 __all__ = ["VerdictGenerator", "Verdict"]
