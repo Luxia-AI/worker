@@ -383,6 +383,18 @@ FAILED ENTITIES:
                 logger.error(f"[TrustedSearch] Single query failed: {e}")
                 return []
 
+    async def search(self, query: str, max_results: int = 5) -> List[Dict[str, str]]:
+        """
+        Execute a search query and return results formatted as dicts with 'url' key.
+        Used by VerdictGenerator for web evidence fetching.
+
+        Returns:
+            List of dicts: [{"url": "https://example.com"}, ...]
+        """
+        urls = await self.execute_single_query(query)
+        # Limit results and format as expected by caller
+        return [{"url": url} for url in urls[:max_results]]
+
     # ---------------------------------------------------------------------
     # Main Search Handler (legacy - runs all queries)
     # ---------------------------------------------------------------------
