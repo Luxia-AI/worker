@@ -11,9 +11,12 @@ from app.core.logger import get_logger
 from app.routers.admin import router as admin_router
 from app.routers.admin import set_log_manager
 from app.routers.pinecone import router as pinecone_router
+from app.routers.scraper import router as scraper_router
+from app.routers.scraper import set_scraper
 from app.services.corrective.pipeline import CorrectivePipeline
 from app.services.logging import LogManager
 from app.services.logging.log_handler import LogManagerHandler
+from app.services.scraper import WHOScraper
 
 logger = get_logger(__name__)
 
@@ -22,6 +25,7 @@ _log_manager: LogManager | None = None
 _kafka_consumer: AIOKafkaConsumer | None = None
 _kafka_producer: AIOKafkaProducer | None = None
 _pipeline: CorrectivePipeline | None = None
+_scraper: WHOScraper | None = None
 
 
 async def process_jobs():
@@ -213,6 +217,16 @@ async def startup_event() -> None:
     except Exception as e:
         logger.error(f"[Main] Kafka initialization failed: {e}")
 
+    # Initialize scraper
+    global _scraper
+    try:
+        _scraper = WHOScraper()
+        set_scraper(_scraper)
+        logger.info("[Main] WHOScraper initialized")
+    except Exception as e:
+        logger.warning(f"[Main] WHOScraper initialization failed: {e}")
+        _scraper = None
+
 
 async def shutdown_event() -> None:
     """Cleanup on app shutdown."""
@@ -238,6 +252,7 @@ app.add_event_handler("shutdown", shutdown_event)
 # Include routers
 app.include_router(pinecone_router, prefix="/worker", tags=["Pinecone"])
 app.include_router(admin_router, tags=["Admin"])
+app.include_router(scraper_router, prefix="/scraper", tags=["Scraper"])
 
 
 # HTTP endpoint for direct claim verification (fallback when Kafka is unavailable)
@@ -340,6 +355,3 @@ async def verify_claim(request: ClaimRequest):
             "error": str(e),
             "claim": request.claim,
         }
-
-
-logger.info("Luxia Worker Service initialized")

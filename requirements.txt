@@ -10,3 +10,5 @@ neo4j
 redis
 httpx>=0.24.0
 aiokafka
+pdfplumber
+readability-lxml
