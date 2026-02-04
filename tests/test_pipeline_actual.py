@@ -200,7 +200,7 @@ async def test_pipeline_actual():
             )
 
         # Patch KG ingest so we don't call Neo4j
-        pipeline.kg_ingest.ingest_triples = AsyncMock(return_value=1)
+        pipeline.kg_ingest.ingest_triples = AsyncMock(return_value={"attempted": 1, "succeeded": 1, "failed": 0})
 
     # Run the pipeline
     print("Running CorrectivePipeline with claim:")

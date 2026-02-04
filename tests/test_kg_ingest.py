@@ -16,7 +16,6 @@ async def test_kg_ingest_success():
             "object": "fracture",
             "confidence": 0.91,
             "source_url": "https://who.int/article",
-            "published_at": "2024-01-01T00:00:00Z",
         }
     ]
 
@@ -29,8 +28,8 @@ async def test_kg_ingest_success():
     mock_context_manager.__aexit__.return_value = None
 
     with patch.object(ingest.client, "session", return_value=mock_context_manager):
-        count = await ingest.ingest_triples(triples)
-        assert count == 1
+        result = await ingest.ingest_triples(triples)
+        assert result == {"attempted": 1, "succeeded": 1, "failed": 0}
         mock_session.run.assert_called_once()
 
 
@@ -48,5 +47,5 @@ async def test_kg_ingest_skips_bad_triple():
     mock_context_manager.__aexit__.return_value = None
 
     with patch.object(ingest.client, "session", return_value=mock_context_manager):
-        count = await ingest.ingest_triples(triples)
-        assert count == 0
+        result = await ingest.ingest_triples(triples)
+        assert result == {"attempted": 1, "succeeded": 0, "failed": 1}

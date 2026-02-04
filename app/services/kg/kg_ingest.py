@@ -34,26 +34,34 @@ class KGIngest:
     def __init__(self) -> None:
         self.client = Neo4jClient()
 
-    async def ingest_triples(self, triples: List[Dict[str, Any]]) -> int:
+    async def ingest_triples(self, triples: List[Dict[str, Any]]) -> Dict[str, int]:
+        """
+        Ingest triples into Neo4j KG.
+
+        Returns:
+            Dict with counts: {"attempted": int, "succeeded": int, "failed": int}
+        """
         if not triples:
-            return 0
+            return {"attempted": 0, "succeeded": 0, "failed": 0}
 
         # Wrap entire operation in timeout to prevent blocking
         try:
             return await asyncio.wait_for(self._do_ingest(triples), timeout=KG_INGEST_TIMEOUT)
         except asyncio.TimeoutError:
             logger.warning(f"[KGIngest] Overall timeout ({KG_INGEST_TIMEOUT}s), skipping KG ingestion")
-            return 0
+            return {"attempted": len(triples), "succeeded": 0, "failed": len(triples)}
         except ConnectionError as e:
             logger.warning(f"[KGIngest] Neo4j unavailable, skipping: {e}")
-            return 0
+            return {"attempted": len(triples), "succeeded": 0, "failed": len(triples)}
         except Exception as e:
             logger.error(f"[KGIngest] Unexpected error, skipping: {e}")
-            return 0
+            return {"attempted": len(triples), "succeeded": 0, "failed": len(triples)}
 
-    async def _do_ingest(self, triples: List[Dict[str, Any]]) -> int:
+    async def _do_ingest(self, triples: List[Dict[str, Any]]) -> Dict[str, int]:
         """Internal method that performs the actual ingestion."""
-        count = 0
+        attempted = len(triples)
+        succeeded = 0
+        failed = 0
 
         try:
             async with self.client.session() as session:
@@ -64,6 +72,7 @@ class KGIngest:
 
                     if not subj_name or not rel_predicate or not obj_name:
                         logger.warning(f"[KGIngest] Skipped malformed triple: {triple}")
+                        failed += 1
                         continue
 
                     # Generate deterministic IDs
@@ -74,7 +83,6 @@ class KGIngest:
                     # Extract optional fields
                     confidence = float(triple.get("confidence", 0.0))
                     source_url = triple.get("source_url")
-                    published_at = triple.get("published_at")
 
                     # Ingest the triple
                     try:
@@ -89,25 +97,26 @@ class KGIngest:
                                 rel_predicate,
                                 confidence,
                                 source_url,
-                                published_at,
                             ),
                             timeout=NEO4J_QUERY_TIMEOUT,
                         )
-                        count += 1
+                        succeeded += 1
                     except asyncio.TimeoutError:
                         logger.warning(f"[KGIngest] Query timeout for triple: {subj_name}->{rel_predicate}->{obj_name}")
-                        # Continue with other triples
+                        failed += 1
                     except Exception as e:
-                        logger.error(f"[KGIngest] Failed ingest triple {triple}: {e}")
+                        logger.error(f"[KGIngest] Failed to ingest triple {rel_rid}: {e}")
+                        failed += 1
 
         except ConnectionError as e:
             logger.warning(f"[KGIngest] Connection failed: {e}")
             raise
         except Exception as e:
             logger.error(f"[KGIngest] Session failed: {e}")
+            raise
 
-        logger.info(f"[KGIngest] Successfully ingested {count} triples")
-        return count
+        logger.info(f"[KGIngest] Completed ingestion: {attempted} attempted, {succeeded} succeeded, {failed} failed")
+        return {"attempted": attempted, "succeeded": succeeded, "failed": failed}
 
     def _generate_entity_id(self, entity_name: str) -> str:
         """Generate deterministic Entity.id from entity name."""
@@ -130,7 +139,6 @@ class KGIngest:
         rel_predicate: str,
         confidence: float,
         source_url: str | None,
-        published_at: str | None,
     ) -> None:
         """Ingest a single triple with proper KG structure."""
 
@@ -186,8 +194,10 @@ class KGIngest:
         MERGE (src:Source {url: $source_url})
         ON CREATE SET src.domain = $domain
 
-        // Find relation and create relationship
-        MATCH (rel:Relation {rid: $rel_rid})
+        // Merge relation by rid (ensure it exists)
+        MERGE (rel:Relation {rid: $rel_rid})
+
+        // Create relationship (idempotent)
         MERGE (rel)-[:SUPPORTED_BY]->(src)
         """
 

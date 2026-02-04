@@ -92,17 +92,17 @@ async def ingest_facts_and_triples(
     # Triples for PENDING_DOMAIN_TRUST facts are also skipped to keep KG consistent
     if triples:
         try:
-            await kg_ingest.ingest_triples(triples)
-            logger.info(f"[IngestionPhase:{round_id}] Ingested {len(triples)} triples to KG")
+            result = await kg_ingest.ingest_triples(triples)
+            logger.info(f"[IngestionPhase:{round_id}] KG ingestion result: {result}")
 
             if log_manager:
                 await log_manager.add_log(
                     level="INFO",
-                    message=f"KG ingestion completed: {len(triples)} triples",
+                    message=f"KG ingestion completed: {result['succeeded']}/{result['attempted']} triples succeeded",
                     module=__name__,
                     request_id=f"claim-{round_id}",
                     round_id=round_id,
-                    context={"triples_ingested": len(triples)},
+                    context=result,
                 )
         except Exception as e:
             logger.warning(f"[IngestionPhase:{round_id}] KG ingest failed: {e}")

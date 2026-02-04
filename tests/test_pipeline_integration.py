@@ -117,7 +117,7 @@ async def test_pipeline_with_real_extraction():
     )
 
     # Mock KG ingest
-    pipeline.kg_ingest.ingest_triples = AsyncMock(return_value=1)
+    pipeline.kg_ingest.ingest_triples = AsyncMock(return_value={"attempted": 1, "succeeded": 1, "failed": 0})
 
     # Run pipeline with real extraction
     result = await pipeline.run(
@@ -222,7 +222,7 @@ async def test_pipeline_hybrid_ranking_integration():
         ]
     )
 
-    pipeline.kg_ingest.ingest_triples = AsyncMock(return_value=0)
+    pipeline.kg_ingest.ingest_triples = AsyncMock(return_value={"attempted": 0, "succeeded": 0, "failed": 0})
 
     # Run pipeline
     result = await pipeline.run("Test query", domain="test", top_k=5)
@@ -411,7 +411,7 @@ async def test_pipeline_full_integration():
     )
 
     # Mock KG ingest
-    pipeline.kg_ingest.ingest_triples = AsyncMock(return_value=2)
+    pipeline.kg_ingest.ingest_triples = AsyncMock(return_value={"attempted": 2, "succeeded": 2, "failed": 0})
 
     # Run the full pipeline
     result = await pipeline.run(
@@ -530,7 +530,7 @@ async def test_entity_overlap_affects_ranking():
     )
 
     pipeline.kg_retrieve = AsyncMock(return_value=[])
-    pipeline.kg_ingest.ingest_triples = AsyncMock(return_value=0)
+    pipeline.kg_ingest.ingest_triples = AsyncMock(return_value={"attempted": 0, "succeeded": 0, "failed": 0})
 
     # Run with query entities
     result = await pipeline.run("Test query", domain="test", top_k=5)
