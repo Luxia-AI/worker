@@ -157,24 +157,24 @@ class Neo4jKGRepository:
         self.neo4j_client = neo4j_client or Neo4jClient()
 
     async def fetch_triples_for_claim(
-        self, claim_id: str | None = None, entity_names: List[str] | None = None, limit: int = 100
+        self, claim_id: str | None = None, entity_ids: List[str] | None = None, limit: int = 100
     ) -> List[KGTriple]:
         """
-        Fetch KG triples relevant to a claim or entity names.
+        Fetch KG triples relevant to a claim or entity IDs.
 
         Uses anchored Cypher query to retrieve claim-specific triples.
-        Either claim_id or entity_names must be provided.
+        Either claim_id or entity_ids must be provided.
 
         Args:
             claim_id: ID of the claim to fetch triples for (optional)
-            entity_names: List of entity names to anchor the search (optional)
+            entity_ids: List of entity IDs to anchor the search (optional)
             limit: Maximum triples to return (default 100, max 1000)
 
         Returns:
             List of KGTriple objects with normalized data
         """
-        if not claim_id and not entity_names:
-            raise ValueError("Either claim_id or entity_names must be provided")
+        if not claim_id and not entity_ids:
+            raise ValueError("Either claim_id or entity_ids must be provided")
 
         # Enforce reasonable limits for Neo4j Aura Free
         limit = min(max(1, limit), 1000)  # 1-1000 range
@@ -188,32 +188,40 @@ class Neo4jKGRepository:
             OPTIONAL MATCH (r)-[:SUPPORTED_BY]->(s:Source)
             RETURN
                 e1.name AS subject,
-                r.normalized_predicate AS relation,
+                e1.id AS subject_id,
+                r.predicate AS predicate,
+                r.rid AS rid,
                 e2.name AS object,
+                e2.id AS object_id,
+                coalesce(r.confidence, 0.0) AS confidence,
                 s.url AS source_url,
-                r.confidence AS confidence,
-                toString(r.updated_at) AS published_at
-            ORDER BY r.confidence DESC, r.updated_at DESC
+                s.domain AS source_domain,
+                toString(r.updated_at) AS updated_at
+            ORDER BY confidence DESC, updated_at DESC
             LIMIT $limit
             """
             params = {"claim_id": claim_id, "limit": limit}
         else:
-            # Query anchored to entity names
+            # Query anchored to entity IDs - EXACT required pattern
             query = """
-            MATCH (e1:Entity)-[:SUBJECT_OF]->(r:Relation)-[:OBJECT_OF]->(e2:Entity)
-            WHERE e1.name IN $entity_names OR e2.name IN $entity_names
+            MATCH (sub:Entity)-[:SUBJECT_OF]->(r:Relation)-[:OBJECT_OF]->(obj:Entity)
+            WHERE sub.id IN $entity_ids OR obj.id IN $entity_ids
             OPTIONAL MATCH (r)-[:SUPPORTED_BY]->(s:Source)
             RETURN
-                e1.name AS subject,
-                r.normalized_predicate AS relation,
-                e2.name AS object,
+                sub.name AS subject,
+                sub.id AS subject_id,
+                r.predicate AS predicate,
+                r.rid AS rid,
+                obj.name AS object,
+                obj.id AS object_id,
+                coalesce(r.confidence, 0.0) AS confidence,
                 s.url AS source_url,
-                r.confidence AS confidence,
-                toString(r.updated_at) AS published_at
-            ORDER BY r.confidence DESC, r.updated_at DESC
+                s.domain AS source_domain,
+                toString(r.updated_at) AS updated_at
+            ORDER BY confidence DESC, updated_at DESC
             LIMIT $limit
             """
-            params = {"entity_names": entity_names, "limit": limit}
+            params = {"entity_ids": entity_ids, "limit": limit}
 
         triples = []
 
@@ -245,24 +253,32 @@ class Neo4jKGRepository:
                 for record in records:
                     # Robust null handling
                     subject = record.get("subject", "").strip() if record.get("subject") else ""
-                    relation = record.get("relation", "").strip() if record.get("relation") else ""
+                    subject_id = record.get("subject_id", "").strip() if record.get("subject_id") else ""
+                    relation = record.get("predicate", "").strip() if record.get("predicate") else ""
+                    rid = record.get("rid", "").strip() if record.get("rid") else ""
                     object_ = record.get("object", "").strip() if record.get("object") else ""
+                    object_id = record.get("object_id", "").strip() if record.get("object_id") else ""
                     source_url = record.get("source_url")
-                    confidence = record.get("confidence")
-                    published_at = record.get("published_at")
+                    source_domain = record.get("source_domain")
+                    confidence = record.get("confidence", 0.0)  # coalesce ensures this is never None
+                    updated_at = record.get("updated_at")
 
                     # Skip incomplete triples
-                    if not subject or not relation or not object_:
+                    if not subject or not relation or not object_ or not subject_id or not object_id or not rid:
                         continue
 
                     # Create KGTriple with safe defaults
                     triple = KGTriple(
                         subject=subject,
+                        subject_id=subject_id,
                         relation=relation,
+                        rid=rid,
                         object=object_,
+                        object_id=object_id,
                         source_url=source_url,
-                        published_at=published_at,
-                        confidence=float(confidence) if confidence is not None else None,
+                        source_domain=source_domain,
+                        published_at=updated_at,  # Now returns as string
+                        confidence=float(confidence),  # Always a valid float due to coalesce
                     )
                     triples.append(triple)
 

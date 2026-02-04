@@ -9,9 +9,9 @@ CREATE CONSTRAINT entity_id_unique IF NOT EXISTS
 FOR (e:Entity)
 REQUIRE e.id IS UNIQUE;
 
-CREATE CONSTRAINT relation_id_unique IF NOT EXISTS
+CREATE CONSTRAINT relation_rid_unique IF NOT EXISTS
 FOR (r:Relation)
-REQUIRE r.id IS UNIQUE;
+REQUIRE r.rid IS UNIQUE;
 
 CREATE CONSTRAINT source_url_unique IF NOT EXISTS
 FOR (s:Source)
@@ -26,15 +26,16 @@ CREATE INDEX entity_name_index IF NOT EXISTS
 FOR (e:Entity)
 ON (e.name);
 
-CREATE INDEX relation_normalized_predicate_index IF NOT EXISTS
+CREATE INDEX relation_predicate_index IF NOT EXISTS
 FOR (r:Relation)
-ON (r.normalized_predicate);
+ON (r.predicate);
 
-// 3. Relationship Indexes (for traversal performance)
-CREATE INDEX mentions_relationship IF NOT EXISTS
-FOR ()-[m:MENTIONS]-()
-ON (m.confidence);
+// 3. Source domain index
+CREATE INDEX source_domain_index IF NOT EXISTS
+FOR (s:Source)
+ON (s.domain);
 
+// 4. Relationship Indexes (for traversal performance)
 CREATE INDEX subject_of_relationship IF NOT EXISTS
 FOR ()-[s:SUBJECT_OF]-()
 ON (s.confidence);
@@ -47,7 +48,14 @@ CREATE INDEX supported_by_relationship IF NOT EXISTS
 FOR ()-[sup:SUPPORTED_BY]-()
 ON (sup.evidence_type);
 
-// 4. Property Indexes (for query performance)
+// 5. Property Indexes (for query performance)
+CREATE INDEX relation_confidence_index IF NOT EXISTS
+FOR (r:Relation)
+ON (r.confidence);
+
+CREATE INDEX relation_updated_at_index IF NOT EXISTS
+FOR (r:Relation)
+ON (r.updated_at);
 CREATE INDEX relation_confidence_index IF NOT EXISTS
 FOR (r:Relation)
 ON (r.confidence);

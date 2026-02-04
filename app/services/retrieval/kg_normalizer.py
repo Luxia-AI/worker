@@ -18,9 +18,13 @@ class KGTriple:
     """Represents a Knowledge Graph triple."""
 
     subject: str
+    subject_id: str
     relation: str
+    rid: str
     object: str
+    object_id: str
     source_url: Optional[str] = None
+    source_domain: Optional[str] = None
     published_at: Optional[str] = None
     confidence: Optional[float] = None
 

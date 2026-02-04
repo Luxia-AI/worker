@@ -603,21 +603,29 @@ class TestNeo4jKGRepository:
         mock_record1 = MagicMock()
         mock_record1.get.side_effect = lambda key: {
             "subject": "COVID-19",
-            "relation": "causes",
+            "subject_id": "5b7f9fa40bdc1207",
+            "predicate": "causes",
+            "rid": "5b7f9fa40bdc1207|causes|abc123def4567890",
             "object": "fever",
+            "object_id": "abc123def4567890",
             "source_url": "https://who.int",
+            "source_domain": "who.int",
             "confidence": 0.9,
-            "published_at": "2023-01-01",
+            "updated_at": "2023-01-01T00:00:00Z",
         }.get(key)
 
         mock_record2 = MagicMock()
         mock_record2.get.side_effect = lambda key: {
             "subject": "Vaccine",
-            "relation": "prevents",
+            "subject_id": "d4aac1a7c59ad68f",
+            "predicate": "prevents",
+            "rid": "d4aac1a7c59ad68f|prevents|5b7f9fa40bdc1207",
             "object": "COVID-19",
+            "object_id": "5b7f9fa40bdc1207",
             "source_url": None,  # Test null handling
-            "confidence": None,
-            "published_at": None,
+            "source_domain": None,
+            "confidence": 0.0,  # coalesce default
+            "updated_at": None,
         }.get(key)
 
         # Mock the retry function to return records directly
@@ -625,28 +633,36 @@ class TestNeo4jKGRepository:
             mock_retry.return_value = [mock_record1, mock_record2]
 
             repo = Neo4jKGRepository(mock_client)
-            triples = await repo.fetch_triples_for_claim(entity_names=["COVID-19", "Vaccine"], limit=10)
+            triples = await repo.fetch_triples_for_claim(entity_ids=["5b7f9fa40bdc1207", "d4aac1a7c59ad68f"], limit=10)
 
             # Verify retry was called with correct parameters
             mock_retry.assert_called_once()
             call_args = mock_retry.call_args
             assert "fetch_kg_triples_for_claim" in call_args.kwargs["query_name"]
-            assert call_args.kwargs["params"] == {"entity_names": ["COVID-19", "Vaccine"], "limit": 10}
+            assert call_args.kwargs["params"] == {"entity_ids": ["5b7f9fa40bdc1207", "d4aac1a7c59ad68f"], "limit": 10}
 
             # Verify mapping
             assert len(triples) == 2
             assert triples[0].subject == "COVID-19"
+            assert triples[0].subject_id == "5b7f9fa40bdc1207"
             assert triples[0].relation == "causes"
+            assert triples[0].rid == "5b7f9fa40bdc1207|causes|abc123def4567890"
             assert triples[0].object == "fever"
+            assert triples[0].object_id == "abc123def4567890"
             assert triples[0].source_url == "https://who.int"
+            assert triples[0].source_domain == "who.int"
             assert triples[0].confidence == 0.9
-            assert triples[0].published_at == "2023-01-01"
+            assert triples[0].published_at == "2023-01-01T00:00:00Z"
 
             assert triples[1].subject == "Vaccine"
+            assert triples[1].subject_id == "d4aac1a7c59ad68f"
             assert triples[1].relation == "prevents"
+            assert triples[1].rid == "d4aac1a7c59ad68f|prevents|5b7f9fa40bdc1207"
             assert triples[1].object == "COVID-19"
+            assert triples[1].object_id == "5b7f9fa40bdc1207"
             assert triples[1].source_url is None
-            assert triples[1].confidence is None
+            assert triples[1].source_domain is None
+            assert triples[1].confidence == 0.0  # coalesce default
             assert triples[1].published_at is None
 
     @pytest.mark.asyncio
@@ -661,11 +677,15 @@ class TestNeo4jKGRepository:
         mock_record = MagicMock()
         mock_record.get.side_effect = lambda key: {
             "subject": "COVID-19",
-            "relation": "causes",
+            "subject_id": "5b7f9fa40bdc1207",
+            "predicate": "causes",
+            "rid": "5b7f9fa40bdc1207|causes|abc123def4567890",
             "object": "fever",
+            "object_id": "abc123def4567890",
             "source_url": "https://who.int",
+            "source_domain": "who.int",
             "confidence": 0.8,
-            "published_at": "2023-01-01",
+            "updated_at": "2023-01-01T00:00:00Z",
         }.get(key)
 
         with patch("app.services.retrieval.neo4j_kg_repository._execute_with_retry") as mock_retry:
@@ -681,12 +701,12 @@ class TestNeo4jKGRepository:
 
     @pytest.mark.asyncio
     async def test_fetch_triples_validation_error(self):
-        """Test that method raises error when neither claim_id nor entity_names provided."""
+        """Test that method raises error when neither claim_id nor entity_ids provided."""
         from app.services.retrieval.neo4j_kg_repository import Neo4jKGRepository
 
         repo = Neo4jKGRepository()
 
-        with pytest.raises(ValueError, match="Either claim_id or entity_names must be provided"):
+        with pytest.raises(ValueError, match="Either claim_id or entity_ids must be provided"):
             await repo.fetch_triples_for_claim()
 
     @pytest.mark.asyncio
@@ -705,7 +725,7 @@ class TestNeo4jKGRepository:
             mock_retry.return_value = mock_records
 
             repo = Neo4jKGRepository(mock_client)
-            triples = await repo.fetch_triples_for_claim(None, limit=100)
+            triples = await repo.fetch_triples_for_claim(entity_ids=["test-entity-id"], limit=100)
 
             # Should truncate to limit
             assert len(triples) <= 100

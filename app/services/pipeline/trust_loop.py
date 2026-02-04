@@ -187,7 +187,7 @@ class IterativeTrustResolver:
                 # Placeholder: return fixed score, in production use embedding similarity
                 return 0.5
 
-            kg_triples = await kg_repo.fetch_triples_for_claim(entity_names=self.extract_entity_names(claim), limit=100)
+            kg_triples = await kg_repo.fetch_triples_for_claim(entity_ids=self.extract_entity_ids(claim), limit=100)
             if kg_triples:
                 kg_evidence = triples_to_evidence(kg_triples, semantic_score_provider)
                 evidence_items.extend(kg_evidence)
@@ -218,6 +218,24 @@ class IterativeTrustResolver:
 
         logger.debug(f"[IterativeTrustResolver] Extracted entities from claim: {entities}")
         return entities
+
+    def extract_entity_ids(self, claim: str) -> List[str]:
+        """
+        Extract entity IDs from a claim using the same deterministic generation as KG ingestion.
+        """
+        import hashlib
+
+        entity_names = self.extract_entity_names(claim)
+        entity_ids = []
+
+        for name in entity_names:
+            # Use same logic as kg_ingest._generate_entity_id
+            normalized = name.lower().strip()
+            entity_id = hashlib.md5(normalized.encode()).hexdigest()[:16]
+            entity_ids.append(entity_id)
+
+        logger.debug(f"[IterativeTrustResolver] Generated entity IDs: {entity_ids}")
+        return entity_ids
 
     def classify_stance(self, claim: str, evidence_list: List[EvidenceItem]) -> None:
         """Classify stance for all evidence items."""
