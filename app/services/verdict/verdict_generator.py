@@ -75,13 +75,19 @@ TRUTHFULNESS CALCULATION:
 Analyze the entire claim holistically against all evidence:
 - How much of the claim is factually accurate based on evidence?
 - Consider evidence quality, source credibility, and direct relevance
-- Return as a precise percentage (e.g., 73.5, 85.0, 42.3)
+- Return as a precise percentage (calculate this based on actual evidence, not example values)
+- Example ranges: high accuracy (80-100%), moderate (40-79%), low (0-39%)
+
+CONFIDENCE CALCULATION:
+- How confident are you in this verdict based on evidence quality and quantity?
+- Consider source credibility, evidence recency, and consensus
+- Return as a decimal between 0.0 and 1.0 (calculate this based on actual evidence)
 
 Return ONLY valid JSON (no markdown, no extra text):
 {{
     "verdict": "TRUE|FALSE|PARTIALLY_TRUE|UNVERIFIABLE",
-    "confidence": 0.85,
-    "truthfulness_percent": 73.5,
+    "confidence": 0.XX,
+    "truthfulness_percent": XX.X,
     "rationale": "Brief explanation of why this verdict was reached",
     "claim_breakdown": [
         {{
@@ -96,7 +102,7 @@ Return ONLY valid JSON (no markdown, no extra text):
             "evidence_id": 0,
             "statement": "The evidence statement",
             "relevance": "SUPPORTS|CONTRADICTS|NEUTRAL",
-            "relevance_score": 0.9,
+            "relevance_score": 0.X,
             "source_url": "https://..."
         }}
     ],
