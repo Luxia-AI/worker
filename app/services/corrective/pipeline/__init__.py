@@ -48,7 +48,7 @@ from app.services.kg.kg_retrieval import KGRetrieval
 from app.services.kg.neo4j_client import Neo4jClient
 from app.services.llms.hybrid_service import reset_groq_counter
 from app.services.logging.log_handler import LogManagerHandler
-from app.services.ranking.trust_ranker import TrustRankingModule
+from app.services.ranking.trust_ranker import EvidenceItem, TrustRankingModule
 from app.services.vdb.vdb_ingest import VDBIngest
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 from app.services.verdict.verdict_generator import VerdictGenerator
@@ -175,12 +175,14 @@ class CorrectivePipeline:
         # Compute trust scores for evidence
 
         top_ranked_evidence = [
-            {
-                "fact": item.get("fact", ""),
-                "source": item.get("source", ""),
-                "score": item.get("score", 0.0),
-                "publish_date": item.get("publish_date"),
-            }
+            EvidenceItem(
+                statement=item.get("statement", item.get("fact", "")),
+                semantic_score=item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
+                source_url=item.get("source_url", item.get("source", "")),
+                published_at=item.get("published_at", item.get("publish_date")),
+                trust=item.get("final_score", item.get("score", 0.0)),  # Use final_score as trust
+                stance="neutral",  # Default stance
+            )
             for item in top_ranked
         ]
 
@@ -388,12 +390,14 @@ class CorrectivePipeline:
 
             # Compute trust scores
             top_ranked_evidence = [
-                {
-                    "fact": item.get("fact", ""),
-                    "source": item.get("source", ""),
-                    "score": item.get("score", 0.0),
-                    "publish_date": item.get("publish_date"),
-                }
+                EvidenceItem(
+                    statement=item.get("statement", item.get("fact", "")),
+                    semantic_score=item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
+                    source_url=item.get("source_url", item.get("source", "")),
+                    published_at=item.get("published_at", item.get("publish_date")),
+                    trust=item.get("final_score", item.get("score", 0.0)),  # Use final_score as trust
+                    stance="neutral",  # Default stance
+                )
                 for item in top_ranked
             ]
 
@@ -457,12 +461,14 @@ class CorrectivePipeline:
 
         # Compute final trust scores
         final_top_ranked_evidence = [
-            {
-                "fact": item.get("fact", ""),
-                "source": item.get("source", ""),
-                "score": item.get("score", 0.0),
-                "publish_date": item.get("publish_date"),
-            }
+            EvidenceItem(
+                statement=item.get("statement", item.get("fact", "")),
+                semantic_score=item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
+                source_url=item.get("source_url", item.get("source", "")),
+                published_at=item.get("published_at", item.get("publish_date")),
+                trust=item.get("final_score", item.get("score", 0.0)),  # Use final_score as trust
+                stance="neutral",  # Default stance
+            )
             for item in top_ranked
         ]
 
