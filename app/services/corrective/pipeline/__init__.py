@@ -48,6 +48,7 @@ from app.services.kg.kg_retrieval import KGRetrieval
 from app.services.kg.neo4j_client import Neo4jClient
 from app.services.llms.hybrid_service import reset_groq_counter
 from app.services.logging.log_handler import LogManagerHandler
+from app.services.ranking.trust_ranker import TrustRankingModule
 from app.services.vdb.vdb_ingest import VDBIngest
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 from app.services.verdict.verdict_generator import VerdictGenerator
@@ -94,6 +95,9 @@ class CorrectivePipeline:
 
         # Verdict generation (RAG phase)
         self.verdict_generator = VerdictGenerator()
+
+        # Trust ranking
+        self.trust_ranker = TrustRankingModule()
 
         # Logging system
         self.log_manager = LogManagerHandler._log_manager
@@ -168,14 +172,28 @@ class CorrectivePipeline:
                 dedup_sem, kg_candidates, claim_entities, top_k, round_id, self.log_manager
             )
 
-        # Check if we have sufficient evidence (trust score >= threshold)
-        top_score = top_ranked[0]["final_score"] if top_ranked else 0.0
-        logger.info(f"[CorrectivePipeline:{round_id}] Initial ranking: top_score={top_score:.3f}")
+        # Compute trust scores for evidence
+        stance_classifier = self.trust_ranker.stance_classifier
 
-        if top_score >= self.CONF_THRESHOLD:
+        top_ranked_evidence = [
+            {
+                "fact": item.get("fact", ""),
+                "source": item.get("source", ""),
+                "score": item.get("score", 0.0),
+                "publish_date": item.get("publish_date"),
+            }
+            for item in top_ranked
+        ]
+
+        trust_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, stance_classifier)
+        trust_score = trust_post["trust_post"]
+
+        logger.info(f"[CorrectivePipeline:{round_id}] Initial ranking: trust_post={trust_score:.3f}")
+
+        if trust_score >= self.CONF_THRESHOLD:
             # ✅ EARLY EXIT: Existing evidence is sufficient, no web search needed!
             logger.info(
-                f"[CorrectivePipeline:{round_id}] Trust threshold met ({top_score:.3f} >= {self.CONF_THRESHOLD}). "
+                f"[CorrectivePipeline:{round_id}] Trust threshold met ({trust_score:.3f} >= {self.CONF_THRESHOLD}). "
                 "Skipping web search - using cached evidence!"
             )
 
@@ -202,7 +220,10 @@ class CorrectivePipeline:
                 "used_web_search": False,
                 "trust_threshold": self.CONF_THRESHOLD,
                 "trust_threshold_met": True,
-                "initial_top_score": top_score,
+                "initial_top_score": trust_score,
+                "trust_post": trust_score,
+                "trust_grade": trust_post.get("grade", "D"),
+                "agreement_ratio": trust_post.get("agreement_ratio", 0.0),
                 "verdict": verdict_result,
             }
 
@@ -210,7 +231,7 @@ class CorrectivePipeline:
         # PHASE 4: Quota-Optimized Incremental Search (ONE QUERY AT A TIME)
         # ====================================================================
         logger.info(
-            f"[CorrectivePipeline:{round_id}] Trust score too low ({top_score:.3f}), "
+            f"[CorrectivePipeline:{round_id}] Trust score too low ({trust_score:.3f}), "
             "starting quota-optimized search..."
         )
 
@@ -240,7 +261,7 @@ class CorrectivePipeline:
                 "search_api_calls": 0,
                 "trust_threshold": self.CONF_THRESHOLD,
                 "trust_threshold_met": False,
-                "initial_top_score": top_score,
+                "initial_top_score": trust_score,
                 "verdict": verdict_result,
             }
 
@@ -366,11 +387,23 @@ class CorrectivePipeline:
                 self.log_manager,
             )
 
-            top_score = top_ranked[0]["final_score"] if top_ranked else 0.0
+            # Compute trust scores
+            top_ranked_evidence = [
+                {
+                    "fact": item.get("fact", ""),
+                    "source": item.get("source", ""),
+                    "score": item.get("score", 0.0),
+                    "publish_date": item.get("publish_date"),
+                }
+                for item in top_ranked
+            ]
+
+            trust_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, stance_classifier)
+            top_score = trust_post["trust_post"]
 
             logger.info(
                 f"[CorrectivePipeline:{round_id}] After query {query_idx + 1}: "
-                f"top_score={top_score:.3f}, total_facts={len(all_facts)}, "
+                f"trust_post={top_score:.3f}, total_facts={len(all_facts)}, "
                 f"search_calls={search_api_calls}"
             )
 
@@ -423,6 +456,20 @@ class CorrectivePipeline:
         # ====================================================================
         logger.info(f"[CorrectivePipeline:{round_id}] Generating verdict with RAG...")
 
+        # Compute final trust scores
+        final_top_ranked_evidence = [
+            {
+                "fact": item.get("fact", ""),
+                "source": item.get("source", ""),
+                "score": item.get("score", 0.0),
+                "publish_date": item.get("publish_date"),
+            }
+            for item in top_ranked
+        ]
+
+        final_trust_post = self.trust_ranker.compute_post_trust(final_top_ranked_evidence, stance_classifier)
+        final_trust_score = final_trust_post["trust_post"]
+
         verdict_result = await self.verdict_generator.generate_verdict(
             claim=post_text,
             ranked_evidence=top_ranked,
@@ -464,8 +511,11 @@ class CorrectivePipeline:
             "urls_processed": len(processed_urls),
             "urls_skipped_already_processed": len(skipped_urls),
             "trust_threshold": self.CONF_THRESHOLD,
-            "trust_threshold_met": top_ranked[0]["final_score"] >= self.CONF_THRESHOLD if top_ranked else False,
-            "initial_top_score": top_score,
+            "trust_threshold_met": final_trust_score >= self.CONF_THRESHOLD,
+            "initial_top_score": final_trust_score,
+            "trust_post": final_trust_score,
+            "trust_grade": final_trust_post.get("grade", "D"),
+            "agreement_ratio": final_trust_post.get("agreement_ratio", 0.0),
             "verdict": verdict_result,
         }
 

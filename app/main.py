@@ -114,16 +114,8 @@ async def process_jobs():
                         ],
                         "evidence_map": verdict_result.get("evidence_map", []),
                         # Ranking metrics for debugging/display
-                        "top_ranking_score": round(ranked_evidence[0]["final_score"], 3) if ranked_evidence else 0,
-                        "avg_ranking_score": (
-                            round(
-                                sum(e.get("final_score", 0) for e in ranked_evidence[:5])
-                                / min(len(ranked_evidence), 5),
-                                3,
-                            )
-                            if ranked_evidence
-                            else 0
-                        ),
+                        "top_ranking_score": round(result.get("initial_top_score", 0), 3),
+                        "avg_ranking_score": round(result.get("initial_top_score", 0), 3),
                         # Trust threshold info (VDB/KG cache vs external search)
                         "trust_threshold": result.get("trust_threshold", 0.70),
                         "trust_threshold_met": result.get("trust_threshold_met", False),
