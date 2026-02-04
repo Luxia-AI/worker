@@ -14,10 +14,11 @@ It provides both per-evidence trust scores and post-level aggregation for decisi
 from __future__ import annotations
 
 import hashlib
+import random
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Protocol
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from app.core.logger import get_logger
 
@@ -37,6 +38,18 @@ DEFAULT_SOURCE_SCORES = {
     # Add more as needed
 }
 
+# Constants for iterative trust loop
+TRUST_THRESHOLD = 0.75
+MIN_TRUST_IMPROVEMENT = 0.02
+MAX_ITERATIONS_DEFAULT = 3
+MAX_EVIDENCE_POOL = 30
+
+# Decision constants
+STOP_THRESHOLD_MET = "stop_threshold_met"
+TRIGGER_CORRECTIVE = "trigger_corrective"
+STOP_NO_IMPROVEMENT = "stop_no_improvement"
+STOP_NO_NEW_EVIDENCE = "stop_no_new_evidence"
+
 
 @dataclass
 class EvidenceItem:
@@ -48,6 +61,22 @@ class EvidenceItem:
     published_at: Optional[str] = None  # ISO datetime string
     stance: str = "neutral"  # "entails", "contradicts", "neutral"
     trust: float = 0.0  # Computed trust score
+    score_components: Optional[Dict[str, float]] = None  # Breakdown of trust components
+
+
+@dataclass
+class IterationState:
+    """Tracks trust evolution per iteration for explainability."""
+
+    iteration: int
+    trust_post: float
+    agreement_ratio: float
+    top_sources: List[str]
+    decision: str
+    trust_delta: float = 0.0
+    stop_reason: Optional[str] = None
+    evidence_count: int = 0
+    new_evidence_count: int = 0
 
 
 class StanceClassifier(Protocol):
@@ -97,11 +126,71 @@ class TrustRankingModule:
         self.stance_classifier = stance_classifier or DummyStanceClassifier()
         self.source_scores = source_scores or DEFAULT_SOURCE_SCORES.copy()
 
+    def _normalize_url_for_dedupe(self, url: str) -> str:
+        """Normalize URL for deduplication by removing fragments and tracking parameters."""
+        try:
+            parsed = urlparse(url)
+            # Canonicalize domain: lowercase, strip www., strip port
+            netloc = parsed.netloc.lower()
+            if netloc.startswith("www."):
+                netloc = netloc[4:]
+            netloc = netloc.split(":")[0]  # strip port
+            # Force scheme to https
+            scheme = "https"
+            # Normalize path: remove trailing slash unless it's the root
+            path = parsed.path.rstrip("/")
+            if not path:
+                path = "/"
+            # Remove fragment (handled by not including it)
+            # Remove common tracking parameters
+            query_params = parse_qs(parsed.query)
+            tracking_params = {
+                "utm_source",
+                "utm_medium",
+                "utm_campaign",
+                "utm_term",
+                "utm_content",
+                "fbclid",
+                "gclid",
+                "msclkid",
+            }
+            filtered_params = {k: v for k, v in query_params.items() if k not in tracking_params}
+            # Sort query params deterministically
+            sorted_params = dict(sorted(filtered_params.items()))
+            if sorted_params:
+                query = urlencode(sorted_params, doseq=True)
+            else:
+                query = ""
+            # Reconstruct URL
+            normalized = f"{scheme}://{netloc}{path}"
+            if query:
+                normalized += f"?{query}"
+            return normalized
+        except Exception:
+            return url
+
     def compute_source_score(self, source_url: str) -> float:
         """Compute source credibility score from domain."""
         try:
             domain = urlparse(source_url).netloc.lower()
-            return self.source_scores.get(domain, 0.5)
+            # Strip port
+            domain = domain.split(":")[0]
+            # Strip www. prefix
+            if domain.startswith("www."):
+                domain = domain[4:]
+
+            # Check exact match first
+            if domain in self.source_scores:
+                return self.source_scores[domain]
+
+            # Check suffix matches (e.g., sub.example.com -> example.com)
+            parts = domain.split(".")
+            for i in range(1, len(parts)):
+                suffix = ".".join(parts[i:])
+                if suffix in self.source_scores:
+                    return self.source_scores[suffix]
+
+            return 0.5
         except Exception:
             return 0.5
 
@@ -163,7 +252,23 @@ class TrustRankingModule:
         trust = w_semantic * S_semantic + w_source * S_source + w_recency * S_recency + w_stance * stance_mapped
 
         # Clamp to [0,1]
-        return max(0.0, min(trust, 1.0))
+        trust = max(0.0, min(trust, 1.0))
+
+        # Store breakdown for admin UI
+        item.score_components = {
+            "semantic": S_semantic,
+            "source": S_source,
+            "recency": S_recency,
+            "stance_raw": S_stance,
+            "stance_mapped": stance_mapped,
+            "w_semantic": w_semantic,
+            "w_source": w_source,
+            "w_recency": w_recency,
+            "w_stance": w_stance,
+            "trust": trust,
+        }
+
+        return trust
 
     def rank_evidence(self, evidence_list: List[EvidenceItem]) -> List[EvidenceItem]:
         """
@@ -171,6 +276,11 @@ class TrustRankingModule:
 
         Returns sorted list (trust desc, then semantic desc) with duplicates removed.
         """
+        # Ensure stance is set for all items
+        for item in evidence_list:
+            if not item.stance or item.stance not in ["entails", "contradicts", "neutral"]:
+                raise ValueError(f"Stance not properly set for evidence item: {item.statement[:50]}...")
+
         # Compute trust for each item
         for item in evidence_list:
             item.trust = self.compute_trust_evidence(item)
@@ -185,9 +295,9 @@ class TrustRankingModule:
         for item in evidence_list:
             # Use normalized URL as key, fallback to statement hash
             if item.source_url:
-                key = item.source_url.lower().strip()
+                key = self._normalize_url_for_dedupe(item.source_url)
             else:
-                key = hashlib.md5(item.statement.encode("utf-8")).hexdigest()
+                key = hashlib.md5(item.statement.lower().strip().encode("utf-8")).hexdigest()
 
             if key not in seen:
                 seen.add(key)
@@ -196,41 +306,51 @@ class TrustRankingModule:
         logger.info(f"[TrustRankingModule] Ranked and deduped {len(evidence_list)} → {len(deduped)} evidence items")
         return deduped
 
-    def compute_post_trust(self, ranked_evidence: List[Dict[str, Any]], top_k: int = 10) -> Dict[str, Any]:
+    def compute_post_trust(self, ranked_evidence: List[EvidenceItem], top_k: int = 10) -> Dict[str, Any]:
         """
         Compute post-level trust metrics from top-k evidence.
 
         Args:
-            ranked_evidence: List of evidence dicts with keys: fact, source, score, publish_date
+            ranked_evidence: List of EvidenceItem objects, assumed sorted by trust desc
             top_k: Number of top items to consider
 
         Returns:
             {
                 "trust_post": float,  # Weighted mean trust
                 "agreement_ratio": float,  # Fraction not contradicting
-                "trust_grade": str  # A+, A, B, C, D, F
+                "trust_grade": str,  # A+, A, B, C, D, F
+                "trust_post_ci_low": float,  # Lower bound of confidence interval
+                "trust_post_ci_high": float,  # Upper bound of confidence interval
+                "trust_post_ci_method": str,  # "bootstrap"
+                "trust_post_ci_samples": int,  # Number of bootstrap samples
+                "trust_post_ci_level": float,  # Confidence level (e.g., 0.95)
+                "post_breakdown": dict,  # Component breakdowns and counts
             }
         """
-        # Convert dicts to EvidenceItem objects if needed
-        evidence_items = []
-        for item in ranked_evidence[:top_k]:
-            if isinstance(item, dict):
-                # Convert dict to EvidenceItem
-                evidence_item = EvidenceItem(
-                    statement=item.get("fact", ""),
-                    semantic_score=item.get("score", 0.0),
-                    source_url=item.get("source", ""),
-                    published_at=item.get("publish_date"),
-                    stance="neutral",  # Default stance, will be classified later if needed
-                )
-                # Compute trust for this item
-                evidence_item.trust = self.compute_trust_evidence(evidence_item)
-                evidence_items.append(evidence_item)
-            else:
-                evidence_items.append(item)
+        evidence_items = ranked_evidence[:top_k]
 
         if not evidence_items:
-            return {"trust_post": 0.0, "agreement_ratio": 0.0, "trust_grade": "F"}
+            return {
+                "trust_post": 0.0,
+                "agreement_ratio": 0.0,
+                "trust_grade": "F",
+                "trust_post_ci_low": 0.0,
+                "trust_post_ci_high": 0.0,
+                "trust_post_ci_method": "bootstrap",
+                "trust_post_ci_samples": 200,
+                "trust_post_ci_level": 0.95,
+                "post_breakdown": {
+                    "semantic_mean": 0.0,
+                    "source_mean": 0.0,
+                    "recency_mean": 0.0,
+                    "stance_mapped_mean": 0.0,
+                    "evidence_used": 0,
+                    "entails_count": 0,
+                    "contradicts_count": 0,
+                    "neutral_count": 0,
+                    "top_sources": [],
+                },
+            }
 
         trusts = [item.trust for item in evidence_items]
 
@@ -257,7 +377,110 @@ class TrustRankingModule:
         else:
             grade = "F"
 
-        return {"trust_post": trust_post, "agreement_ratio": agreement_ratio, "trust_grade": grade}
+        # Bootstrap confidence interval
+        N = 200
+        ci_level = 0.95
+        ci_method = "bootstrap"
+        if len(evidence_items) < 2:
+            ci_low = ci_high = trust_post
+        else:
+            # Create deterministic seed from evidence keys
+            keys = []
+            for item in evidence_items:
+                if item.source_url:
+                    key = self._normalize_url_for_dedupe(item.source_url)
+                else:
+                    key = hashlib.md5(item.statement.lower().strip().encode("utf-8")).hexdigest()
+                keys.append(key)
+            keys.sort()  # Ensure deterministic order
+            seed_str = "".join(keys)
+            seed = int(hashlib.md5(seed_str.encode()).hexdigest(), 16) % (2**32)
+            rng = random.Random(seed)
+
+            bootstrap_trusts = []
+            for _ in range(N):
+                sample = [rng.choice(evidence_items) for _ in evidence_items]  # Sample with replacement
+                trusts_sample = [item.trust for item in sample]
+                if sum(trusts_sample) > 0:
+                    trust_post_sample = sum(t * t for t in trusts_sample) / sum(trusts_sample)
+                else:
+                    trust_post_sample = 0.0
+                bootstrap_trusts.append(trust_post_sample)
+
+            bootstrap_trusts.sort()
+            ci_low = bootstrap_trusts[int(0.025 * N)]
+            ci_high = bootstrap_trusts[int(0.975 * N)]
+
+        # Compute post breakdown
+        if evidence_items:
+            # Weighted means (weighted by trust)
+            total_weight = sum(item.trust for item in evidence_items)
+            if total_weight > 0:
+                semantic_mean = (
+                    sum(item.score_components["semantic"] * item.trust for item in evidence_items) / total_weight
+                )
+                source_mean = (
+                    sum(item.score_components["source"] * item.trust for item in evidence_items) / total_weight
+                )
+                recency_mean = (
+                    sum(item.score_components["recency"] * item.trust for item in evidence_items) / total_weight
+                )
+                stance_mapped_mean = (
+                    sum(item.score_components["stance_mapped"] * item.trust for item in evidence_items) / total_weight
+                )
+            else:
+                semantic_mean = source_mean = recency_mean = stance_mapped_mean = 0.0
+
+            # Counts
+            evidence_used = len(evidence_items)
+            entails_count = sum(1 for item in evidence_items if item.stance == "entails")
+            contradicts_count = sum(1 for item in evidence_items if item.stance == "contradicts")
+            neutral_count = sum(1 for item in evidence_items if item.stance == "neutral")
+
+            # Top sources (unique, sorted by frequency)
+            source_counts = {}
+            for item in evidence_items:
+                normalized = self._normalize_url_for_dedupe(item.source_url)
+                domain = normalized.split("//")[1].split("/")[0] if item.source_url else "unknown"
+                source_counts[domain] = source_counts.get(domain, 0) + 1
+            top_sources = sorted(source_counts.items(), key=lambda x: x[1], reverse=True)[:5]  # Top 5
+            top_sources = [s[0] for s in top_sources]
+
+            post_breakdown = {
+                "semantic_mean": semantic_mean,
+                "source_mean": source_mean,
+                "recency_mean": recency_mean,
+                "stance_mapped_mean": stance_mapped_mean,
+                "evidence_used": evidence_used,
+                "entails_count": entails_count,
+                "contradicts_count": contradicts_count,
+                "neutral_count": neutral_count,
+                "top_sources": top_sources,
+            }
+        else:
+            post_breakdown = {
+                "semantic_mean": 0.0,
+                "source_mean": 0.0,
+                "recency_mean": 0.0,
+                "stance_mapped_mean": 0.0,
+                "evidence_used": 0,
+                "entails_count": 0,
+                "contradicts_count": 0,
+                "neutral_count": 0,
+                "top_sources": [],
+            }
+
+        return {
+            "trust_post": trust_post,
+            "agreement_ratio": agreement_ratio,
+            "trust_grade": grade,
+            "trust_post_ci_low": ci_low,
+            "trust_post_ci_high": ci_high,
+            "trust_post_ci_method": ci_method,
+            "trust_post_ci_samples": N,
+            "trust_post_ci_level": ci_level,
+            "post_breakdown": post_breakdown,
+        }
 
     def decide(self, evidence_list: List[EvidenceItem], threshold: float = 0.75) -> str:
         """
@@ -323,13 +546,13 @@ class TrustRanker:
         """Assess semantic similarity confidence level."""
         semantic_score = max(0.0, min(semantic_score, 1.0))
 
-        if semantic_score >= 0.8:
+        if semantic_score >= 0.9:
             return "HIGH"
-        elif semantic_score >= 0.6:
+        elif semantic_score >= 0.75:
             return "GOOD"
-        elif semantic_score >= 0.4:
+        elif semantic_score >= 0.6:
             return "FAIR"
-        elif semantic_score >= 0.2:
+        elif semantic_score >= 0.4:
             return "LOW"
         else:
             return "NONE"
@@ -395,3 +618,13 @@ class TrustRanker:
 
         logger.info(f"[TrustRanker] Filtered {len(enriched_results)} → {len(filtered)} results (min_grade={min_grade})")
         return filtered
+
+    @staticmethod
+    def _grade_distribution(results: List[Dict[str, Any]]) -> Dict[str, int]:
+        """Count distribution of grades in results."""
+        dist = {}
+        for result in results:
+            grade = result.get("grade")
+            if grade:
+                dist[grade] = dist.get(grade, 0) + 1
+        return dist

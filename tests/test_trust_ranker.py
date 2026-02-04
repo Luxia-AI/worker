@@ -4,7 +4,8 @@ Tests for TrustRanker: Grade assignment, semantic confidence, filtering, enrichm
 
 import pytest
 
-from app.services.ranking.trust_ranker import TrustRanker
+from app.services.ranking.trust_ranker import EvidenceItem, TrustRanker, TrustRankingModule
+from app.services.retrieval.kg_normalizer import KGTriple, triple_to_statement, triples_to_evidence
 
 
 class TestGradeAssignment:
@@ -388,6 +389,521 @@ class TestTrustRankerIntegration:
             assert (
                 confidence == expected_confidence
             ), f"Score {score} → confidence {confidence} != {expected_confidence}"
+
+
+class TestTrustRankingModule:
+    """Test TrustRankingModule functionality."""
+
+    @pytest.fixture
+    def module(self):
+        return TrustRankingModule()
+
+    def test_normalize_url_for_dedupe_scheme_and_domain(self, module):
+        """Test URL normalization: http/https, www. stripping, port stripping."""
+        # Different schemes and www. should normalize to same
+        url1 = "http://who.int/page"
+        url2 = "https://www.who.int/page/"
+        url3 = "https://who.int:443/page"
+        norm1 = module._normalize_url_for_dedupe(url1)
+        norm2 = module._normalize_url_for_dedupe(url2)
+        norm3 = module._normalize_url_for_dedupe(url3)
+        assert norm1 == norm2 == norm3 == "https://who.int/page"
+
+    def test_normalize_url_keeps_ref_and_source(self, module):
+        """Test that 'ref' and 'source' query params are NOT removed."""
+        url1 = "https://example.com/page?ref=abc"
+        url2 = "https://example.com/page?source=xyz"
+        norm1 = module._normalize_url_for_dedupe(url1)
+        norm2 = module._normalize_url_for_dedupe(url2)
+        assert norm1 == "https://example.com/page?ref=abc"
+        assert norm2 == "https://example.com/page?source=xyz"
+        assert norm1 != norm2  # Should be distinct
+
+    def test_normalize_url_removes_utm_params(self, module):
+        """Test that utm_* params are still removed."""
+        url = "https://example.com/page?utm_source=google&utm_medium=email"
+        norm = module._normalize_url_for_dedupe(url)
+        assert norm == "https://example.com/page"
+
+    def test_normalize_url_sorts_query_params(self, module):
+        """Test that query params are sorted deterministically."""
+        url1 = "https://example.com/page?z=1&a=2"
+        url2 = "https://example.com/page?a=2&z=1"
+        norm1 = module._normalize_url_for_dedupe(url1)
+        norm2 = module._normalize_url_for_dedupe(url2)
+        assert norm1 == norm2 == "https://example.com/page?a=2&z=1"
+
+    def test_statement_hash_normalization(self, module):
+        """Test that statement hash dedupes case and whitespace differences."""
+        evidence = [
+            EvidenceItem("Test statement", 0.8, "", stance="entails"),
+            EvidenceItem("  TEST STATEMENT  ", 0.7, "", stance="entails"),
+            EvidenceItem("test statement", 0.6, "", stance="entails"),
+        ]
+        ranked = module.rank_evidence(evidence)
+        assert len(ranked) == 1  # Should dedupe to one item
+
+    def test_compute_post_trust_confidence_intervals(self, module):
+        """Test confidence intervals in compute_post_trust."""
+        evidence = [
+            EvidenceItem("Evidence 1", 0.8, "https://example.com/1", stance="entails"),
+            EvidenceItem("Evidence 2", 0.6, "https://example.com/2", stance="entails"),
+            EvidenceItem("Evidence 3", 0.4, "https://example.com/3", stance="neutral"),
+        ]
+        ranked = module.rank_evidence(evidence)
+        result = module.compute_post_trust(ranked, top_k=10)
+
+        # Check new keys exist
+        assert "trust_post_ci_low" in result
+        assert "trust_post_ci_high" in result
+        assert "trust_post_ci_method" in result
+        assert "trust_post_ci_samples" in result
+        assert "trust_post_ci_level" in result
+
+        # Check values
+        assert result["trust_post_ci_method"] == "bootstrap"
+        assert result["trust_post_ci_samples"] == 200
+        assert result["trust_post_ci_level"] == 0.95
+        assert result["trust_post_ci_low"] <= result["trust_post"] <= result["trust_post_ci_high"]
+
+    def test_compute_post_trust_ci_deterministic(self, module):
+        """Test that confidence intervals are deterministic."""
+        evidence = [
+            EvidenceItem("Evidence 1", 0.8, "https://example.com/1", stance="entails"),
+            EvidenceItem("Evidence 2", 0.6, "https://example.com/2", stance="entails"),
+        ]
+        ranked = module.rank_evidence(evidence)
+        result1 = module.compute_post_trust(ranked, top_k=10)
+        result2 = module.compute_post_trust(ranked, top_k=10)
+
+        assert result1["trust_post_ci_low"] == result2["trust_post_ci_low"]
+        assert result1["trust_post_ci_high"] == result2["trust_post_ci_high"]
+
+    def test_compute_post_trust_ci_edge_cases(self, module):
+        """Test CI for empty and single evidence."""
+        # Empty
+        result_empty = module.compute_post_trust([], top_k=10)
+        assert result_empty["trust_post"] == 0.0
+        assert result_empty["trust_post_ci_low"] == 0.0
+        assert result_empty["trust_post_ci_high"] == 0.0
+
+        # Single evidence
+        evidence = [EvidenceItem("Single", 0.7, "https://example.com", stance="entails")]
+        ranked = module.rank_evidence(evidence)
+        result_single = module.compute_post_trust(ranked, top_k=10)
+        assert result_single["trust_post_ci_low"] == result_single["trust_post"]
+        assert result_single["trust_post_ci_high"] == result_single["trust_post"]
+
+    def test_score_components_set_in_rank_evidence(self, module):
+        """Test that score_components are set for each evidence item after ranking."""
+        evidence = [
+            EvidenceItem("Evidence 1", 0.8, "https://who.int/page1", stance="entails"),
+            EvidenceItem("Evidence 2", 0.6, "https://cdc.gov/page2", stance="neutral"),
+        ]
+        ranked = module.rank_evidence(evidence)
+        for item in ranked:
+            assert item.score_components is not None
+            assert "semantic" in item.score_components
+            assert "source" in item.score_components
+            assert "recency" in item.score_components
+            assert "stance_raw" in item.score_components
+            assert "stance_mapped" in item.score_components
+            assert "trust" in item.score_components
+            assert item.score_components["trust"] == item.trust
+
+    def test_post_breakdown_in_compute_post_trust(self, module):
+        """Test that post_breakdown is included with expected keys."""
+        evidence = [
+            EvidenceItem("Evidence 1", 0.8, "https://who.int/page1", stance="entails"),
+            EvidenceItem("Evidence 2", 0.6, "https://cdc.gov/page2", stance="neutral"),
+            EvidenceItem("Evidence 3", 0.4, "https://example.com/page3", stance="contradicts"),
+        ]
+        ranked = module.rank_evidence(evidence)
+        result = module.compute_post_trust(ranked, top_k=10)
+
+        assert "post_breakdown" in result
+        breakdown = result["post_breakdown"]
+        expected_keys = [
+            "semantic_mean",
+            "source_mean",
+            "recency_mean",
+            "stance_mapped_mean",
+            "evidence_used",
+            "entails_count",
+            "contradicts_count",
+            "neutral_count",
+            "top_sources",
+        ]
+        for key in expected_keys:
+            assert key in breakdown
+
+        assert breakdown["evidence_used"] == 3
+        assert breakdown["entails_count"] == 1
+        assert breakdown["contradicts_count"] == 1
+        assert breakdown["neutral_count"] == 1
+        assert isinstance(breakdown["top_sources"], list)
+
+
+class TestKGNormalizer:
+    """Test KG triple normalization."""
+
+    def test_triple_to_statement_basic(self):
+        """Test basic triple to statement conversion."""
+        triple = KGTriple(subject="COVID-19", relation="causes", object="fever")
+        statement = triple_to_statement(triple)
+        assert statement == "COVID-19 causes fever."
+
+    def test_triple_to_statement_underscores(self):
+        """Test relation with underscores gets spaces."""
+        triple = KGTriple(subject="Vaccine", relation="prevents_disease", object="infection")
+        statement = triple_to_statement(triple)
+        assert statement == "Vaccine prevents disease infection."
+
+    def test_triple_to_statement_whitespace(self):
+        """Test whitespace normalization."""
+        triple = KGTriple(subject="  COVID-19  ", relation="  causes  ", object="  fever  ")
+        statement = triple_to_statement(triple)
+        assert statement == "COVID-19 causes fever."
+
+    def test_triples_to_evidence(self):
+        """Test conversion of triples to EvidenceItem list."""
+        triples = [
+            KGTriple(subject="COVID-19", relation="causes", object="fever", source_url="https://who.int"),
+            KGTriple(subject="Vaccine", relation="prevents", object="COVID-19", published_at="2023-01-01"),
+        ]
+
+        def semantic_score_provider(statement: str) -> float:
+            return 0.8  # Mock score
+
+        evidence = triples_to_evidence(triples, semantic_score_provider)
+
+        assert len(evidence) == 2
+        assert evidence[0].statement == "COVID-19 causes fever."
+        assert evidence[0].semantic_score == 0.8
+        assert evidence[0].source_url == "https://who.int"
+        assert evidence[0].stance == "neutral"
+        assert evidence[1].statement == "Vaccine prevents COVID-19."
+        assert evidence[1].published_at == "2023-01-01"
+
+
+class TestNeo4jKGRepository:
+    """Test Neo4j KG repository functionality."""
+
+    @pytest.mark.asyncio
+    async def test_fetch_triples_mapping(self):
+        """Test that Neo4j records are correctly mapped to KGTriple objects."""
+        from unittest.mock import MagicMock, patch
+
+        from app.services.retrieval.neo4j_kg_repository import Neo4jKGRepository
+
+        # Mock Neo4j client and session
+        mock_client = MagicMock()
+
+        # Mock successful query execution
+        mock_record1 = MagicMock()
+        mock_record1.get.side_effect = lambda key: {
+            "subject": "COVID-19",
+            "relation": "causes",
+            "object": "fever",
+            "source_url": "https://who.int",
+            "confidence": 0.9,
+            "published_at": "2023-01-01",
+        }.get(key)
+
+        mock_record2 = MagicMock()
+        mock_record2.get.side_effect = lambda key: {
+            "subject": "Vaccine",
+            "relation": "prevents",
+            "object": "COVID-19",
+            "source_url": None,  # Test null handling
+            "confidence": None,
+            "published_at": None,
+        }.get(key)
+
+        # Mock the retry function to return records directly
+        with patch("app.services.retrieval.neo4j_kg_repository._execute_with_retry") as mock_retry:
+            mock_retry.return_value = [mock_record1, mock_record2]
+
+            repo = Neo4jKGRepository(mock_client)
+            triples = await repo.fetch_triples_for_claim(entity_names=["COVID-19", "Vaccine"], limit=10)
+
+            # Verify retry was called with correct parameters
+            mock_retry.assert_called_once()
+            call_args = mock_retry.call_args
+            assert "fetch_kg_triples_for_claim" in call_args.kwargs["query_name"]
+            assert call_args.kwargs["params"] == {"entity_names": ["COVID-19", "Vaccine"], "limit": 10}
+
+            # Verify mapping
+            assert len(triples) == 2
+            assert triples[0].subject == "COVID-19"
+            assert triples[0].relation == "causes"
+            assert triples[0].object == "fever"
+            assert triples[0].source_url == "https://who.int"
+            assert triples[0].confidence == 0.9
+            assert triples[0].published_at == "2023-01-01"
+
+            assert triples[1].subject == "Vaccine"
+            assert triples[1].relation == "prevents"
+            assert triples[1].object == "COVID-19"
+            assert triples[1].source_url is None
+            assert triples[1].confidence is None
+            assert triples[1].published_at is None
+
+    @pytest.mark.asyncio
+    async def test_fetch_triples_with_claim_id(self):
+        """Test fetching triples using claim_id parameter."""
+        from unittest.mock import MagicMock, patch
+
+        from app.services.retrieval.neo4j_kg_repository import Neo4jKGRepository
+
+        mock_client = MagicMock()
+
+        mock_record = MagicMock()
+        mock_record.get.side_effect = lambda key: {
+            "subject": "COVID-19",
+            "relation": "causes",
+            "object": "fever",
+            "source_url": "https://who.int",
+            "confidence": 0.8,
+            "published_at": "2023-01-01",
+        }.get(key)
+
+        with patch("app.services.retrieval.neo4j_kg_repository._execute_with_retry") as mock_retry:
+            mock_retry.return_value = [mock_record]
+
+            repo = Neo4jKGRepository(mock_client)
+            triples = await repo.fetch_triples_for_claim(claim_id="claim-123", limit=5)
+
+            mock_retry.assert_called_once()
+            call_args = mock_retry.call_args
+            assert call_args.kwargs["params"] == {"claim_id": "claim-123", "limit": 5}
+            assert len(triples) == 1
+
+    @pytest.mark.asyncio
+    async def test_fetch_triples_validation_error(self):
+        """Test that method raises error when neither claim_id nor entity_names provided."""
+        from app.services.retrieval.neo4j_kg_repository import Neo4jKGRepository
+
+        repo = Neo4jKGRepository()
+
+        with pytest.raises(ValueError, match="Either claim_id or entity_names must be provided"):
+            await repo.fetch_triples_for_claim()
+
+    @pytest.mark.asyncio
+    async def test_fetch_triples_limit_enforcement(self):
+        """Test that limits are properly enforced and truncated if needed."""
+        from unittest.mock import MagicMock, patch
+
+        from app.services.retrieval.neo4j_kg_repository import Neo4jKGRepository
+
+        mock_client = MagicMock()
+
+        # Mock records that exceed limit
+        mock_records = [MagicMock()] * 150  # More than limit of 100
+
+        with patch("app.services.retrieval.neo4j_kg_repository._execute_with_retry") as mock_retry:
+            mock_retry.return_value = mock_records
+
+            repo = Neo4jKGRepository(mock_client)
+            triples = await repo.fetch_triples_for_claim(None, limit=100)
+
+            # Should truncate to limit
+            assert len(triples) <= 100
+
+    @pytest.mark.asyncio
+    async def test_store_evidence_metadata_success(self):
+        """Test successful storage of evidence metadata."""
+        from unittest.mock import MagicMock, patch
+
+        from app.services.retrieval.neo4j_kg_repository import Neo4jKGRepository
+
+        mock_client = MagicMock()
+
+        with patch("app.services.retrieval.neo4j_kg_repository._execute_with_retry") as mock_retry:
+            mock_retry.return_value = []  # No results expected for write
+
+            repo = Neo4jKGRepository(mock_client)
+            success = await repo.store_evidence_metadata(
+                claim_text="Test claim",
+                evidence_count=5,
+                sources_used=["https://example.com"],
+                processing_timestamp="2024-01-01T00:00:00Z",
+            )
+
+            assert success is True
+            mock_retry.assert_called_once()
+            call_args = mock_retry.call_args
+            assert "store_evidence_metadata" in call_args.kwargs["query_name"]
+            params = call_args.kwargs["params"]
+            assert "claim_hash" in params
+            assert params["evidence_count"] == 5
+            assert params["sources_used"] == ["https://example.com"]
+
+    @pytest.mark.asyncio
+    async def test_store_evidence_metadata_failure(self):
+        """Test failure handling in evidence metadata storage."""
+        from unittest.mock import MagicMock, patch
+
+        from app.services.retrieval.neo4j_kg_repository import Neo4jKGRepository
+
+        mock_client = MagicMock()
+
+        with patch("app.services.retrieval.neo4j_kg_repository._execute_with_retry") as mock_retry:
+            mock_retry.side_effect = Exception("Connection failed")
+
+            repo = Neo4jKGRepository(mock_client)
+            success = await repo.store_evidence_metadata(
+                claim_text="Test claim",
+                evidence_count=5,
+                sources_used=["https://example.com"],
+                processing_timestamp="2024-01-01T00:00:00Z",
+            )
+
+            assert success is False
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_success_first_attempt(self):
+        """Test successful execution on first attempt."""
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.retrieval.neo4j_kg_repository import _execute_with_retry
+
+        mock_session = AsyncMock()
+        mock_result = AsyncMock()
+        mock_result.data.return_value = [{"test": "data"}]
+        mock_session.run.return_value = mock_result
+
+        with patch("app.services.retrieval.neo4j_kg_repository.logger") as mock_logger:
+            records = await _execute_with_retry(
+                query="RETURN 1", params={}, session=mock_session, query_name="test_query"
+            )
+
+            assert records == [{"test": "data"}]
+            # Verify success logging
+            mock_logger.info.assert_called()
+            call_args = mock_logger.info.call_args
+            assert "test_query" in call_args[0][0]
+            assert call_args[1]["extra"]["success"] is True
+            assert call_args[1]["extra"]["retry_count"] == 0
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_transient_error_retry(self):
+        """Test retry logic for transient errors."""
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.retrieval.neo4j_kg_repository import _execute_with_retry
+
+        mock_session = AsyncMock()
+
+        # First two calls fail with transient error, third succeeds
+        mock_session.run.side_effect = [
+            Exception("Neo.TransientError.Network.CommunicationError"),
+            Exception("Neo.TransientError.General.DatabaseUnavailable"),
+            AsyncMock(data=AsyncMock(return_value=[{"success": True}])),
+        ]
+
+        with patch("app.services.retrieval.neo4j_kg_repository.logger") as mock_logger, patch("asyncio.sleep"):
+
+            records = await _execute_with_retry(
+                query="RETURN 1", params={}, session=mock_session, query_name="test_query"
+            )
+
+            assert records == [{"success": True}]
+            # Should have logged warnings for retries
+            warning_calls = [call for call in mock_logger.warning.call_args_list if "failed" in str(call)]
+            assert len(warning_calls) == 2  # Two failures before success
+            # Should have logged backoff delays
+            info_calls = [call for call in mock_logger.info.call_args_list if "Retrying" in str(call)]
+            assert len(info_calls) == 2  # Two retry attempts
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_permanent_error_no_retry(self):
+        """Test that permanent errors don't trigger retry."""
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.retrieval.neo4j_kg_repository import _execute_with_retry
+
+        mock_session = AsyncMock()
+        mock_session.run.side_effect = Exception("Syntax error in Cypher query")
+
+        with (
+            patch("app.services.retrieval.neo4j_kg_repository.logger") as mock_logger,
+            patch("asyncio.sleep") as mock_sleep,
+        ):
+
+            with pytest.raises(Exception, match="Syntax error"):
+                await _execute_with_retry(
+                    query="INVALID QUERY", params={}, session=mock_session, query_name="test_query"
+                )
+
+            # Should log once and not retry
+            mock_logger.warning.assert_called_once()
+            mock_sleep.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_execute_with_retry_max_retries_exhausted(self):
+        """Test behavior when all retries are exhausted."""
+        from unittest.mock import AsyncMock, patch
+
+        from app.services.retrieval.neo4j_kg_repository import _execute_with_retry
+
+        mock_session = AsyncMock()
+        # Always fail with transient error
+        mock_session.run.side_effect = Exception("Neo.TransientError.Network.CommunicationError")
+
+        with patch("app.services.retrieval.neo4j_kg_repository.logger") as mock_logger, patch("asyncio.sleep"):
+
+            with pytest.raises(Exception):
+                await _execute_with_retry(query="RETURN 1", params={}, session=mock_session, query_name="test_query")
+
+            # Should have 4 attempts (initial + 3 retries)
+            assert mock_session.run.call_count == 4
+            # Should have logged final error
+            mock_logger.error.assert_called_once()
+
+
+class TestKGIntegration:
+    """Test KG integration with trust ranking pipeline."""
+
+    def test_kg_triples_to_evidence_pipeline(self, module):
+        """Test that KG triples flow through to ranked evidence."""
+        triples = [
+            KGTriple("COVID-19", "causes", "fever", "https://who.int", "2023-01-01"),
+            KGTriple("Vaccine", "prevents", "COVID-19", "https://cdc.gov", "2023-02-01"),
+        ]
+
+        def score_provider(s):
+            return 0.8
+
+        evidence = triples_to_evidence(triples, score_provider)
+
+        # Should produce EvidenceItem list
+        assert len(evidence) == 2
+        assert all(isinstance(item, EvidenceItem) for item in evidence)
+        assert evidence[0].statement == "COVID-19 causes fever."
+        assert evidence[0].source_url == "https://who.int"
+        assert evidence[0].published_at == "2023-01-01"
+        assert evidence[0].stance == "neutral"
+
+        # Should rank without errors
+        ranked = module.rank_evidence(evidence)
+        assert len(ranked) == 2
+        assert all(hasattr(item, "score_components") for item in ranked)
+
+    def test_kg_evidence_dedupe_with_url(self, module):
+        """Test deduplication of KG evidence using URL normalization."""
+        triples = [
+            KGTriple("COVID-19", "causes", "fever", "https://who.int/page", "2023-01-01"),
+            KGTriple("COVID-19", "causes", "fever", "https://www.who.int/page/", "2023-01-01"),  # Same normalized URL
+        ]
+
+        def score_provider(s):
+            return 0.8
+
+        evidence = triples_to_evidence(triples, score_provider)
+
+        ranked = module.rank_evidence(evidence)
+        assert len(ranked) == 1  # Should dedupe
 
 
 if __name__ == "__main__":
