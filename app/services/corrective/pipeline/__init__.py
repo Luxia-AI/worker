@@ -194,15 +194,19 @@ class CorrectivePipeline:
             for item in top_ranked
         ]
 
-        trust_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, top_k)
-        trust_score = trust_post["trust_post"]
+        # Use adaptive trust policy for multi-part claims
+        adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(post_text, top_ranked_evidence, top_k)
+        is_sufficient = adaptive_trust["is_sufficient"]
 
-        logger.info(f"[CorrectivePipeline:{round_id}] Initial ranking: trust_post={trust_score:.3f}")
+        logger.info(
+            f"[CorrectivePipeline:{round_id}] Adaptive trust: sufficient={is_sufficient}, "
+            f"coverage={adaptive_trust['coverage']:.2f}, diversity={adaptive_trust['diversity']:.2f}"
+        )
 
-        if trust_score >= self.CONF_THRESHOLD:
+        if is_sufficient:
             # ✅ EARLY EXIT: Existing evidence is sufficient, no web search needed!
             logger.info(
-                f"[CorrectivePipeline:{round_id}] Trust threshold met ({trust_score:.3f} >= {self.CONF_THRESHOLD}). "
+                f"[CorrectivePipeline:{round_id}] Adaptive trust sufficient. "
                 "Skipping web search - using cached evidence!"
             )
 
@@ -227,12 +231,15 @@ class CorrectivePipeline:
                 "kg_candidates_count": len(kg_candidates),
                 "ranked": top_ranked,
                 "used_web_search": False,
-                "trust_threshold": self.CONF_THRESHOLD,
+                "trust_threshold": "adaptive",  # Now using adaptive policy
                 "trust_threshold_met": True,
-                "initial_top_score": trust_score,
-                "trust_post": trust_score,
-                "trust_grade": trust_post.get("grade", "D"),
-                "agreement_ratio": trust_post.get("agreement_ratio", 0.0),
+                "initial_top_score": adaptive_trust["trust_post"],
+                "trust_post": adaptive_trust["trust_post"],
+                "trust_grade": "adaptive",  # Adaptive grading
+                "agreement_ratio": adaptive_trust["agreement"],
+                "coverage": adaptive_trust["coverage"],
+                "diversity": adaptive_trust["diversity"],
+                "num_subclaims": adaptive_trust["num_subclaims"],
                 "verdict": verdict_result,
             }
 
@@ -240,8 +247,8 @@ class CorrectivePipeline:
         # PHASE 4: Quota-Optimized Incremental Search (ONE QUERY AT A TIME)
         # ====================================================================
         logger.info(
-            f"[CorrectivePipeline:{round_id}] Trust score too low ({trust_score:.3f}), "
-            "starting quota-optimized search..."
+            f"[CorrectivePipeline:{round_id}] Evidence insufficient (coverage={adaptive_trust['coverage']:.2f}, "
+            f"diversity={adaptive_trust['diversity']:.2f}), starting quota-optimized search..."
         )
 
         # Generate all search queries upfront (1 LLM call only)
@@ -268,9 +275,12 @@ class CorrectivePipeline:
                 "ranked": top_ranked,
                 "used_web_search": False,
                 "search_api_calls": 0,
-                "trust_threshold": self.CONF_THRESHOLD,
+                "trust_threshold": "adaptive",
                 "trust_threshold_met": False,
-                "initial_top_score": trust_score,
+                "initial_top_score": adaptive_trust["trust_post"],
+                "coverage": adaptive_trust["coverage"],
+                "diversity": adaptive_trust["diversity"],
+                "num_subclaims": adaptive_trust["num_subclaims"],
                 "verdict": verdict_result,
             }
 

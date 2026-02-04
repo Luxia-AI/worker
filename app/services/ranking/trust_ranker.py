@@ -125,6 +125,10 @@ class TrustRankingModule:
     ):
         self.stance_classifier = stance_classifier or DummyStanceClassifier()
         self.source_scores = source_scores or DEFAULT_SOURCE_SCORES.copy()
+        # Import locally to avoid circular imports
+        from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
+
+        self.adaptive_policy = AdaptiveTrustPolicy()
 
     def _normalize_url_for_dedupe(self, url: str) -> str:
         """Normalize URL for deduplication by removing fragments and tracking parameters."""
@@ -501,6 +505,48 @@ class TrustRankingModule:
         logger.info(
             f"[TrustRankingModule] Decision: {decision} "
             f"(trust_post={post_trust['trust_post']:.3f}, threshold={threshold})"
+        )
+        return decision
+
+    def compute_adaptive_post_trust(
+        self, claim: str, ranked_evidence: List[EvidenceItem], top_k: int = 10
+    ) -> Dict[str, Any]:
+        """
+        Compute adaptive post-level trust for multi-part claims.
+
+        Uses the adaptive trust policy to handle complex claims with dynamic thresholds.
+
+        Args:
+            claim: The full claim text
+            ranked_evidence: List of EvidenceItem objects, assumed sorted by trust desc
+            top_k: Number of top items to consider
+
+        Returns:
+            Dictionary with adaptive trust metrics and decision
+        """
+        return self.adaptive_policy.compute_adaptive_trust(claim, ranked_evidence, top_k)
+
+    def decide_adaptive(self, claim: str, evidence_list: List[EvidenceItem], threshold: float = 0.75) -> str:
+        """
+        Make adaptive decision based on claim complexity and evidence sufficiency.
+
+        Uses adaptive trust policy for multi-part claims.
+
+        Returns:
+            "proceed_to_generation" if evidence is sufficient
+            "trigger_corrective_retrieval" otherwise
+        """
+        ranked = self.rank_evidence(evidence_list)
+        adaptive_trust = self.compute_adaptive_post_trust(claim, ranked)
+
+        if adaptive_trust["is_sufficient"]:
+            decision = "proceed_to_generation"
+        else:
+            decision = "trigger_corrective_retrieval"
+
+        logger.info(
+            f"[TrustRankingModule] Adaptive decision: {decision} "
+            f"(sufficient={adaptive_trust['is_sufficient']}, trust_post={adaptive_trust['trust_post']:.3f})"
         )
         return decision
 
