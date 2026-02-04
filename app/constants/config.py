@@ -24,6 +24,7 @@ class VerdictState(Enum):
     CONFIRMED = "confirmed"  # Domain was trusted at verdict time
     PROVISIONAL = "provisional"  # Domain approval pending; verdict may change
     REVOKED = "revoked"  # Domain trust was removed after verdict
+    EVIDENCE_INSUFFICIENCY = "evidence_insufficiency"  # Insufficient evidence coverage for multi-part claims
 
 
 # ============================================================================
@@ -49,8 +50,8 @@ PIPELINE_MAX_SEARCH_QUERIES = 4
 # LLM MODEL SETTINGS
 # ============================================================================
 
-# Default LLM model for Groq service (MoonshotAI's Kimi K2)
-LLM_MODEL_NAME = "moonshotai/kimi-k2-instruct"
+# Default LLM model for Groq service (Llama 3.1 Instant)
+LLM_MODEL_NAME = "llama-3.1-8b-instant"
 
 # Temperature for LLM calls (lower = more deterministic)
 LLM_TEMPERATURE = 0.2
