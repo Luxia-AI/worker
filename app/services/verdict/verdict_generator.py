@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional
 from app.constants.config import LLM_TEMPERATURE_VERDICT
 from app.core.logger import get_logger
 from app.services.corrective.fact_extractor import FactExtractor
+from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 from app.services.vdb.vdb_retrieval import VDBRetrieval
@@ -135,6 +136,7 @@ class VerdictGenerator:
         self.vdb_retriever = vdb_retriever or VDBRetrieval()
         self.trusted_search = TrustedSearch()
         self.fact_extractor = FactExtractor()
+        self.scraper = Scraper()
 
     async def generate_verdict(
         self,
@@ -530,8 +532,20 @@ class VerdictGenerator:
                         continue
 
                     try:
-                        logger.debug(f"[VerdictGenerator] Extracting facts from: {url}")
-                        facts = await self.fact_extractor.extract_facts_from_url(url, segment)
+                        logger.debug(f"[VerdictGenerator] Scraping and extracting facts from: {url}")
+
+                        # Scrape the URL to get content
+                        import aiohttp
+
+                        async with aiohttp.ClientSession() as session:
+                            scraped_page = await self.scraper.scrape_one(session, url)
+
+                        if not scraped_page.get("content"):
+                            logger.warning(f"[VerdictGenerator] No content scraped from {url}")
+                            continue
+
+                        # Extract facts from the scraped content
+                        facts = await self.fact_extractor.extract([scraped_page])
 
                         for fact in facts:
                             # Format as evidence dict
