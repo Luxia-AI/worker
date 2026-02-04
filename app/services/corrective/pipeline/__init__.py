@@ -182,6 +182,14 @@ class CorrectivePipeline:
                 published_at=item.get("published_at", item.get("publish_date")),
                 trust=item.get("final_score", item.get("score", 0.0)),  # Use final_score as trust
                 stance="neutral",  # Default stance
+                score_components={
+                    "semantic": item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
+                    "source": 0.5,  # Default source credibility
+                    "recency": 0.5,  # Default recency
+                    "stance_raw": 0.0,  # Neutral stance
+                    "stance_mapped": 0.5,  # Neutral mapped to 0.5
+                    "trust": item.get("final_score", item.get("score", 0.0)),
+                },
             )
             for item in top_ranked
         ]
@@ -397,6 +405,14 @@ class CorrectivePipeline:
                     published_at=item.get("published_at", item.get("publish_date")),
                     trust=item.get("final_score", item.get("score", 0.0)),  # Use final_score as trust
                     stance="neutral",  # Default stance
+                    score_components={
+                        "semantic": item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
+                        "source": 0.5,  # Default source credibility
+                        "recency": 0.5,  # Default recency
+                        "stance_raw": 0.0,  # Neutral stance
+                        "stance_mapped": 0.5,  # Neutral mapped to 0.5
+                        "trust": item.get("final_score", item.get("score", 0.0)),
+                    },
                 )
                 for item in top_ranked
             ]
@@ -468,6 +484,14 @@ class CorrectivePipeline:
                 published_at=item.get("published_at", item.get("publish_date")),
                 trust=item.get("final_score", item.get("score", 0.0)),  # Use final_score as trust
                 stance="neutral",  # Default stance
+                score_components={
+                    "semantic": item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
+                    "source": 0.5,  # Default source credibility
+                    "recency": 0.5,  # Default recency
+                    "stance_raw": 0.0,  # Neutral stance
+                    "stance_mapped": 0.5,  # Neutral mapped to 0.5
+                    "trust": item.get("final_score", item.get("score", 0.0)),
+                },
             )
             for item in top_ranked
         ]
