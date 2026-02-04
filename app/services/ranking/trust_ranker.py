@@ -196,9 +196,13 @@ class TrustRankingModule:
         logger.info(f"[TrustRankingModule] Ranked and deduped {len(evidence_list)} → {len(deduped)} evidence items")
         return deduped
 
-    def compute_post_trust(self, ranked_evidence: List[EvidenceItem], top_k: int = 10) -> Dict[str, Any]:
+    def compute_post_trust(self, ranked_evidence: List[Dict[str, Any]], top_k: int = 10) -> Dict[str, Any]:
         """
         Compute post-level trust metrics from top-k evidence.
+
+        Args:
+            ranked_evidence: List of evidence dicts with keys: fact, source, score, publish_date
+            top_k: Number of top items to consider
 
         Returns:
             {
@@ -207,12 +211,28 @@ class TrustRankingModule:
                 "trust_grade": str  # A+, A, B, C, D, F
             }
         """
-        top_k_items = ranked_evidence[:top_k]
+        # Convert dicts to EvidenceItem objects if needed
+        evidence_items = []
+        for item in ranked_evidence[:top_k]:
+            if isinstance(item, dict):
+                # Convert dict to EvidenceItem
+                evidence_item = EvidenceItem(
+                    statement=item.get("fact", ""),
+                    semantic_score=item.get("score", 0.0),
+                    source_url=item.get("source", ""),
+                    published_at=item.get("publish_date"),
+                    stance="neutral",  # Default stance, will be classified later if needed
+                )
+                # Compute trust for this item
+                evidence_item.trust = self.compute_trust_evidence(evidence_item)
+                evidence_items.append(evidence_item)
+            else:
+                evidence_items.append(item)
 
-        if not top_k_items:
+        if not evidence_items:
             return {"trust_post": 0.0, "agreement_ratio": 0.0, "trust_grade": "F"}
 
-        trusts = [item.trust for item in top_k_items]
+        trusts = [item.trust for item in evidence_items]
 
         # Self-weighted mean: sum(trust_i * trust_i) / sum(trust_i)
         if sum(trusts) > 0:
@@ -221,7 +241,7 @@ class TrustRankingModule:
             trust_post = 0.0
 
         # Agreement ratio: fraction where stance != "contradicts"
-        agreement_ratio = sum(1 for item in top_k_items if item.stance != "contradicts") / len(top_k_items)
+        agreement_ratio = sum(1 for item in evidence_items if item.stance != "contradicts") / len(evidence_items)
 
         # Assign grade
         if trust_post >= 0.85:

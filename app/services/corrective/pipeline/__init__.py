@@ -173,7 +173,6 @@ class CorrectivePipeline:
             )
 
         # Compute trust scores for evidence
-        stance_classifier = self.trust_ranker.stance_classifier
 
         top_ranked_evidence = [
             {
@@ -185,7 +184,7 @@ class CorrectivePipeline:
             for item in top_ranked
         ]
 
-        trust_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, stance_classifier)
+        trust_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, top_k)
         trust_score = trust_post["trust_post"]
 
         logger.info(f"[CorrectivePipeline:{round_id}] Initial ranking: trust_post={trust_score:.3f}")
@@ -398,7 +397,7 @@ class CorrectivePipeline:
                 for item in top_ranked
             ]
 
-            trust_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, stance_classifier)
+            trust_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, top_k)
             top_score = trust_post["trust_post"]
 
             logger.info(
@@ -467,7 +466,7 @@ class CorrectivePipeline:
             for item in top_ranked
         ]
 
-        final_trust_post = self.trust_ranker.compute_post_trust(final_top_ranked_evidence, stance_classifier)
+        final_trust_post = self.trust_ranker.compute_post_trust(final_top_ranked_evidence, top_k)
         final_trust_score = final_trust_post["trust_post"]
 
         verdict_result = await self.verdict_generator.generate_verdict(
