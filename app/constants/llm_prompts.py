@@ -54,41 +54,54 @@ Entities: {entities}"""
 # QUERY REFORMULATION PROMPTS
 # ============================================================================
 
-QUERY_REFORMULATION_PROMPT = """You are a search query optimizer for medical fact-checking.
-Generate exactly 3-4 highly targeted Google search queries to find authoritative medical evidence.
+QUERY_REFORMULATION_PROMPT = """You are a search query optimizer for claim verification (medical/health).
+Your job: generate EXACTLY 3–4 web search queries that help verify THIS specific claim.
 
-RULES:
-1. Each query must be 3-6 words (short and specific)
-2. Use medical/scientific terminology
-3. Focus on the CORE verifiable claims only
-4. Prioritize specificity over quantity - 3 excellent queries beat 8 mediocre ones
-5. Target verifiable mechanisms (e.g., "vitamin C collagen synthesis" not "vitamin C benefits")
+ABSOLUTE RULES (must follow):
+1) Claim-anchored: Every query MUST include at least 1–2 key terms copied verbatim from the claim \
+   (entity names, condition, drug, mechanism, population, outcome, numbers).
+2) No topic drift: Do NOT introduce new entities/topics not present in the claim \
+   (e.g., vitamins, nutrients, collagen, selenium) unless explicitly mentioned in the claim.
+3) Query length: 3–7 words each, short and specific.
+4) Evidence-oriented: Prefer terms that retrieve authoritative sources \
+   (guideline, systematic review, RCT, cohort, meta-analysis, CDC/WHO/NIH).
+5) Coverage: Queries should collectively cover:
+   - definition/claim core (what is asserted)
+   - mechanism or causality (if asserted)
+   - effect/outcome magnitude or safety (if asserted)
+6) Output MUST be ONLY valid JSON.
 
-GOOD EXAMPLES:
-- "vitamin C hydroxylation collagen"
-- "selenium glutathione peroxidase mechanism"
+FORMAT EXAMPLES (structure only — DO NOT reuse these words):
+Example claim: "<CLAIM_TEXT>"
+Good query shapes:
+- "<KEY_TERM_1> <KEY_TERM_2> systematic review"
+- "<KEY_TERM_1> <OUTCOME_TERM> randomized trial"
+- "<KEY_TERM_1> mechanism evidence"
+Bad query shapes:
+- "benefits of <KEY_TERM_1>" (too vague/promotional)
+- "<unrelated nutrient> mechanism" (introduces new topic)
 
-BAD EXAMPLES (avoid):
-- "is vitamin C good for skin" (too vague)
-- "health benefits of selenium" (promotional language)
+Return ONLY valid JSON:
+{"queries": ["...", "...", "..."]}
 
-Return ONLY valid JSON (no markdown):
-{{"queries": ["query1", "query2", "query3"]}}
+Claim: {post}"""
 
-Post: {post}"""
+REINFORCEMENT_QUERY_PROMPT = """You are a search-query optimization model for claim verification.
+Generate 8–12 highly effective web search queries for authoritative evidence.
 
-REINFORCEMENT_QUERY_PROMPT = """You are a search-query optimization model for misinformation
-detection. Generate 8-12 highly effective Web search queries for authoritative,
-peer-reviewed, scientific, or government-backed evidence.
-
+Inputs:
 Low-confidence statements:
 {statements}
 
-Failed/uncertain entities:
+Entities (use these; do NOT add new ones):
 {entities}
 
-Requirements: Queries must be highly targeted, focused on scientific/medical/
-factual verification, prefer NIH/WHO/CDC/Mayo Clinic/PubMed.
+STRICT RULES:
+1) Every query must include at least one entity term from the provided Entities list (verbatim).
+2) Do NOT introduce new entities/topics not present in Entities or Statements.
+3) Prefer authoritative targets: WHO, CDC, NIH, NICE, Cochrane, PubMed, major journals.
+4) Keep queries 4–9 words, specific and evidence-oriented.
+5) Output ONLY valid JSON.
 
-Return ONLY valid JSON (no markdown):
-{{{{"queries": ["query1", "query2", "query3"]}}}}"""
+Return ONLY valid JSON:
+{"queries": ["query1", "query2", "query3"]}"""
