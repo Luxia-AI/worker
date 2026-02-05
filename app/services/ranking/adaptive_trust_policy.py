@@ -176,22 +176,49 @@ class AdaptiveTrustPolicy:
         return coverage
 
     def _evidence_covers_subclaim(self, subclaim: str, evidence: EvidenceItem) -> bool:
-        """Check if evidence covers a subclaim using semantic similarity."""
-        # Simple heuristic: check for overlapping keywords
-        subclaim_words = set(re.findall(r"\b\w+\b", subclaim.lower()))
-        evidence_words = set(re.findall(r"\b\w+\b", evidence.statement.lower()))
-
-        # Require at least 30% word overlap or high semantic score
-        overlap = len(subclaim_words & evidence_words)
-        total_words = len(subclaim_words | evidence_words)
-
-        if total_words == 0:
+        """Stricter coverage: require meaningful overlap AND strong semantic match."""
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "could",
+            "would",
+            "should",
+            "can",
+        }
+        sub_words = [w for w in re.findall(r"\b\w+\b", subclaim.lower()) if w not in stop]
+        ev_words = [w for w in re.findall(r"\b\w+\b", evidence.statement.lower()) if w not in stop]
+        if not sub_words or not ev_words:
             return False
 
-        overlap_ratio = overlap / total_words
-        semantic_match = evidence.semantic_score > 0.7
+        sub_set, ev_set = set(sub_words), set(ev_words)
+        overlap = len(sub_set & ev_set)
+        # Require at least 2 overlapping "content" words to avoid accidental matches
+        if overlap < 2:
+            return False
 
-        return overlap_ratio > 0.3 or semantic_match
+        overlap_ratio = overlap / max(1, len(sub_set))
+        sem = getattr(evidence, "semantic_score", 0.0)
+        # Require both: decent overlap and strong semantic match
+        return overlap_ratio >= 0.25 and sem >= 0.80
 
     def calculate_diversity(self, evidence_list: List[EvidenceItem]) -> float:
         """
@@ -252,7 +279,7 @@ class AdaptiveTrustPolicy:
         if not evidence_list:
             return 0.0
 
-        non_contradicting = sum(1 for e in evidence_list if e.stance != "contradicts")
+        non_contradicting = sum(1 for e in evidence_list if getattr(e, "stance", "unknown") != "contradicts")
         agreement = non_contradicting / len(evidence_list)
 
         logger.info(f"Agreement: {non_contradicting}/{len(evidence_list)} = {agreement:.2f}")
@@ -275,15 +302,25 @@ class AdaptiveTrustPolicy:
         Returns:
             True if evidence is sufficient, False otherwise
         """
-        if coverage >= self.COVERAGE_THRESHOLD_HIGH:
-            logger.info(f"Gating: PASS - High coverage ({coverage:.2f} >= {self.COVERAGE_THRESHOLD_HIGH})")
+        if coverage >= self.COVERAGE_THRESHOLD_HIGH and agreement >= self.AGREEMENT_THRESHOLD_HIGH:
+            logger.info(
+                f"Gating: PASS - High coverage ({coverage:.2f} >= {self.COVERAGE_THRESHOLD_HIGH}) "
+                f"+ high agreement ({agreement:.2f} >= {self.AGREEMENT_THRESHOLD_HIGH})"
+            )
             return True
 
-        if coverage >= self.COVERAGE_THRESHOLD_MEDIUM and diversity >= self.DIVERSITY_THRESHOLD_HIGH:
-            logger.info(f"Gating: PASS - Medium coverage ({coverage:.2f}) + high diversity ({diversity:.2f})")
+        if (
+            coverage >= self.COVERAGE_THRESHOLD_MEDIUM
+            and diversity >= self.DIVERSITY_THRESHOLD_HIGH
+            and agreement >= self.AGREEMENT_THRESHOLD_HIGH
+        ):
+            logger.info(
+                f"Gating: PASS - Medium coverage ({coverage:.2f}) + high diversity ({diversity:.2f}) "
+                f"+ high agreement ({agreement:.2f})"
+            )
             return True
 
-        logger.info(f"Gating: FAIL - Coverage {coverage:.2f}, diversity {diversity:.2f}")
+        logger.info(f"Gating: FAIL - coverage={coverage:.2f}, diversity={diversity:.2f}, agreement={agreement:.2f}")
         return False
 
     def compute_adaptive_trust(self, claim: str, evidence_list: List[EvidenceItem], top_k: int = 10) -> Dict[str, Any]:
@@ -368,4 +405,18 @@ class AdaptiveTrustPolicy:
             f"Adaptive trust result: trust_post={trust_post:.3f}, "
             f"coverage={coverage:.2f}, sufficient={is_sufficient}"
         )
+
+        # Hard relevance floor: don’t skip web if evidence is weak overall
+        sem_scores = [getattr(e, "semantic_score", 0.0) for e in top_evidence] if top_evidence else [0.0]
+        trust_scores = [getattr(e, "trust", 0.0) for e in top_evidence] if top_evidence else [0.0]
+        top_sem = max(sem_scores) if sem_scores else 0.0
+        top_trust = max(trust_scores) if trust_scores else 0.0
+        if is_sufficient and (trust_post < 0.55 or top_sem < 0.60 or top_trust < 0.55):
+            logger.info(
+                "[AdaptiveTrustPolicy] Overriding sufficient=False due to weak relevance "
+                f"(trust_post={trust_post:.3f}, top_sem={top_sem:.3f}, top_trust={top_trust:.3f})"
+            )
+            result["is_sufficient"] = False
+            result["verdict_state"] = "evidence_insufficiency"
+
         return result

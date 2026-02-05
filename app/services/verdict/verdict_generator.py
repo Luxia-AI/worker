@@ -25,6 +25,7 @@ from app.services.corrective.fact_extractor import FactExtractor
 from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
+from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 
 logger = get_logger(__name__)
@@ -137,6 +138,118 @@ class VerdictGenerator:
         self.trusted_search = TrustedSearch()
         self.fact_extractor = FactExtractor()
         self.scraper = Scraper()
+        self.trust_policy = AdaptiveTrustPolicy()
+        self.MAX_WEB_ROUNDS_PRE_VERDICT = 2
+        self.WEB_SEGMENTS_LIMIT = 3
+        self.MAX_UNKNOWN_ROUNDS_POST_VERDICT = 2
+
+    def _quick_web_score(self, segment: str, fact_stmt: str, conf: float) -> float:
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "could",
+            "would",
+            "should",
+            "can",
+        }
+        seg_words = set(w for w in re.findall(r"\b\w+\b", (segment or "").lower()) if w not in stop)
+        fact_words = set(w for w in re.findall(r"\b\w+\b", (fact_stmt or "").lower()) if w not in stop)
+        overlap = len(seg_words & fact_words)
+        overlap_ratio = overlap / max(1, len(seg_words))
+        conf = float(conf or 0.0)
+        score = 0.25 + 0.45 * max(0.0, min(1.0, conf)) + 0.35 * max(0.0, min(1.0, overlap_ratio))
+        return max(0.0, min(1.0, score))
+
+    def _policy_says_insufficient(self, claim: str, evidence: List[Dict[str, Any]]) -> bool:
+        if not evidence:
+            return True
+
+        class _Ev:
+            __slots__ = ("statement", "source_url", "semantic_score", "stance", "trust")
+
+            def __init__(self, d: Dict[str, Any]):
+                self.statement = d.get("statement") or d.get("text") or ""
+                self.source_url = d.get("source_url") or d.get("source") or ""
+                self.semantic_score = float(
+                    d.get("semantic_score") or d.get("sem_score") or d.get("final_score") or d.get("score") or 0.0
+                )
+                self.stance = d.get("stance") or "unknown"
+                self.trust = float(
+                    d.get("trust") or d.get("credibility") or d.get("final_score") or d.get("score") or 0.0
+                )
+
+        adapted = [_Ev(d) for d in evidence if (d.get("statement") or d.get("text"))]
+        metrics = self.trust_policy.compute_adaptive_trust(claim, adapted, top_k=min(10, len(adapted)))
+        return not bool(metrics.get("is_sufficient", False))
+
+    def _needs_web_boost(self, evidence: List[Dict[str, Any]], claim: str = "") -> bool:
+        """Heuristic: trigger web search when ranked evidence is weak/off-topic."""
+        if not evidence:
+            return True
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "could",
+            "would",
+            "should",
+            "can",
+        }
+        claim_words = set(w for w in re.findall(r"\b\w+\b", (claim or "").lower()) if w not in stop)
+
+        scores = []
+        overlap_ok = False
+        for ev in evidence:
+            s = ev.get("final_score")
+            if s is None:
+                s = ev.get("score", 0.0)
+            scores.append(float(s or 0.0))
+
+            stmt = (ev.get("statement") or ev.get("text") or "").lower()
+            ev_words = set(w for w in re.findall(r"\b\w+\b", stmt) if w not in stop)
+            if len(claim_words & ev_words) >= 2:
+                overlap_ok = True
+
+        top = max(scores) if scores else 0.0
+        avg = (sum(scores) / len(scores)) if scores else 0.0
+        return (top < 0.65 or avg < 0.45) or (claim_words and not overlap_ok)
 
     async def generate_verdict(
         self,
@@ -164,21 +277,20 @@ class VerdictGenerator:
                 - key_findings: List of key findings
         """
         if not ranked_evidence:
-            logger.warning("[VerdictGenerator] No evidence provided, returning UNVERIFIABLE")
-            return self._unverifiable_result(claim, "No evidence retrieved")
+            logger.warning("[VerdictGenerator] No VDB/KG evidence -> trying web boost")
+            segments = self._split_claim_into_segments(claim)[:3]
+            web_boost = await self._fetch_web_evidence_for_unknown_segments(segments)
+            if not web_boost:
+                return self._unverifiable_result(claim, "No evidence retrieved (VDB/KG empty and web boost failed)")
+            ranked_evidence = web_boost
 
-        # ================================================================
-        # CLAIM-SEGMENT RETRIEVAL: Only if ranked evidence is insufficient
-        # OPTIMIZATION: Skip segment retrieval if we already have good evidence
-        # ================================================================
+        # Step 1) Start with VDB/KG evidence + (optional) segment retrieval
         segment_evidence: List[Dict[str, Any]] = []
-
-        # Only do segment retrieval if ranked evidence is sparse (<3 items)
-        # This avoids unnecessary VDB queries when we already have enough evidence
-        if len(ranked_evidence) < 3:
+        if self._needs_web_boost(
+            ranked_evidence[: min(len(ranked_evidence), 6)], claim=claim
+        ) or self._policy_says_insufficient(claim, ranked_evidence[: min(len(ranked_evidence), 10)]):
             segment_evidence = await self._retrieve_segment_evidence(claim, top_k=2)
 
-        # Merge segment evidence with ranked evidence (dedup by statement)
         enriched_evidence = self._merge_evidence(ranked_evidence, segment_evidence)
 
         if segment_evidence:
@@ -189,10 +301,26 @@ class VerdictGenerator:
         else:
             logger.info(f"[VerdictGenerator] Using {len(ranked_evidence)} ranked evidence (segment retrieval skipped)")
 
-        # OPTIMIZATION: Use exactly top_k evidence, capped at 6 to reduce prompt size
-        # More evidence doesn't improve accuracy but increases latency and LLM cost
-        evidence_limit = min(len(enriched_evidence), top_k, 6)
-        top_evidence = enriched_evidence[:evidence_limit]
+        # Step 2) PRE-VERDICT web-boost loop driven by *sufficiency*
+        pre_evidence = enriched_evidence[: min(len(enriched_evidence), max(top_k, 8), 12)]
+        for round_i in range(self.MAX_WEB_ROUNDS_PRE_VERDICT):
+            insufficient = self._policy_says_insufficient(claim, pre_evidence)
+            weak = self._needs_web_boost(pre_evidence[: min(len(pre_evidence), 6)], claim=claim)
+            if not insufficient and not weak:
+                logger.info(f"[VerdictGenerator] Pre-verdict evidence sufficient (round={round_i}). Skipping web.")
+                break
+            logger.info(
+                f"[VerdictGenerator] Pre-verdict evidence insufficient/weak (round={round_i}). "
+                f"insufficient={insufficient} weak={weak} -> web search"
+            )
+            segments = self._split_claim_into_segments(claim)[: self.WEB_SEGMENTS_LIMIT]
+            web_boost = await self._fetch_web_evidence_for_unknown_segments(segments)
+            if not web_boost:
+                logger.warning("[VerdictGenerator] Web boost returned no facts.")
+                break
+            logger.info(f"[VerdictGenerator] Web boost facts: {len(web_boost)}")
+            pre_evidence = (pre_evidence + web_boost)[: min(len(pre_evidence + web_boost), 18)]
+        top_evidence = pre_evidence[: min(len(pre_evidence), top_k, 12)]
 
         # Format evidence for prompt
         evidence_text = self._format_evidence_for_prompt(top_evidence)
@@ -215,9 +343,11 @@ class VerdictGenerator:
                 f"(confidence: {verdict_result['confidence']:.2f})"
             )
 
-            # Check for UNKNOWN segments and fetch web evidence if needed
-            unknown_segments = self._get_unknown_segments(verdict_result)
-            if unknown_segments:
+            # If UNKNOWN segments remain, iterate a couple times (bounded) to avoid UNKNOWN
+            for _ in range(self.MAX_UNKNOWN_ROUNDS_POST_VERDICT):
+                unknown_segments = self._get_unknown_segments(verdict_result)
+                if not unknown_segments:
+                    break
                 logger.info(
                     f"[VerdictGenerator] Found {len(unknown_segments)} UNKNOWN segments, fetching web evidence..."
                 )
@@ -246,6 +376,7 @@ class VerdictGenerator:
                         )
                     except Exception as e:
                         logger.warning(f"[VerdictGenerator] Failed to re-generate verdict with web evidence: {e}")
+                        break
 
             return verdict_result
 
@@ -309,11 +440,71 @@ class VerdictGenerator:
         # Extract claim breakdown for client display
         claim_breakdown = llm_result.get("claim_breakdown", [])
 
+        # Guardrail: prevent hallucinated support (source_url / supporting_fact must map to provided evidence)
+        ev_urls = set((e.get("source_url") or e.get("source") or "") for e in evidence)
+        ev_text = " ".join((e.get("statement") or e.get("text") or "") for e in evidence).lower()
+
+        def _overlap_ok(fact: str, ev_text: str) -> bool:
+            if not fact:
+                return True
+            stop = {
+                "the",
+                "a",
+                "an",
+                "and",
+                "or",
+                "but",
+                "to",
+                "for",
+                "of",
+                "in",
+                "on",
+                "with",
+                "by",
+                "at",
+                "is",
+                "are",
+                "was",
+                "were",
+                "be",
+                "been",
+                "being",
+                "could",
+                "would",
+                "should",
+                "can",
+            }
+            fw = [w for w in re.findall(r"\b\w+\b", fact.lower()) if w not in stop]
+            if len(fw) < 3:
+                return True  # don't over-penalize short facts
+            hits = sum(1 for w in set(fw) if w in ev_text)
+            return hits >= 2
+
+        for seg in claim_breakdown:
+            status = (seg.get("status") or "UNKNOWN").upper()
+            if status == "UNKNOWN":
+                continue
+            src = seg.get("source_url") or ""
+            fact = (seg.get("supporting_fact") or "").strip().lower()
+            if (src and src not in ev_urls) or (fact and not _overlap_ok(fact, ev_text)):
+                seg["status"] = "UNKNOWN"
+                seg["supporting_fact"] = ""
+                seg["source_url"] = ""
+
         # Extract or calculate truthfulness percentage
         truthfulness_percent = llm_result.get("truthfulness_percent")
         if truthfulness_percent is None:
-            # Calculate from claim_breakdown if not provided
             truthfulness_percent = self._calculate_truthfulness_percent(claim_breakdown)
+        else:
+            truthfulness_percent = float(truthfulness_percent)
+            truthfulness_percent = max(0.0, min(100.0, truthfulness_percent))
+
+            # sanity fallback: avoid extreme truthfulness when breakdown is mostly UNKNOWN
+            if claim_breakdown:
+                statuses = [s.get("status", "UNKNOWN").upper() for s in claim_breakdown]
+                unknown_ratio = sum(1 for s in statuses if s == "UNKNOWN") / max(1, len(statuses))
+                if unknown_ratio >= 0.5 and (truthfulness_percent <= 10.0 or truthfulness_percent >= 90.0):
+                    truthfulness_percent = self._calculate_truthfulness_percent(claim_breakdown)
 
         return {
             "verdict": verdict_str,
@@ -345,7 +536,8 @@ class VerdictGenerator:
         status_weights = {
             "VALID": 100.0,
             "PARTIALLY_VALID": 75.0,
-            "UNKNOWN": 50.0,
+            # Important: UNKNOWN should not inflate truthfulness
+            "UNKNOWN": 25.0,
             "PARTIALLY_INVALID": 25.0,
             "INVALID": 0.0,
         }
@@ -548,11 +740,14 @@ class VerdictGenerator:
                         facts = await self.fact_extractor.extract([scraped_page])
 
                         for fact in facts:
-                            # Format as evidence dict
+                            stmt = fact.get("statement", "") or ""
+                            conf = float(fact.get("confidence", 0.5) or 0.5)
+                            score = self._quick_web_score(segment, stmt, conf)
                             evidence_item = {
-                                "statement": fact.get("statement", ""),
+                                "statement": stmt,
                                 "source_url": url,
-                                "final_score": fact.get("confidence", 0.5),
+                                "final_score": score,
+                                "extraction_confidence": conf,
                                 "credibility": 0.7,  # Default credibility for web-extracted facts
                                 "_web_search": True,  # Mark as web-sourced
                                 "_original_query": query,

@@ -204,44 +204,58 @@ class CorrectivePipeline:
         )
 
         if is_sufficient:
-            # ✅ EARLY EXIT: Existing evidence is sufficient, no web search needed!
             logger.info(
                 f"[CorrectivePipeline:{round_id}] Adaptive trust sufficient. "
                 "Skipping web search - using cached evidence!"
             )
 
-            # Generate verdict using RAG
             verdict_result = await self.verdict_generator.generate_verdict(
                 claim=post_text,
                 ranked_evidence=top_ranked,
                 top_k=top_k,
             )
-            logger.info(
-                f"[CorrectivePipeline:{round_id}] Verdict: {verdict_result['verdict']} "
-                f"(confidence: {verdict_result['confidence']:.2f})"
-            )
 
-            return {
-                "round_id": round_id,
-                "status": "completed_from_cache",
-                "facts": [],  # No new facts extracted
-                "triples": [],
-                "queries": [post_text],
-                "semantic_candidates_count": len(dedup_sem),
-                "kg_candidates_count": len(kg_candidates),
-                "ranked": top_ranked,
-                "used_web_search": False,
-                "trust_threshold": "adaptive",  # Now using adaptive policy
-                "trust_threshold_met": True,
-                "initial_top_score": adaptive_trust["trust_post"],
-                "trust_post": adaptive_trust["trust_post"],
-                "trust_grade": "adaptive",  # Adaptive grading
-                "agreement_ratio": adaptive_trust["agreement"],
-                "coverage": adaptive_trust["coverage"],
-                "diversity": adaptive_trust["diversity"],
-                "num_subclaims": adaptive_trust["num_subclaims"],
-                "verdict": verdict_result,
-            }
+            # If verdict still looks weak/unknown -> do NOT early-exit; continue to web search loop
+            breakdown = verdict_result.get("claim_breakdown", []) or []
+            unknown_ratio = sum(1 for s in breakdown if (s.get("status") or "").upper() == "UNKNOWN") / max(
+                1, len(breakdown)
+            )
+            if (
+                verdict_result.get("verdict") == "UNVERIFIABLE"
+                or verdict_result.get("confidence", 0.0) < 0.45
+                or unknown_ratio >= 0.34
+            ):
+                logger.info(
+                    f"[CorrectivePipeline:{round_id}] Cache evidence looked sufficient, but verdict weak "
+                    f"(verdict={verdict_result.get('verdict')}, conf={verdict_result.get('confidence')}, "
+                    f"unknown_ratio={unknown_ratio:.2f}) -> continuing to web search"
+                )
+            else:
+                logger.info(
+                    f"[CorrectivePipeline:{round_id}] Verdict: {verdict_result['verdict']} "
+                    f"(confidence: {verdict_result['confidence']:.2f})"
+                )
+                return {
+                    "round_id": round_id,
+                    "status": "completed_from_cache",
+                    "facts": [],  # No new facts extracted
+                    "triples": [],
+                    "queries": [post_text],
+                    "semantic_candidates_count": len(dedup_sem),
+                    "kg_candidates_count": len(kg_candidates),
+                    "ranked": top_ranked,
+                    "used_web_search": False,
+                    "trust_threshold": "adaptive",  # Now using adaptive policy
+                    "trust_threshold_met": True,
+                    "initial_top_score": adaptive_trust["trust_post"],
+                    "trust_post": adaptive_trust["trust_post"],
+                    "trust_grade": "adaptive",  # Adaptive grading
+                    "agreement_ratio": adaptive_trust["agreement"],
+                    "coverage": adaptive_trust["coverage"],
+                    "diversity": adaptive_trust["diversity"],
+                    "num_subclaims": adaptive_trust["num_subclaims"],
+                    "verdict": verdict_result,
+                }
 
         # ====================================================================
         # PHASE 4: Quota-Optimized Incremental Search (ONE QUERY AT A TIME)
@@ -427,21 +441,22 @@ class CorrectivePipeline:
                 for item in top_ranked
             ]
 
-            trust_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, top_k)
-            top_score = trust_post["trust_post"]
+            adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(post_text, top_ranked_evidence, top_k)
+            is_sufficient = adaptive_trust["is_sufficient"]
 
             logger.info(
                 f"[CorrectivePipeline:{round_id}] After query {query_idx + 1}: "
-                f"trust_post={top_score:.3f}, total_facts={len(all_facts)}, "
+                f"adaptive_sufficient={is_sufficient}, "
+                f"trust_post={adaptive_trust['trust_post']:.3f}, "
+                f"total_facts={len(all_facts)}, "
                 f"search_calls={search_api_calls}"
             )
 
-            # Step 6: Check if threshold reached - STOP to save quota!
-            if top_score >= self.CONF_THRESHOLD:
+            # Step 6: Check if adaptive trust sufficient - STOP to save quota!
+            if is_sufficient:
                 remaining_queries = len(queries) - query_idx - 1
                 logger.info(
-                    f"[CorrectivePipeline:{round_id}] ✅ THRESHOLD MET after query {query_idx + 1}! "
-                    f"({top_score:.3f} >= {self.CONF_THRESHOLD}) "
+                    f"[CorrectivePipeline:{round_id}] ✅ ADAPTIVE THRESHOLD MET after query {query_idx + 1}! "
                     f"Saved {remaining_queries} search API calls!"
                 )
                 break
