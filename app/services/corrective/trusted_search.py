@@ -195,6 +195,9 @@ class TrustedSearch:
         ranked_terms = sorted(set(tokens), key=lambda t: (-_score(t), t))
         numbers_raw = self._extract_numbers_raw(text)
         numbers_norm = self._extract_numbers(text)
+        # Avoid number-only queries; keep at most 3 numbers
+        numbers_raw = numbers_raw[:3]
+        numbers_norm = numbers_norm[:3]
 
         terms: List[str] = []
         for n in numbers_raw:
@@ -206,8 +209,16 @@ class TrustedSearch:
         for w in ranked_terms:
             terms.append(w)
 
-        # Keep query concise and direct
+        # Keep query concise and ensure at least 2 content words
         terms = dedupe_list(terms)
+        # Ensure at least two alphabetic tokens are retained
+        word_terms = [t for t in terms if t.isalpha()]
+        if len(word_terms) < 2:
+            for w in ranked_terms:
+                if w not in terms:
+                    terms.append(w)
+                if len([t for t in terms if t.isalpha()]) >= 2:
+                    break
         terms = terms[:7]
         return " ".join(terms).strip()
 

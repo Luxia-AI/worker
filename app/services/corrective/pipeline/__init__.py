@@ -155,7 +155,7 @@ class CorrectivePipeline:
         # ====================================================================
         # PHASE 2: Retrieve existing evidence from VDB + KG (NO LLM calls)
         # ====================================================================
-        claim_topics, topic_conf = await self.topic_classifier.classify(post_text, claim_entities, None)
+        claim_topics, topic_conf = await self._infer_claim_topics(post_text, claim_entities)
         logger.info(f"[CorrectivePipeline:{round_id}] Claim topics: {claim_topics} (conf={topic_conf:.2f})")
 
         retrieval_queries = self._build_retrieval_queries(post_text)
@@ -713,6 +713,18 @@ class CorrectivePipeline:
             if s and s not in queries:
                 queries.append(s)
         return queries
+
+    async def _infer_claim_topics(self, claim: str, entities: List[str]) -> tuple[list[str], float]:
+        subclaims = self.trust_ranker.adaptive_policy.decompose_claim(claim)
+        topics: set[str] = set()
+        best_conf = 0.0
+        for sub in subclaims:
+            t, conf = await self.topic_classifier.classify(sub, entities, None)
+            for item in t:
+                topics.add(item)
+            if conf > best_conf:
+                best_conf = conf
+        return list(topics), best_conf
 
 
 __all__ = ["CorrectivePipeline"]

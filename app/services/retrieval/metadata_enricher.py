@@ -105,9 +105,12 @@ class TopicClassifier:
         if not ranked or ranked[0][1] == 0:
             return [], 0.0
 
-        best_topic, best_score = ranked[0]
+        best_score = ranked[0][1]
+        # Keep up to 2 topics if scores are close (multi-topic claims)
+        keep = [t for t, s in ranked if s >= max(1, best_score - 1)]
+        keep = keep[:2]
         confidence = min(1.0, best_score / 5.0)
-        return [best_topic], confidence
+        return keep, confidence
 
     async def classify(self, statement: str, entities: List[str], source_url: str | None) -> Tuple[List[str], float]:
         cache_key = f"{statement}|{','.join(entities)}|{source_url}"
