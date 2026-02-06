@@ -55,9 +55,15 @@ class Scraper:
         self,
         timeout: int = 12,
         playwright_timeout: int = 8000,
+        who_playwright_timeout: int = 20000,
+        max_line_size: int = 16384,
+        max_field_size: int = 65536,
     ):
         self.timeout = timeout
         self.playwright_timeout = playwright_timeout
+        self.who_playwright_timeout = who_playwright_timeout
+        self.max_line_size = max_line_size
+        self.max_field_size = max_field_size
 
     def _get_headers(self) -> Dict[str, str]:
         """Get browser-like headers with random User-Agent."""
@@ -113,7 +119,7 @@ class Scraper:
     # ---------------------------------------------------------------------
     # Playwright Fallback (JS-rendered pages)
     # ---------------------------------------------------------------------
-    async def playwright_fallback(self, url: str) -> str | None:
+    async def playwright_fallback(self, url: str, timeout_override: int | None = None) -> str | None:
         """
         Only used when Trafilatura fails or HTML is empty.
         Requires Playwright installed with: playwright install chromium
@@ -135,7 +141,8 @@ class Scraper:
                 )
                 page = await context.new_page()
 
-                await page.goto(url, timeout=self.playwright_timeout)
+                timeout = timeout_override or self.playwright_timeout
+                await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
                 await page.wait_for_load_state("domcontentloaded")
 
                 html: str = await page.content()
@@ -152,6 +159,7 @@ class Scraper:
     # ---------------------------------------------------------------------
     async def scrape_one(self, session: aiohttp.ClientSession, url: str) -> Dict[str, Any]:
         logger.info(f"[Scraper] Scraping URL: {url}")
+        is_who = "who.int" in url.lower()
 
         # Step 1: Try normal HTTP fetch
         html, should_fallback = await self.fetch_html(session, url)
@@ -160,7 +168,8 @@ class Scraper:
         # Do NOT fallback for 4xx errors (403, 404, etc.) - they won't be fixed by JS rendering
         if html is None and should_fallback:
             logger.info(f"[Scraper] Falling back to Playwright: {url}")
-            html = await self.playwright_fallback(url)
+            timeout_override = self.who_playwright_timeout if is_who else None
+            html = await self.playwright_fallback(url, timeout_override=timeout_override)
         elif html is None:
             logger.info(f"[Scraper] Skipping Playwright fallback (client error): {url}")
 
@@ -194,7 +203,11 @@ class Scraper:
     async def scrape_all(self, urls: List[str]) -> List[Dict[str, Any]]:
         logger.info(f"[Scraper] Starting scrape for {len(urls)} URLs")
 
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+            max_line_size=self.max_line_size,
+            max_field_size=self.max_field_size,
+        ) as session:
             tasks = [self.scrape_one(session, url) for url in urls]
             results = await asyncio.gather(*tasks)
 

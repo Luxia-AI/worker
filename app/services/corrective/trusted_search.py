@@ -479,7 +479,7 @@ FAILED ENTITIES:
         failed_entities: List[str],
     ) -> List[str]:
         """
-        Uses LLM (Groq with Ollama fallback) to generate highly optimized reinforcement search queries.
+        Uses LLM (Groq) to generate highly optimized reinforcement search queries.
         Much better than heuristic string concatenation.
         """
 
