@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -9,6 +10,7 @@ from app.constants.config import (
     CREDIBILITY_DEFAULT,
     CREDIBILITY_EDU_GOV,
     CREDIBILITY_NEWS,
+    RANKING_MIN_CLAIM_OVERLAP,
     RANKING_MIN_CREDIBILITY_THRESHOLD,
     RANKING_MIN_SCORE_FLOOR,
     RANKING_WEIGHTS,
@@ -89,6 +91,58 @@ def _entity_overlap_score(query_entities: List[str], item_entities: List[str]) -
     return len(inter) / len(set_q)
 
 
+def _claim_overlap_score(claim_text: str, statement: str) -> float:
+    """
+    Lexical overlap between claim text and evidence statement.
+    Returns 0..1 based on proportion of claim content words present in statement.
+    """
+    if not claim_text or not statement:
+        return 0.0
+
+    stop = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "to",
+        "for",
+        "of",
+        "in",
+        "on",
+        "with",
+        "by",
+        "at",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "could",
+        "would",
+        "should",
+        "can",
+        "may",
+        "might",
+        "about",
+        "over",
+        "under",
+        "average",
+    }
+    claim_words = [w for w in re.findall(r"\b\w+\b", claim_text.lower()) if w not in stop]
+    stmt_words = [w for w in re.findall(r"\b\w+\b", statement.lower()) if w not in stop]
+    if not claim_words or not stmt_words:
+        return 0.0
+
+    claim_set = set(claim_words)
+    stmt_set = set(stmt_words)
+    overlap = len(claim_set & stmt_set)
+    return overlap / max(1, len(claim_set))
+
+
 def _credibility_score_from_meta(meta: Dict[str, Any]) -> float:
     """
     Return credibility boost only for known authoritative sources.
@@ -124,6 +178,7 @@ def hybrid_rank(
     semantic_results: List[Dict[str, Any]],
     kg_results: List[Dict[str, Any]],
     query_entities: Optional[List[str]] = None,
+    query_text: Optional[str] = None,
     weights: Optional[Dict[str, float]] = None,
     now: Optional[datetime] = None,
 ) -> List[Dict[str, Any]]:
@@ -152,11 +207,13 @@ def hybrid_rank(
     """
 
     query_entities = query_entities or []
+    query_text = query_text or ""
     weights = weights or {}
     # weights defaults
     w_sem = float(weights.get("w_semantic", RANKING_WEIGHTS["w_semantic"]))
     w_kg = float(weights.get("w_kg", RANKING_WEIGHTS["w_kg"]))
     w_entity = float(weights.get("w_entity", RANKING_WEIGHTS["w_entity"]))
+    w_claim_overlap = float(weights.get("w_claim_overlap", RANKING_WEIGHTS["w_claim_overlap"]))
     w_recency = float(weights.get("w_recency", RANKING_WEIGHTS["w_recency"]))
     w_cred = float(weights.get("w_credibility", RANKING_WEIGHTS["w_credibility"]))
 
@@ -230,7 +287,16 @@ def hybrid_rank(
         recency_s = _recency_boost(item.get("published_at"), now=now)
         cred_s = _safe_float(item.get("credibility"), 0.5)
 
-        final_score = (w_sem * sem_s) + (w_kg * kg_s) + (w_entity * ent_s) + (w_recency * recency_s) + (w_cred * cred_s)
+        claim_overlap = _claim_overlap_score(query_text, item["statement"])
+
+        final_score = (
+            (w_sem * sem_s)
+            + (w_kg * kg_s)
+            + (w_entity * ent_s)
+            + (w_claim_overlap * claim_overlap)
+            + (w_recency * recency_s)
+            + (w_cred * cred_s)
+        )
 
         # small heuristic: if both sem and kg are zero but credibility high, ensure min floor
         if sem_s == 0.0 and kg_s == 0.0 and cred_s >= RANKING_MIN_CREDIBILITY_THRESHOLD:
@@ -245,11 +311,15 @@ def hybrid_rank(
             "sem_score_raw": item.get("sem_score_raw", 0.0),
             "kg_score": kg_s,
             "entity_overlap": ent_s,
+            "claim_overlap": claim_overlap,
             "recency": recency_s,
             "credibility": cred_s,
             "final_score": max(0.0, min(final_score, 1.0)),
             "orig": item.get("orig", {}),
         }
+        # Filter out low-overlap items unless they are very strong sem/kg matches
+        if claim_overlap < RANKING_MIN_CLAIM_OVERLAP and sem_s < 0.65 and kg_s < 0.65:
+            continue
         results.append(out)
 
     # Sort descending by final_score, then by sem_score, then by credibility, then stable textual tie-breaker

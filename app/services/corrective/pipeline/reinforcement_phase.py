@@ -163,7 +163,15 @@ async def reinforcement_loop(
         dedup_sem, kg_candidates = await retrieve_candidates(
             vdb_retriever, kg_retriever, queries, all_entities, top_k, round_id, log_manager
         )
-        top_ranked = await rank_candidates(dedup_sem, kg_candidates, all_entities, top_k, round_id, log_manager)
+        top_ranked = await rank_candidates(
+            dedup_sem,
+            kg_candidates,
+            all_entities,
+            post_text,
+            top_k,
+            round_id,
+            log_manager,
+        )
 
         # Decay confidence threshold
         conf_threshold -= round_count * 0.05

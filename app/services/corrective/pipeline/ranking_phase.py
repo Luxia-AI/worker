@@ -16,6 +16,7 @@ async def rank_candidates(
     semantic_candidates: List[Dict[str, Any]],
     kg_candidates: List[Dict[str, Any]],
     query_entities: List[str],
+    query_text: str,
     top_k: int,
     round_id: str,
     log_manager: Optional[LogManager] = None,
@@ -38,6 +39,7 @@ async def rank_candidates(
             - source_url: Optional[str]
             - credibility: float [0, 1]
         query_entities: Entities extracted from original post
+        query_text: Full claim text (used for overlap-aware ranking)
         top_k: Number of top results to return
         round_id: Round identifier for logging
 
@@ -50,7 +52,12 @@ async def rank_candidates(
             - grade_rationale: str (explanation of grade)
     """
     # Phase 1: Hybrid rank semantic and KG candidates
-    ranked = hybrid_rank(semantic_candidates, kg_candidates, query_entities=query_entities)
+    ranked = hybrid_rank(
+        semantic_candidates,
+        kg_candidates,
+        query_entities=query_entities,
+        query_text=query_text,
+    )
     top_ranked = ranked[:top_k]
 
     # Phase 2: Enrich with trust grades

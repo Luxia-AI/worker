@@ -151,10 +151,11 @@ class CorrectivePipeline:
         # ====================================================================
         # PHASE 2: Retrieve existing evidence from VDB + KG (NO LLM calls)
         # ====================================================================
+        retrieval_queries = self._build_retrieval_queries(post_text)
         dedup_sem, kg_candidates = await retrieve_candidates(
             self.vdb_retriever,
             self.kg_retriever,
-            [post_text],  # Use claim as query
+            retrieval_queries,
             claim_entities,
             top_k * 3,  # Get more candidates for better ranking
             round_id,
@@ -171,7 +172,13 @@ class CorrectivePipeline:
         top_ranked = []
         if dedup_sem or kg_candidates:
             top_ranked = await rank_candidates(
-                dedup_sem, kg_candidates, claim_entities, top_k, round_id, self.log_manager
+                dedup_sem,
+                kg_candidates,
+                claim_entities,
+                post_text,
+                top_k,
+                round_id,
+                self.log_manager,
             )
 
         # Compute trust scores for evidence
@@ -411,6 +418,7 @@ class CorrectivePipeline:
                 dedup_sem,
                 kg_candidates,
                 list(set(all_entities)),
+                post_text,
                 top_k,
                 round_id,
                 self.log_manager,
@@ -672,6 +680,20 @@ class CorrectivePipeline:
                     context={"fallback_entities": fallback},
                 )
         return fallback
+
+    def _build_retrieval_queries(self, claim: str) -> List[str]:
+        """
+        Build retrieval queries using the full claim plus a few decomposed subclaims.
+        This increases recall for multi-part claims while keeping VDB calls bounded.
+        """
+        queries = [claim.strip()] if claim and claim.strip() else []
+        subclaims = self.trust_ranker.adaptive_policy.decompose_claim(claim)
+        # Limit to top 3 subclaims to avoid query explosion
+        for sub in subclaims[:3]:
+            s = sub.strip()
+            if s and s not in queries:
+                queries.append(s)
+        return queries
 
 
 __all__ = ["CorrectivePipeline"]

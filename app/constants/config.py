@@ -222,9 +222,10 @@ RECENCY_HALF_LIFE_DAYS = 365.0
 RANKING_WEIGHTS = {
     "w_semantic": 0.25,  # semantic similarity score (increased for better matching)
     "w_kg": 0.15,  # knowledge graph score (increased from 0.01 for relation impact)
-    "w_entity": 0.30,  # entity overlap with query (reduced but still significant)
+    "w_entity": 0.20,  # entity overlap with query (reduced but still significant)
+    "w_claim_overlap": 0.15,  # lexical overlap between claim text and evidence statement
     "w_recency": 0.05,  # publication recency (slight boost for fresh evidence)
-    "w_credibility": 0.25,  # source credibility (balanced with semantic)
+    "w_credibility": 0.20,  # source credibility (balanced with semantic)
 }
 
 # Minimum final score floor when both semantic and KG are zero but credibility high
@@ -232,6 +233,9 @@ RANKING_MIN_SCORE_FLOOR = 0.2
 
 # Minimum credibility threshold to trigger min score floor
 RANKING_MIN_CREDIBILITY_THRESHOLD = 0.9
+
+# Minimum lexical overlap between claim text and evidence statement to keep candidate
+RANKING_MIN_CLAIM_OVERLAP = 0.15
 
 # ============================================================================
 # TRUST-RANKING GRADE THRESHOLDS
