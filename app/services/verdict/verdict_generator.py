@@ -432,7 +432,7 @@ class VerdictGenerator:
         if verdict_str not in [v.value for v in Verdict]:
             verdict_str = "UNVERIFIABLE"
 
-        # Extract confidence with bounds
+        # Extract confidence (will be re-scored from evidence if possible)
         confidence = llm_result.get("confidence", 0.5)
         confidence = max(0.0, min(1.0, float(confidence)))
 
@@ -501,20 +501,16 @@ class VerdictGenerator:
                 seg["supporting_fact"] = ""
                 seg["source_url"] = ""
 
-        # Extract or calculate truthfulness percentage
-        truthfulness_percent = llm_result.get("truthfulness_percent")
-        if truthfulness_percent is None:
+        # Always calculate truthfulness from claim breakdown when available
+        if claim_breakdown:
             truthfulness_percent = self._calculate_truthfulness_percent(claim_breakdown)
         else:
-            truthfulness_percent = float(truthfulness_percent)
+            truthfulness_percent = float(llm_result.get("truthfulness_percent", 50.0))
             truthfulness_percent = max(0.0, min(100.0, truthfulness_percent))
 
-            # sanity fallback: avoid extreme truthfulness when breakdown is mostly UNKNOWN
-            if claim_breakdown:
-                statuses = [s.get("status", "UNKNOWN").upper() for s in claim_breakdown]
-                unknown_ratio = sum(1 for s in statuses if s == "UNKNOWN") / max(1, len(statuses))
-                if unknown_ratio >= 0.5 and (truthfulness_percent <= 10.0 or truthfulness_percent >= 90.0):
-                    truthfulness_percent = self._calculate_truthfulness_percent(claim_breakdown)
+        # Re-score confidence from evidence + breakdown when possible
+        if evidence:
+            confidence = self._calculate_confidence(evidence, claim_breakdown)
 
         return {
             "verdict": verdict_str,
@@ -558,6 +554,39 @@ class VerdictGenerator:
             total += status_weights.get(status, 50.0)
 
         return round(total / len(claim_breakdown), 1)
+
+    def _calculate_confidence(self, evidence: List[Dict[str, Any]], claim_breakdown: List[Dict[str, Any]]) -> float:
+        """
+        Heuristic confidence score derived from evidence quality and breakdown certainty.
+        This avoids static LLM confidence outputs across different claims.
+        """
+        scores = []
+        for ev in evidence[:5]:
+            s = ev.get("final_score")
+            if s is None:
+                s = ev.get("score", 0.0)
+            try:
+                scores.append(float(s or 0.0))
+            except Exception:
+                continue
+
+        avg_score = sum(scores) / max(1, len(scores))
+
+        unknown_ratio = 0.0
+        if claim_breakdown:
+            statuses = [s.get("status", "UNKNOWN").upper() for s in claim_breakdown]
+            unknown_ratio = sum(1 for s in statuses if s == "UNKNOWN") / max(1, len(statuses))
+
+        logger.debug(
+            "[VerdictGenerator] Confidence inputs: avg_score=%.3f unknown_ratio=%.2f evidence_n=%d",
+            avg_score,
+            unknown_ratio,
+            len(evidence),
+        )
+
+        # Base + evidence quality - uncertainty penalty
+        confidence = 0.2 + (0.7 * avg_score) - (0.3 * unknown_ratio)
+        return max(0.05, min(0.98, confidence))
 
     def _build_default_evidence_map(self, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Build default evidence map when LLM doesn't provide one."""
