@@ -52,12 +52,25 @@ async def retrieve_candidates(
         logger.warning(f"[RetrievalPhase:{round_id}] No topics provided; skipping VDB retrieval.")
 
     for q in queries:
-        try:
-            if topics:
+        if topics:
+            try:
                 sem_res = await vdb_retriever.search(q, top_k=top_k, topics=topics)
                 semantic_candidates.extend(sem_res or [])
+            except Exception as e:
+                logger.warning(f"[RetrievalPhase:{round_id}] VDB retrieval failed for query='{q}': {e}")
 
-            if lexical_index and topics:
+                if log_manager:
+                    await log_manager.add_log(
+                        level="WARNING",
+                        message=f"VDB retrieval failed for query: {q}",
+                        module=__name__,
+                        request_id=f"claim-{round_id}",
+                        round_id=round_id,
+                        context={"query": q, "error": str(e)},
+                    )
+
+        if lexical_index and topics:
+            try:
                 bm25_hits = lexical_index.search(q, topics=topics)
                 for hit in bm25_hits:
                     fact_id = hit.get("fact_id")
@@ -66,18 +79,18 @@ async def retrieve_candidates(
                         existing = bm25_ids.get(fact_id)
                         if existing is None or bm25 < existing:
                             bm25_ids[fact_id] = bm25
-        except Exception as e:
-            logger.warning(f"[RetrievalPhase:{round_id}] VDB retrieval failed for query='{q}': {e}")
+            except Exception as e:
+                logger.warning(f"[RetrievalPhase:{round_id}] BM25 retrieval failed for query='{q}': {e}")
 
-            if log_manager:
-                await log_manager.add_log(
-                    level="WARNING",
-                    message=f"VDB retrieval failed for query: {q}",
-                    module=__name__,
-                    request_id=f"claim-{round_id}",
-                    round_id=round_id,
-                    context={"query": q, "error": str(e)},
-                )
+                if log_manager:
+                    await log_manager.add_log(
+                        level="WARNING",
+                        message=f"BM25 retrieval failed for query: {q}",
+                        module=__name__,
+                        request_id=f"claim-{round_id}",
+                        round_id=round_id,
+                        context={"query": q, "error": str(e)},
+                    )
 
     # Re-rank BM25 shortlist with Pinecone vectors (if available)
     if bm25_ids and topics:

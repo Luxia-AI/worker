@@ -41,6 +41,7 @@ async def _enrich_and_index(index, lexical: LexicalIndex, enricher: MetadataEnri
             "fact_type": enriched.get("fact_type"),
             "count_value": enriched.get("count_value"),
         }
+        set_meta = {k: v for k, v in set_meta.items() if v is not None}
         try:
             index.update(id=vec_id, namespace=namespace, set_metadata=set_meta)
         except Exception:

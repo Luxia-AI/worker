@@ -111,22 +111,26 @@ class VDBIngest:
 
         vectors = []
         for fact, emb in zip(trusted_facts, embeddings):
+            metadata = {
+                "statement": fact["statement"],
+                "entities": fact.get("entities", []),
+                "source_url": fact.get("source_url"),
+                "language": fact.get("language", "en"),
+                "domain": fact.get("domain"),
+                "topic": fact.get("topic"),
+                "source": fact.get("source"),
+                "doc_type": fact.get("doc_type"),
+                "fact_type": fact.get("fact_type"),
+                "count_value": fact.get("count_value"),
+            }
+            # Pinecone metadata cannot include null values
+            metadata = {k: v for k, v in metadata.items() if v is not None}
+
             vectors.append(
                 {
                     "id": fact["fact_id"],
                     "values": emb,
-                    "metadata": {
-                        "statement": fact["statement"],
-                        "entities": fact.get("entities", []),
-                        "source_url": fact.get("source_url"),
-                        "language": fact.get("language", "en"),
-                        "domain": fact.get("domain"),
-                        "topic": fact.get("topic"),
-                        "source": fact.get("source"),
-                        "doc_type": fact.get("doc_type"),
-                        "fact_type": fact.get("fact_type"),
-                        "count_value": fact.get("count_value"),
-                    },
+                    "metadata": metadata,
                 }
             )
 

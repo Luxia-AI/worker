@@ -1,4 +1,5 @@
 import os
+import re
 import sqlite3
 from typing import Any, Dict, List
 
@@ -68,6 +69,12 @@ class LexicalIndex:
         if not query or not topics:
             return []
 
+        # FTS5 cannot parse raw punctuation like commas; sanitize input
+        safe_query = re.sub(r"[^\w\s]", " ", query.lower())
+        safe_query = re.sub(r"\s+", " ", safe_query).strip()
+        if not safe_query:
+            return []
+
         placeholders = ",".join("?" for _ in topics)
         sql = (
             "SELECT fact_id, bm25(facts_fts) as score "
@@ -75,7 +82,7 @@ class LexicalIndex:
             f"AND topic IN ({placeholders}) "
             "ORDER BY score LIMIT ?"
         )
-        params = [query] + topics + [limit]
+        params = [safe_query] + topics + [limit]
 
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()
