@@ -68,34 +68,39 @@ class KGRetrieval:
         cypher = """
         UNWIND $ents AS e
 
-        // 1-hop relations
-        MATCH (s:Entity)-[r:RELATION]->(o:Entity)
+        // 1-hop relations: (Entity)-[:SUBJECT_OF]->(Relation)-[:OBJECT_OF]->(Entity)
+        MATCH (s:Entity)-[:SUBJECT_OF]->(rel:Relation)-[:OBJECT_OF]->(o:Entity)
         WHERE toLower(s.name) = toLower(e)
               OR toLower(o.name) = toLower(e)
+        OPTIONAL MATCH (rel)-[:SUPPORTED_BY]->(src:Source)
 
-        WITH DISTINCT s, r, o, 1 AS hop, e AS matched, r.source_url AS src_url
+        WITH DISTINCT s, rel, o, 1 AS hop, src.url AS src_url
         RETURN s.name AS subject,
-               r.relation AS relation,
+               rel.predicate AS relation,
                o.name AS object,
-               r.confidence AS confidence,
+               rel.confidence AS confidence,
                hop,
                src_url AS source_url
 
         UNION ALL
 
-        // 2-hop relations (with path reconstruction)
+        // 2-hop relations via intermediate entity
         UNWIND $ents AS e
-        MATCH (e1:Entity)-[r1:RELATION]->(m:Entity)-[r2:RELATION]->(e2:Entity)
+        MATCH (e1:Entity)-[:SUBJECT_OF]->(rel1:Relation)-[:OBJECT_OF]->(m:Entity)
+              -[:SUBJECT_OF]->(rel2:Relation)-[:OBJECT_OF]->(e2:Entity)
         WHERE toLower(e1.name) = toLower(e)
               OR toLower(e2.name) = toLower(e)
+        OPTIONAL MATCH (rel1)-[:SUPPORTED_BY]->(src1:Source)
+        OPTIONAL MATCH (rel2)-[:SUPPORTED_BY]->(src2:Source)
 
-        WITH DISTINCT e1, r1, m, r2, e2, 2 AS hop, e AS matched
+        WITH DISTINCT e1, rel1, m, rel2, e2, 2 AS hop,
+             COALESCE(src1.url, src2.url) AS src_url
         RETURN e1.name AS subject,
-               r1.relation AS relation,
+               rel1.predicate AS relation,
                m.name AS object,
-               CASE WHEN r1.confidence > r2.confidence THEN r1.confidence ELSE r2.confidence END AS confidence,
+               CASE WHEN rel1.confidence > rel2.confidence THEN rel1.confidence ELSE rel2.confidence END AS confidence,
                hop,
-               COALESCE(r1.source_url, r2.source_url) AS source_url
+               src_url AS source_url
         LIMIT $limit
         """
 

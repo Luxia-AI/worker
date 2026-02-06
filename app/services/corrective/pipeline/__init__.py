@@ -216,49 +216,35 @@ class CorrectivePipeline:
                 ranked_evidence=top_ranked,
                 top_k=top_k,
                 used_web_search=False,
+                cache_sufficient=True,
             )
 
-            # If verdict still looks weak/unknown -> do NOT early-exit; continue to web search loop
-            breakdown = verdict_result.get("claim_breakdown", []) or []
-            unknown_ratio = sum(1 for s in breakdown if (s.get("status") or "").upper() == "UNKNOWN") / max(
-                1, len(breakdown)
+            logger.info(
+                f"[CorrectivePipeline:{round_id}] Verdict (cache-sufficient): {verdict_result['verdict']} "
+                f"(confidence: {verdict_result['confidence']:.2f})"
             )
-            if (
-                verdict_result.get("verdict") == "UNVERIFIABLE"
-                or verdict_result.get("confidence", 0.0) < 0.45
-                or unknown_ratio >= 0.34
-            ):
-                logger.info(
-                    f"[CorrectivePipeline:{round_id}] Cache evidence looked sufficient, but verdict weak "
-                    f"(verdict={verdict_result.get('verdict')}, conf={verdict_result.get('confidence')}, "
-                    f"unknown_ratio={unknown_ratio:.2f}) -> continuing to web search"
-                )
-            else:
-                logger.info(
-                    f"[CorrectivePipeline:{round_id}] Verdict: {verdict_result['verdict']} "
-                    f"(confidence: {verdict_result['confidence']:.2f})"
-                )
-                return {
-                    "round_id": round_id,
-                    "status": "completed_from_cache",
-                    "facts": [],  # No new facts extracted
-                    "triples": [],
-                    "queries": [post_text],
-                    "semantic_candidates_count": len(dedup_sem),
-                    "kg_candidates_count": len(kg_candidates),
-                    "ranked": top_ranked,
-                    "used_web_search": False,
-                    "trust_threshold": "adaptive",  # Now using adaptive policy
-                    "trust_threshold_met": True,
-                    "initial_top_score": adaptive_trust["trust_post"],
-                    "trust_post": adaptive_trust["trust_post"],
-                    "trust_grade": "adaptive",  # Adaptive grading
-                    "agreement_ratio": adaptive_trust["agreement"],
-                    "coverage": adaptive_trust["coverage"],
-                    "diversity": adaptive_trust["diversity"],
-                    "num_subclaims": adaptive_trust["num_subclaims"],
-                    "verdict": verdict_result,
-                }
+            return {
+                "round_id": round_id,
+                "status": "completed_from_cache",
+                "facts": [],  # No new facts extracted
+                "triples": [],
+                "queries": [post_text],
+                "semantic_candidates_count": len(dedup_sem),
+                "kg_candidates_count": len(kg_candidates),
+                "ranked": top_ranked,
+                "used_web_search": False,
+                "trust_threshold": "adaptive",  # Now using adaptive policy
+                "trust_threshold_met": True,
+                "initial_top_score": adaptive_trust["trust_post"],
+                "trust_post": adaptive_trust["trust_post"],
+                "trust_grade": "adaptive",  # Adaptive grading
+                "agreement_ratio": adaptive_trust["agreement"],
+                "coverage": adaptive_trust["coverage"],
+                "diversity": adaptive_trust["diversity"],
+                "num_subclaims": adaptive_trust["num_subclaims"],
+                "verdict": verdict_result,
+                "cache_sufficient": True,
+            }
 
         # ====================================================================
         # PHASE 4: Quota-Optimized Incremental Search (ONE QUERY AT A TIME)

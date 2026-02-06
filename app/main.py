@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import traceback
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
@@ -14,6 +15,7 @@ from app.routers.pinecone import router as pinecone_router
 from app.routers.scraper import router as scraper_router
 from app.routers.scraper import set_scraper
 from app.services.corrective.pipeline import CorrectivePipeline
+from app.services.kg.neo4j_client import Neo4jClient
 from app.services.logging import LogManager
 from app.services.logging.log_handler import LogManagerHandler
 from app.services.scraper import WHOScraper
@@ -26,6 +28,7 @@ _kafka_consumer: AIOKafkaConsumer | None = None
 _kafka_producer: AIOKafkaProducer | None = None
 _pipeline: CorrectivePipeline | None = None
 _scraper: WHOScraper | None = None
+_neo4j_client: Neo4jClient | None = None
 
 
 async def process_jobs():
@@ -174,7 +177,7 @@ async def process_jobs():
 
 async def startup_event() -> None:
     """Initialize logging system and Kafka consumer on app startup."""
-    global _log_manager, _kafka_consumer, _kafka_producer
+    global _log_manager, _kafka_consumer, _kafka_producer, _neo4j_client
 
     # Try to initialize LogManager (Redis + SQLite) - optional, pipeline works without it
     try:
@@ -186,6 +189,17 @@ async def startup_event() -> None:
     except Exception as e:
         logger.warning(f"[Main] LogManager failed (non-fatal, pipeline continues): {e}")
         _log_manager = None
+
+    # Warm up Neo4j connection early to avoid first-use latency mid-pipeline
+    try:
+        _neo4j_client = Neo4jClient()
+        start = time.monotonic()
+        await _neo4j_client.execute("RETURN 1 AS ok")
+        elapsed_ms = (time.monotonic() - start) * 1000.0
+        logger.info("[Main] Neo4j connection pre-warmed in %.0f ms", elapsed_ms)
+    except Exception as e:
+        logger.warning(f"[Main] Neo4j pre-warm failed (non-fatal): {e}")
+        _neo4j_client = None
 
     # Initialize Kafka - this is required for the pipeline
     try:
@@ -241,6 +255,10 @@ async def shutdown_event() -> None:
     if _kafka_producer:
         await _kafka_producer.stop()
         logger.info("[Main] Kafka producer stopped")
+
+    if _neo4j_client:
+        await _neo4j_client.close()
+        logger.info("[Main] Neo4j client closed")
 
 
 app = FastAPI(title="Luxia Worker Service", version="1.0.0")

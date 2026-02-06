@@ -51,16 +51,17 @@ RETRIEVED EVIDENCE (ranked by relevance and credibility):
 {evidence_text}
 
 INSTRUCTIONS:
-1. Extract EXACT text segments from the claim (copy-paste, no paraphrasing)
+1. Extract claim segments as short, complete clauses or sentences
 2. For each segment, search the evidence for supporting or contradicting facts
 3. Determine each segment's status based on evidence strength and credibility
 4. Calculate truthfulness_percent by comparing claim content against evidence
 
 CRITICAL RULES FOR CLAIM SEGMENTS:
-- claim_segment MUST be an EXACT substring copied directly from the original claim
-- DO NOT paraphrase, summarize, or reword any part of the claim
-- DO NOT add words that don't exist in the original claim
-- Each segment should be a complete verifiable statement from the claim
+- claim_segment MUST be copied from the original claim (verbatim), but you may
+  trim leading/trailing filler words for readability
+- DO NOT paraphrase, summarize, or add new words
+- Avoid splitting on a single conjunction unless it forms two independent clauses
+- Each segment should be a complete, verifiable statement from the claim
 
 VERDICT OPTIONS:
 - TRUE: Evidence strongly supports ALL segments (>=90% truthfulness)
@@ -95,7 +96,7 @@ Return ONLY valid JSON (no markdown, no extra text):
     "rationale": "Brief explanation of why this verdict was reached",
     "claim_breakdown": [
         {{
-            "claim_segment": "EXACT text copied from the claim - no changes allowed",
+            "claim_segment": "Verbatim text copied from the claim (trim OK)",
             "status": "VALID|INVALID|PARTIALLY_VALID|PARTIALLY_INVALID|UNKNOWN",
             "supporting_fact": "The evidence fact that supports or contradicts this segment",
             "source_url": "https://source.url.of.the.fact"
@@ -257,6 +258,7 @@ class VerdictGenerator:
         ranked_evidence: List[Dict[str, Any]],
         top_k: int = 5,
         used_web_search: bool = False,
+        cache_sufficient: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate a verdict for the claim based on ranked evidence.
@@ -283,6 +285,9 @@ class VerdictGenerator:
                     "[VerdictGenerator] No VDB/KG evidence and web search already used; skipping extra web boost"
                 )
                 return self._unverifiable_result(claim, "No evidence retrieved (VDB/KG empty after web search)")
+            if cache_sufficient:
+                logger.info("[VerdictGenerator] Cache sufficient; skipping web boost despite empty evidence")
+                return self._unverifiable_result(claim, "Cache marked sufficient but no evidence available")
             logger.warning("[VerdictGenerator] No VDB/KG evidence -> trying web boost")
             segments = self._split_claim_into_segments(claim)[:3]
             web_boost = await self._fetch_web_evidence_for_unknown_segments(segments)
@@ -292,7 +297,7 @@ class VerdictGenerator:
 
         # Step 1) Start with VDB/KG evidence + (optional) segment retrieval
         segment_evidence: List[Dict[str, Any]] = []
-        if not used_web_search and (
+        if (not used_web_search and not cache_sufficient) and (
             self._needs_web_boost(ranked_evidence[: min(len(ranked_evidence), 6)], claim=claim)
             or self._policy_says_insufficient(claim, ranked_evidence[: min(len(ranked_evidence), 10)])
         ):
@@ -310,7 +315,7 @@ class VerdictGenerator:
 
         # Step 2) PRE-VERDICT web-boost loop driven by *sufficiency*
         pre_evidence = enriched_evidence[: min(len(enriched_evidence), max(top_k, 8), 12)]
-        if not used_web_search:
+        if not used_web_search and not cache_sufficient:
             for round_i in range(self.MAX_WEB_ROUNDS_PRE_VERDICT):
                 insufficient = self._policy_says_insufficient(claim, pre_evidence)
                 weak = self._needs_web_boost(pre_evidence[: min(len(pre_evidence), 6)], claim=claim)
@@ -352,7 +357,7 @@ class VerdictGenerator:
             )
 
             # If UNKNOWN segments remain, iterate a couple times (bounded) to avoid UNKNOWN
-            if not used_web_search:
+            if not used_web_search and not cache_sufficient:
                 for _ in range(self.MAX_UNKNOWN_ROUNDS_POST_VERDICT):
                     unknown_segments = self._get_unknown_segments(verdict_result)
                     if not unknown_segments:
@@ -625,7 +630,7 @@ class VerdictGenerator:
         """
         Split claim into logical segments for independent retrieval.
 
-        Uses sentence boundaries and common connectors to split.
+        Uses sentence boundaries and minimal connectors to split.
         Each segment should be a complete, verifiable statement.
         """
         # Split on sentence boundaries and common connectors
@@ -635,8 +640,6 @@ class VerdictGenerator:
             r"\. However,",  # Common transition
             r", however,",
             r"\. Additionally,",
-            r", and ",  # Compound statements
-            r", but ",
         ]
 
         # Join delimiters into regex pattern
@@ -645,13 +648,26 @@ class VerdictGenerator:
         # Split and clean
         raw_segments = re.split(pattern, claim, flags=re.IGNORECASE)
 
-        # Clean up segments
+        # Clean up segments and merge too-short fragments
         segments = []
+        current = ""
         for seg in raw_segments:
             seg = seg.strip()
             # Skip very short segments (likely incomplete)
-            if len(seg) > 20:
-                segments.append(seg)
+            if len(seg) <= 20:
+                continue
+            if not current:
+                current = seg
+                continue
+            # Merge tiny fragments into the current segment
+            if len(seg) < 40:
+                current = f"{current} {seg}".strip()
+                continue
+            segments.append(current)
+            current = seg
+
+        if current:
+            segments.append(current)
 
         # If splitting produced no good segments, use full claim
         if not segments:

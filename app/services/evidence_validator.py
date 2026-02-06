@@ -51,14 +51,15 @@ class EvidenceValidator:
             logger.warning(f"[EvidenceValidator] Could not extract domain from {source_url}")
             return ValidationState.UNTRUSTED
 
-        # Check hardcoded trusted domains (exact match)
-        if domain in TRUSTED_DOMAINS:
+        # Check hardcoded trusted domains (exact match or trusted parent domain)
+        trusted_set = {d.lower() for d in TRUSTED_DOMAINS}
+        domain_lower = domain.lower()
+        if domain_lower in trusted_set or any(domain_lower.endswith(f".{d}") for d in trusted_set):
             return ValidationState.TRUSTED
 
         # Check .gov/.edu suffix matching (e.g., medlineplus.gov, pmc.ncbi.nlm.nih.gov)
         if any(domain.endswith(suffix) for suffix in TRUSTED_DOMAINS_EDU_GOV):
             logger.debug(f"[EvidenceValidator] Domain {domain} trusted via .gov/.edu suffix")
-            return ValidationState.TRUSTED
             return ValidationState.TRUSTED
 
         # Check dynamic admin approvals
