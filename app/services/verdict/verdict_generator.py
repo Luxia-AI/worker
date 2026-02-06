@@ -528,14 +528,19 @@ class VerdictGenerator:
     def _calculate_truthfulness_from_evidence(self, claim: str, evidence: List[Dict[str, Any]]) -> float:
         """
         Evidence-driven truthfulness score based on:
+        - segment-level best evidence support
         - semantic relevance (final_score / sem_score)
-        - lexical overlap between claim and evidence statement
+        - lexical overlap between segment and evidence statement
         - source credibility
         - contradiction penalty using simple negation detection
         - diversity adjustment to avoid single-source inflation
         """
         if not evidence:
             return 0.0
+
+        segments = self._split_claim_into_segments(claim)
+        if not segments:
+            segments = [claim]
 
         stop = {
             "the",
@@ -564,62 +569,11 @@ class VerdictGenerator:
             "should",
             "can",
         }
-        claim_words = [w for w in re.findall(r"\b\w+\b", claim.lower()) if w not in stop]
-        claim_set = set(claim_words)
-
         neg_terms = {"no", "not", "never", "none", "without", "lack", "lacks", "lacking"}
 
-        scored = []
+        # Diversity adjustment based on unique domains in top evidence
         domains = set()
-        for idx, ev in enumerate(evidence[:8]):
-            stmt = (ev.get("statement") or ev.get("text") or "").strip()
-            if not stmt:
-                continue
-
-            s = ev.get("final_score")
-            if s is None:
-                s = ev.get("sem_score", ev.get("score", 0.0))
-            try:
-                rel = float(s or 0.0)
-            except Exception:
-                rel = 0.0
-            rel = max(0.0, min(1.0, rel))
-
-            credibility = ev.get("credibility")
-            try:
-                cred = float(credibility if credibility is not None else 0.5)
-            except Exception:
-                cred = 0.5
-            cred = max(0.0, min(1.0, cred))
-
-            stmt_words = [w for w in re.findall(r"\b\w+\b", stmt.lower()) if w not in stop]
-            stmt_set = set(stmt_words)
-            overlap = len(claim_set & stmt_set)
-            overlap_ratio = overlap / max(1, len(claim_set))
-
-            stmt_has_neg = any(t in stmt_set for t in neg_terms)
-            claim_has_neg = any(t in claim_set for t in neg_terms)
-            contradiction = 1.0 if (stmt_has_neg and not claim_has_neg and overlap_ratio >= 0.25) else 0.0
-
-            support = (0.45 * rel) + (0.35 * overlap_ratio) + (0.20 * cred)
-            net = support - (0.60 * contradiction)
-            net = max(0.0, min(1.0, net))
-
-            scored.append(net)
-
-            # Detailed numeric logging for transparency/debug
-            logger.info(
-                "[VerdictGenerator] Truthfulness inputs ev=%d rel=%.3f overlap=%.3f cred=%.3f "
-                "contra=%.1f net=%.3f src=%s",
-                idx,
-                rel,
-                overlap_ratio,
-                cred,
-                contradiction,
-                net,
-                (ev.get("source_url") or ev.get("source") or ""),
-            )
-
+        for ev in evidence[:8]:
             src = ev.get("source_url") or ev.get("source") or ""
             if src:
                 try:
@@ -629,14 +583,69 @@ class VerdictGenerator:
                     domains.add(domain)
                 except Exception:
                     pass
-
-        if not scored:
-            return 0.0
-
-        avg_support = sum(scored) / len(scored)
-        diversity = len(domains) / max(1, len(scored))
+        diversity = len(domains) / max(1, len(evidence[:8]))
         diversity = max(0.5, min(1.0, diversity))
 
+        def _segment_score(segment: str) -> float:
+            seg_words = [w for w in re.findall(r"\b\w+\b", (segment or "").lower()) if w not in stop]
+            seg_set = set(seg_words)
+            if not seg_set:
+                return 0.0
+            seg_has_neg = any(t in seg_set for t in neg_terms)
+
+            best = 0.0
+            best_src = ""
+            for ev in evidence[:8]:
+                stmt = (ev.get("statement") or ev.get("text") or "").strip()
+                if not stmt:
+                    continue
+
+                s = ev.get("final_score")
+                if s is None:
+                    s = ev.get("sem_score", ev.get("score", 0.0))
+                try:
+                    rel = float(s or 0.0)
+                except Exception:
+                    rel = 0.0
+                rel = max(0.0, min(1.0, rel))
+
+                credibility = ev.get("credibility")
+                try:
+                    cred = float(credibility if credibility is not None else 0.5)
+                except Exception:
+                    cred = 0.5
+                cred = max(0.0, min(1.0, cred))
+
+                stmt_words = [w for w in re.findall(r"\b\w+\b", stmt.lower()) if w not in stop]
+                stmt_set = set(stmt_words)
+                overlap = len(seg_set & stmt_set)
+                overlap_ratio = overlap / max(1, len(seg_set))
+
+                stmt_has_neg = any(t in stmt_set for t in neg_terms)
+                contradiction = 1.0 if (stmt_has_neg and not seg_has_neg and overlap_ratio >= 0.25) else 0.0
+
+                support = (0.45 * rel) + (0.35 * overlap_ratio) + (0.20 * cred)
+                net = support - (0.60 * contradiction)
+                net = max(0.0, min(1.0, net))
+
+                if net > best:
+                    best = net
+                    best_src = ev.get("source_url") or ev.get("source") or ""
+
+            if best_src:
+                logger.info(
+                    "[VerdictGenerator] Segment truthfulness best=%.3f src=%s segment=%s",
+                    best,
+                    best_src,
+                    segment[:60],
+                )
+            return best
+
+        segment_scores = [_segment_score(seg) for seg in segments]
+        if not segment_scores:
+            return 0.0
+
+        avg_support = sum(segment_scores) / len(segment_scores)
         truthfulness = avg_support * diversity
         return round(truthfulness * 100.0, 1)
 

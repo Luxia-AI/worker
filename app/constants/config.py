@@ -43,8 +43,8 @@ PIPELINE_CONF_THRESHOLD = 0.70
 PIPELINE_MIN_NEW_URLS = 2
 
 # Maximum search queries to execute before stopping (even if threshold not met)
-# New setting to prevent runaway searches
-PIPELINE_MAX_SEARCH_QUERIES = 4
+# Increased to improve subclaim coverage (keep queries direct to claim points)
+PIPELINE_MAX_SEARCH_QUERIES = 6
 
 # Maximum URLs to scrape per search query (limits extraction cost)
 PIPELINE_MAX_URLS_PER_QUERY = 5
@@ -112,6 +112,31 @@ TRUSTED_DOMAINS_AUTHORITY = {
     "www.cochranelibrary.com",
     "www.health.harvard.edu",
     "health.harvard.edu",
+    # Statistics and publishers/journals
+    "statcan.gc.ca",
+    "www.statcan.gc.ca",
+    "worldbank.org",
+    "data.worldbank.org",
+    "www.worldbank.org",
+    "un.org",
+    "www.un.org",
+    "nejm.org",
+    "www.nejm.org",
+    "jamanetwork.com",
+    "www.jamanetwork.com",
+    "thelancet.com",
+    "www.thelancet.com",
+    "bmj.com",
+    "www.bmj.com",
+    "nature.com",
+    "www.nature.com",
+    "sciencedirect.com",
+    "www.sciencedirect.com",
+    "springer.com",
+    "link.springer.com",
+    "www.springer.com",
+    "ieee.org",
+    "www.ieee.org",
 }
 
 # Government and educational domains
@@ -178,6 +203,31 @@ TRUSTED_DOMAINS = {
     "cochranelibrary.com",
     "www.health.harvard.edu",
     "health.harvard.edu",
+    # Statistics and publishers/journals
+    "statcan.gc.ca",
+    "www.statcan.gc.ca",
+    "worldbank.org",
+    "data.worldbank.org",
+    "www.worldbank.org",
+    "un.org",
+    "www.un.org",
+    "nejm.org",
+    "www.nejm.org",
+    "jamanetwork.com",
+    "www.jamanetwork.com",
+    "thelancet.com",
+    "www.thelancet.com",
+    "bmj.com",
+    "www.bmj.com",
+    "nature.com",
+    "www.nature.com",
+    "sciencedirect.com",
+    "www.sciencedirect.com",
+    "springer.com",
+    "link.springer.com",
+    "www.springer.com",
+    "ieee.org",
+    "www.ieee.org",
 }
 
 # ============================================================================

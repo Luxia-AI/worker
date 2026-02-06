@@ -60,16 +60,18 @@ Your job: generate EXACTLY 3–4 web search queries that help verify THIS specif
 ABSOLUTE RULES (must follow):
 1) Claim-anchored: Every query MUST include at least 1–2 key terms copied verbatim from the claim \
    (entity names, condition, drug, mechanism, population, outcome, numbers).
-2) No topic drift: Do NOT introduce new entities/topics not present in the claim \
+2) Subclaim coverage: Queries should collectively cover EACH subclaim if subclaims are provided.
+3) Numbers are mandatory when present: If a subclaim contains a number, include it verbatim in at least one query.
+4) No topic drift: Do NOT introduce new entities/topics not present in the claim \
    (e.g., vitamins, nutrients, collagen, selenium) unless explicitly mentioned in the claim.
-3) Query length: 3–7 words each, short and specific.
-4) Evidence-oriented: Prefer terms that retrieve authoritative sources \
+5) Query length: 3–7 words each, short and specific.
+6) Evidence-oriented: Prefer terms that retrieve authoritative sources \
    (guideline, systematic review, RCT, cohort, meta-analysis, CDC/WHO/NIH).
-5) Coverage: Queries should collectively cover:
+7) Coverage: Queries should collectively cover:
    - definition/claim core (what is asserted)
    - mechanism or causality (if asserted)
    - effect/outcome magnitude or safety (if asserted)
-6) Output MUST be ONLY valid JSON.
+8) Output MUST be ONLY valid JSON.
 
 FORMAT EXAMPLES (structure only — DO NOT reuse these words):
 Example claim: "<CLAIM_TEXT>"
@@ -82,9 +84,7 @@ Bad query shapes:
 - "<unrelated nutrient> mechanism" (introduces new topic)
 
 Return ONLY valid JSON:
-{"queries": ["...", "...", "..."]}
-
-Claim: {post}"""
+{"queries": ["...", "...", "..."]}"""
 
 REINFORCEMENT_QUERY_PROMPT = """You are a search-query optimization model for claim verification.
 Generate 8–12 highly effective web search queries for authoritative evidence.

@@ -262,7 +262,15 @@ class CorrectivePipeline:
         )
 
         # Generate all search queries upfront (1 LLM call only)
-        queries = await self.search_agent.generate_search_queries(post_text, failed_entities)
+        raw_subclaims = self.trust_ranker.adaptive_policy.decompose_claim(post_text)
+        merged_subclaims = self.search_agent.merge_subclaims(raw_subclaims)
+        queries = await self.search_agent.generate_search_queries(
+            post_text,
+            failed_entities,
+            max_queries=self.MAX_SEARCH_QUERIES,
+            subclaims=merged_subclaims,
+            entities=claim_entities,
+        )
 
         if not queries:
             logger.warning(f"[CorrectivePipeline:{round_id}] No search queries generated")
