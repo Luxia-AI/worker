@@ -506,12 +506,8 @@ class VerdictGenerator:
                 seg["supporting_fact"] = ""
                 seg["source_url"] = ""
 
-        # Always calculate truthfulness from claim breakdown when available
-        if claim_breakdown:
-            truthfulness_percent = self._calculate_truthfulness_percent(claim_breakdown)
-        else:
-            truthfulness_percent = float(llm_result.get("truthfulness_percent", 50.0))
-            truthfulness_percent = max(0.0, min(100.0, truthfulness_percent))
+        # Calculate truthfulness from evidence (deterministic, claim-aware)
+        truthfulness_percent = self._calculate_truthfulness_from_evidence(claim, evidence)
 
         # Re-score confidence from evidence + breakdown when possible
         if evidence:
@@ -529,36 +525,120 @@ class VerdictGenerator:
             "evidence_count": len(evidence),
         }
 
-    def _calculate_truthfulness_percent(self, claim_breakdown: List[Dict[str, Any]]) -> float:
+    def _calculate_truthfulness_from_evidence(self, claim: str, evidence: List[Dict[str, Any]]) -> float:
         """
-        Fallback calculation of truthfulness percentage from claim breakdown.
-        Only used if LLM doesn't provide truthfulness_percent.
-
-        Status weights:
-        - VALID: 100%
-        - PARTIALLY_VALID: 75%
-        - UNKNOWN: 50%
-        - PARTIALLY_INVALID: 25%
-        - INVALID: 0%
+        Evidence-driven truthfulness score based on:
+        - semantic relevance (final_score / sem_score)
+        - lexical overlap between claim and evidence statement
+        - source credibility
+        - contradiction penalty using simple negation detection
+        - diversity adjustment to avoid single-source inflation
         """
-        if not claim_breakdown:
-            return 50.0  # Default to 50% when no breakdown available
+        if not evidence:
+            return 0.0
 
-        status_weights = {
-            "VALID": 100.0,
-            "PARTIALLY_VALID": 75.0,
-            # Important: UNKNOWN should not inflate truthfulness
-            "UNKNOWN": 25.0,
-            "PARTIALLY_INVALID": 25.0,
-            "INVALID": 0.0,
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "could",
+            "would",
+            "should",
+            "can",
         }
+        claim_words = [w for w in re.findall(r"\b\w+\b", claim.lower()) if w not in stop]
+        claim_set = set(claim_words)
 
-        total = 0.0
-        for segment in claim_breakdown:
-            status = segment.get("status", "UNKNOWN").upper()
-            total += status_weights.get(status, 50.0)
+        neg_terms = {"no", "not", "never", "none", "without", "lack", "lacks", "lacking"}
 
-        return round(total / len(claim_breakdown), 1)
+        scored = []
+        domains = set()
+        for idx, ev in enumerate(evidence[:8]):
+            stmt = (ev.get("statement") or ev.get("text") or "").strip()
+            if not stmt:
+                continue
+
+            s = ev.get("final_score")
+            if s is None:
+                s = ev.get("sem_score", ev.get("score", 0.0))
+            try:
+                rel = float(s or 0.0)
+            except Exception:
+                rel = 0.0
+            rel = max(0.0, min(1.0, rel))
+
+            credibility = ev.get("credibility")
+            try:
+                cred = float(credibility if credibility is not None else 0.5)
+            except Exception:
+                cred = 0.5
+            cred = max(0.0, min(1.0, cred))
+
+            stmt_words = [w for w in re.findall(r"\b\w+\b", stmt.lower()) if w not in stop]
+            stmt_set = set(stmt_words)
+            overlap = len(claim_set & stmt_set)
+            overlap_ratio = overlap / max(1, len(claim_set))
+
+            stmt_has_neg = any(t in stmt_set for t in neg_terms)
+            claim_has_neg = any(t in claim_set for t in neg_terms)
+            contradiction = 1.0 if (stmt_has_neg and not claim_has_neg and overlap_ratio >= 0.25) else 0.0
+
+            support = (0.45 * rel) + (0.35 * overlap_ratio) + (0.20 * cred)
+            net = support - (0.60 * contradiction)
+            net = max(0.0, min(1.0, net))
+
+            scored.append(net)
+
+            # Detailed numeric logging for transparency/debug
+            logger.info(
+                "[VerdictGenerator] Truthfulness inputs ev=%d rel=%.3f overlap=%.3f cred=%.3f "
+                "contra=%.1f net=%.3f src=%s",
+                idx,
+                rel,
+                overlap_ratio,
+                cred,
+                contradiction,
+                net,
+                (ev.get("source_url") or ev.get("source") or ""),
+            )
+
+            src = ev.get("source_url") or ev.get("source") or ""
+            if src:
+                try:
+                    domain = src.split("/")[2].lower()
+                    if domain.startswith("www."):
+                        domain = domain[4:]
+                    domains.add(domain)
+                except Exception:
+                    pass
+
+        if not scored:
+            return 0.0
+
+        avg_support = sum(scored) / len(scored)
+        diversity = len(domains) / max(1, len(scored))
+        diversity = max(0.5, min(1.0, diversity))
+
+        truthfulness = avg_support * diversity
+        return round(truthfulness * 100.0, 1)
 
     def _calculate_confidence(self, evidence: List[Dict[str, Any]], claim_breakdown: List[Dict[str, Any]]) -> float:
         """

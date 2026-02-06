@@ -571,16 +571,107 @@ class CorrectivePipeline:
         }
 
     async def _extract_claim_entities(self, claim: str, round_id: str) -> List[str]:
-        """Extract entities from the claim text using LLM (1 call)."""
+        """Extract entities from the claim text using LLM (1 call) with a deterministic fallback."""
         try:
             # Use entity extractor on a synthetic fact
             synthetic_facts = [{"statement": claim, "source_url": "claim", "fact_id": "claim_0"}]
             annotated = await self.entity_extractor.annotate_entities(synthetic_facts)
             if annotated:
-                return annotated[0].get("entities", [])
+                entities = annotated[0].get("entities", []) or []
+                # Filter generic/placeholder labels
+                generic = {
+                    "anatomical terms",
+                    "medical terms",
+                    "health terms",
+                    "general",
+                    "unknown",
+                    "misc",
+                }
+                cleaned = [e for e in entities if isinstance(e, str) and e.strip()]
+                cleaned = [e for e in cleaned if e.strip().lower() not in generic]
+                if cleaned:
+                    return cleaned
         except Exception as e:
             logger.warning(f"[CorrectivePipeline:{round_id}] Entity extraction from claim failed: {e}")
-        return []
+
+        # Deterministic fallback: keyword + bigram extraction from claim text
+        import re
+
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "over",
+            "under",
+            "about",
+            "around",
+            "average",
+            "per",
+            "times",
+        }
+        tokens = [t.lower() for t in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", claim)]
+        tokens = [t for t in tokens if t not in stop]
+
+        # Unigram counts
+        freq = {}
+        for t in tokens:
+            freq[t] = freq.get(t, 0) + 1
+
+        # Bigram candidates (e.g., "heart rate", "life span")
+        bigrams = []
+        for i in range(len(tokens) - 1):
+            w1, w2 = tokens[i], tokens[i + 1]
+            if w1 in stop or w2 in stop:
+                continue
+            bigrams.append(f"{w1} {w2}")
+
+        # Rank: frequency desc, length desc, alpha
+        ranked_unigrams = sorted(freq.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
+        unigram_entities = [w for w, _ in ranked_unigrams[:5]]
+
+        # Keep distinct bigrams that don't duplicate unigrams
+        bigram_entities = []
+        for bg in bigrams:
+            if bg.split()[0] in unigram_entities and bg.split()[1] in unigram_entities:
+                bigram_entities.append(bg)
+            if len(bigram_entities) >= 3:
+                break
+
+        fallback = []
+        for item in bigram_entities + unigram_entities:
+            if item not in fallback:
+                fallback.append(item)
+
+        if fallback:
+            logger.info(f"[CorrectivePipeline:{round_id}] Fallback entities from claim: {fallback}")
+            if self.log_manager:
+                await self.log_manager.add_log(
+                    level="INFO",
+                    message=f"Fallback entities from claim: {fallback}",
+                    module=__name__,
+                    request_id=f"claim-{round_id}",
+                    round_id=round_id,
+                    context={"fallback_entities": fallback},
+                )
+        return fallback
 
 
 __all__ = ["CorrectivePipeline"]
