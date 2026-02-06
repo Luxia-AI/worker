@@ -256,6 +256,7 @@ class VerdictGenerator:
         claim: str,
         ranked_evidence: List[Dict[str, Any]],
         top_k: int = 5,
+        used_web_search: bool = False,
     ) -> Dict[str, Any]:
         """
         Generate a verdict for the claim based on ranked evidence.
@@ -277,6 +278,11 @@ class VerdictGenerator:
                 - key_findings: List of key findings
         """
         if not ranked_evidence:
+            if used_web_search:
+                logger.warning(
+                    "[VerdictGenerator] No VDB/KG evidence and web search already used; skipping extra web boost"
+                )
+                return self._unverifiable_result(claim, "No evidence retrieved (VDB/KG empty after web search)")
             logger.warning("[VerdictGenerator] No VDB/KG evidence -> trying web boost")
             segments = self._split_claim_into_segments(claim)[:3]
             web_boost = await self._fetch_web_evidence_for_unknown_segments(segments)
@@ -286,9 +292,10 @@ class VerdictGenerator:
 
         # Step 1) Start with VDB/KG evidence + (optional) segment retrieval
         segment_evidence: List[Dict[str, Any]] = []
-        if self._needs_web_boost(
-            ranked_evidence[: min(len(ranked_evidence), 6)], claim=claim
-        ) or self._policy_says_insufficient(claim, ranked_evidence[: min(len(ranked_evidence), 10)]):
+        if not used_web_search and (
+            self._needs_web_boost(ranked_evidence[: min(len(ranked_evidence), 6)], claim=claim)
+            or self._policy_says_insufficient(claim, ranked_evidence[: min(len(ranked_evidence), 10)])
+        ):
             segment_evidence = await self._retrieve_segment_evidence(claim, top_k=2)
 
         enriched_evidence = self._merge_evidence(ranked_evidence, segment_evidence)
@@ -303,23 +310,24 @@ class VerdictGenerator:
 
         # Step 2) PRE-VERDICT web-boost loop driven by *sufficiency*
         pre_evidence = enriched_evidence[: min(len(enriched_evidence), max(top_k, 8), 12)]
-        for round_i in range(self.MAX_WEB_ROUNDS_PRE_VERDICT):
-            insufficient = self._policy_says_insufficient(claim, pre_evidence)
-            weak = self._needs_web_boost(pre_evidence[: min(len(pre_evidence), 6)], claim=claim)
-            if not insufficient and not weak:
-                logger.info(f"[VerdictGenerator] Pre-verdict evidence sufficient (round={round_i}). Skipping web.")
-                break
-            logger.info(
-                f"[VerdictGenerator] Pre-verdict evidence insufficient/weak (round={round_i}). "
-                f"insufficient={insufficient} weak={weak} -> web search"
-            )
-            segments = self._split_claim_into_segments(claim)[: self.WEB_SEGMENTS_LIMIT]
-            web_boost = await self._fetch_web_evidence_for_unknown_segments(segments)
-            if not web_boost:
-                logger.warning("[VerdictGenerator] Web boost returned no facts.")
-                break
-            logger.info(f"[VerdictGenerator] Web boost facts: {len(web_boost)}")
-            pre_evidence = (pre_evidence + web_boost)[: min(len(pre_evidence + web_boost), 18)]
+        if not used_web_search:
+            for round_i in range(self.MAX_WEB_ROUNDS_PRE_VERDICT):
+                insufficient = self._policy_says_insufficient(claim, pre_evidence)
+                weak = self._needs_web_boost(pre_evidence[: min(len(pre_evidence), 6)], claim=claim)
+                if not insufficient and not weak:
+                    logger.info(f"[VerdictGenerator] Pre-verdict evidence sufficient (round={round_i}). Skipping web.")
+                    break
+                logger.info(
+                    f"[VerdictGenerator] Pre-verdict evidence insufficient/weak (round={round_i}). "
+                    f"insufficient={insufficient} weak={weak} -> web search"
+                )
+                segments = self._split_claim_into_segments(claim)[: self.WEB_SEGMENTS_LIMIT]
+                web_boost = await self._fetch_web_evidence_for_unknown_segments(segments)
+                if not web_boost:
+                    logger.warning("[VerdictGenerator] Web boost returned no facts.")
+                    break
+                logger.info(f"[VerdictGenerator] Web boost facts: {len(web_boost)}")
+                pre_evidence = (pre_evidence + web_boost)[: min(len(pre_evidence + web_boost), 18)]
         top_evidence = pre_evidence[: min(len(pre_evidence), top_k, 12)]
 
         # Format evidence for prompt
@@ -344,39 +352,41 @@ class VerdictGenerator:
             )
 
             # If UNKNOWN segments remain, iterate a couple times (bounded) to avoid UNKNOWN
-            for _ in range(self.MAX_UNKNOWN_ROUNDS_POST_VERDICT):
-                unknown_segments = self._get_unknown_segments(verdict_result)
-                if not unknown_segments:
-                    break
-                logger.info(
-                    f"[VerdictGenerator] Found {len(unknown_segments)} UNKNOWN segments, fetching web evidence..."
-                )
-                web_evidence = await self._fetch_web_evidence_for_unknown_segments(unknown_segments)
-                if web_evidence:
-                    logger.info(f"[VerdictGenerator] Retrieved {len(web_evidence)} additional facts from web")
-                    # Merge web evidence with existing evidence
-                    enriched_evidence = top_evidence + web_evidence
-                    # Re-run verdict generation with additional evidence
-                    enriched_evidence_text = self._format_evidence_for_prompt(enriched_evidence)
-                    enriched_prompt = VERDICT_GENERATION_PROMPT.format(
-                        claim=claim, evidence_text=enriched_evidence_text
-                    )
-
-                    try:
-                        enriched_result = await self.llm_service.ainvoke(
-                            enriched_prompt,
-                            response_format="json",
-                            priority=LLMPriority.HIGH,
-                            temperature=LLM_TEMPERATURE_VERDICT,
-                        )
-                        verdict_result = self._parse_verdict_result(enriched_result, claim, enriched_evidence)
-                        logger.info(
-                            f"[VerdictGenerator] Re-generated verdict with web evidence: {verdict_result['verdict']} "
-                            f"(confidence: {verdict_result['confidence']:.2f})"
-                        )
-                    except Exception as e:
-                        logger.warning(f"[VerdictGenerator] Failed to re-generate verdict with web evidence: {e}")
+            if not used_web_search:
+                for _ in range(self.MAX_UNKNOWN_ROUNDS_POST_VERDICT):
+                    unknown_segments = self._get_unknown_segments(verdict_result)
+                    if not unknown_segments:
                         break
+                    logger.info(
+                        f"[VerdictGenerator] Found {len(unknown_segments)} UNKNOWN segments, fetching web evidence..."
+                    )
+                    web_evidence = await self._fetch_web_evidence_for_unknown_segments(unknown_segments)
+                    if web_evidence:
+                        logger.info(f"[VerdictGenerator] Retrieved {len(web_evidence)} additional facts from web")
+                        # Merge web evidence with existing evidence
+                        enriched_evidence = top_evidence + web_evidence
+                        # Re-run verdict generation with additional evidence
+                        enriched_evidence_text = self._format_evidence_for_prompt(enriched_evidence)
+                        enriched_prompt = VERDICT_GENERATION_PROMPT.format(
+                            claim=claim, evidence_text=enriched_evidence_text
+                        )
+
+                        try:
+                            enriched_result = await self.llm_service.ainvoke(
+                                enriched_prompt,
+                                response_format="json",
+                                priority=LLMPriority.HIGH,
+                                temperature=LLM_TEMPERATURE_VERDICT,
+                            )
+                            verdict_result = self._parse_verdict_result(enriched_result, claim, enriched_evidence)
+                            logger.info(
+                                f"[VerdictGenerator] Re-generated verdict with web evidence: "
+                                f"{verdict_result['verdict']} "
+                                f"(confidence: {verdict_result['confidence']:.2f})"
+                            )
+                        except Exception as e:
+                            logger.warning(f"[VerdictGenerator] Failed to re-generate verdict with web evidence: {e}")
+                            break
 
             return verdict_result
 

@@ -406,12 +406,19 @@ class AdaptiveTrustPolicy:
             f"coverage={coverage:.2f}, sufficient={is_sufficient}"
         )
 
-        # Hard relevance floor: don’t skip web if evidence is weak overall
+        # Hard relevance floor: don't skip web if evidence is weak overall
         sem_scores = [getattr(e, "semantic_score", 0.0) for e in top_evidence] if top_evidence else [0.0]
         trust_scores = [getattr(e, "trust", 0.0) for e in top_evidence] if top_evidence else [0.0]
         top_sem = max(sem_scores) if sem_scores else 0.0
         top_trust = max(trust_scores) if trust_scores else 0.0
-        if is_sufficient and (trust_post < 0.55 or top_sem < 0.60 or top_trust < 0.55):
+        # Performance optimization: avoid overriding when coverage+agreement are strong.
+        strong_coverage = coverage >= 0.95
+        strong_agreement = agreement >= 0.9
+        if (
+            is_sufficient
+            and not (strong_coverage and strong_agreement)
+            and (trust_post < 0.55 or top_sem < 0.60 or top_trust < 0.55)
+        ):
             logger.info(
                 "[AdaptiveTrustPolicy] Overriding sufficient=False due to weak relevance "
                 f"(trust_post={trust_post:.3f}, top_sem={top_sem:.3f}, top_trust={top_trust:.3f})"

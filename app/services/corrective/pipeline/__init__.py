@@ -31,6 +31,7 @@ from app.constants.config import (
     PIPELINE_CONF_THRESHOLD,
     PIPELINE_MAX_ROUNDS,
     PIPELINE_MAX_SEARCH_QUERIES,
+    PIPELINE_MAX_URLS_PER_QUERY,
     PIPELINE_MIN_NEW_URLS,
 )
 from app.core.logger import get_logger
@@ -75,6 +76,7 @@ class CorrectivePipeline:
     CONF_THRESHOLD = PIPELINE_CONF_THRESHOLD
     MIN_NEW_URLS = PIPELINE_MIN_NEW_URLS
     MAX_SEARCH_QUERIES = PIPELINE_MAX_SEARCH_QUERIES
+    MAX_URLS_PER_QUERY = PIPELINE_MAX_URLS_PER_QUERY
 
     def __init__(self) -> None:
         # Search and scraping
@@ -213,6 +215,7 @@ class CorrectivePipeline:
                 claim=post_text,
                 ranked_evidence=top_ranked,
                 top_k=top_k,
+                used_web_search=False,
             )
 
             # If verdict still looks weak/unknown -> do NOT early-exit; continue to web search loop
@@ -276,6 +279,7 @@ class CorrectivePipeline:
                 claim=post_text,
                 ranked_evidence=top_ranked,
                 top_k=top_k,
+                used_web_search=False,
             )
 
             return {
@@ -357,6 +361,12 @@ class CorrectivePipeline:
                 continue
 
             # Step 2: Scrape only NEW URLs from this query
+            if len(new_urls) > self.MAX_URLS_PER_QUERY:
+                logger.info(
+                    f"[CorrectivePipeline:{round_id}] Capping URLs to {self.MAX_URLS_PER_QUERY} "
+                    f"from {len(new_urls)} candidates for this query"
+                )
+                new_urls = new_urls[: self.MAX_URLS_PER_QUERY]
             scraped_pages = await scrape_pages(self.scraper, new_urls, round_id, self.log_manager)
             processed_urls.extend(new_urls)
             # Add to already_processed set to avoid re-scraping in subsequent queries
@@ -528,6 +538,7 @@ class CorrectivePipeline:
             claim=post_text,
             ranked_evidence=top_ranked,
             top_k=top_k,
+            used_web_search=search_api_calls > 0,
         )
 
         logger.info(

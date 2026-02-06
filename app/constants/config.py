@@ -46,6 +46,9 @@ PIPELINE_MIN_NEW_URLS = 2
 # New setting to prevent runaway searches
 PIPELINE_MAX_SEARCH_QUERIES = 4
 
+# Maximum URLs to scrape per search query (limits extraction cost)
+PIPELINE_MAX_URLS_PER_QUERY = 5
+
 # ============================================================================
 # LLM MODEL SETTINGS
 # ============================================================================
@@ -84,21 +87,31 @@ EMBEDDING_MODEL_NAME_TEST = "sentence-transformers/all-MiniLM-L6-v2"
 # High-authority medical and government domains
 TRUSTED_DOMAINS_AUTHORITY = {
     "www.who.int",
+    "who.int",
     "www.nih.gov",
+    "nih.gov",
     "www.nlm.nih.gov",
+    "nlm.nih.gov",
     "pubmed.ncbi.nlm.nih.gov",
     "pmc.ncbi.nlm.nih.gov",
     "ncbi.nlm.nih.gov",
     "www.ncbi.nlm.nih.gov",
     "clinicaltrials.gov",
     "www.cdc.gov",
+    "cdc.gov",
     "www.fda.gov",
+    "fda.gov",
     "www.hhs.gov",
+    "hhs.gov",
     "www.health.gov",
+    "health.gov",
     "www.nhs.uk",
+    "nhs.uk",
     "www.nice.org.uk",
+    "nice.org.uk",
     "www.cochranelibrary.com",
     "www.health.harvard.edu",
+    "health.harvard.edu",
 }
 
 # Government and educational domains
@@ -111,39 +124,60 @@ TRUSTED_DOMAINS_NEWS = {"news", "press", "blog", "medium.com"}
 TRUSTED_DOMAINS = {
     # World Health Organization
     "www.who.int",
+    "who.int",
     # US Health Organizations
     "www.nih.gov",
+    "nih.gov",
     "www.nlm.nih.gov",
+    "nlm.nih.gov",
     "pubmed.ncbi.nlm.nih.gov",
     "pmc.ncbi.nlm.nih.gov",
     "ncbi.nlm.nih.gov",
     "www.ncbi.nlm.nih.gov",
     "clinicaltrials.gov",
     "www.cdc.gov",
+    "cdc.gov",
     "www.fda.gov",
+    "fda.gov",
     "www.hhs.gov",
+    "hhs.gov",
     "www.health.gov",
+    "health.gov",
     # UK Health Organizations
     "www.nhs.uk",
+    "nhs.uk",
     "www.nice.org.uk",
+    "nice.org.uk",
     "www.gov.uk",
+    "gov.uk",
     # European Health Organizations
     "www.ecdc.europa.eu",
+    "ecdc.europa.eu",
     "www.ema.europa.eu",
+    "ema.europa.eu",
     # Australia Health Organizations
     "www.tga.gov.au",
+    "tga.gov.au",
     "www.health.gov.au",
+    "health.gov.au",
     "www.healthdirect.gov.au",
+    "healthdirect.gov.au",
     # Canada Health Organizations
     "www.canada.ca",
+    "canada.ca",
     # Singapore Health Organizations
     "www.moh.gov.sg",
+    "moh.gov.sg",
     "www.healthhub.sg",
+    "healthhub.sg",
     # Sri Lanka Health Organizations
     "www.health.gov.lk",
+    "health.gov.lk",
     # Academic/Research
     "www.cochranelibrary.com",
+    "cochranelibrary.com",
     "www.health.harvard.edu",
+    "health.harvard.edu",
 }
 
 # ============================================================================
