@@ -156,7 +156,7 @@ class CorrectivePipeline:
             self.kg_retriever,
             [post_text],  # Use claim as query
             claim_entities,
-            top_k * 2,  # Get more candidates for better ranking
+            top_k * 3,  # Get more candidates for better ranking
             round_id,
             self.log_manager,
         )
@@ -402,7 +402,7 @@ class CorrectivePipeline:
                 self.kg_retriever,
                 queries_executed,
                 list(set(all_entities)),
-                top_k * 2,
+                top_k * 3,
                 round_id,
                 self.log_manager,
             )

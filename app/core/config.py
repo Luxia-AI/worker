@@ -7,6 +7,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     PINECONE_API_KEY: Optional[str] = Field(default=None)
     PINECONE_INDEX_NAME: Optional[str] = Field(default=None)
+    PINECONE_CLOUD: str = Field(default="aws")
+    PINECONE_REGION: str = Field(default="us-east-1")
 
     GOOGLE_API_KEY: Optional[str] = Field(default=None)
     GOOGLE_CSE_ID: Optional[str] = Field(default=None)

@@ -112,6 +112,7 @@ class VDBIngest:
                         "statement": fact["statement"],
                         "entities": fact.get("entities", []),
                         "source_url": fact.get("source_url"),
+                        "language": fact.get("language", "en"),
                     },
                 }
             )

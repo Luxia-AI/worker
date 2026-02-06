@@ -13,9 +13,10 @@ class VDBRetrieval:
     Returns facts with full metadata for hybrid ranking.
     """
 
-    def __init__(self, namespace: str = "health") -> None:
+    def __init__(self, namespace: str = "health", language: str | None = "en") -> None:
         self.index = get_pinecone_index()
         self.namespace = namespace
+        self.language = language
 
     async def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """
@@ -43,7 +44,14 @@ class VDBRetrieval:
             return []
 
         try:
-            response = self.index.query(vector=vector, top_k=top_k, namespace=self.namespace, include_metadata=True)
+            pinecone_filter = {"language": self.language} if self.language else None
+            response = self.index.query(
+                vector=vector,
+                top_k=top_k,
+                namespace=self.namespace,
+                include_metadata=True,
+                filter=pinecone_filter,
+            )
         except Exception as e:
             logger.error(f"[VDBRetrieval] Pinecone query failed: {e}")
             return []

@@ -48,9 +48,15 @@ def get_pinecone_index() -> Any:
             existing_names.remove(index_name)
 
     if index_name not in existing_names:
-        logger.info(f"[Pinecone] Creating index '{index_name}' with dimension {dimension}")
+        logger.info(
+            f"[Pinecone] Creating index '{index_name}' with dimension {dimension} "
+            f"(cloud={settings.PINECONE_CLOUD}, region={settings.PINECONE_REGION})"
+        )
         pc.create_index(
-            name=index_name, dimension=dimension, metric="cosine", spec=ServerlessSpec(cloud="aws", region="us-east-1")
+            name=index_name,
+            dimension=dimension,
+            metric="cosine",
+            spec=ServerlessSpec(cloud=settings.PINECONE_CLOUD, region=settings.PINECONE_REGION),
         )
 
     _index = pc.Index(index_name)
