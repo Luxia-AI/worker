@@ -1,5 +1,6 @@
 from typing import Any, Dict, List
 
+from app.constants.config import VDB_MIN_SCORE
 from app.core.logger import get_logger
 from app.services.embedding.model import embed_async
 from app.services.vdb.pinecone_client import get_pinecone_index
@@ -18,13 +19,14 @@ class VDBRetrieval:
         self.namespace = namespace
         self.language = language
 
-    async def search(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    async def search(self, query: str, top_k: int = 5, topics: List[str] | None = None) -> List[Dict[str, Any]]:
         """
         Search vector DB for semantically similar facts.
 
         Args:
             query: Search query text
             top_k: Number of top results to return
+            topics: Required topic filter (no unrestricted queries)
 
         Returns:
             List of fact dicts with keys:
@@ -43,8 +45,15 @@ class VDBRetrieval:
             logger.error(f"[VDBRetrieval] Embedding generation failed: {e}")
             return []
 
+        if not topics:
+            logger.warning("[VDBRetrieval] No topics provided; skipping VDB retrieval")
+            return []
+
         try:
-            pinecone_filter = {"language": self.language} if self.language else None
+            pinecone_filter: Dict[str, Any] = {"topic": {"$in": topics}}
+            if self.language:
+                pinecone_filter["language"] = self.language
+
             response = self.index.query(
                 vector=vector,
                 top_k=top_k,
@@ -59,16 +68,26 @@ class VDBRetrieval:
         matches = response.get("matches") or []
 
         results = []
+        dropped = 0
         for m in matches:
             metadata = m.get("metadata", {})
+            score = float(m.get("score", 0.0))
+            if score < VDB_MIN_SCORE:
+                dropped += 1
+                continue
             result = {
-                "score": float(m.get("score", 0.0)),
+                "score": score,
                 "statement": metadata.get("statement", ""),
                 "entities": metadata.get("entities", []) or [],
                 "source_url": metadata.get("source_url") or metadata.get("source", ""),
                 "published_at": metadata.get("published_at"),
                 "credibility": metadata.get("credibility"),
                 "source": metadata.get("source"),
+                "domain": metadata.get("domain"),
+                "topic": metadata.get("topic"),
+                "doc_type": metadata.get("doc_type"),
+                "fact_type": metadata.get("fact_type"),
+                "count_value": metadata.get("count_value"),
             }
             if result["statement"]:  # Only include non-empty statements
                 results.append(result)
@@ -81,4 +100,43 @@ class VDBRetrieval:
         logger.debug(
             f"[VDBRetrieval] Query='{query[:50]}...' returned {len(results)} matches " f"(top score: {top_score})"
         )
+        if dropped:
+            logger.info(f"[VDBRetrieval] Dropped {dropped} matches below min score {VDB_MIN_SCORE}")
+        return results
+
+    def fetch_by_ids(self, ids: List[str], include_values: bool = False) -> List[Dict[str, Any]]:
+        if not ids:
+            return []
+        try:
+            try:
+                response = self.index.fetch(ids=ids, namespace=self.namespace, include_values=include_values)
+            except TypeError:
+                response = self.index.fetch(ids=ids, namespace=self.namespace)
+        except Exception as e:
+            logger.error(f"[VDBRetrieval] Pinecone fetch failed: {e}")
+            return []
+
+        vectors = response.get("vectors") or {}
+        results = []
+        for vec_id, vec_data in vectors.items():
+            metadata = vec_data.get("metadata", {})
+            result = {
+                "id": vec_id,
+                "statement": metadata.get("statement", ""),
+                "entities": metadata.get("entities", []) or [],
+                "source_url": metadata.get("source_url") or metadata.get("source", ""),
+                "published_at": metadata.get("published_at"),
+                "credibility": metadata.get("credibility"),
+                "source": metadata.get("source"),
+                "domain": metadata.get("domain"),
+                "topic": metadata.get("topic"),
+                "doc_type": metadata.get("doc_type"),
+                "fact_type": metadata.get("fact_type"),
+                "count_value": metadata.get("count_value"),
+            }
+            if include_values:
+                result["values"] = vec_data.get("values")
+            if result["statement"]:
+                results.append(result)
+
         return results

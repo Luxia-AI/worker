@@ -50,6 +50,8 @@ from app.services.kg.neo4j_client import Neo4jClient
 from app.services.llms.hybrid_service import reset_groq_counter
 from app.services.logging.log_handler import LogManagerHandler
 from app.services.ranking.trust_ranker import EvidenceItem, TrustRankingModule
+from app.services.retrieval.lexical_index import LexicalIndex
+from app.services.retrieval.metadata_enricher import TopicClassifier
 from app.services.vdb.vdb_ingest import VDBIngest
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 from app.services.verdict.verdict_generator import VerdictGenerator
@@ -94,6 +96,8 @@ class CorrectivePipeline:
         self.kg_client = Neo4jClient()
         self.kg_ingest = KGIngest()
         self.kg_retriever = KGRetrieval()
+        self.lexical_index = LexicalIndex()
+        self.topic_classifier = TopicClassifier()
 
         # Verdict generation (RAG phase)
         self.verdict_generator = VerdictGenerator()
@@ -151,6 +155,9 @@ class CorrectivePipeline:
         # ====================================================================
         # PHASE 2: Retrieve existing evidence from VDB + KG (NO LLM calls)
         # ====================================================================
+        claim_topics, topic_conf = await self.topic_classifier.classify(post_text, claim_entities, None)
+        logger.info(f"[CorrectivePipeline:{round_id}] Claim topics: {claim_topics} (conf={topic_conf:.2f})")
+
         retrieval_queries = self._build_retrieval_queries(post_text)
         dedup_sem, kg_candidates = await retrieve_candidates(
             self.vdb_retriever,
@@ -159,6 +166,8 @@ class CorrectivePipeline:
             claim_entities,
             top_k * 3,  # Get more candidates for better ranking
             round_id,
+            claim_topics,
+            self.lexical_index,
             self.log_manager,
         )
 
@@ -419,6 +428,8 @@ class CorrectivePipeline:
                 list(set(all_entities)),
                 top_k * 3,
                 round_id,
+                claim_topics,
+                self.lexical_index,
                 self.log_manager,
             )
 

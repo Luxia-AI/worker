@@ -39,6 +39,8 @@ async def reinforcement_loop(
     ranked: List[Dict[str, Any]],
     post_text: str,
     failed_entities: List[str],
+    topics: List[str],
+    lexical_index: Any,
     top_k: int,
     max_rounds: int,
     conf_threshold: float,
@@ -161,7 +163,15 @@ async def reinforcement_loop(
 
         # Retrieve and re-rank
         dedup_sem, kg_candidates = await retrieve_candidates(
-            vdb_retriever, kg_retriever, queries, all_entities, top_k, round_id, log_manager
+            vdb_retriever,
+            kg_retriever,
+            queries,
+            all_entities,
+            top_k,
+            round_id,
+            topics,
+            lexical_index,
+            log_manager,
         )
         top_ranked = await rank_candidates(
             dedup_sem,

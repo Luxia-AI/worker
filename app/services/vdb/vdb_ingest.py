@@ -4,6 +4,8 @@ from app.constants.config import ValidationState
 from app.core.logger import get_logger
 from app.services.embedding.model import embed_async
 from app.services.evidence_validator import EvidenceValidator
+from app.services.retrieval.lexical_index import LexicalIndex
+from app.services.retrieval.metadata_enricher import MetadataEnricher
 from app.services.vdb.pinecone_client import get_pinecone_index
 
 logger = get_logger(__name__)
@@ -13,6 +15,8 @@ class VDBIngest:
     def __init__(self, namespace: str = "health"):
         self.index = get_pinecone_index()
         self.namespace = namespace
+        self.metadata_enricher = MetadataEnricher()
+        self.lexical_index = LexicalIndex()
 
     def get_processed_urls(self) -> Set[str]:
         """
@@ -97,6 +101,9 @@ class VDBIngest:
                 f"[VDBIngest] Filtered {len(facts)} facts → {len(trusted_facts)} trusted, {skipped_count} skipped"
             )
 
+        # Enrich trusted facts with metadata before embedding
+        trusted_facts = await self.metadata_enricher.enrich_facts(trusted_facts)
+
         logger.info(f"[VDBIngest] Embedding {len(trusted_facts)} facts from trusted domains")
 
         statements = [f["statement"] for f in trusted_facts]
@@ -113,6 +120,12 @@ class VDBIngest:
                         "entities": fact.get("entities", []),
                         "source_url": fact.get("source_url"),
                         "language": fact.get("language", "en"),
+                        "domain": fact.get("domain"),
+                        "topic": fact.get("topic"),
+                        "source": fact.get("source"),
+                        "doc_type": fact.get("doc_type"),
+                        "fact_type": fact.get("fact_type"),
+                        "count_value": fact.get("count_value"),
                     },
                 }
             )
@@ -120,5 +133,11 @@ class VDBIngest:
         logger.info(f"[VDBIngest] Upserting into Pinecone: {len(vectors)} vectors")
 
         self.index.upsert(vectors=vectors, namespace=self.namespace)
+
+        # Update lexical BM25 index (best-effort)
+        try:
+            self.lexical_index.upsert_facts(trusted_facts)
+        except Exception as e:
+            logger.warning(f"[VDBIngest] Lexical index update failed: {e}")
 
         return [v["id"] for v in vectors]

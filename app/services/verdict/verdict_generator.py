@@ -26,6 +26,7 @@ from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
+from app.services.retrieval.metadata_enricher import TopicClassifier
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 
 logger = get_logger(__name__)
@@ -140,6 +141,7 @@ class VerdictGenerator:
         self.fact_extractor = FactExtractor()
         self.scraper = Scraper()
         self.trust_policy = AdaptiveTrustPolicy()
+        self.topic_classifier = TopicClassifier()
         self.MAX_WEB_ROUNDS_PRE_VERDICT = 2
         self.WEB_SEGMENTS_LIMIT = 3
         self.MAX_UNKNOWN_ROUNDS_POST_VERDICT = 2
@@ -782,7 +784,13 @@ class VerdictGenerator:
 
         for segment in segments:
             try:
-                results = await self.vdb_retriever.search(segment, top_k=top_k)
+                topics, _ = await self.topic_classifier.classify(segment, [], None)
+                if not topics:
+                    logger.warning(
+                        f"[VerdictGenerator] No topics for segment '{segment[:30]}...', skipping VDB retrieval"
+                    )
+                    continue
+                results = await self.vdb_retriever.search(segment, top_k=top_k, topics=topics)
                 for result in results:
                     stmt = result.get("statement", "")
                     # Deduplicate by statement
@@ -845,63 +853,67 @@ class VerdictGenerator:
             try:
                 logger.info(f"[VerdictGenerator] Searching web for UNKNOWN segment: '{segment[:50]}...'")
 
-                # Generate search queries for this segment
-                queries = await self.trusted_search.reformulate_queries(segment, [])
+                # Generate deterministic + site-specific queries for this segment
+                queries = await self.trusted_search.generate_search_queries(
+                    post_text=segment,
+                    failed_entities=[],
+                    max_queries=2,
+                    subclaims=[segment],
+                    entities=[],
+                )
                 if not queries:
                     logger.warning(f"[VerdictGenerator] No search queries generated for segment: {segment[:30]}...")
                     continue
 
-                # Use only the first query to avoid excessive API calls
-                query = queries[0]
-                logger.info(f"[VerdictGenerator] Using search query: '{query}'")
+                for query in queries[:2]:
+                    logger.info(f"[VerdictGenerator] Using search query: '{query}'")
 
-                # Perform the search
-                search_results = await self.trusted_search.search(query, max_results=5)
-                if not search_results:
-                    logger.warning(f"[VerdictGenerator] No search results for query: {query}")
-                    continue
-
-                # Extract facts from search results
-                for result in search_results[:3]:  # Limit to 3 URLs per segment
-                    url = result.get("url", "")
-                    if not url:
+                    # Perform the search
+                    search_results = await self.trusted_search.search(query, max_results=5)
+                    if not search_results:
+                        logger.warning(f"[VerdictGenerator] No search results for query: {query}")
                         continue
 
-                    try:
-                        logger.debug(f"[VerdictGenerator] Scraping and extracting facts from: {url}")
-
-                        # Scrape the URL to get content
-                        import aiohttp
-
-                        async with aiohttp.ClientSession() as session:
-                            scraped_page = await self.scraper.scrape_one(session, url)
-
-                        if not scraped_page.get("content"):
-                            logger.warning(f"[VerdictGenerator] No content scraped from {url}")
+                    # Extract facts from search results
+                    for result in search_results[:3]:  # Limit to 3 URLs per segment
+                        url = result.get("url", "")
+                        if not url:
                             continue
 
-                        # Extract facts from the scraped content
-                        facts = await self.fact_extractor.extract([scraped_page])
+                        try:
+                            logger.debug(f"[VerdictGenerator] Scraping and extracting facts from: {url}")
 
-                        for fact in facts:
-                            stmt = fact.get("statement", "") or ""
-                            conf = float(fact.get("confidence", 0.5) or 0.5)
-                            score = self._quick_web_score(segment, stmt, conf)
-                            evidence_item = {
-                                "statement": stmt,
-                                "source_url": url,
-                                "final_score": score,
-                                "extraction_confidence": conf,
-                                "credibility": 0.7,  # Default credibility for web-extracted facts
-                                "_web_search": True,  # Mark as web-sourced
-                                "_original_query": query,
-                            }
-                            all_web_evidence.append(evidence_item)
+                            # Scrape the URL to get content
+                            import aiohttp
 
-                    except Exception as e:
-                        logger.warning(f"[VerdictGenerator] Failed to extract facts from {url}: {e}")
-                        continue
+                            async with aiohttp.ClientSession() as session:
+                                scraped_page = await self.scraper.scrape_one(session, url)
 
+                            if not scraped_page.get("content"):
+                                logger.warning(f"[VerdictGenerator] No content scraped from {url}")
+                                continue
+
+                            # Extract facts from the scraped content
+                            facts = await self.fact_extractor.extract([scraped_page])
+
+                            for fact in facts:
+                                stmt = fact.get("statement", "") or ""
+                                conf = float(fact.get("confidence", 0.5) or 0.5)
+                                score = self._quick_web_score(segment, stmt, conf)
+                                evidence_item = {
+                                    "statement": stmt,
+                                    "source_url": url,
+                                    "final_score": score,
+                                    "extraction_confidence": conf,
+                                    "credibility": 0.7,  # Default credibility for web-extracted facts
+                                    "_web_search": True,  # Mark as web-sourced
+                                    "_original_query": query,
+                                }
+                                all_web_evidence.append(evidence_item)
+
+                        except Exception as e:
+                            logger.warning(f"[VerdictGenerator] Failed to extract facts from {url}: {e}")
+                            continue
             except Exception as e:
                 logger.warning(f"[VerdictGenerator] Failed to fetch web evidence for segment '{segment[:30]}...': {e}")
                 continue
@@ -911,6 +923,3 @@ class VerdictGenerator:
             f"for {len(unknown_segments)} UNKNOWN segments"
         )
         return all_web_evidence
-
-
-__all__ = ["VerdictGenerator", "Verdict"]

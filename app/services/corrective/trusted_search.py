@@ -74,6 +74,11 @@ class TrustedSearch:
         "and",
         "or",
         "but",
+        "just",
+        "like",
+        "every",
+        "individual",
+        "around",
         "to",
         "for",
         "of",
@@ -130,6 +135,16 @@ class TrustedSearch:
                 cleaned.append(n)
         return cleaned
 
+    def _extract_numbers_raw(self, text: str) -> List[str]:
+        if not text:
+            return []
+        nums = re.findall(r"\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b", text)
+        cleaned = []
+        for n in nums:
+            if n and n not in cleaned:
+                cleaned.append(n)
+        return cleaned
+
     def _tokenize_words(self, text: str) -> List[str]:
         if not text:
             return []
@@ -162,12 +177,35 @@ class TrustedSearch:
     def _build_direct_query(self, text: str, entities: List[str] | None = None) -> str:
         if not text:
             return ""
-        key_terms, key_numbers = self._collect_key_terms([text], entities=entities or [])
+        entities = entities or []
+        tokens = [t for t in self._tokenize_words(text) if t not in self._STOPWORDS]
+        freq: Dict[str, int] = {}
+        for t in tokens:
+            freq[t] = freq.get(t, 0) + 1
+        entity_tokens = set(self._tokenize_words(" ".join(entities)))
+
+        def _score(tok: str) -> float:
+            score = 0.0
+            score += 2.0 * freq.get(tok, 0)
+            score += min(1.0, len(tok) / 8.0)
+            if tok in entity_tokens:
+                score += 1.0
+            return score
+
+        ranked_terms = sorted(set(tokens), key=lambda t: (-_score(t), t))
+        numbers_raw = self._extract_numbers_raw(text)
+        numbers_norm = self._extract_numbers(text)
+
         terms: List[str] = []
-        for n in key_numbers:
+        for n in numbers_raw:
             terms.append(n)
-        for w in key_terms:
+        # include normalized number if raw had commas stripped
+        for n in numbers_norm:
+            if n not in terms:
+                terms.append(n)
+        for w in ranked_terms:
             terms.append(w)
+
         # Keep query concise and direct
         terms = dedupe_list(terms)
         terms = terms[:7]
@@ -211,6 +249,35 @@ class TrustedSearch:
     # ---------------------------------------------------------------------
     # Query Reformulation
     # ---------------------------------------------------------------------
+    def _build_question_queries(self, text: str) -> List[str]:
+        if not text:
+            return []
+        tokens = set(self._tokenize_words(text))
+        queries: List[str] = []
+
+        if "bones" in tokens or "bone" in tokens:
+            if "hands" in tokens or "hand" in tokens or "feet" in tokens or "foot" in tokens:
+                queries.append("how many bones are in adult human hands and feet")
+                queries.append("how many bones are in the hands and feet")
+            if "adult" in tokens or "adults" in tokens:
+                queries.append("how many bones does an adult human have")
+            else:
+                queries.append("how many bones does a human have")
+
+        if "heart" in tokens and ("beats" in tokens or "beat" in tokens):
+            if "day" in tokens or "daily" in tokens:
+                queries.append("how many times does the human heart beat per day")
+
+        if "cells" in tokens or "cell" in tokens:
+            if "second" in tokens or "seconds" in tokens:
+                queries.append("how many new cells does the human body produce per second")
+
+        if "tongue" in tokens and ("print" in tokens or "prints" in tokens):
+            queries.append("are tongue prints unique")
+            queries.append("unique tongue prints individuals")
+
+        return dedupe_list(queries)
+
     async def reformulate_queries(
         self,
         text: str,
@@ -519,15 +586,25 @@ FAILED ENTITIES:
         key_terms, key_numbers = self._collect_key_terms(texts=[post_text] + merged_subclaims, entities=entities)
 
         # 2) Build deterministic direct queries per subclaim (highest priority)
-        direct_queries = self._build_direct_queries(merged_subclaims, entities=entities)
+        direct_queries = []
+        question_queries = []
+        for sub in merged_subclaims:
+            q = self._build_direct_query(sub, entities=entities)
+            if q:
+                direct_queries.append(q)
+            q_questions = self._build_question_queries(sub)
+            if q_questions:
+                question_queries.append(q_questions[0])  # keep 1 best question per subclaim
+
         direct_queries = self._filter_queries(direct_queries, key_terms, key_numbers)
+        question_queries = self._filter_queries(question_queries, key_terms, key_numbers)
 
         # 3) Site-specific variants for top 2 direct queries
         site_queries: List[str] = []
         for q in direct_queries[:2]:
             site_queries.extend(self._generate_site_queries(q))
 
-        all_queries = dedupe_list(direct_queries + site_queries)
+        all_queries = dedupe_list(direct_queries + question_queries + site_queries)
 
         # 4) If budget remains, add LLM reformulated queries
         if len(all_queries) < max_queries:

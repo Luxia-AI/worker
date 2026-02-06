@@ -8,6 +8,7 @@ from app.core.logger import get_logger
 from app.services.logging.log_manager import LogManager
 from app.services.ranking.hybrid_ranker import hybrid_rank
 from app.services.ranking.trust_ranker import TrustRanker
+from app.services.retrieval.evidence_gate import filter_candidates_for_count_claim
 
 logger = get_logger(__name__)
 
@@ -51,6 +52,14 @@ async def rank_candidates(
             - semantic_confidence: str (HIGH, GOOD, FAIR, LOW, NONE)
             - grade_rationale: str (explanation of grade)
     """
+    # Gate evidence for count-claims (prevents unrelated results)
+    semantic_candidates, kg_candidates = filter_candidates_for_count_claim(
+        semantic_candidates,
+        kg_candidates,
+        query_text,
+        query_entities,
+    )
+
     # Phase 1: Hybrid rank semantic and KG candidates
     ranked = hybrid_rank(
         semantic_candidates,

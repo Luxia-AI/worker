@@ -1,4 +1,5 @@
 import json
+import re
 from typing import Any, Dict, List, Optional
 
 from app.constants.llm_prompts import FACT_EXTRACTION_PROMPT
@@ -11,7 +12,7 @@ logger = get_logger(__name__)
 
 # Batch fact extraction prompt - extract facts from multiple pages at once
 BATCH_FACT_PROMPT = """Extract key factual statements from each content section below.
-For each section, return the facts found.
+For each section, return ONLY atomic, single-claim facts (no conjunctions).
 
 IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
 Return ONLY valid JSON with this exact structure:
@@ -72,6 +73,40 @@ class FactExtractor:
                 pass
 
         return None
+
+    def _split_atomic_statement(self, statement: str) -> List[str]:
+        text = (statement or "").strip()
+        if not text:
+            return []
+
+        # Split on semicolons first
+        parts = [p.strip() for p in text.split(";") if p.strip()]
+        if len(parts) > 1:
+            return parts
+
+        # Split on " and " only when there are multiple numbers present
+        num_count = len(re.findall(r"\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b", text))
+        if num_count >= 2 and " and " in text.lower():
+            segments = [p.strip() for p in re.split(r"\band\b", text, flags=re.IGNORECASE) if p.strip()]
+            # Avoid splitting common paired-body phrases
+            if any("hands and feet" in text.lower() for _ in [0]):
+                return [text]
+            return segments
+
+        return [text]
+
+    def _normalize_atomic_facts(self, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        for fact in facts:
+            stmt = clean_statement(fact.get("statement", ""))
+            for part in self._split_atomic_statement(stmt):
+                if len(part) < 10:
+                    continue
+                new_fact = dict(fact)
+                new_fact["statement"] = clean_statement(part)
+                new_fact["fact_id"] = generate_fact_id(new_fact["statement"], new_fact.get("source_url", ""))
+                normalized.append(new_fact)
+        return normalized
 
     async def _parse_llm_response(
         self, result: Any, original_prompt: str, required_format: str, max_retries: int = 1
@@ -174,6 +209,7 @@ class FactExtractor:
                     fact["fact_id"] = generate_fact_id(fact["statement"], fact["source_url"])
                     facts.append(fact)
 
+            facts = self._normalize_atomic_facts(facts)
             logger.info(f"[FactExtractor] Extracted {len(facts)} facts from {len(valid_pages)} pages (batched)")
             return facts
 
@@ -208,5 +244,6 @@ class FactExtractor:
                 logger.warning(f"[FactExtractor] Failed to extract from {page.get('url')}: {e}")
                 continue
 
+        facts = self._normalize_atomic_facts(facts)
         logger.info(f"[FactExtractor] Extracted {len(facts)} facts (fallback mode)")
         return facts

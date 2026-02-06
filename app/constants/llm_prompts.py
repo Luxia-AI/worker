@@ -21,6 +21,7 @@ Fact: {statement}"""
 # ============================================================================
 
 FACT_EXTRACTION_PROMPT = """Extract key factual statements from this content.
+IMPORTANT: Return only atomic, single-claim facts (no conjunctions, no multi-part statements).
 Return ONLY valid JSON with this exact structure (no extra text, no markdown):
 {{"facts": [{{"statement": "...", "confidence": 0.85}}, {{"statement": "...", "confidence": 0.90}}]}}
 

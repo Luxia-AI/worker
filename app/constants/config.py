@@ -50,6 +50,19 @@ PIPELINE_MAX_SEARCH_QUERIES = 6
 PIPELINE_MAX_URLS_PER_QUERY = 5
 
 # ============================================================================
+# RETRIEVAL FILTERS
+# ============================================================================
+
+# Minimum acceptable VDB similarity score (cosine) for evidence retention
+VDB_MIN_SCORE = 0.55
+
+# Lexical (FTS5) database path for BM25 retrieval
+LEXICAL_DB_PATH = "worker/data/lexical.db"
+
+# Maximum BM25 candidates to retrieve per query
+LEXICAL_BM25_LIMIT = 50
+
+# ============================================================================
 # LLM MODEL SETTINGS
 # ============================================================================
 
