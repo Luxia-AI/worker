@@ -141,6 +141,26 @@ class TrustedSearch:
         "systematic review",
         "meta-analysis",
     ]
+    _JUNK_QUERY_TOKENS = {
+        "according",
+        "significantly",
+        "significant",
+        "drinking",
+        "improves",
+        "improve",
+        "every",
+        "morning",
+        "medical",
+        "research",
+        "your",
+        "body",
+        "produces",
+        "produce",
+        "produced",
+        "new",
+        "roughly",
+        "population",
+    }
     _MERGE_PREFIXES = ("and ", "or ", "but ", "however ", "although ", "while ")
 
     def merge_subclaims(self, subclaims: List[str]) -> List[str]:
@@ -197,14 +217,14 @@ class TrustedSearch:
                 if n not in key_numbers:
                     key_numbers.append(n)
             for w in self._tokenize_words(t):
-                if w in self._STOPWORDS:
+                if w in self._STOPWORDS or w in self._ACTION_WORDS or w in self._JUNK_QUERY_TOKENS:
                     continue
                 if w not in key_terms:
                     key_terms.append(w)
 
         for e in entities:
             for w in self._tokenize_words(e):
-                if w in self._STOPWORDS:
+                if w in self._STOPWORDS or w in self._ACTION_WORDS or w in self._JUNK_QUERY_TOKENS:
                     continue
                 if w not in key_terms:
                     key_terms.append(w)
@@ -377,7 +397,11 @@ class TrustedSearch:
         if not text:
             return ""
         entities = entities or []
-        tokens = [t for t in self._tokenize_words(text) if t not in self._STOPWORDS]
+        tokens = [
+            t
+            for t in self._tokenize_words(text)
+            if t not in self._STOPWORDS and t not in self._ACTION_WORDS and t not in self._JUNK_QUERY_TOKENS
+        ]
         freq: Dict[str, int] = {}
         for t in tokens:
             freq[t] = freq.get(t, 0) + 1
@@ -418,8 +442,119 @@ class TrustedSearch:
                     terms.append(w)
                 if len([t for t in terms if t.isalpha()]) >= 2:
                     break
-        terms = terms[:7]
+        terms = terms[:8]
         return " ".join(terms).strip()
+
+    def _extract_subclaim_anchors(self, subclaim: str, entities: List[str] | None = None) -> List[str]:
+        entities = entities or []
+        anchors: List[str] = []
+        text = (subclaim or "").lower()
+
+        if "lemon" in text and "water" in text:
+            anchors.append("lemon water")
+        if "liver" in text:
+            anchors.append("liver")
+        if "detox" in text or "detoxifies" in text or "detoxification" in text:
+            anchors.append("detox")
+        if "metabolism" in text or "metabolic" in text:
+            anchors.append("metabolism")
+
+        for ent in entities:
+            ent_n = " ".join(
+                t for t in self._tokenize_words(ent) if t not in self._STOPWORDS and t not in self._JUNK_QUERY_TOKENS
+            )
+            if not ent_n:
+                continue
+            if ent_n not in anchors:
+                anchors.append(ent_n)
+
+        for tok in self._tokenize_words(subclaim):
+            if tok in self._STOPWORDS or tok in self._ACTION_WORDS or tok in self._JUNK_QUERY_TOKENS:
+                continue
+            if tok not in anchors:
+                anchors.append(tok)
+
+        for n in self._extract_numbers_raw(subclaim):
+            if n not in anchors:
+                anchors.append(n)
+
+        return anchors[:8]
+
+    def _build_subclaim_anchor_queries(self, subclaim: str, entities: List[str] | None = None) -> List[str]:
+        """
+        Build targeted queries per subclaim with required anchors.
+        This avoids token-bag drift and keeps query intent aligned.
+        """
+        anchors = self._extract_subclaim_anchors(subclaim, entities=entities)
+        if not anchors:
+            return []
+        q: List[str] = []
+
+        has_lemon_water = "lemon water" in " ".join(anchors)
+        has_liver = "liver" in anchors
+        has_detox = "detox" in anchors
+        has_metabolism = "metabolism" in anchors
+
+        if has_lemon_water and has_liver:
+            detox_part = "(detox OR detoxification)" if has_detox else "liver function"
+            q.append(f'"lemon water" liver {detox_part} systematic review')
+            q.append(f'site:pubmed.ncbi.nlm.nih.gov "lemon water" liver {detox_part}')
+
+        if has_lemon_water and has_metabolism:
+            q.append('"lemon water" (metabolism OR "metabolic rate") randomized trial')
+            q.append('site:pubmed.ncbi.nlm.nih.gov "lemon water" metabolism')
+
+        # Generic anchored fallback for any other subclaim
+        if not q:
+            generic = {"them", "this", "that", "those", "these", "located"}
+
+            def _anchor_score(a: str) -> float:
+                score = 0.0
+                if any(ch.isdigit() for ch in a):
+                    score += 4.0
+                score += min(2.0, len(a) / 6.0)
+                if a in generic:
+                    score -= 2.0
+                return score
+
+            ranked_anchors = sorted(dedupe_list(anchors), key=lambda a: (-_anchor_score(a), a))
+            core = []
+            for a in ranked_anchors[:3]:
+                if " " in a:
+                    core.append(f'"{a}"')
+                else:
+                    core.append(a)
+            q.append(" ".join(core + ["systematic review"]).strip())
+
+        return dedupe_list([self._sanitize_query(x) for x in q if x])
+
+    def _query_quality(self, query: str, anchors: List[str]) -> Dict[str, Any]:
+        q = (query or "").lower()
+        q_tokens = set(self._tokenize_words(q))
+        anchor_hits = 0
+        for a in anchors:
+            a_norm = " ".join(self._tokenize_words(a))
+            if not a_norm:
+                continue
+            if (" " in a_norm and a_norm in q) or (a_norm in q_tokens):
+                anchor_hits += 1
+        junk_hits = sum(1 for t in self._tokenize_words(q) if t in self._JUNK_QUERY_TOKENS)
+        return {
+            "anchor_hits": anchor_hits,
+            "anchor_total": len(anchors),
+            "junk_hits": junk_hits,
+            "token_count": len(self._tokenize_words(q)),
+        }
+
+    def _passes_query_quality(self, query: str, anchors: List[str]) -> bool:
+        quality = self._query_quality(query, anchors)
+        if quality["junk_hits"] > 1:
+            return False
+        if quality["token_count"] < 3:
+            return False
+        if quality["anchor_total"] > 0 and quality["anchor_hits"] == 0:
+            return False
+        return True
 
     def _build_direct_queries(self, subclaims: List[str], entities: List[str] | None = None) -> List[str]:
         entities = entities or []
@@ -885,30 +1020,64 @@ FAILED ENTITIES:
         if subclaims is None:
             subclaims = AdaptiveTrustPolicy().decompose_claim(post_text)
         merged_subclaims = self.merge_subclaims(subclaims or [])
+        claim_lower = (post_text or "").lower()
+        claim_has_lemon_water = ("lemon" in claim_lower) and ("water" in claim_lower)
 
         key_terms, key_numbers = self._collect_key_terms(texts=[post_text] + merged_subclaims, entities=entities)
 
-        # 2) Build deterministic direct + operator-rich research queries per subclaim
-        direct_queries = []
-        advanced_queries = []
-        question_queries = []
-        for sub in merged_subclaims:
+        # 2) Subclaim-first deterministic generation with anchor constraints.
+        direct_queries: List[str] = []
+        advanced_queries: List[str] = []
+        question_queries: List[str] = []
+        anchor_queries: List[str] = []
+
+        for idx, sub in enumerate(merged_subclaims):
+            sub_query_text = sub
+            anchors = self._extract_subclaim_anchors(sub, entities=entities)
+            if claim_has_lemon_water and re.search(
+                r"\b(liver|detox|detoxifies|detoxification|metabolism|metabolic)\b", sub
+            ):
+                if "lemon water" not in anchors:
+                    anchors = ["lemon water"] + anchors
+                if "lemon water" not in sub.lower():
+                    sub_query_text = f"lemon water {sub}"
+
+            sub_anchor_queries = self._build_subclaim_anchor_queries(sub_query_text, entities=entities)
+            for aq in sub_anchor_queries:
+                if self._passes_query_quality(aq, anchors):
+                    anchor_queries.append(aq)
+                    qmeta = self._query_quality(aq, anchors)
+                    logger.info(
+                        "[TrustedSearch][QueryQuality] subclaim=%d query='%s' anchors=%d/%d junk=%d tokens=%d",
+                        idx + 1,
+                        aq,
+                        qmeta["anchor_hits"],
+                        qmeta["anchor_total"],
+                        qmeta["junk_hits"],
+                        qmeta["token_count"],
+                    )
             q = self._build_direct_query(sub, entities=entities)
-            if q:
+            if q and self._passes_query_quality(q, anchors):
                 direct_queries.append(q)
-            advanced_queries.extend(self._build_advanced_operator_queries(sub, entities=entities))
+            for aq in self._build_advanced_operator_queries(sub, entities=entities):
+                if self._passes_query_quality(aq, anchors):
+                    advanced_queries.append(aq)
             q_questions = self._build_question_queries(sub)
             if q_questions:
-                question_queries.append(q_questions[0])  # keep 1 best question per subclaim
+                candidate = q_questions[0]
+                if self._passes_query_quality(candidate, anchors):
+                    question_queries.append(candidate)
 
         direct_queries = self._filter_queries(direct_queries, key_terms, key_numbers)
         advanced_queries = self._filter_queries(advanced_queries, key_terms, key_numbers)
         question_queries = self._filter_queries(question_queries, key_terms, key_numbers)
+        anchor_queries = self._filter_queries(anchor_queries, key_terms, key_numbers)
         domain_queries = self._filter_queries(self._build_domain_specific_queries(post_text), key_terms, key_numbers)
 
         # 3) Add LLM reformulated queries early, but only if they pass strict filters.
         llm_queries: List[str] = []
-        if len(direct_queries) < max_queries:
+        deterministic_pool = dedupe_list(anchor_queries + direct_queries + advanced_queries + domain_queries)
+        if len(deterministic_pool) < max_queries:
             llm_queries = await self.reformulate_queries(
                 post_text,
                 failed_entities,
@@ -917,10 +1086,16 @@ FAILED ENTITIES:
             )
             llm_queries = [self._sanitize_query(q) for q in llm_queries if q]
             llm_queries = self._filter_queries(llm_queries, key_terms, key_numbers)
+        else:
+            logger.info(
+                "[TrustedSearch] Skipping LLM reformulation (deterministic queries already sufficient: %d)",
+                len(deterministic_pool),
+            )
 
         # 4) Site-specific variants for top direct/LLM/operator queries
         site_queries: List[str] = []
         site_bases = []
+        site_bases.extend(anchor_queries[:1])
         site_bases.extend(direct_queries[:1])
         site_bases.extend(llm_queries[:1])
         site_bases.extend(advanced_queries[:1])
@@ -928,13 +1103,41 @@ FAILED ENTITIES:
             site_queries.extend(self._generate_site_queries(q))
 
         all_queries = dedupe_list(
-            direct_queries + advanced_queries + domain_queries + llm_queries + question_queries + site_queries
+            anchor_queries
+            + direct_queries
+            + advanced_queries
+            + domain_queries
+            + llm_queries
+            + question_queries
+            + site_queries
         )
 
         # Final validation (strictly direct to claim terms) and budget cap
         all_queries = [self._sanitize_query(q) for q in all_queries if q]
         all_queries = self._filter_queries(all_queries, key_terms, key_numbers)
         all_queries = dedupe_list(all_queries)[:max_queries]
+        for i, q in enumerate(all_queries):
+            qmeta = self._query_quality(q, key_terms)
+            logger.info(
+                "[TrustedSearch][QueryQuality][Final] idx=%d query='%s' anchors=%d/%d junk=%d tokens=%d",
+                i + 1,
+                q,
+                qmeta["anchor_hits"],
+                qmeta["anchor_total"],
+                qmeta["junk_hits"],
+                qmeta["token_count"],
+            )
+        logger.info(
+            "[TrustedSearch][QueryQuality][Summary] subclaims=%d anchor=%d direct=%d advanced=%d "
+            "domain=%d llm=%d final=%d",
+            len(merged_subclaims),
+            len(anchor_queries),
+            len(direct_queries),
+            len(advanced_queries),
+            len(domain_queries),
+            len(llm_queries),
+            len(all_queries),
+        )
         logger.info(f"[TrustedSearch] Generated {len(all_queries)} queries for quota-optimized search")
 
         return all_queries

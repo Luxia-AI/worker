@@ -71,11 +71,15 @@ async def rank_candidates(
 
     # Phase 2: Enrich with trust grades
     graded_results = TrustRanker.enrich_ranked_results(top_ranked)
+    kg_in_top = sum(1 for r in graded_results if float(r.get("kg_score", 0.0) or 0.0) > 0.0)
+    kg_in_ranked = sum(1 for r in ranked if float(r.get("kg_score", 0.0) or 0.0) > 0.0)
+    sem_in_top = sum(1 for r in graded_results if float(r.get("sem_score", 0.0) or 0.0) > 0.0)
 
     score_str = top_ranked[0]["final_score"] if top_ranked else "N/A"
     logger.info(
         f"[RankingPhase:{round_id}] Ranked {len(ranked)} candidates (final score: {score_str}), "
-        f"returned {len(graded_results)} top-k with trust grades"
+        f"returned {len(graded_results)} top-k with trust grades "
+        f"(kg_in_ranked={kg_in_ranked}, kg_in_top={kg_in_top}, sem_in_top={sem_in_top})"
     )
 
     if log_manager:
@@ -90,6 +94,9 @@ async def rank_candidates(
                 "top_k_returned": len(graded_results),
                 "top_score": top_ranked[0]["final_score"] if top_ranked else 0.0,
                 "top_grade": top_ranked[0].get("grade") if top_ranked else "N/A",
+                "kg_in_ranked": kg_in_ranked,
+                "kg_in_top": kg_in_top,
+                "sem_in_top": sem_in_top,
             },
         )
 

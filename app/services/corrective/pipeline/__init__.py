@@ -33,6 +33,7 @@ from app.constants.config import (
     PIPELINE_MAX_SEARCH_QUERIES,
     PIPELINE_MAX_URLS_PER_QUERY,
     PIPELINE_MIN_NEW_URLS,
+    PIPELINE_RETRIEVAL_TOP_K,
 )
 from app.core.logger import get_logger
 from app.services.corrective.entity_extractor import EntityExtractor
@@ -159,12 +160,13 @@ class CorrectivePipeline:
         logger.info(f"[CorrectivePipeline:{round_id}] Claim topics: {claim_topics} (conf={topic_conf:.2f})")
 
         retrieval_queries = self._build_retrieval_queries(post_text)
+        raw_retrieval_top_k = max(PIPELINE_RETRIEVAL_TOP_K, top_k * 3)
         dedup_sem, kg_candidates = await retrieve_candidates(
             self.vdb_retriever,
             self.kg_retriever,
             retrieval_queries,
             claim_entities,
-            top_k * 3,  # Get more candidates for better ranking
+            raw_retrieval_top_k,
             round_id,
             claim_topics,
             self.lexical_index,
@@ -443,7 +445,7 @@ class CorrectivePipeline:
                 self.kg_retriever,
                 queries_executed,
                 retrieval_entities,
-                top_k * 3,
+                raw_retrieval_top_k,
                 round_id,
                 claim_topics,
                 self.lexical_index,
@@ -657,8 +659,21 @@ class CorrectivePipeline:
                 "per",
                 "times",
             }
+            junk = {
+                "according",
+                "significantly",
+                "significant",
+                "every",
+                "morning",
+                "drinking",
+                "improves",
+                "improve",
+                "research",
+                "medical",
+            }
             tokens = [t.lower() for t in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", text)]
             tokens = [t for t in tokens if t not in stop]
+            tokens = [t for t in tokens if t not in junk]
             freq: dict[str, int] = {}
             for t in tokens:
                 freq[t] = freq.get(t, 0) + 1
@@ -672,6 +687,8 @@ class CorrectivePipeline:
             unigram_entities = [w for w, _ in ranked_unigrams[:6]]
             bigram_entities: List[str] = []
             for bg in bigrams:
+                if any(part in junk for part in bg.split()):
+                    continue
                 if bg.split()[0] in unigram_entities and bg.split()[1] in unigram_entities:
                     bigram_entities.append(bg)
                 if len(bigram_entities) >= 4:

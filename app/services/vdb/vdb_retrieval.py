@@ -1,6 +1,6 @@
 from typing import Any, Dict, List
 
-from app.constants.config import VDB_MIN_SCORE
+from app.constants.config import PIPELINE_MIN_RANK_CANDIDATES, VDB_BACKFILL_MIN_SCORE, VDB_MIN_SCORE
 from app.core.logger import get_logger
 from app.services.embedding.model import embed_async
 from app.services.vdb.pinecone_client import get_pinecone_index
@@ -31,7 +31,13 @@ class VDBRetrieval:
                 return {}
         return {}
 
-    async def search(self, query: str, top_k: int = 5, topics: List[str] | None = None) -> List[Dict[str, Any]]:
+    async def search(
+        self,
+        query: str,
+        top_k: int = 5,
+        topics: List[str] | None = None,
+        min_score: float | None = None,
+    ) -> List[Dict[str, Any]]:
         """
         Search vector DB for semantically similar facts.
 
@@ -103,13 +109,17 @@ class VDBRetrieval:
                 pass
 
         results = []
+        below_threshold: List[Dict[str, Any]] = []
         dropped = 0
+        dropped_low_signal = 0
         low_signal_phrases = (
             "data element definitions",
             "registration or results information",
             "javascript and cookies",
             "requires human verification",
         )
+        effective_min_score = float(min_score if min_score is not None else VDB_MIN_SCORE)
+        pre_filter_count = len(matches)
         for m in matches:
             if hasattr(m, "metadata"):
                 metadata = m.metadata or {}
@@ -117,8 +127,26 @@ class VDBRetrieval:
             else:
                 metadata = m.get("metadata", {}) if isinstance(m, dict) else {}
                 score = float((m.get("score", 0.0) if isinstance(m, dict) else 0.0) or 0.0)
-            if score < VDB_MIN_SCORE:
+            if score < effective_min_score:
                 dropped += 1
+                # Keep a lightweight backfill pool to avoid starvation.
+                if score >= VDB_BACKFILL_MIN_SCORE:
+                    below_threshold.append(
+                        {
+                            "score": score,
+                            "statement": metadata.get("statement", ""),
+                            "entities": metadata.get("entities", []) or [],
+                            "source_url": metadata.get("source_url") or metadata.get("source", ""),
+                            "published_at": metadata.get("published_at"),
+                            "credibility": metadata.get("credibility"),
+                            "source": metadata.get("source"),
+                            "domain": metadata.get("domain"),
+                            "topic": metadata.get("topic"),
+                            "doc_type": metadata.get("doc_type"),
+                            "fact_type": metadata.get("fact_type"),
+                            "count_value": metadata.get("count_value"),
+                        }
+                    )
                 continue
             result = {
                 "score": score,
@@ -136,8 +164,19 @@ class VDBRetrieval:
             }
             if result["statement"]:  # Only include non-empty statements
                 if any(p in result["statement"].lower() for p in low_signal_phrases):
+                    dropped_low_signal += 1
                     continue
                 results.append(result)
+
+        # Backfill if too few candidates survive strict threshold.
+        if len(results) < PIPELINE_MIN_RANK_CANDIDATES and below_threshold:
+            needed = PIPELINE_MIN_RANK_CANDIDATES - len(results)
+            below_threshold.sort(key=lambda r: (-r["score"], r["statement"]))
+            for item in below_threshold[: max(0, needed)]:
+                if item["statement"] and not any(
+                    p in item["statement"].lower() for p in ("javascript and cookies", "human verification")
+                ):
+                    results.append(item)
 
         # DETERMINISTIC ORDERING: Sort by score DESC, then statement ASC for consistent results
         # This ensures identical queries return identical ordering even when scores are equal
@@ -147,8 +186,17 @@ class VDBRetrieval:
         logger.debug(
             f"[VDBRetrieval] Query='{query[:50]}...' returned {len(results)} matches " f"(top score: {top_score})"
         )
-        if dropped:
-            logger.info(f"[VDBRetrieval] Dropped {dropped} matches below min score {VDB_MIN_SCORE}")
+        logger.info(
+            "[VDBRetrieval][Filter] query='%s' pre=%d above_min=%d post=%d "
+            "dropped_min=%d dropped_low_signal=%d min=%.2f",
+            query[:80],
+            pre_filter_count,
+            max(0, pre_filter_count - dropped),
+            len(results),
+            dropped,
+            dropped_low_signal,
+            effective_min_score,
+        )
         return results
 
     def fetch_by_ids(self, ids: List[str], include_values: bool = False) -> List[Dict[str, Any]]:

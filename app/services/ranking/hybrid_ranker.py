@@ -103,8 +103,39 @@ def _entity_overlap_score(query_entities: List[str], item_entities: List[str]) -
         return 0.0
 
     inter = set_q.intersection(set_i)
-    # Recall: what fraction of query entities are found
-    return len(inter) / len(set_q)
+    exact_recall = len(inter) / len(set_q)
+
+    # Token-aware overlap handles phrase/entity granularity mismatch
+    stop = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "to",
+        "for",
+        "of",
+        "in",
+        "on",
+        "with",
+        "by",
+        "at",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+    }
+    q_tokens = {w for e in set_q for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", e) if w not in stop}
+    i_tokens = {w for e in set_i for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", e) if w not in stop}
+    if not q_tokens or not i_tokens:
+        return exact_recall
+
+    token_recall = len(q_tokens & i_tokens) / max(1, len(q_tokens))
+    return max(exact_recall, token_recall)
 
 
 def _claim_overlap_score(claim_text: str, statement: str) -> float:
@@ -267,6 +298,7 @@ def hybrid_rank(
         else:
             val = _safe_float(item.get("score"), 0.0)
             candidates_map[key]["kg_score"] = max(candidates_map[key]["kg_score"], val)
+            candidates_map[key]["kg_score_raw"] = max(candidates_map[key]["kg_score_raw"], val)
             candidates_map[key]["orig"]["kg"] = item
             kg_scores.append(candidates_map[key]["kg_score"])
 
@@ -299,6 +331,7 @@ def hybrid_rank(
     for key, item in candidates_map.items():
         sem_s = sem_norm_map.get(key, 0.0)
         kg_s = kg_norm_map.get(key, 0.0)
+        kg_raw = _safe_float(item.get("kg_score_raw"), 0.0)
         ent_s = _entity_overlap_score(query_entities, item.get("entities", []))
         recency_s = _recency_boost(item.get("published_at"), now=now)
         cred_s = _safe_float(item.get("credibility"), 0.5)
@@ -325,6 +358,9 @@ def hybrid_rank(
             + (w_recency * recency_s)
             + (w_cred * cred_s)
         )
+        # Keep raw KG confidence relevant even when normalization compresses scores.
+        if kg_raw > 0.0 and claim_overlap >= 0.08:
+            final_score += 0.05 * min(1.0, kg_raw)
         # Reward KG-backed, entity-aligned evidence so KG can contribute in top-k.
         if kg_s > 0.0 and ent_s >= 0.34 and claim_overlap >= 0.10:
             final_score += 0.10
@@ -342,6 +378,7 @@ def hybrid_rank(
             "sem_score": sem_s,
             "sem_score_raw": item.get("sem_score_raw", 0.0),
             "kg_score": kg_s,
+            "kg_score_raw": kg_raw,
             "entity_overlap": ent_s,
             "claim_overlap": claim_overlap,
             "recency": recency_s,
@@ -351,16 +388,32 @@ def hybrid_rank(
         }
         # Filter out low-overlap items unless strongly supported semantically
         # or by KG+entity alignment. This prevents KG-only off-topic drift.
-        if claim_overlap < RANKING_MIN_CLAIM_OVERLAP and sem_s < 0.75 and not (kg_s >= 0.8 and ent_s >= 0.4):
+        if (
+            claim_overlap < RANKING_MIN_CLAIM_OVERLAP
+            and sem_s < 0.75
+            and not ((kg_s >= 0.55 or kg_raw >= 0.45) and ent_s >= 0.20 and claim_overlap >= 0.08)
+        ):
             continue
-        if sem_s < 0.20 and claim_overlap < 0.10 and ent_s < 0.34:
+        if sem_s < 0.20 and claim_overlap < 0.08 and ent_s < 0.20 and kg_raw < 0.40:
             continue
         results.append(out)
 
     # Sort descending by final_score, then by sem_score, then by credibility, then stable textual tie-breaker
     results.sort(key=lambda r: (-r["final_score"], -r["sem_score"], -r["credibility"], r["statement"]))
 
+    kg_in_ranked = sum(1 for r in results if _safe_float(r.get("kg_score"), 0.0) > 0.0)
+    if kg_results and kg_in_ranked == 0 and results:
+        logger.info(
+            "[hybrid_rank] KG candidates present but none survived ranking filters (kg_raw=%d, ranked=%d)",
+            len(kg_results),
+            len(results),
+        )
+
     logger.info(
-        f"[hybrid_rank] Ranked {len(results)} candidates. Top score: {results[0]['final_score'] if results else 'N/A'}"
+        "[hybrid_rank] Ranked %d candidates. Top score: %s (kg_input=%d, kg_in_ranked=%d)",
+        len(results),
+        (results[0]["final_score"] if results else "N/A"),
+        len(kg_results or []),
+        kg_in_ranked,
     )
     return results

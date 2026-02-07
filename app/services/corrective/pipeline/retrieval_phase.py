@@ -159,5 +159,11 @@ async def retrieve_candidates(
         logger.warning(f"[RetrievalPhase:{round_id}] KG retrieval failed: {e}")
 
     logger.info(f"[RetrievalPhase:{round_id}] Retrieved {len(kg_candidates)} KG candidates")
+    kg_with_text = sum(1 for c in kg_candidates if (c.get("statement") or "").strip())
+    kg_with_source = sum(1 for c in kg_candidates if (c.get("source_url") or "").strip())
+    logger.info(
+        f"[RetrievalPhase:{round_id}] KG->evidence conversion: total={len(kg_candidates)}, "
+        f"textualized={kg_with_text}, with_source={kg_with_source}"
+    )
 
     return dedup_sem, kg_candidates

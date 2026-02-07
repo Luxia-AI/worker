@@ -563,6 +563,7 @@ class VerdictGenerator:
         # Re-score confidence from evidence + breakdown when possible
         if evidence:
             confidence = self._calculate_confidence(evidence, claim_breakdown)
+        self._log_subclaim_coverage(claim_breakdown)
 
         return {
             "verdict": verdict_str,
@@ -575,6 +576,50 @@ class VerdictGenerator:
             "claim": claim,
             "evidence_count": len(evidence),
         }
+
+    def _log_subclaim_coverage(self, claim_breakdown: List[Dict[str, Any]]) -> None:
+        if not claim_breakdown:
+            logger.info("[VerdictGenerator][Coverage] subclaims=0 covered=0 strong=0 partial=0 unknown=0 coverage=0.00")
+            return
+
+        total = len(claim_breakdown)
+        unknown = 0
+        strong = 0
+        partial = 0
+        covered = 0
+
+        for idx, item in enumerate(claim_breakdown):
+            status = (item.get("status") or "UNKNOWN").upper()
+            has_support = bool((item.get("supporting_fact") or "").strip() and (item.get("source_url") or "").strip())
+
+            if status == "UNKNOWN":
+                unknown += 1
+            elif status in {"VALID", "INVALID"}:
+                strong += 1
+                covered += 1
+            else:
+                partial += 1
+                covered += 1
+
+            logger.info(
+                "[VerdictGenerator][Coverage] subclaim=%d status=%s supported=%s source=%s segment=%s",
+                idx + 1,
+                status,
+                str(has_support).lower(),
+                (item.get("source_url") or "")[:80],
+                (item.get("claim_segment") or "")[:80],
+            )
+
+        coverage = covered / max(1, total)
+        logger.info(
+            "[VerdictGenerator][Coverage] subclaims=%d covered=%d strong=%d partial=%d unknown=%d coverage=%.2f",
+            total,
+            covered,
+            strong,
+            partial,
+            unknown,
+            coverage,
+        )
 
     def _is_meaningful_segment(self, segment: str) -> bool:
         if not segment:
@@ -692,6 +737,8 @@ class VerdictGenerator:
                 if assertive_claim and any(t in stmt_l for t in uncertainty_terms):
                     uncertainty_penalty = 0.18
                 score = (0.6 * max(0.0, min(1.0, rel_f))) + (0.4 * max(0.0, min(1.0, overlap))) - uncertainty_penalty
+                if overlap < 0.20:
+                    score *= 0.45
                 if score > best_score:
                     best_score = score
                     best = ev
@@ -899,6 +946,9 @@ class VerdictGenerator:
         avg_cred = sum(cred_scores) / max(1, len(cred_scores))
 
         count_factor = min(len(evidence), 5) / 5.0
+        low_count_penalty = 0.0
+        if len(evidence) < 3:
+            low_count_penalty = 0.20 * ((3 - len(evidence)) / 2.0)
 
         domains = set()
         for ev in evidence[:5]:
@@ -914,20 +964,40 @@ class VerdictGenerator:
         diversity = min(1.0, len(domains) / max(1, min(len(evidence), 5)))
         evidence_strength = (0.55 * avg_score) + (0.30 * avg_cred) + (0.15 * count_factor)
         certainty = (0.75 * certainty_ratio) + (0.25 * diversity)
+        supported_ratio = 0.0
+        if claim_breakdown:
+            supported_ratio = sum(
+                1
+                for s in claim_breakdown
+                if (s.get("status") or "").upper() in {"VALID", "INVALID", "PARTIALLY_VALID", "PARTIALLY_INVALID"}
+            ) / max(1, len(claim_breakdown))
+        coverage_penalty = 0.15 if supported_ratio < 0.50 else 0.0
 
         logger.debug(
             "[VerdictGenerator] Confidence inputs: avg_score=%.3f avg_cred=%.3f "
-            "certainty_ratio=%.2f unknown_ratio=%.2f conflict_ratio=%.2f diversity=%.2f evidence_n=%d",
+            "certainty_ratio=%.2f unknown_ratio=%.2f conflict_ratio=%.2f diversity=%.2f "
+            "supported_ratio=%.2f low_count_penalty=%.2f coverage_penalty=%.2f evidence_n=%d",
             avg_score,
             avg_cred,
             certainty_ratio,
             unknown_ratio,
             conflict_ratio,
             diversity,
+            supported_ratio,
+            low_count_penalty,
+            coverage_penalty,
             len(evidence),
         )
 
-        confidence = 0.05 + (0.55 * evidence_strength) + (0.35 * certainty) - (0.30 * unknown_ratio) - conflict_ratio
+        confidence = (
+            0.05
+            + (0.55 * evidence_strength)
+            + (0.35 * certainty)
+            - (0.30 * unknown_ratio)
+            - conflict_ratio
+            - low_count_penalty
+            - coverage_penalty
+        )
         return max(0.05, min(0.98, confidence))
 
     def _build_default_evidence_map(self, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -972,7 +1042,10 @@ class VerdictGenerator:
         """
 
         def _clean_spaces(t: str) -> str:
-            return re.sub(r"\s+", " ", t).strip(" ,.")
+            s = re.sub(r"\s+", " ", t).strip(" ,.")
+            s = re.sub(r"^(and|or|but|however|while)\s+", "", s, flags=re.IGNORECASE)
+            s = re.sub(r",?\s*according to (medical|scientific) research\.?$", "", s, flags=re.IGNORECASE)
+            return re.sub(r"\s+", " ", s).strip(" ,.")
 
         def _expand_enumeration(sentence: str) -> List[str]:
             # Build meaningful segments for patterns like:

@@ -1,6 +1,8 @@
 import asyncio
 import random
+import time
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 import aiohttp
 import trafilatura
@@ -64,12 +66,108 @@ class Scraper:
         self.who_playwright_timeout = who_playwright_timeout
         self.max_line_size = max_line_size
         self.max_field_size = max_field_size
+        self.domain_http_timeouts: Dict[str, int] = {
+            "canada.ca": 8,
+            "jamanetwork.com": 8,
+            "cochranelibrary.com": 10,
+            "who.int": 14,
+        }
+        self.domain_playwright_timeouts: Dict[str, int] = {
+            "who.int": self.who_playwright_timeout,
+            "canada.ca": 5000,
+            "jamanetwork.com": 5000,
+            "cochranelibrary.com": 6000,
+        }
+        self.domain_failure_skip_threshold = 2
+        self.domain_failure_skip_seconds = 900  # 15 minutes
+        self._domain_failures: Dict[str, Dict[str, float]] = {}
 
     def _get_headers(self) -> Dict[str, str]:
         """Get browser-like headers with random User-Agent."""
         headers = DEFAULT_HEADERS.copy()
         headers["User-Agent"] = random.choice(USER_AGENTS)
         return headers
+
+    def _extract_domain(self, url: str) -> str | None:
+        try:
+            host = (urlparse(url).netloc or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+            return host or None
+        except Exception:
+            return None
+
+    def _domain_key(self, domain: str | None) -> str | None:
+        if not domain:
+            return None
+        for key in self.domain_http_timeouts:
+            if domain == key or domain.endswith(f".{key}"):
+                return key
+        for key in self.domain_playwright_timeouts:
+            if domain == key or domain.endswith(f".{key}"):
+                return key
+        return domain
+
+    def _http_timeout_for_url(self, url: str) -> int:
+        key = self._domain_key(self._extract_domain(url))
+        if key and key in self.domain_http_timeouts:
+            return int(self.domain_http_timeouts[key])
+        return int(self.timeout)
+
+    def _playwright_timeout_for_url(self, url: str, default_timeout: int) -> int:
+        key = self._domain_key(self._extract_domain(url))
+        if key and key in self.domain_playwright_timeouts:
+            return int(self.domain_playwright_timeouts[key])
+        return int(default_timeout)
+
+    def _should_skip_domain(self, url: str) -> bool:
+        domain = self._extract_domain(url)
+        if not domain:
+            return False
+        state = self._domain_failures.get(domain)
+        if not state:
+            return False
+        blocked_until = float(state.get("blocked_until", 0.0) or 0.0)
+        if blocked_until > time.time():
+            logger.warning(
+                "[Scraper][DomainPolicy] Skipping domain due to recent failures: %s (blocked for %.0fs)",
+                domain,
+                blocked_until - time.time(),
+            )
+            return True
+        return False
+
+    def _record_domain_failure(self, url: str, stage: str, reason: str) -> None:
+        domain = self._extract_domain(url)
+        if not domain:
+            return
+        now = time.time()
+        state = self._domain_failures.setdefault(domain, {"count": 0.0, "last": 0.0, "blocked_until": 0.0})
+        count = int(state.get("count", 0.0) or 0)
+        last = float(state.get("last", 0.0) or 0.0)
+        if now - last > self.domain_failure_skip_seconds:
+            count = 0
+        count += 1
+        blocked_until = float(state.get("blocked_until", 0.0) or 0.0)
+        if count >= self.domain_failure_skip_threshold:
+            blocked_until = now + self.domain_failure_skip_seconds
+        state["count"] = float(count)
+        state["last"] = now
+        state["blocked_until"] = blocked_until
+        logger.warning(
+            "[Scraper][DomainPolicy] Failure recorded domain=%s stage=%s count=%d reason=%s",
+            domain,
+            stage,
+            count,
+            reason[:120],
+        )
+
+    def _record_domain_success(self, url: str) -> None:
+        domain = self._extract_domain(url)
+        if not domain:
+            return
+        if domain in self._domain_failures:
+            self._domain_failures.pop(domain, None)
 
     # ---------------------------------------------------------------------
     # Primary HTTP Fetcher
@@ -86,13 +184,18 @@ class Scraper:
               (e.g., 403/404 errors should NOT trigger fallback)
         """
         try:
+            if self._should_skip_domain(url):
+                return None, False
+
             headers = self._get_headers()
-            async with session.get(url, timeout=self.timeout, headers=headers) as resp:
+            http_timeout = self._http_timeout_for_url(url)
+            async with session.get(url, timeout=http_timeout, headers=headers) as resp:
                 if resp.status != 200:
                     logger.warning(f"[Scraper] Non-200 status: {url} — {resp.status}")
                     # 4xx client errors (403, 404, etc.) won't be fixed by Playwright
                     # Only network issues or empty content should trigger fallback
                     should_fallback = resp.status >= 500  # Only server errors
+                    self._record_domain_failure(url, stage="http_status", reason=f"status={resp.status}")
                     return None, should_fallback
 
                 content_type = (resp.headers.get("Content-Type") or "").lower()
@@ -100,14 +203,19 @@ class Scraper:
                     pdf_bytes = await resp.read()
                     pdf_text = self._extract_pdf_text(pdf_bytes)
                     if pdf_text:
+                        self._record_domain_success(url)
                         return f"[[PDF_TEXT]]{pdf_text}", False
+                    self._record_domain_failure(url, stage="pdf_extract", reason="empty_pdf_text")
                     return None, False
 
                 html = await resp.text(errors="ignore")
+                if html:
+                    self._record_domain_success(url)
                 return html, True  # Success, but fallback OK if extraction fails
 
         except Exception as e:
             logger.error(f"[Scraper] HTTP fetch failed for {url}: {e}")
+            self._record_domain_failure(url, stage="http_exception", reason=str(e))
             return None, True  # Network error - Playwright might help
 
     # ---------------------------------------------------------------------
@@ -168,16 +276,20 @@ class Scraper:
                 page = await context.new_page()
 
                 timeout = timeout_override or self.playwright_timeout
+                timeout = self._playwright_timeout_for_url(url, timeout)
                 await page.goto(url, timeout=timeout, wait_until="domcontentloaded")
                 await page.wait_for_load_state("domcontentloaded")
 
                 html: str = await page.content()
                 await context.close()
                 await browser.close()
+                if html:
+                    self._record_domain_success(url)
                 return html
 
         except Exception as e:
             logger.error(f"[Scraper] Playwright fallback failed for {url}: {e}")
+            self._record_domain_failure(url, stage="playwright_exception", reason=str(e))
             return None
 
     # ---------------------------------------------------------------------
@@ -185,6 +297,9 @@ class Scraper:
     # ---------------------------------------------------------------------
     async def scrape_one(self, session: aiohttp.ClientSession, url: str) -> Dict[str, Any]:
         logger.info(f"[Scraper] Scraping URL: {url}")
+        if self._should_skip_domain(url):
+            logger.warning(f"[Scraper] Skipped by domain policy: {url}")
+            return {"url": url, "content": None, "source": None, "published_at": None}
         is_who = "who.int" in url.lower()
 
         # Step 1: Try normal HTTP fetch
@@ -201,6 +316,7 @@ class Scraper:
 
         if not isinstance(html, str) or not html:
             logger.warning(f"[Scraper] No HTML content for {url}")
+            self._record_domain_failure(url, stage="empty_html", reason="no_html_content")
             return {"url": url, "content": None, "source": None, "published_at": None}
 
         # Step 2: Extract text (Trafilatura or pre-extracted PDF text)
@@ -211,6 +327,7 @@ class Scraper:
 
         if not text:
             logger.warning(f"[Scraper] No extractable text for {url}")
+            self._record_domain_failure(url, stage="extract_text", reason="empty_extracted_text")
             return {"url": url, "content": None, "source": None, "published_at": None}
 
         # Step 3: Metadata parsing
@@ -218,6 +335,7 @@ class Scraper:
         published_at = self._extract_publish_date(html)
 
         logger.info(f"[Scraper] Extracted {len(text)} chars from {url}")
+        self._record_domain_success(url)
 
         return {
             "url": url,
@@ -245,13 +363,6 @@ class Scraper:
     # ---------------------------------------------------------------------
     # Helpers
     # ---------------------------------------------------------------------
-    @staticmethod
-    def _extract_domain(url: str) -> str | None:
-        try:
-            return url.split("/")[2]
-        except Exception:
-            return None
-
     @staticmethod
     def _extract_publish_date(html: str) -> str | None:
         """

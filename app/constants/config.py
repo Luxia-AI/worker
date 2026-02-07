@@ -49,13 +49,22 @@ PIPELINE_MAX_SEARCH_QUERIES = 6
 # Maximum URLs to scrape per search query (limits extraction cost)
 PIPELINE_MAX_URLS_PER_QUERY = 3
 
+# Raw retrieval breadth before ranking (per query, VDB/KG retrieval stage)
+PIPELINE_RETRIEVAL_TOP_K = 40
+
+# Minimum candidate target entering ranking (retrieval permissive, ranking strict)
+PIPELINE_MIN_RANK_CANDIDATES = 5
+
 # ============================================================================
 # RETRIEVAL FILTERS
 # ============================================================================
 
 # Minimum acceptable VDB similarity score (cosine) for evidence retention
 # Lowered slightly to improve recall on longer, compositional health claims.
-VDB_MIN_SCORE = 0.45
+VDB_MIN_SCORE = 0.28
+
+# Backfill floor used when strict score threshold yields too few candidates
+VDB_BACKFILL_MIN_SCORE = 0.20
 
 # Lexical (FTS5) database path for BM25 retrieval
 LEXICAL_DB_PATH = "worker/data/lexical.db"
