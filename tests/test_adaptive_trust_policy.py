@@ -161,6 +161,10 @@ class TestAdaptiveTrustPolicy:
         """Test gating rules with insufficient evidence."""
         assert not policy.apply_gating_rules(coverage=0.3, diversity=0.4, agreement=0.8)
 
+    def test_apply_gating_rules_requires_minimum_evidence_count(self, policy):
+        """Even strong ratios should fail when evidence count is too small."""
+        assert not policy.apply_gating_rules(coverage=0.8, diversity=0.8, agreement=0.9, evidence_count=2)
+
     def test_compute_adaptive_trust_single_claim(self, policy, sample_evidence):
         """Test adaptive trust computation for single-part claim."""
         claim = "COVID-19 vaccines are effective."

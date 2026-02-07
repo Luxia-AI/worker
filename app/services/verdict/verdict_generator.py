@@ -516,16 +516,46 @@ class VerdictGenerator:
             hits = sum(1 for w in set(fw) if w in ev_text)
             return hits >= 2
 
+        def _has_negation(text: str) -> bool:
+            if not text:
+                return False
+            neg_terms = {
+                "no",
+                "not",
+                "never",
+                "none",
+                "without",
+                "lack",
+                "lacks",
+                "lacking",
+                "myth",
+                "debunked",
+                "doesn't",
+                "isn't",
+                "cannot",
+                "can't",
+            }
+            tokens = {w.lower() for w in re.findall(r"\b[\w']+\b", text)}
+            return any(t in tokens for t in neg_terms)
+
         for seg in claim_breakdown:
             status = (seg.get("status") or "UNKNOWN").upper()
             if status == "UNKNOWN":
                 continue
+            seg_text = seg.get("claim_segment") or ""
             src = seg.get("source_url") or ""
-            fact = (seg.get("supporting_fact") or "").strip().lower()
+            fact = (seg.get("supporting_fact") or "").strip()
             if (src and src not in ev_urls) or (fact and not _overlap_ok(fact, ev_text)):
                 seg["status"] = "UNKNOWN"
                 seg["supporting_fact"] = ""
                 seg["source_url"] = ""
+                continue
+
+            # Polarity guardrail: a negating fact cannot validate an affirmative segment.
+            seg_neg = _has_negation(seg_text)
+            fact_neg = _has_negation(fact)
+            if status in {"VALID", "PARTIALLY_VALID"} and fact and fact_neg and not seg_neg:
+                seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
 
         # Calculate truthfulness from evidence (deterministic, claim-aware)
         truthfulness_percent = self._calculate_truthfulness_from_evidence(claim, evidence)
@@ -620,8 +650,11 @@ class VerdictGenerator:
         )
         for seg in segments:
             seg_words = set(re.findall(r"\b\w+\b", seg.lower()))
+            seg_tokens = {w.lower() for w in re.findall(r"\b[\w']+\b", seg)}
+            seg_neg = any(t in seg_tokens for t in {"no", "not", "never", "without", "lack", "lacks", "lacking"})
             best = None
             best_score = 0.0
+            best_neg = False
             for ev in evidence[:8]:
                 stmt = (ev.get("statement") or ev.get("text") or "").strip()
                 if not stmt:
@@ -636,6 +669,25 @@ class VerdictGenerator:
                 except Exception:
                     rel_f = 0.0
                 stmt_l = stmt.lower()
+                stmt_tokens = {w.lower() for w in re.findall(r"\b[\w']+\b", stmt)}
+                stmt_neg = any(
+                    t in stmt_tokens
+                    for t in {
+                        "no",
+                        "not",
+                        "never",
+                        "without",
+                        "lack",
+                        "lacks",
+                        "lacking",
+                        "myth",
+                        "debunked",
+                        "doesn't",
+                        "isn't",
+                        "cannot",
+                        "can't",
+                    }
+                )
                 uncertainty_penalty = 0.0
                 if assertive_claim and any(t in stmt_l for t in uncertainty_terms):
                     uncertainty_penalty = 0.18
@@ -643,11 +695,16 @@ class VerdictGenerator:
                 if score > best_score:
                     best_score = score
                     best = ev
+                    best_neg = stmt_neg
 
-            if best and best_score >= 0.55:
+            if best and best_score >= 0.55 and (best_neg == seg_neg):
                 status = "VALID"
-            elif best and best_score >= 0.28:
+            elif best and best_score >= 0.55 and (best_neg != seg_neg):
+                status = "INVALID"
+            elif best and best_score >= 0.28 and (best_neg == seg_neg):
                 status = "PARTIALLY_VALID"
+            elif best and best_score >= 0.28 and (best_neg != seg_neg):
+                status = "PARTIALLY_INVALID"
             else:
                 status = "UNKNOWN"
 

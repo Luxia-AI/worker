@@ -141,3 +141,32 @@ def test_parse_verdict_result_normalizes_duplicated_segment_prefix():
     out = vg._parse_verdict_result(llm_result, claim, evidence)
     segments = [b.get("claim_segment", "").lower() for b in out["claim_breakdown"]]
     assert all("a diet a diet" not in s for s in segments)
+
+
+def test_parse_verdict_result_flips_valid_when_supporting_fact_negates_claim():
+    vg = _vg()
+    claim = "Drinking at least eight glasses of water a day is essential."
+    evidence = [
+        {
+            "statement": "Drinking 8 glasses of water a day is not necessary for everyone.",
+            "source_url": "https://example.org/water",
+            "final_score": 0.8,
+            "credibility": 0.9,
+        }
+    ]
+    llm_result = {
+        "verdict": "PARTIALLY_TRUE",
+        "confidence": 0.9,
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": "Drinking at least eight glasses of water a day is essential",
+                "status": "VALID",
+                "supporting_fact": "Drinking 8 glasses of water a day is not necessary for everyone.",
+                "source_url": "https://example.org/water",
+            }
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm_result, claim, evidence)
+    assert out["claim_breakdown"][0]["status"] in {"INVALID", "PARTIALLY_INVALID"}

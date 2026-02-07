@@ -115,7 +115,8 @@ class AdaptiveTrustPolicy:
         if pred:
             head = _clean(text[: pred.start()])
             tail = _clean(text[pred.start() :])
-            if ("," in head) or (" and " in head.lower()):
+            # Only treat as enumeration when list punctuation exists.
+            if "," in head:
                 normalized = re.sub(r"\s*,\s*and\s+", ", ", head, flags=re.IGNORECASE)
                 normalized = re.sub(r"\s+and\s+", ", ", normalized, flags=re.IGNORECASE)
                 items = [_clean(x) for x in normalized.split(",") if _clean(x)]
@@ -177,6 +178,19 @@ class AdaptiveTrustPolicy:
 
     def _split_on_comparatives(self, text: str) -> List[str]:
         """Split on comparative structures (higher than, more than, etc.)."""
+        # Pattern: "more/less X than Y"
+        m = re.search(
+            r"\b(more|less|higher|lower|greater|fewer|better|worse)\b(.+?)\bthan\b(.+)$",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            left = text[: m.start()].strip()
+            comp_mid = (m.group(1) + m.group(2)).strip()
+            right = m.group(3).strip()
+            if left and comp_mid and right:
+                return [left, f"{comp_mid} than {right}".strip()]
+
         comparatives = [
             " more than ",
             " less than ",
@@ -331,7 +345,9 @@ class AdaptiveTrustPolicy:
         logger.info(f"Agreement: {non_contradicting}/{len(evidence_list)} = {agreement:.2f}")
         return agreement
 
-    def apply_gating_rules(self, coverage: float, diversity: float, agreement: float) -> bool:
+    def apply_gating_rules(
+        self, coverage: float, diversity: float, agreement: float, evidence_count: int | None = None
+    ) -> bool:
         """
         Apply adaptive gating rules to determine if evidence is sufficient.
 
@@ -348,6 +364,10 @@ class AdaptiveTrustPolicy:
         Returns:
             True if evidence is sufficient, False otherwise
         """
+        if evidence_count is not None and evidence_count < 3:
+            logger.info(f"Gating: FAIL - insufficient evidence count ({evidence_count} < 3)")
+            return False
+
         if coverage >= self.COVERAGE_THRESHOLD_HIGH and agreement >= self.AGREEMENT_THRESHOLD_HIGH:
             logger.info(
                 f"Gating: PASS - High coverage ({coverage:.2f} >= {self.COVERAGE_THRESHOLD_HIGH}) "
@@ -394,7 +414,7 @@ class AdaptiveTrustPolicy:
         agreement = self.calculate_agreement(top_evidence)
 
         # Apply gating rules
-        is_sufficient = self.apply_gating_rules(coverage, diversity, agreement)
+        is_sufficient = self.apply_gating_rules(coverage, diversity, agreement, evidence_count=len(top_evidence))
 
         # Compute adaptive trust score
         if not top_evidence:
