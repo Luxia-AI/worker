@@ -99,11 +99,55 @@ class AdaptiveTrustPolicy:
 
     def _split_on_conjunctives(self, text: str) -> List[str]:
         """Split on conjunctive words while preserving context."""
+
+        def _clean(t: str) -> str:
+            return re.sub(r"\s+", " ", t).strip(" ,.")
+
+        # Enumeration-aware expansion for list claims with a shared predicate.
+        pred = re.search(
+            (
+                r"\b(helps?|prevents?|reduces?|increases?|causes?|improves?|worsens?|protects?|"
+                r"associated with|linked to|leads to)\b"
+            ),
+            text,
+            flags=re.IGNORECASE,
+        )
+        if pred:
+            head = _clean(text[: pred.start()])
+            tail = _clean(text[pred.start() :])
+            if ("," in head) or (" and " in head.lower()):
+                normalized = re.sub(r"\s*,\s*and\s+", ", ", head, flags=re.IGNORECASE)
+                normalized = re.sub(r"\s+and\s+", ", ", normalized, flags=re.IGNORECASE)
+                items = [_clean(x) for x in normalized.split(",") if _clean(x)]
+                if len(items) >= 2:
+                    first = items[0]
+                    q = re.search(r"\b(rich in|low in|high in|with|without|deficient in)\b", first, flags=re.IGNORECASE)
+                    subject_root = _clean(first[: q.start()]) if q else _clean(" ".join(first.split()[:2]))
+                    qualifier_prefix = (first[: q.end()].strip() + " ") if q else ""
+                    out: List[str] = []
+                    for idx, item in enumerate(items):
+                        phrase = item
+                        if idx > 0 and len(item.split()) <= 4:
+                            if qualifier_prefix:
+                                phrase = qualifier_prefix + item
+                            elif subject_root:
+                                phrase = f"{subject_root} {item}"
+                        elif (
+                            idx > 0
+                            and subject_root
+                            and re.match(
+                                r"^(rich in|low in|high in|with|without|deficient in)\b", item, flags=re.IGNORECASE
+                            )
+                        ):
+                            phrase = f"{subject_root} {item}"
+                        out.append(_clean(f"{phrase} {tail}"))
+                    return out
+
         conjunctives = [" and ", " or ", " but ", " however ", " although ", " while "]
 
         for conj in conjunctives:
             if conj in text.lower():
-                parts = [p.strip() for p in text.split(conj) if p.strip()]
+                parts = [_clean(p) for p in text.split(conj) if _clean(p)]
                 if len(parts) > 1:
                     # Reconstruct with conjunction for context
                     result = []

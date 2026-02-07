@@ -244,13 +244,14 @@ class TrustedSearch:
         variants = [norm]
 
         # Singular/plural variant on last token.
+        # Keep conservative to avoid malformed forms like "diet richs".
         if words:
             last = words[-1]
-            if last.endswith("s") and len(last) > 3:
+            if len(words) == 1 and last.endswith("s") and len(last) > 3:
                 singular = " ".join(words[:-1] + [last[:-1]])
                 if singular not in variants:
                     variants.append(singular)
-            elif not last.endswith("s"):
+            elif len(words) == 1 and not last.endswith("s"):
                 plural = " ".join(words[:-1] + [last + "s"])
                 if plural not in variants:
                     variants.append(plural)

@@ -92,6 +92,11 @@ async def process_jobs():
                     verdict_result = result.get("verdict", {})
 
                     # Build response with evidence and verdict
+                    vdb_signal_count = sum(1 for e in ranked_evidence if float(e.get("sem_score", 0.0) or 0.0) > 0.0)
+                    kg_signal_count = sum(1 for e in ranked_evidence if float(e.get("kg_score", 0.0) or 0.0) > 0.0)
+                    vdb_signal_sum = sum(float(e.get("sem_score", 0.0) or 0.0) for e in ranked_evidence[:5])
+                    kg_signal_sum = sum(float(e.get("kg_score", 0.0) or 0.0) for e in ranked_evidence[:5])
+
                     response = {
                         "job_id": job_id,
                         "post_id": post_id,
@@ -109,11 +114,19 @@ async def process_jobs():
                         # Evidence details
                         "evidence_count": len(ranked_evidence),
                         "facts_extracted": facts_count,
+                        "semantic_candidates_count": result.get("semantic_candidates_count", 0),
+                        "kg_candidates_count": result.get("kg_candidates_count", 0),
+                        "vdb_signal_count": vdb_signal_count,
+                        "kg_signal_count": kg_signal_count,
+                        "vdb_signal_sum_top5": round(vdb_signal_sum, 3),
+                        "kg_signal_sum_top5": round(kg_signal_sum, 3),
                         "evidence": [
                             {
                                 "statement": e.get("statement", ""),
                                 "source_url": e.get("source_url", ""),
                                 "score": round(e.get("final_score", 0), 3),
+                                "sem_score": round(float(e.get("sem_score", 0.0) or 0.0), 3),
+                                "kg_score": round(float(e.get("kg_score", 0.0) or 0.0), 3),
                                 "credibility": e.get("credibility"),
                                 "grade": e.get("grade", "N/A"),
                             }
@@ -339,11 +352,19 @@ async def verify_claim(request: ClaimRequest):
             # Evidence details
             "evidence_count": len(ranked_evidence),
             "facts_extracted": facts_count,
+            "semantic_candidates_count": result.get("semantic_candidates_count", 0),
+            "kg_candidates_count": result.get("kg_candidates_count", 0),
+            "vdb_signal_count": sum(1 for e in ranked_evidence if float(e.get("sem_score", 0.0) or 0.0) > 0.0),
+            "kg_signal_count": sum(1 for e in ranked_evidence if float(e.get("kg_score", 0.0) or 0.0) > 0.0),
+            "vdb_signal_sum_top5": round(sum(float(e.get("sem_score", 0.0) or 0.0) for e in ranked_evidence[:5]), 3),
+            "kg_signal_sum_top5": round(sum(float(e.get("kg_score", 0.0) or 0.0) for e in ranked_evidence[:5]), 3),
             "evidence": [
                 {
                     "statement": e.get("statement", ""),
                     "source_url": e.get("source_url", ""),
                     "score": round(e.get("final_score", 0), 3),
+                    "sem_score": round(float(e.get("sem_score", 0.0) or 0.0), 3),
+                    "kg_score": round(float(e.get("kg_score", 0.0) or 0.0), 3),
                     "credibility": e.get("credibility"),
                     "grade": e.get("grade", "N/A"),
                 }

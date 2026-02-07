@@ -456,6 +456,8 @@ class VerdictGenerator:
 
         # Extract claim breakdown for client display
         claim_breakdown = llm_result.get("claim_breakdown", [])
+        if self._should_rebuild_claim_breakdown(claim_breakdown):
+            claim_breakdown = self._build_deterministic_claim_breakdown(claim, evidence)
 
         # Guardrail: prevent hallucinated support (source_url / supporting_fact must map to provided evidence)
         ev_urls = set((e.get("source_url") or e.get("source") or "") for e in evidence)
@@ -526,6 +528,91 @@ class VerdictGenerator:
             "claim": claim,
             "evidence_count": len(evidence),
         }
+
+    def _is_meaningful_segment(self, segment: str) -> bool:
+        if not segment:
+            return False
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+        }
+        words = [w for w in re.findall(r"\b\w+\b", segment.lower()) if w not in stop]
+        return len(words) >= 2 and len(segment.strip()) >= 12
+
+    def _should_rebuild_claim_breakdown(self, claim_breakdown: List[Dict[str, Any]]) -> bool:
+        if not claim_breakdown:
+            return True
+        low_quality = 0
+        for item in claim_breakdown:
+            seg = (item.get("claim_segment") or "").strip()
+            if not self._is_meaningful_segment(seg):
+                low_quality += 1
+        return low_quality > 0
+
+    def _build_deterministic_claim_breakdown(self, claim: str, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Build a deterministic claim breakdown with meaningful segments.
+        Used when LLM returns fragmentary segments (e.g. single words).
+        """
+        segments = self._split_claim_into_segments(claim)
+        out: List[Dict[str, Any]] = []
+        for seg in segments:
+            seg_words = set(re.findall(r"\b\w+\b", seg.lower()))
+            best = None
+            best_score = 0.0
+            for ev in evidence[:8]:
+                stmt = (ev.get("statement") or ev.get("text") or "").strip()
+                if not stmt:
+                    continue
+                stmt_words = set(re.findall(r"\b\w+\b", stmt.lower()))
+                overlap = len(seg_words & stmt_words) / max(1, len(seg_words))
+                rel = ev.get("final_score")
+                if rel is None:
+                    rel = ev.get("score", 0.0)
+                try:
+                    rel_f = float(rel or 0.0)
+                except Exception:
+                    rel_f = 0.0
+                score = (0.6 * max(0.0, min(1.0, rel_f))) + (0.4 * max(0.0, min(1.0, overlap)))
+                if score > best_score:
+                    best_score = score
+                    best = ev
+
+            if best and best_score >= 0.60:
+                status = "VALID"
+            elif best and best_score >= 0.38:
+                status = "PARTIALLY_VALID"
+            else:
+                status = "UNKNOWN"
+
+            out.append(
+                {
+                    "claim_segment": seg,
+                    "status": status,
+                    "supporting_fact": (best.get("statement") if best and status != "UNKNOWN" else "") or "",
+                    "source_url": (best.get("source_url") if best and status != "UNKNOWN" else "") or "",
+                }
+            )
+        return out
 
     def _calculate_truthfulness_from_evidence(self, claim: str, evidence: List[Dict[str, Any]]) -> float:
         """
@@ -724,48 +811,85 @@ class VerdictGenerator:
         Uses sentence boundaries and minimal connectors to split.
         Each segment should be a complete, verifiable statement.
         """
-        # Split on sentence boundaries and common connectors
-        delimiters = [
-            r"\. ",  # Period followed by space
-            r"; ",  # Semicolon
-            r"\. However,",  # Common transition
-            r", however,",
-            r"\. Additionally,",
-        ]
 
-        # Join delimiters into regex pattern
-        pattern = "|".join(delimiters)
+        def _clean_spaces(t: str) -> str:
+            return re.sub(r"\s+", " ", t).strip(" ,.")
 
-        # Split and clean
-        raw_segments = re.split(pattern, claim, flags=re.IGNORECASE)
+        def _expand_enumeration(sentence: str) -> List[str]:
+            # Build meaningful segments for patterns like:
+            # "A diet rich in fruits, vegetables, and low in saturated fats helps prevent ..."
+            pred = re.search(
+                (
+                    r"\b(helps?|prevents?|reduces?|increases?|causes?|improves?|worsens?|protects?|"
+                    r"associated with|linked to|leads to)\b"
+                ),
+                sentence,
+                flags=re.IGNORECASE,
+            )
+            if not pred:
+                return []
+            head = _clean_spaces(sentence[: pred.start()])
+            tail = _clean_spaces(sentence[pred.start() :])
+            if ("," not in head) and (" and " not in head.lower()):
+                return []
 
-        # Clean up segments and merge too-short fragments
-        segments = []
-        current = ""
-        for seg in raw_segments:
-            seg = seg.strip()
-            # Skip very short segments (likely incomplete)
-            if len(seg) <= 20:
+            normalized = re.sub(r"\s*,\s*and\s+", ", ", head, flags=re.IGNORECASE)
+            normalized = re.sub(r"\s+and\s+", ", ", normalized, flags=re.IGNORECASE)
+            items = [_clean_spaces(x) for x in normalized.split(",") if _clean_spaces(x)]
+            if len(items) < 2:
+                return []
+
+            first = items[0]
+            q = re.search(r"\b(rich in|low in|high in|with|without|deficient in)\b", first, flags=re.IGNORECASE)
+            subject_root = _clean_spaces(first[: q.start()]) if q else _clean_spaces(" ".join(first.split()[:2]))
+            qualifier_prefix = (first[: q.end()].strip() + " ") if q else ""
+
+            out: List[str] = []
+            for idx, item in enumerate(items):
+                phrase = item
+                if idx > 0 and len(item.split()) <= 4:
+                    if qualifier_prefix:
+                        phrase = qualifier_prefix + item
+                    elif subject_root:
+                        phrase = f"{subject_root} {item}"
+                elif (
+                    idx > 0
+                    and subject_root
+                    and re.match(r"^(rich in|low in|high in|with|without|deficient in)\b", item, flags=re.IGNORECASE)
+                ):
+                    phrase = f"{subject_root} {item}"
+
+                seg = _clean_spaces(f"{phrase} {tail}")
+                if self._is_meaningful_segment(seg):
+                    out.append(seg)
+            return out
+
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", claim) if s.strip()]
+        segments: List[str] = []
+        for sentence in sentences:
+            expanded = _expand_enumeration(sentence)
+            if expanded:
+                segments.extend(expanded)
                 continue
-            if not current:
-                current = seg
+            parts = [p.strip() for p in re.split(r"\s*;\s*", sentence) if p.strip()]
+            segments.extend(parts or [sentence])
+
+        filtered: List[str] = []
+        seen = set()
+        for seg in segments:
+            seg = _clean_spaces(seg)
+            if not self._is_meaningful_segment(seg):
                 continue
-            # Merge tiny fragments into the current segment
-            if len(seg) < 40:
-                current = f"{current} {seg}".strip()
-                continue
-            segments.append(current)
-            current = seg
+            key = seg.lower()
+            if key not in seen:
+                seen.add(key)
+                filtered.append(seg)
 
-        if current:
-            segments.append(current)
+        if not filtered:
+            filtered = [_clean_spaces(claim)]
 
-        # If splitting produced no good segments, use full claim
-        if not segments:
-            segments = [claim]
-
-        logger.debug(f"[VerdictGenerator] Split claim into {len(segments)} segments")
-        return segments
+        logger.debug(f"[VerdictGenerator] Split claim into {len(filtered)} segments")
+        return filtered
 
     async def _retrieve_segment_evidence(self, claim: str, top_k: int = 2) -> List[Dict[str, Any]]:
         """

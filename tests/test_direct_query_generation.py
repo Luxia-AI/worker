@@ -53,7 +53,7 @@ async def test_advanced_queries_include_boolean_and_operator_constraints():
         entities=["human heart", "adults"],
     )
 
-    assert any(" or " in q.lower() for q in queries), f"Missing boolean synonym query: {queries}"
+    assert any('"' in q for q in queries), f"Missing quoted phrase constraint query: {queries}"
     assert any("filetype:pdf" in q for q in queries), f"Missing filetype query: {queries}"
     assert any("intitle:" in q for q in queries), f"Missing intitle query: {queries}"
 
