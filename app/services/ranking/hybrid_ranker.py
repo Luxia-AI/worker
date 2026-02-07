@@ -21,6 +21,7 @@ from app.constants.config import (
 )
 from app.core.logger import get_logger
 from app.services.common.list_ops import dedupe_list
+from app.services.ranking.subclaim_coverage import evaluate_anchor_match
 
 logger = get_logger(__name__)
 
@@ -286,6 +287,8 @@ def hybrid_rank(
                 "sem_score_raw": 0.0,
                 "kg_score": 0.0,
                 "kg_score_raw": 0.0,
+                "candidate_type": item.get("candidate_type") or ("KG" if src_type == "kg" else "VDB"),
+                "is_backfill": bool(item.get("is_backfill", False)),
                 "credibility": _credibility_score_from_meta(item),
                 "orig": {"semantic": None, "kg": None},
             }
@@ -296,11 +299,17 @@ def hybrid_rank(
             candidates_map[key]["orig"]["semantic"] = item
             sem_scores.append(candidates_map[key]["sem_score"])
         else:
-            val = _safe_float(item.get("score"), 0.0)
+            val = max(
+                _safe_float(item.get("kg_score_raw"), 0.0),
+                _safe_float(item.get("kg_score"), 0.0),
+                _safe_float(item.get("score"), 0.0),
+            )
             candidates_map[key]["kg_score"] = max(candidates_map[key]["kg_score"], val)
             candidates_map[key]["kg_score_raw"] = max(candidates_map[key]["kg_score_raw"], val)
             candidates_map[key]["orig"]["kg"] = item
+            candidates_map[key]["candidate_type"] = "KG"
             kg_scores.append(candidates_map[key]["kg_score"])
+        candidates_map[key]["is_backfill"] = bool(candidates_map[key]["is_backfill"] or item.get("is_backfill", False))
 
         # merge entities
         ents = item.get("entities") or []
@@ -340,6 +349,9 @@ def hybrid_rank(
             continue
 
         claim_overlap = _claim_overlap_score(query_text, item["statement"])
+        anchor_eval = evaluate_anchor_match(query_text, item["statement"])
+        if not anchor_eval["anchor_ok"]:
+            claim_overlap = min(claim_overlap, 0.20)
         stmt_lq = item["statement"].lower()
         claim_assertive = bool(
             re.search(
@@ -364,6 +376,11 @@ def hybrid_rank(
         # Reward KG-backed, entity-aligned evidence so KG can contribute in top-k.
         if kg_s > 0.0 and ent_s >= 0.34 and claim_overlap >= 0.10:
             final_score += 0.10
+        if item.get("candidate_type") == "KG" and kg_raw >= 0.40 and anchor_eval.get("anchor_ok", True):
+            final_score += 0.08
+        is_backfill = bool(item.get("is_backfill", False))
+        if is_backfill and not (ent_s >= 0.25 or kg_s >= 0.55 or kg_raw >= 0.55):
+            final_score *= 0.85
         final_score -= uncertainty_penalty
 
         # small heuristic: if both sem and kg are zero but credibility high, ensure min floor
@@ -381,6 +398,11 @@ def hybrid_rank(
             "kg_score_raw": kg_raw,
             "entity_overlap": ent_s,
             "claim_overlap": claim_overlap,
+            "anchors_matched": int(anchor_eval.get("matched_groups", 0)),
+            "anchors_required": int(anchor_eval.get("required_groups", 0)),
+            "anchor_ok": bool(anchor_eval.get("anchor_ok", True)),
+            "candidate_type": item.get("candidate_type", "VDB"),
+            "is_backfill": is_backfill,
             "recency": recency_s,
             "credibility": cred_s,
             "final_score": max(0.0, min(final_score, 1.0)),
@@ -402,6 +424,28 @@ def hybrid_rank(
     results.sort(key=lambda r: (-r["final_score"], -r["sem_score"], -r["credibility"], r["statement"]))
 
     kg_in_ranked = sum(1 for r in results if _safe_float(r.get("kg_score"), 0.0) > 0.0)
+    kg_with_score = sum(
+        1
+        for r in kg_results or []
+        if max(
+            _safe_float(r.get("kg_score_raw"), 0.0),
+            _safe_float(r.get("kg_score"), 0.0),
+            _safe_float(r.get("score"), 0.0),
+        )
+        > 0.0
+    )
+    kg_max = max(
+        [
+            max(
+                _safe_float(r.get("kg_score_raw"), 0.0),
+                _safe_float(r.get("kg_score"), 0.0),
+                _safe_float(r.get("score"), 0.0),
+            )
+            for r in (kg_results or [])
+        ]
+        or [0.0]
+    )
+    kg_in_top = sum(1 for r in (results[:5] if results else []) if _safe_float(r.get("kg_score"), 0.0) > 0.0)
     if kg_results and kg_in_ranked == 0 and results:
         logger.info(
             "[hybrid_rank] KG candidates present but none survived ranking filters (kg_raw=%d, ranked=%d)",
@@ -410,10 +454,14 @@ def hybrid_rank(
         )
 
     logger.info(
-        "[hybrid_rank] Ranked %d candidates. Top score: %s (kg_input=%d, kg_in_ranked=%d)",
+        "[hybrid_rank] Ranked %d candidates. Top score: %s (kg_input=%d, kg_with_score=%d, "
+        "max_kg_score=%.3f, kg_in_ranked=%d, kg_in_top=%d)",
         len(results),
         (results[0]["final_score"] if results else "N/A"),
         len(kg_results or []),
+        kg_with_score,
+        kg_max,
         kg_in_ranked,
+        kg_in_top,
     )
     return results

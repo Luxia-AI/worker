@@ -943,13 +943,20 @@ FAILED ENTITIES:
             return False
         try:
             domain = url.split("/")[2].lower()
+            if "@" in domain:
+                domain = domain.split("@")[-1]
+            if ":" in domain:
+                domain = domain.split(":")[0]
+            if domain.startswith("www."):
+                domain = domain[4:]
 
             # Check exact domain match
-            if domain in TRUSTED_DOMAINS:
+            trusted_norm = {d.lower().removeprefix("www.") for d in TRUSTED_DOMAINS}
+            if domain in trusted_norm:
                 return True
 
             # Check if any trusted domain is a suffix (handles subdomains)
-            for trusted in TRUSTED_DOMAINS:
+            for trusted in trusted_norm:
                 if domain.endswith(trusted) or domain.endswith("." + trusted):
                     return True
 

@@ -136,6 +136,9 @@ async def retrieve_candidates(
         source_key="source_url",
         score_key="score",
     )
+    for c in dedup_sem:
+        c["candidate_type"] = c.get("candidate_type") or "VDB"
+        c["is_backfill"] = bool(c.get("is_backfill", False))
     logger.info(
         f"[RetrievalPhase:{round_id}] Retrieved {len(dedup_sem)} semantic candidates "
         f"(from {len(semantic_candidates)} raw)"
@@ -158,12 +161,40 @@ async def retrieve_candidates(
     except Exception as e:
         logger.warning(f"[RetrievalPhase:{round_id}] KG retrieval failed: {e}")
 
+    kg_with_positive_score = 0
+    kg_max_score = 0.0
+    for c in kg_candidates:
+        if not (c.get("statement") or "").strip():
+            subj = (c.get("subject") or "").strip()
+            rel = (c.get("relation") or "").replace("_", " ").strip()
+            obj = (c.get("object") or "").strip()
+            stmt = " ".join(p for p in [subj, rel, obj] if p).strip()
+            c["statement"] = stmt
+        raw = max(
+            float(c.get("kg_score_raw") or 0.0),
+            float(c.get("kg_score") or 0.0),
+            float(c.get("confidence") or 0.0),
+            float(c.get("path_quality_score") or 0.0),
+            float(c.get("score") or 0.0),
+        )
+        # Small provenance lift when source exists.
+        if (c.get("source_url") or "").strip():
+            raw = min(1.0, raw + 0.05)
+        c["kg_score_raw"] = raw
+        c["kg_score"] = raw
+        c["score"] = max(float(c.get("score") or 0.0), raw)
+        c["candidate_type"] = "KG"
+        if raw > 0.0:
+            kg_with_positive_score += 1
+        kg_max_score = max(kg_max_score, raw)
+
     logger.info(f"[RetrievalPhase:{round_id}] Retrieved {len(kg_candidates)} KG candidates")
     kg_with_text = sum(1 for c in kg_candidates if (c.get("statement") or "").strip())
     kg_with_source = sum(1 for c in kg_candidates if (c.get("source_url") or "").strip())
     logger.info(
         f"[RetrievalPhase:{round_id}] KG->evidence conversion: total={len(kg_candidates)}, "
-        f"textualized={kg_with_text}, with_source={kg_with_source}"
+        f"textualized={kg_with_text}, with_source={kg_with_source}, "
+        f"kg_with_score={kg_with_positive_score}, max_kg_score={kg_max_score:.3f}"
     )
 
     return dedup_sem, kg_candidates

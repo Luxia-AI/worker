@@ -14,6 +14,7 @@ import re
 from typing import Any, Dict, List
 
 from app.core.logger import get_logger
+from app.services.ranking.subclaim_coverage import compute_subclaim_coverage
 from app.services.ranking.trust_ranker import EvidenceItem
 
 logger = get_logger(__name__)
@@ -223,16 +224,22 @@ class AdaptiveTrustPolicy:
         if not subclaims:
             return 0.0
 
-        covered_count = 0
-        for subclaim in subclaims:
-            # Check if any evidence item semantically covers this subclaim
-            for evidence in evidence_list:
-                if self._evidence_covers_subclaim(subclaim, evidence):
-                    covered_count += 1
-                    break
-
-        coverage = covered_count / len(subclaims)
-        logger.info(f"Coverage: {covered_count}/{len(subclaims)} = {coverage:.2f}")
+        cov = compute_subclaim_coverage(subclaims, evidence_list, partial_weight=0.5)
+        coverage = float(cov.get("coverage", 0.0))
+        weighted = float(cov.get("weighted_covered", 0.0))
+        logger.info("Coverage: weighted=%.2f/%d = %.2f", weighted, len(subclaims), coverage)
+        for d in cov.get("details", []):
+            logger.info(
+                "[AdaptiveTrustPolicy][Coverage] subclaim=%d best_evidence_id=%s "
+                "relevance=%.3f overlap=%.3f anchors=%d/%d status=%s",
+                d.get("subclaim_id"),
+                d.get("best_evidence_id"),
+                float(d.get("relevance_score", 0.0)),
+                float(d.get("overlap", 0.0)),
+                int(d.get("anchors_matched", 0)),
+                int(d.get("anchors_required", 0)),
+                d.get("status"),
+            )
         return coverage
 
     def _evidence_covers_subclaim(self, subclaim: str, evidence: EvidenceItem) -> bool:
@@ -422,15 +429,20 @@ class AdaptiveTrustPolicy:
         else:
             # Get individual evidence trust scores
             subclaim_trusts = []
-            for subclaim in subclaims:
-                # Find best evidence for this subclaim
-                best_trust = 0.0
-                for evidence in top_evidence:
-                    if self._evidence_covers_subclaim(subclaim, evidence):
-                        best_trust = max(best_trust, evidence.trust)
-
-                if best_trust > 0:
-                    subclaim_trusts.append(best_trust)
+            cov = compute_subclaim_coverage(subclaims, top_evidence, partial_weight=0.5)
+            for d in cov.get("details", []):
+                best_idx = int(d.get("best_evidence_id", -1))
+                if best_idx < 0 or best_idx >= len(top_evidence):
+                    continue
+                weight = float(d.get("weight", 0.0))
+                if weight <= 0.0:
+                    continue
+                try:
+                    best_trust = float(getattr(top_evidence[best_idx], "trust", 0.0) or 0.0)
+                except Exception:
+                    best_trust = 0.0
+                if best_trust > 0.0:
+                    subclaim_trusts.append(best_trust * weight)
 
             if subclaim_trusts:
                 mean_subclaim_trust = sum(subclaim_trusts) / len(subclaim_trusts)

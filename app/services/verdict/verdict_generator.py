@@ -26,6 +26,7 @@ from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
+from app.services.ranking.subclaim_coverage import compute_subclaim_coverage
 from app.services.retrieval.metadata_enricher import TopicClassifier
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 
@@ -563,7 +564,7 @@ class VerdictGenerator:
         # Re-score confidence from evidence + breakdown when possible
         if evidence:
             confidence = self._calculate_confidence(evidence, claim_breakdown)
-        self._log_subclaim_coverage(claim_breakdown)
+        self._log_subclaim_coverage(claim, evidence, claim_breakdown)
 
         return {
             "verdict": verdict_str,
@@ -577,49 +578,78 @@ class VerdictGenerator:
             "evidence_count": len(evidence),
         }
 
-    def _log_subclaim_coverage(self, claim_breakdown: List[Dict[str, Any]]) -> None:
-        if not claim_breakdown:
+    def _log_subclaim_coverage(
+        self,
+        claim: str,
+        evidence: List[Dict[str, Any]],
+        claim_breakdown: List[Dict[str, Any]],
+    ) -> None:
+        trust_policy = getattr(self, "trust_policy", None) or AdaptiveTrustPolicy()
+        subclaims = trust_policy.decompose_claim(claim)
+        cov = compute_subclaim_coverage(subclaims, evidence, partial_weight=0.5)
+        details = cov.get("details", [])
+        if not details:
             logger.info("[VerdictGenerator][Coverage] subclaims=0 covered=0 strong=0 partial=0 unknown=0 coverage=0.00")
             return
 
-        total = len(claim_breakdown)
-        unknown = 0
         strong = 0
         partial = 0
-        covered = 0
-
-        for idx, item in enumerate(claim_breakdown):
-            status = (item.get("status") or "UNKNOWN").upper()
-            has_support = bool((item.get("supporting_fact") or "").strip() and (item.get("source_url") or "").strip())
-
-            if status == "UNKNOWN":
-                unknown += 1
-            elif status in {"VALID", "INVALID"}:
+        unknown = 0
+        for d in details:
+            status = (d.get("status") or "UNKNOWN").upper()
+            if status == "STRONGLY_VALID":
                 strong += 1
-                covered += 1
-            else:
+            elif status == "PARTIALLY_VALID":
                 partial += 1
-                covered += 1
-
+            else:
+                unknown += 1
             logger.info(
-                "[VerdictGenerator][Coverage] subclaim=%d status=%s supported=%s source=%s segment=%s",
-                idx + 1,
+                "[VerdictGenerator][Coverage] subclaim=%d status=%s best_evidence_id=%s "
+                "relevance=%.3f overlap=%.3f anchors=%d/%d segment=%s",
+                d.get("subclaim_id"),
                 status,
-                str(has_support).lower(),
-                (item.get("source_url") or "")[:80],
-                (item.get("claim_segment") or "")[:80],
+                d.get("best_evidence_id"),
+                float(d.get("relevance_score", 0.0)),
+                float(d.get("overlap", 0.0)),
+                int(d.get("anchors_matched", 0)),
+                int(d.get("anchors_required", 0)),
+                (d.get("subclaim") or "")[:80],
             )
 
-        coverage = covered / max(1, total)
         logger.info(
-            "[VerdictGenerator][Coverage] subclaims=%d covered=%d strong=%d partial=%d unknown=%d coverage=%.2f",
-            total,
-            covered,
+            "[VerdictGenerator][Coverage] subclaims=%d weighted_covered=%.2f strong=%d partial=%d "
+            "unknown=%d coverage=%.2f",
+            int(cov.get("subclaims", len(details))),
+            float(cov.get("weighted_covered", 0.0)),
             strong,
             partial,
             unknown,
-            coverage,
+            float(cov.get("coverage", 0.0)),
         )
+        try:
+
+            class _Ev:
+                __slots__ = ("statement", "source_url", "semantic_score", "stance", "trust")
+
+                def __init__(self, d: Dict[str, Any]):
+                    self.statement = d.get("statement") or d.get("text") or ""
+                    self.source_url = d.get("source_url") or d.get("source") or ""
+                    self.semantic_score = float(
+                        d.get("semantic_score") or d.get("sem_score") or d.get("final_score") or d.get("score") or 0.0
+                    )
+                    self.stance = d.get("stance") or "unknown"
+                    self.trust = float(d.get("trust") or d.get("final_score") or d.get("score") or 0.0)
+
+            adaptive = trust_policy.compute_adaptive_trust(
+                claim, [_Ev(d) for d in evidence if (d.get("statement") or d.get("text"))], top_k=min(12, len(evidence))
+            )
+            logger.info(
+                "[VerdictGenerator][Coverage][Aligned] verdict_coverage=%.2f adaptive_coverage=%.2f",
+                float(cov.get("coverage", 0.0)),
+                float(adaptive.get("coverage", 0.0)),
+            )
+        except Exception as e:
+            logger.warning("[VerdictGenerator][Coverage] adaptive alignment failed: %s", e)
 
     def _is_meaningful_segment(self, segment: str) -> bool:
         if not segment:

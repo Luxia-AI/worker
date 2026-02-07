@@ -174,10 +174,13 @@ class KGRetrieval:
             result = {
                 "statement": statement,
                 "score": path_score,  # hybrid ranker score
+                "kg_score_raw": path_score,
+                "kg_score": path_score,
                 "entities": [subj, obj, rel_norm],
                 "source_url": src,
                 "published_at": None,  # KG relations don't have publish dates
                 "credibility": credibility,
+                "candidate_type": "KG",
                 # Additional structured fields for transparency
                 "subject": subj,
                 "relation": rel,
