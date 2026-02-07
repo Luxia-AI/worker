@@ -299,7 +299,7 @@ class VerdictGenerator:
 
         # Step 1) Start with VDB/KG evidence + (optional) segment retrieval
         segment_evidence: List[Dict[str, Any]] = []
-        if (not used_web_search and not cache_sufficient) and (
+        if (not cache_sufficient) and (
             self._needs_web_boost(ranked_evidence[: min(len(ranked_evidence), 6)], claim=claim)
             or self._policy_says_insufficient(claim, ranked_evidence[: min(len(ranked_evidence), 10)])
         ):
@@ -614,6 +614,10 @@ class VerdictGenerator:
         """
         segments = self._split_claim_into_segments(claim)
         out: List[Dict[str, Any]] = []
+        uncertainty_terms = {"less", "uncertain", "unclear", "inconclusive", "mixed", "limited", "insufficient"}
+        assertive_claim = bool(
+            re.search(r"\b(helps?|prevents?|reduces?|increases?|causes?|proves?|protects?)\b", claim, re.IGNORECASE)
+        )
         for seg in segments:
             seg_words = set(re.findall(r"\b\w+\b", seg.lower()))
             best = None
@@ -631,7 +635,11 @@ class VerdictGenerator:
                     rel_f = float(rel or 0.0)
                 except Exception:
                     rel_f = 0.0
-                score = (0.6 * max(0.0, min(1.0, rel_f))) + (0.4 * max(0.0, min(1.0, overlap)))
+                stmt_l = stmt.lower()
+                uncertainty_penalty = 0.0
+                if assertive_claim and any(t in stmt_l for t in uncertainty_terms):
+                    uncertainty_penalty = 0.18
+                score = (0.6 * max(0.0, min(1.0, rel_f))) + (0.4 * max(0.0, min(1.0, overlap))) - uncertainty_penalty
                 if score > best_score:
                     best_score = score
                     best = ev
@@ -698,6 +706,10 @@ class VerdictGenerator:
             "can",
         }
         neg_terms = {"no", "not", "never", "none", "without", "lack", "lacks", "lacking"}
+        uncertainty_terms = {"uncertain", "unclear", "inconclusive", "mixed", "limited", "insufficient"}
+        claim_assertive = bool(
+            re.search(r"\b(helps?|prevents?|reduces?|increases?|causes?|proves?|protects?)\b", claim, re.IGNORECASE)
+        )
 
         # Diversity adjustment based on unique domains in top evidence
         domains = set()
@@ -712,7 +724,7 @@ class VerdictGenerator:
                 except Exception:
                     pass
         diversity = len(domains) / max(1, len(evidence[:8]))
-        diversity = max(0.5, min(1.0, diversity))
+        diversity = max(0.4, min(1.0, diversity))
 
         def _segment_score(segment: str) -> float:
             seg_words = [w for w in re.findall(r"\b\w+\b", (segment or "").lower()) if w not in stop]
@@ -753,11 +765,14 @@ class VerdictGenerator:
 
                 stmt_has_neg = any(t in stmt_set for t in neg_terms)
                 contradiction = 1.0 if (stmt_has_neg and not seg_has_neg and overlap_ratio >= 0.25) else 0.0
+                uncertainty_penalty = 0.0
+                if claim_assertive and any(t in stmt_set for t in uncertainty_terms):
+                    uncertainty_penalty = 0.22
 
                 support = (0.50 * rel) + (0.35 * overlap_ratio) + (0.15 * cred)
                 if overlap_ratio < 0.20:
                     support *= 0.50
-                net = support - (0.60 * contradiction)
+                net = support - (0.60 * contradiction) - uncertainty_penalty
                 net = max(0.0, min(1.0, net))
 
                 if net > best:
@@ -778,7 +793,8 @@ class VerdictGenerator:
             return 0.0
 
         avg_support = sum(segment_scores) / len(segment_scores)
-        truthfulness = avg_support * diversity
+        # Keep diversity as a mild reliability adjustment, not a hard multiplier.
+        truthfulness = avg_support * (0.85 + (0.15 * diversity))
         return round(truthfulness * 100.0, 1)
 
     def _calculate_confidence(self, evidence: List[Dict[str, Any]], claim_breakdown: List[Dict[str, Any]]) -> float:
@@ -928,7 +944,7 @@ class VerdictGenerator:
             first = items[0]
             q = re.search(r"\b(rich in|low in|high in|with|without|deficient in)\b", first, flags=re.IGNORECASE)
             subject_root = _clean_spaces(first[: q.start()]) if q else _clean_spaces(" ".join(first.split()[:2]))
-            qualifier_prefix = (first[: q.end()].strip() + " ") if q else ""
+            qualifier_prefix = (q.group(1).strip() + " ") if q else ""
             out: List[str] = []
             for idx, item in enumerate(items):
                 phrase = item

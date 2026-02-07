@@ -31,6 +31,14 @@ LOW_SIGNAL_PHRASES = (
     "requires human verification",
     "enable javascript",
 )
+UNCERTAINTY_PHRASES = (
+    "less certain",
+    "uncertain",
+    "unclear",
+    "inconclusive",
+    "insufficient evidence",
+    "mixed evidence",
+)
 
 
 def _safe_float(v: Optional[float], default: float = 0.0) -> float:
@@ -299,6 +307,15 @@ def hybrid_rank(
             continue
 
         claim_overlap = _claim_overlap_score(query_text, item["statement"])
+        stmt_lq = item["statement"].lower()
+        claim_assertive = bool(
+            re.search(
+                r"\b(helps?|prevents?|reduces?|increases?|causes?|proves?|protects?)\b", query_text, re.IGNORECASE
+            )
+        )
+        uncertainty_penalty = 0.0
+        if claim_assertive and any(p in stmt_lq for p in UNCERTAINTY_PHRASES):
+            uncertainty_penalty = 0.12
 
         final_score = (
             (w_sem * sem_s)
@@ -308,6 +325,10 @@ def hybrid_rank(
             + (w_recency * recency_s)
             + (w_cred * cred_s)
         )
+        # Reward KG-backed, entity-aligned evidence so KG can contribute in top-k.
+        if kg_s > 0.0 and ent_s >= 0.34 and claim_overlap >= 0.10:
+            final_score += 0.10
+        final_score -= uncertainty_penalty
 
         # small heuristic: if both sem and kg are zero but credibility high, ensure min floor
         if sem_s == 0.0 and kg_s == 0.0 and cred_s >= RANKING_MIN_CREDIBILITY_THRESHOLD:

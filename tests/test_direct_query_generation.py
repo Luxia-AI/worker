@@ -129,3 +129,15 @@ def test_simplify_query_for_serper_fallback_removes_strict_operators():
     assert "intitle:" not in simplified
     assert "filetype:" not in simplified
     assert "(" not in simplified and ")" not in simplified
+
+
+def test_domain_specific_queries_for_nutrition_claim():
+    ts = _init_trusted_search()
+    claim = (
+        "A diet rich in fruits, vegetables, and low in saturated fats helps prevent "
+        "noncommunicable diseases like diabetes and cancer."
+    )
+    qs = ts._build_domain_specific_queries(claim)
+    joined = " | ".join(qs).lower()
+    assert "fruit and vegetable intake" in joined
+    assert "saturated fat" in joined

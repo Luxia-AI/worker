@@ -21,6 +21,7 @@ def test_split_claim_into_segments_expands_list_claim_meaningfully():
     assert len(segments) >= 3
     assert not any(seg.strip().lower() == "vegetables" for seg in segments)
     assert all("helps prevent" in seg.lower() for seg in segments)
+    assert not any("a diet a diet" in seg.lower() for seg in segments)
 
 
 def test_should_rebuild_claim_breakdown_for_fragmentary_segments():

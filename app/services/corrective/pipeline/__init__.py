@@ -169,6 +169,7 @@ class CorrectivePipeline:
             claim_topics,
             self.lexical_index,
             self.log_manager,
+            post_text,
         )
 
         logger.info(
@@ -249,9 +250,16 @@ class CorrectivePipeline:
                 "kg_candidates_count": len(kg_candidates),
                 "ranked": top_ranked,
                 "used_web_search": False,
+                "data_source": "CACHE",
                 "trust_threshold": "adaptive",  # Now using adaptive policy
                 "trust_threshold_met": True,
                 "initial_top_score": adaptive_trust["trust_post"],
+                "ranking_top_score": (top_ranked[0].get("final_score", 0.0) if top_ranked else 0.0),
+                "ranking_avg_score": (
+                    sum(float(r.get("final_score", 0.0) or 0.0) for r in top_ranked[:5]) / max(1, len(top_ranked[:5]))
+                    if top_ranked
+                    else 0.0
+                ),
                 "trust_post": adaptive_trust["trust_post"],
                 "trust_grade": "adaptive",  # Adaptive grading
                 "agreement_ratio": adaptive_trust["agreement"],
@@ -302,10 +310,17 @@ class CorrectivePipeline:
                 "kg_candidates_count": len(kg_candidates),
                 "ranked": top_ranked,
                 "used_web_search": False,
+                "data_source": "CACHE",
                 "search_api_calls": 0,
                 "trust_threshold": "adaptive",
                 "trust_threshold_met": False,
                 "initial_top_score": adaptive_trust["trust_post"],
+                "ranking_top_score": (top_ranked[0].get("final_score", 0.0) if top_ranked else 0.0),
+                "ranking_avg_score": (
+                    sum(float(r.get("final_score", 0.0) or 0.0) for r in top_ranked[:5]) / max(1, len(top_ranked[:5]))
+                    if top_ranked
+                    else 0.0
+                ),
                 "coverage": adaptive_trust["coverage"],
                 "diversity": adaptive_trust["diversity"],
                 "num_subclaims": adaptive_trust["num_subclaims"],
@@ -433,6 +448,7 @@ class CorrectivePipeline:
                 claim_topics,
                 self.lexical_index,
                 self.log_manager,
+                post_text,
             )
 
             top_ranked = await rank_candidates(
@@ -586,6 +602,7 @@ class CorrectivePipeline:
             "kg_candidates_count": len(kg_candidates),
             "ranked": top_ranked,
             "used_web_search": search_api_calls > 0,
+            "data_source": "WEB_SEARCH" if search_api_calls > 0 else "CACHE",
             "search_api_calls": search_api_calls,
             "search_api_calls_saved": len(queries) - search_api_calls,
             "urls_processed": len(processed_urls),
@@ -593,6 +610,12 @@ class CorrectivePipeline:
             "trust_threshold": self.CONF_THRESHOLD,
             "trust_threshold_met": final_trust_score >= self.CONF_THRESHOLD,
             "initial_top_score": final_trust_score,
+            "ranking_top_score": (top_ranked[0].get("final_score", 0.0) if top_ranked else 0.0),
+            "ranking_avg_score": (
+                sum(float(r.get("final_score", 0.0) or 0.0) for r in top_ranked[:5]) / max(1, len(top_ranked[:5]))
+                if top_ranked
+                else 0.0
+            ),
             "trust_post": final_trust_score,
             "trust_grade": final_trust_post.get("grade", "D"),
             "agreement_ratio": final_trust_post.get("agreement_ratio", 0.0),

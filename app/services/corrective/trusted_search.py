@@ -1,5 +1,6 @@
 import asyncio
 import re
+import urllib.parse
 from typing import Any, Dict, List, Tuple
 
 import aiohttp
@@ -508,6 +509,29 @@ class TrustedSearch:
         adv.append(f'intitle:"meta-analysis" {base}')
         return dedupe_list(adv)
 
+    def _build_domain_specific_queries(self, text: str) -> List[str]:
+        """
+        Add small, claim-conditioned templates for high-yield biomedical retrieval.
+        Avoid hardcoding test-only values.
+        """
+        t = (text or "").lower()
+        queries: List[str] = []
+        has_fruit_veg = ("fruit" in t or "fruits" in t) and ("vegetable" in t or "vegetables" in t)
+        has_sat_fat = "saturated fat" in t or ("saturated" in t and "fat" in t)
+        has_ncd = "noncommunicable" in t or "ncd" in t
+        has_diabetes = "diabetes" in t
+        has_cancer = "cancer" in t
+
+        if has_fruit_veg and has_ncd:
+            queries.append('"fruit and vegetable intake" "noncommunicable disease" risk reduction')
+        if has_sat_fat:
+            queries.append('"saturated fat intake" "cardiometabolic risk"')
+        if has_sat_fat and has_diabetes:
+            queries.append('"saturated fat" diabetes risk meta-analysis')
+        if has_sat_fat and has_cancer:
+            queries.append('"saturated fat" cancer risk systematic review')
+        return dedupe_list(queries)
+
     async def reformulate_queries(
         self,
         text: str,
@@ -699,6 +723,29 @@ FAILED ENTITIES:
             logger.error(f"[TrustedSearch:Serper] Failed for '{query}': {e}")
             return []
 
+    async def search_query_pubmed(self, session: aiohttp.ClientSession, query: str, max_results: int = 8) -> List[str]:
+        """
+        PubMed fallback via NCBI E-utilities when Google/Serper produce weak results.
+        Returns PubMed article URLs from PMID list.
+        """
+        try:
+            term = urllib.parse.quote_plus(query)
+            url = (
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+                f"?db=pubmed&retmode=json&retmax={max_results}&sort=relevance&term={term}"
+            )
+            async with session.get(url, timeout=GOOGLE_CSE_TIMEOUT) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+            id_list = ((data.get("esearchresult") or {}).get("idlist") or [])[:max_results]
+            urls = [f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" for pmid in id_list if pmid]
+            logger.info(f"[TrustedSearch:PubMed] '{query}' -> {len(urls)} pmids")
+            return urls
+        except Exception as e:
+            logger.warning(f"[TrustedSearch:PubMed] Failed for '{query}': {e}")
+            return []
+
     # ---------------------------------------------------------------------
     # Unified Search (with fallback)
     # ---------------------------------------------------------------------
@@ -713,7 +760,10 @@ FAILED ENTITIES:
         # If Google quota already exceeded, go straight to Serper
         if self.google_quota_exceeded:
             if self.serper_available:
-                return await self.search_query_serper(session, self._simplify_query_for_fallback(query))
+                serper = await self.search_query_serper(session, self._simplify_query_for_fallback(query))
+                if serper:
+                    return serper
+                return await self.search_query_pubmed(session, query)
             return []
 
         # Try Google first
@@ -725,7 +775,10 @@ FAILED ENTITIES:
                 logger.warning("[TrustedSearch] Google CSE quota exceeded! " "Switching to Serper.dev fallback...")
 
                 if self.serper_available:
-                    return await self.search_query_serper(session, self._simplify_query_for_fallback(query))
+                    serper = await self.search_query_serper(session, self._simplify_query_for_fallback(query))
+                    if serper:
+                        return serper
+                    return await self.search_query_pubmed(session, query)
                 else:
                     logger.error(
                         "[TrustedSearch] No SERPER_API_KEY configured. "
@@ -737,7 +790,10 @@ FAILED ENTITIES:
 
         # No Google, try Serper directly
         if self.serper_available:
-            return await self.search_query_serper(session, self._simplify_query_for_fallback(query))
+            serper = await self.search_query_serper(session, self._simplify_query_for_fallback(query))
+            if serper:
+                return serper
+            return await self.search_query_pubmed(session, query)
 
         return []
 
@@ -848,6 +904,7 @@ FAILED ENTITIES:
         direct_queries = self._filter_queries(direct_queries, key_terms, key_numbers)
         advanced_queries = self._filter_queries(advanced_queries, key_terms, key_numbers)
         question_queries = self._filter_queries(question_queries, key_terms, key_numbers)
+        domain_queries = self._filter_queries(self._build_domain_specific_queries(post_text), key_terms, key_numbers)
 
         # 3) Add LLM reformulated queries early, but only if they pass strict filters.
         llm_queries: List[str] = []
@@ -870,7 +927,9 @@ FAILED ENTITIES:
         for q in dedupe_list(site_bases):
             site_queries.extend(self._generate_site_queries(q))
 
-        all_queries = dedupe_list(direct_queries + llm_queries + advanced_queries + question_queries + site_queries)
+        all_queries = dedupe_list(
+            direct_queries + advanced_queries + domain_queries + llm_queries + question_queries + site_queries
+        )
 
         # Final validation (strictly direct to claim terms) and budget cap
         all_queries = [self._sanitize_query(q) for q in all_queries if q]

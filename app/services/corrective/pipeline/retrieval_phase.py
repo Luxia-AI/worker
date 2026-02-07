@@ -26,6 +26,7 @@ async def retrieve_candidates(
     topics: List[str],
     lexical_index: Optional[LexicalIndex] = None,
     log_manager: Optional[LogManager] = None,
+    query_text: str = "",
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """
     Retrieve semantic and KG candidates.
@@ -153,7 +154,7 @@ async def retrieve_candidates(
     # KG retrieval
     kg_candidates = []
     try:
-        kg_candidates = await kg_retriever.retrieve(all_entities, top_k=top_k)
+        kg_candidates = await kg_retriever.retrieve(all_entities, top_k=top_k, query_text=query_text)
     except Exception as e:
         logger.warning(f"[RetrievalPhase:{round_id}] KG retrieval failed: {e}")
 

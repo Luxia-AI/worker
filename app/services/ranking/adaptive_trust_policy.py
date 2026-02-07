@@ -123,7 +123,7 @@ class AdaptiveTrustPolicy:
                     first = items[0]
                     q = re.search(r"\b(rich in|low in|high in|with|without|deficient in)\b", first, flags=re.IGNORECASE)
                     subject_root = _clean(first[: q.start()]) if q else _clean(" ".join(first.split()[:2]))
-                    qualifier_prefix = (first[: q.end()].strip() + " ") if q else ""
+                    qualifier_prefix = (q.group(1).strip() + " ") if q else ""
                     out: List[str] = []
                     for idx, item in enumerate(items):
                         phrase = item

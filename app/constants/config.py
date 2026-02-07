@@ -284,8 +284,8 @@ RECENCY_HALF_LIFE_DAYS = 365.0
 # Default weights for hybrid ranking (must sum to 1.0 for interpretability)
 # Tuned for maximum accuracy with balanced KG contribution
 RANKING_WEIGHTS = {
-    "w_semantic": 0.35,  # prioritize direct semantic evidence from VDB/web facts
-    "w_kg": 0.08,  # keep KG supportive, but prevent KG-only domination
+    "w_semantic": 0.31,  # prioritize direct semantic evidence from VDB/web facts
+    "w_kg": 0.12,  # increase KG signal so structured evidence can surface in top-k
     "w_entity": 0.20,  # entity overlap with query (reduced but still significant)
     "w_claim_overlap": 0.15,  # lexical overlap between claim text and evidence statement
     "w_recency": 0.05,  # publication recency (slight boost for fresh evidence)

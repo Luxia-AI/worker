@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Any, Dict, List
 
 from app.core.logger import get_logger
@@ -25,7 +26,7 @@ class KGRetrieval:
     def __init__(self) -> None:
         self.client = Neo4jClient()
 
-    async def retrieve(self, entities: List[str], top_k: int = 20) -> List[Dict[str, Any]]:
+    async def retrieve(self, entities: List[str], top_k: int = 20, query_text: str = "") -> List[Dict[str, Any]]:
         """
         Retrieve knowledge graph paths connecting query entities.
 
@@ -52,7 +53,7 @@ class KGRetrieval:
 
         # Wrap in timeout to prevent blocking when Neo4j is unavailable
         try:
-            return await asyncio.wait_for(self._do_retrieve(entities, top_k), timeout=KG_RETRIEVAL_TIMEOUT)
+            return await asyncio.wait_for(self._do_retrieve(entities, top_k, query_text), timeout=KG_RETRIEVAL_TIMEOUT)
         except asyncio.TimeoutError:
             logger.warning(f"[KGRetrieval] Timeout ({KG_RETRIEVAL_TIMEOUT}s), returning empty results")
             return []
@@ -63,7 +64,7 @@ class KGRetrieval:
             logger.error(f"[KGRetrieval] Unexpected error: {e}")
             return []
 
-    async def _do_retrieve(self, entities: List[str], top_k: int) -> List[Dict[str, Any]]:
+    async def _do_retrieve(self, entities: List[str], top_k: int, query_text: str = "") -> List[Dict[str, Any]]:
         """Internal method that performs the actual retrieval."""
         cypher = """
         UNWIND $ents AS e
@@ -72,6 +73,8 @@ class KGRetrieval:
         MATCH (s:Entity)-[:SUBJECT_OF]->(rel:Relation)-[:OBJECT_OF]->(o:Entity)
         WHERE toLower(s.name) = toLower(e)
               OR toLower(o.name) = toLower(e)
+              OR (size(e) > 3 AND toLower(s.name) CONTAINS toLower(e))
+              OR (size(e) > 3 AND toLower(o.name) CONTAINS toLower(e))
         OPTIONAL MATCH (rel)-[:SUPPORTED_BY]->(src:Source)
 
         WITH DISTINCT s, rel, o, 1 AS hop, src.url AS src_url
@@ -90,6 +93,8 @@ class KGRetrieval:
               -[:SUBJECT_OF]->(rel2:Relation)-[:OBJECT_OF]->(e2:Entity)
         WHERE toLower(e1.name) = toLower(e)
               OR toLower(e2.name) = toLower(e)
+              OR (size(e) > 3 AND toLower(e1.name) CONTAINS toLower(e))
+              OR (size(e) > 3 AND toLower(e2.name) CONTAINS toLower(e))
         OPTIONAL MATCH (rel1)-[:SUPPORTED_BY]->(src1:Source)
         OPTIONAL MATCH (rel2)-[:SUPPORTED_BY]->(src2:Source)
 
@@ -115,6 +120,32 @@ class KGRetrieval:
         results = []
         seen = set()
 
+        query_keywords = set(re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (query_text or "").lower()))
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+        }
+        query_keywords = {w for w in query_keywords if w not in stop}
+
         for row in rows:
             subj, rel, obj, confidence, hop, src = row
 
@@ -131,10 +162,19 @@ class KGRetrieval:
             # Infer credibility from source domain authority
             credibility = self._infer_credibility(src)
 
+            rel_norm = (rel or "").replace("_", " ").strip()
+            statement = f"{subj} {rel_norm} {obj}".strip()
+            # Lightweight lexical anchoring improves KG survival in hybrid ranking.
+            if query_keywords:
+                stmt_words = set(re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", statement.lower()))
+                overlap = len(stmt_words & query_keywords)
+                if overlap == 0 and hop > 1:
+                    continue
+
             result = {
-                "statement": f"{subj} {rel} {obj}",
+                "statement": statement,
                 "score": path_score,  # hybrid ranker score
-                "entities": [subj, obj],
+                "entities": [subj, obj, rel_norm],
                 "source_url": src,
                 "published_at": None,  # KG relations don't have publish dates
                 "credibility": credibility,

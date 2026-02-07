@@ -134,13 +134,34 @@ async def process_jobs():
                         ],
                         "evidence_map": verdict_result.get("evidence_map", []),
                         # Ranking metrics for debugging/display
-                        "top_ranking_score": round(result.get("initial_top_score", 0), 3),
-                        "avg_ranking_score": round(result.get("initial_top_score", 0), 3),
+                        "top_ranking_score": round(
+                            result.get(
+                                "ranking_top_score", ranked_evidence[0].get("final_score", 0) if ranked_evidence else 0
+                            ),
+                            3,
+                        ),
+                        "avg_ranking_score": round(
+                            result.get(
+                                "ranking_avg_score",
+                                (
+                                    (
+                                        sum(float(e.get("final_score", 0) or 0.0) for e in ranked_evidence[:5])
+                                        / max(1, len(ranked_evidence[:5]))
+                                    )
+                                    if ranked_evidence
+                                    else 0.0
+                                ),
+                            ),
+                            3,
+                        ),
                         # Trust threshold info (VDB/KG cache vs external search)
                         "trust_threshold": result.get("trust_threshold", 0.70),
                         "trust_threshold_met": result.get("trust_threshold_met", False),
                         "used_web_search": result.get("used_web_search", False),
-                        "data_source": "cache" if not result.get("used_web_search", False) else "web_search",
+                        "data_source": result.get(
+                            "data_source",
+                            "WEB_SEARCH" if result.get("used_web_search", False) else "CACHE",
+                        ),
                         "timestamp": asyncio.get_event_loop().time(),
                     }
 
@@ -372,6 +393,25 @@ async def verify_claim(request: ClaimRequest):
             ],
             "evidence_map": verdict_result.get("evidence_map", []),
             "top_score": round(ranked_evidence[0]["final_score"], 3) if ranked_evidence else 0,
+            "top_ranking_score": round(
+                result.get("ranking_top_score", ranked_evidence[0].get("final_score", 0) if ranked_evidence else 0), 3
+            ),
+            "avg_ranking_score": round(
+                result.get(
+                    "ranking_avg_score",
+                    (
+                        (
+                            sum(float(e.get("final_score", 0) or 0.0) for e in ranked_evidence[:5])
+                            / max(1, len(ranked_evidence[:5]))
+                        )
+                        if ranked_evidence
+                        else 0.0
+                    ),
+                ),
+                3,
+            ),
+            "used_web_search": result.get("used_web_search", False),
+            "data_source": result.get("data_source", "WEB_SEARCH" if result.get("used_web_search", False) else "CACHE"),
         }
 
         logger.info(
