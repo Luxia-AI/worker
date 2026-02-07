@@ -24,6 +24,14 @@ from app.services.common.list_ops import dedupe_list
 
 logger = get_logger(__name__)
 
+LOW_SIGNAL_PHRASES = (
+    "data element definitions",
+    "registration or results information",
+    "javascript and cookies",
+    "requires human verification",
+    "enable javascript",
+)
+
 
 def _safe_float(v: Optional[float], default: float = 0.0) -> float:
     try:
@@ -286,6 +294,9 @@ def hybrid_rank(
         ent_s = _entity_overlap_score(query_entities, item.get("entities", []))
         recency_s = _recency_boost(item.get("published_at"), now=now)
         cred_s = _safe_float(item.get("credibility"), 0.5)
+        stmt_l = item["statement"].lower()
+        if any(p in stmt_l for p in LOW_SIGNAL_PHRASES):
+            continue
 
         claim_overlap = _claim_overlap_score(query_text, item["statement"])
 
@@ -317,8 +328,11 @@ def hybrid_rank(
             "final_score": max(0.0, min(final_score, 1.0)),
             "orig": item.get("orig", {}),
         }
-        # Filter out low-overlap items unless they are very strong sem/kg matches
-        if claim_overlap < RANKING_MIN_CLAIM_OVERLAP and sem_s < 0.65 and kg_s < 0.65:
+        # Filter out low-overlap items unless strongly supported semantically
+        # or by KG+entity alignment. This prevents KG-only off-topic drift.
+        if claim_overlap < RANKING_MIN_CLAIM_OVERLAP and sem_s < 0.75 and not (kg_s >= 0.8 and ent_s >= 0.4):
+            continue
+        if sem_s < 0.20 and claim_overlap < 0.10 and ent_s < 0.34:
             continue
         results.append(out)
 

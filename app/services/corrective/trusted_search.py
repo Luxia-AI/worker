@@ -212,8 +212,24 @@ class TrustedSearch:
 
     def _extract_phrase_candidates(self, text: str, entities: List[str] | None = None) -> List[str]:
         entities = entities or []
+        text_l = (text or "").lower()
         tokens = [t for t in self._tokenize_words(text) if t not in self._STOPWORDS and t not in self._ACTION_WORDS]
         phrases: List[str] = []
+
+        # Extract meaningful health patterns (better than generic bigrams).
+        pattern_candidates = re.findall(
+            r"\b(?:diet|intake|consumption|levels?)\s+(?:rich in|low in|high in)\s+[a-zA-Z][a-zA-Z\-\s]{2,30}",
+            text_l,
+        )
+        for p in pattern_candidates:
+            p = " ".join(self._tokenize_words(p))
+            if len(p.split()) >= 3 and p not in phrases:
+                phrases.append(p)
+
+        for p in re.findall(r"\bnoncommunicable diseases?\b", text_l):
+            p = " ".join(self._tokenize_words(p))
+            if p and p not in phrases:
+                phrases.append(p)
 
         # Add non-trivial entities as exact phrases.
         for ent in entities:
@@ -221,7 +237,7 @@ class TrustedSearch:
             if len(ent_clean.split()) >= 2 and ent_clean not in phrases:
                 phrases.append(ent_clean)
 
-        # Backfill with token bigrams (noun-focused approximation).
+        # Backfill with token bigrams as fallback only.
         for i in range(len(tokens) - 1):
             bg = f"{tokens[i]} {tokens[i + 1]}"
             if bg not in phrases and len(bg) >= 8:
@@ -561,7 +577,7 @@ FAILED ENTITIES:
                 urls = []
                 for item in data["items"]:
                     link = item.get("link")
-                    if link and self.is_trusted(link):
+                    if link and self.is_trusted(link) and not self._is_low_signal_url(link):
                         urls.append(link)
                         logger.info(f"[TrustedSearch] ✓ {link}")
 
@@ -622,7 +638,7 @@ FAILED ENTITIES:
                 urls = []
                 for result in organic:
                     link = result.get("link")
-                    if link and self.is_trusted(link):
+                    if link and self.is_trusted(link) and not self._is_low_signal_url(link):
                         urls.append(link)
                         logger.info(f"[TrustedSearch] ✓ {link}")
 
@@ -703,6 +719,17 @@ FAILED ENTITIES:
         except Exception:
             return False
 
+    @staticmethod
+    def _is_low_signal_url(url: str) -> bool:
+        u = (url or "").lower()
+        low_signal_patterns = [
+            "/references",
+            "human-verification",
+            "javascript-and-cookies",
+            "/study/nct",  # trial registry pages often contain template metadata only
+        ]
+        return any(p in u for p in low_signal_patterns)
+
     # ---------------------------------------------------------------------
     # Site-Specific Query Generation
     # ---------------------------------------------------------------------
@@ -776,7 +803,7 @@ FAILED ENTITIES:
         for q in direct_queries[:1] + advanced_queries[:1]:
             site_queries.extend(self._generate_site_queries(q))
 
-        all_queries = dedupe_list(advanced_queries + direct_queries + question_queries + site_queries)
+        all_queries = dedupe_list(direct_queries + advanced_queries + question_queries + site_queries)
 
         # 4) If budget remains, add LLM reformulated queries
         if len(all_queries) < max_queries:

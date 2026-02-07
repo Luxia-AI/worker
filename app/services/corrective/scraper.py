@@ -31,7 +31,7 @@ USER_AGENTS = [
 DEFAULT_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
+    "Accept-Encoding": "gzip, deflate",
     "DNT": "1",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
@@ -95,7 +95,15 @@ class Scraper:
                     should_fallback = resp.status >= 500  # Only server errors
                     return None, should_fallback
 
-                html = await resp.text()
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                if "application/pdf" in content_type or url.lower().endswith(".pdf"):
+                    pdf_bytes = await resp.read()
+                    pdf_text = self._extract_pdf_text(pdf_bytes)
+                    if pdf_text:
+                        return f"[[PDF_TEXT]]{pdf_text}", False
+                    return None, False
+
+                html = await resp.text(errors="ignore")
                 return html, True  # Success, but fallback OK if extraction fails
 
         except Exception as e:
@@ -114,6 +122,24 @@ class Scraper:
             return None
         except Exception as e:
             logger.error(f"[Scraper] Trafilatura extraction failed: {e}")
+            return None
+
+    def _extract_pdf_text(self, pdf_bytes: bytes) -> str | None:
+        try:
+            from io import BytesIO
+
+            import pdfplumber
+
+            pages: List[str] = []
+            with pdfplumber.open(BytesIO(pdf_bytes)) as pdf:
+                for page in pdf.pages[:8]:
+                    text = page.extract_text() or ""
+                    if text.strip():
+                        pages.append(text.strip())
+            joined = "\n".join(pages).strip()
+            return joined or None
+        except Exception as e:
+            logger.warning(f"[Scraper] PDF extraction failed: {e}")
             return None
 
     # ---------------------------------------------------------------------
@@ -177,8 +203,11 @@ class Scraper:
             logger.warning(f"[Scraper] No HTML content for {url}")
             return {"url": url, "content": None, "source": None, "published_at": None}
 
-        # Step 2: Extract text (Trafilatura)
-        text = self.extract_text(html)
+        # Step 2: Extract text (Trafilatura or pre-extracted PDF text)
+        if html.startswith("[[PDF_TEXT]]"):
+            text = html[len("[[PDF_TEXT]]") :].strip()
+        else:
+            text = self.extract_text(html)
 
         if not text:
             logger.warning(f"[Scraper] No extractable text for {url}")

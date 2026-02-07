@@ -1,5 +1,6 @@
 import pytest
 
+from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
 from app.services.verdict.verdict_generator import VerdictGenerator
 
 
@@ -66,3 +67,31 @@ async def test_parse_verdict_result_rebuilds_low_quality_breakdown():
     out = vg._parse_verdict_result(llm_result, claim, evidence)
     assert out["claim_breakdown"]
     assert not any(item.get("claim_segment", "").strip().lower() == "vegetables" for item in out["claim_breakdown"])
+
+
+def test_adaptive_decompose_claim_avoids_rich_in_low_in_phrase():
+    policy = AdaptiveTrustPolicy()
+    claim = (
+        "A diet rich in fruits, vegetables, and low in saturated fats helps prevent "
+        "noncommunicable diseases like diabetes and cancer."
+    )
+    parts = policy.decompose_claim(claim)
+    assert not any("rich in low in" in p.lower() for p in parts)
+
+
+def test_confidence_high_with_strong_supported_evidence():
+    vg = _vg()
+    evidence = [
+        {"final_score": 0.82, "credibility": 0.95},
+        {"final_score": 0.79, "credibility": 0.9},
+        {"final_score": 0.77, "credibility": 0.92},
+        {"final_score": 0.81, "credibility": 0.93},
+        {"final_score": 0.76, "credibility": 0.9},
+    ]
+    claim_breakdown = [
+        {"status": "VALID"},
+        {"status": "PARTIALLY_VALID"},
+        {"status": "VALID"},
+    ]
+    conf = vg._calculate_confidence(evidence, claim_breakdown)
+    assert conf >= 0.75

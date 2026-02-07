@@ -127,12 +127,7 @@ class AdaptiveTrustPolicy:
                     out: List[str] = []
                     for idx, item in enumerate(items):
                         phrase = item
-                        if idx > 0 and len(item.split()) <= 4:
-                            if qualifier_prefix:
-                                phrase = qualifier_prefix + item
-                            elif subject_root:
-                                phrase = f"{subject_root} {item}"
-                        elif (
+                        if (
                             idx > 0
                             and subject_root
                             and re.match(
@@ -140,6 +135,13 @@ class AdaptiveTrustPolicy:
                             )
                         ):
                             phrase = f"{subject_root} {item}"
+                        elif idx > 0 and len(item.split()) <= 4:
+                            if qualifier_prefix and subject_root:
+                                phrase = f"{subject_root} {qualifier_prefix}{item}"
+                            elif subject_root:
+                                phrase = f"{subject_root} {item}"
+                            elif qualifier_prefix:
+                                phrase = qualifier_prefix + item
                         out.append(_clean(f"{phrase} {tail}"))
                     return out
 
@@ -262,7 +264,7 @@ class AdaptiveTrustPolicy:
         overlap_ratio = overlap / max(1, len(sub_set))
         sem = max(getattr(evidence, "semantic_score", 0.0), getattr(evidence, "trust", 0.0))
         # Require both: decent overlap and strong semantic/trust match
-        return overlap_ratio >= 0.25 and sem >= 0.60
+        return overlap_ratio >= 0.20 and sem >= 0.45
 
     def calculate_diversity(self, evidence_list: List[EvidenceItem]) -> float:
         """

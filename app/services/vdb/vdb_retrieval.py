@@ -61,11 +61,11 @@ class VDBRetrieval:
             logger.warning("[VDBRetrieval] No topics provided; skipping VDB retrieval")
             return []
 
-        try:
-            pinecone_filter: Dict[str, Any] = {"topic": {"$in": topics}}
-            if self.language:
-                pinecone_filter["language"] = self.language
+        pinecone_filter: Dict[str, Any] = {"topic": {"$in": list(set(topics + ["other"]))}}
+        if self.language:
+            pinecone_filter["language"] = self.language
 
+        try:
             response = self.index.query(
                 vector=vector,
                 top_k=top_k,
@@ -81,11 +81,42 @@ class VDBRetrieval:
         else:
             matches = self._as_dict(response).get("matches") or []
 
+        # Fallback: if strict topic filter produced no matches, retry with language-only filter.
+        if not matches:
+            try:
+                fallback_filter: Dict[str, Any] = {}
+                if self.language:
+                    fallback_filter["language"] = self.language
+                response = self.index.query(
+                    vector=vector,
+                    top_k=top_k,
+                    namespace=self.namespace,
+                    include_metadata=True,
+                    filter=fallback_filter if fallback_filter else None,
+                )
+                matches = (
+                    response.matches or []
+                    if hasattr(response, "matches")
+                    else self._as_dict(response).get("matches") or []
+                )
+            except Exception:
+                pass
+
         results = []
         dropped = 0
+        low_signal_phrases = (
+            "data element definitions",
+            "registration or results information",
+            "javascript and cookies",
+            "requires human verification",
+        )
         for m in matches:
-            metadata = m.get("metadata", {})
-            score = float(m.get("score", 0.0))
+            if hasattr(m, "metadata"):
+                metadata = m.metadata or {}
+                score = float(getattr(m, "score", 0.0) or 0.0)
+            else:
+                metadata = m.get("metadata", {}) if isinstance(m, dict) else {}
+                score = float((m.get("score", 0.0) if isinstance(m, dict) else 0.0) or 0.0)
             if score < VDB_MIN_SCORE:
                 dropped += 1
                 continue
@@ -104,6 +135,8 @@ class VDBRetrieval:
                 "count_value": metadata.get("count_value"),
             }
             if result["statement"]:  # Only include non-empty statements
+                if any(p in result["statement"].lower() for p in low_signal_phrases):
+                    continue
                 results.append(result)
 
         # DETERMINISTIC ORDERING: Sort by score DESC, then statement ASC for consistent results

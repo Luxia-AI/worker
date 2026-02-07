@@ -96,11 +96,20 @@ class FactExtractor:
         return [text]
 
     def _normalize_atomic_facts(self, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        low_signal_phrases = (
+            "data element definitions",
+            "registration or results information",
+            "javascript and cookies",
+            "requires human verification",
+            "enable javascript",
+        )
         normalized: List[Dict[str, Any]] = []
         for fact in facts:
             stmt = clean_statement(fact.get("statement", ""))
             for part in self._split_atomic_statement(stmt):
                 if len(part) < 10:
+                    continue
+                if any(p in part.lower() for p in low_signal_phrases):
                     continue
                 new_fact = dict(fact)
                 new_fact["statement"] = clean_statement(part)

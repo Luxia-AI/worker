@@ -54,7 +54,8 @@ PIPELINE_MAX_URLS_PER_QUERY = 3
 # ============================================================================
 
 # Minimum acceptable VDB similarity score (cosine) for evidence retention
-VDB_MIN_SCORE = 0.55
+# Lowered slightly to improve recall on longer, compositional health claims.
+VDB_MIN_SCORE = 0.45
 
 # Lexical (FTS5) database path for BM25 retrieval
 LEXICAL_DB_PATH = "worker/data/lexical.db"
@@ -283,12 +284,12 @@ RECENCY_HALF_LIFE_DAYS = 365.0
 # Default weights for hybrid ranking (must sum to 1.0 for interpretability)
 # Tuned for maximum accuracy with balanced KG contribution
 RANKING_WEIGHTS = {
-    "w_semantic": 0.25,  # semantic similarity score (increased for better matching)
-    "w_kg": 0.15,  # knowledge graph score (increased from 0.01 for relation impact)
+    "w_semantic": 0.35,  # prioritize direct semantic evidence from VDB/web facts
+    "w_kg": 0.08,  # keep KG supportive, but prevent KG-only domination
     "w_entity": 0.20,  # entity overlap with query (reduced but still significant)
     "w_claim_overlap": 0.15,  # lexical overlap between claim text and evidence statement
     "w_recency": 0.05,  # publication recency (slight boost for fresh evidence)
-    "w_credibility": 0.20,  # source credibility (balanced with semantic)
+    "w_credibility": 0.17,  # source credibility (balanced with semantic)
 }
 
 # Minimum final score floor when both semantic and KG are zero but credibility high

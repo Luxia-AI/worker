@@ -164,6 +164,8 @@ class RelationExtractor:
 
                 for rt in raw_triples:
                     try:
+                        if not isinstance(rt, dict):
+                            continue
                         subj = rt.get("subject", "").strip()
                         rel = rt.get("relation", "").strip()
                         obj = rt.get("object", "").strip()

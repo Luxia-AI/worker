@@ -421,11 +421,13 @@ class CorrectivePipeline:
             )
 
             # Step 5: Re-retrieve and re-rank with new evidence
+            # Keep retrieval anchored to claim entities to avoid topic drift from scraped-page artifacts.
+            retrieval_entities = list(set(claim_entities + failed_entities))
             dedup_sem, kg_candidates = await retrieve_candidates(
                 self.vdb_retriever,
                 self.kg_retriever,
                 queries_executed,
-                list(set(all_entities)),
+                retrieval_entities,
                 top_k * 3,
                 round_id,
                 claim_topics,
@@ -436,7 +438,7 @@ class CorrectivePipeline:
             top_ranked = await rank_candidates(
                 dedup_sem,
                 kg_candidates,
-                list(set(all_entities)),
+                retrieval_entities,
                 post_text,
                 top_k,
                 round_id,
@@ -599,6 +601,65 @@ class CorrectivePipeline:
 
     async def _extract_claim_entities(self, claim: str, round_id: str) -> List[str]:
         """Extract entities from the claim text using LLM (1 call) with a deterministic fallback."""
+        import re
+
+        def _fallback_entities(text: str) -> List[str]:
+            stop = {
+                "the",
+                "a",
+                "an",
+                "and",
+                "or",
+                "but",
+                "to",
+                "for",
+                "of",
+                "in",
+                "on",
+                "with",
+                "by",
+                "at",
+                "is",
+                "are",
+                "was",
+                "were",
+                "be",
+                "been",
+                "being",
+                "over",
+                "under",
+                "about",
+                "around",
+                "average",
+                "per",
+                "times",
+            }
+            tokens = [t.lower() for t in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", text)]
+            tokens = [t for t in tokens if t not in stop]
+            freq: dict[str, int] = {}
+            for t in tokens:
+                freq[t] = freq.get(t, 0) + 1
+            bigrams: List[str] = []
+            for i in range(len(tokens) - 1):
+                w1, w2 = tokens[i], tokens[i + 1]
+                if w1 in stop or w2 in stop:
+                    continue
+                bigrams.append(f"{w1} {w2}")
+            ranked_unigrams = sorted(freq.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
+            unigram_entities = [w for w, _ in ranked_unigrams[:6]]
+            bigram_entities: List[str] = []
+            for bg in bigrams:
+                if bg.split()[0] in unigram_entities and bg.split()[1] in unigram_entities:
+                    bigram_entities.append(bg)
+                if len(bigram_entities) >= 4:
+                    break
+            out: List[str] = []
+            for item in bigram_entities + unigram_entities:
+                if item not in out:
+                    out.append(item)
+            return out[:10]
+
+        llm_entities: List[str] = []
         try:
             # Use entity extractor on a synthetic fact
             synthetic_facts = [{"statement": claim, "source_url": "claim", "fact_id": "claim_0"}]
@@ -616,78 +677,17 @@ class CorrectivePipeline:
                 }
                 cleaned = [e for e in entities if isinstance(e, str) and e.strip()]
                 cleaned = [e for e in cleaned if e.strip().lower() not in generic]
-                if cleaned:
-                    return cleaned
+                llm_entities = cleaned
         except Exception as e:
             logger.warning(f"[CorrectivePipeline:{round_id}] Entity extraction from claim failed: {e}")
 
-        # Deterministic fallback: keyword + bigram extraction from claim text
-        import re
+        fallback = _fallback_entities(claim)
+        merged = []
+        for e in llm_entities + fallback:
+            if e and e not in merged:
+                merged.append(e)
 
-        stop = {
-            "the",
-            "a",
-            "an",
-            "and",
-            "or",
-            "but",
-            "to",
-            "for",
-            "of",
-            "in",
-            "on",
-            "with",
-            "by",
-            "at",
-            "is",
-            "are",
-            "was",
-            "were",
-            "be",
-            "been",
-            "being",
-            "over",
-            "under",
-            "about",
-            "around",
-            "average",
-            "per",
-            "times",
-        }
-        tokens = [t.lower() for t in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", claim)]
-        tokens = [t for t in tokens if t not in stop]
-
-        # Unigram counts
-        freq = {}
-        for t in tokens:
-            freq[t] = freq.get(t, 0) + 1
-
-        # Bigram candidates (e.g., "heart rate", "life span")
-        bigrams = []
-        for i in range(len(tokens) - 1):
-            w1, w2 = tokens[i], tokens[i + 1]
-            if w1 in stop or w2 in stop:
-                continue
-            bigrams.append(f"{w1} {w2}")
-
-        # Rank: frequency desc, length desc, alpha
-        ranked_unigrams = sorted(freq.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
-        unigram_entities = [w for w, _ in ranked_unigrams[:5]]
-
-        # Keep distinct bigrams that don't duplicate unigrams
-        bigram_entities = []
-        for bg in bigrams:
-            if bg.split()[0] in unigram_entities and bg.split()[1] in unigram_entities:
-                bigram_entities.append(bg)
-            if len(bigram_entities) >= 3:
-                break
-
-        fallback = []
-        for item in bigram_entities + unigram_entities:
-            if item not in fallback:
-                fallback.append(item)
-
-        if fallback:
+        if fallback and fallback != llm_entities:
             logger.info(f"[CorrectivePipeline:{round_id}] Fallback entities from claim: {fallback}")
             if self.log_manager:
                 await self.log_manager.add_log(
@@ -698,7 +698,7 @@ class CorrectivePipeline:
                     round_id=round_id,
                     context={"fallback_entities": fallback},
                 )
-        return fallback
+        return merged or fallback
 
     def _build_retrieval_queries(self, claim: str) -> List[str]:
         """

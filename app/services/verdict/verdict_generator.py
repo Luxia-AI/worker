@@ -561,12 +561,17 @@ class VerdictGenerator:
     def _should_rebuild_claim_breakdown(self, claim_breakdown: List[Dict[str, Any]]) -> bool:
         if not claim_breakdown:
             return True
+        unknown_count = 0
         low_quality = 0
         for item in claim_breakdown:
             seg = (item.get("claim_segment") or "").strip()
             if not self._is_meaningful_segment(seg):
                 low_quality += 1
-        return low_quality > 0
+            if (item.get("status") or "UNKNOWN").upper() == "UNKNOWN":
+                unknown_count += 1
+        if low_quality > 0:
+            return True
+        return unknown_count >= max(1, int(0.8 * len(claim_breakdown)))
 
     def _build_deterministic_claim_breakdown(self, claim: str, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -597,9 +602,9 @@ class VerdictGenerator:
                     best_score = score
                     best = ev
 
-            if best and best_score >= 0.60:
+            if best and best_score >= 0.55:
                 status = "VALID"
-            elif best and best_score >= 0.38:
+            elif best and best_score >= 0.28:
                 status = "PARTIALLY_VALID"
             else:
                 status = "UNKNOWN"
@@ -709,11 +714,15 @@ class VerdictGenerator:
                 stmt_set = set(stmt_words)
                 overlap = len(seg_set & stmt_set)
                 overlap_ratio = overlap / max(1, len(seg_set))
+                if overlap_ratio < 0.12 and rel < 0.75:
+                    continue
 
                 stmt_has_neg = any(t in stmt_set for t in neg_terms)
                 contradiction = 1.0 if (stmt_has_neg and not seg_has_neg and overlap_ratio >= 0.25) else 0.0
 
-                support = (0.45 * rel) + (0.35 * overlap_ratio) + (0.20 * cred)
+                support = (0.50 * rel) + (0.35 * overlap_ratio) + (0.15 * cred)
+                if overlap_ratio < 0.20:
+                    support *= 0.50
                 net = support - (0.60 * contradiction)
                 net = max(0.0, min(1.0, net))
 
@@ -756,19 +765,41 @@ class VerdictGenerator:
         avg_score = sum(scores) / max(1, len(scores))
 
         unknown_ratio = 0.0
+        support_ratio = 0.0
         if claim_breakdown:
             statuses = [s.get("status", "UNKNOWN").upper() for s in claim_breakdown]
             unknown_ratio = sum(1 for s in statuses if s == "UNKNOWN") / max(1, len(statuses))
+            support_ratio = sum(1 for s in statuses if s in {"VALID", "PARTIALLY_VALID"}) / max(1, len(statuses))
+
+        cred_scores = []
+        for ev in evidence[:5]:
+            c = ev.get("credibility")
+            try:
+                cred_scores.append(float(c if c is not None else 0.5))
+            except Exception:
+                cred_scores.append(0.5)
+        avg_cred = sum(cred_scores) / max(1, len(cred_scores))
+
+        count_factor = min(len(evidence), 5) / 5.0
 
         logger.debug(
-            "[VerdictGenerator] Confidence inputs: avg_score=%.3f unknown_ratio=%.2f evidence_n=%d",
+            "[VerdictGenerator] Confidence inputs: avg_score=%.3f avg_cred=%.3f "
+            "support_ratio=%.2f unknown_ratio=%.2f evidence_n=%d",
             avg_score,
+            avg_cred,
+            support_ratio,
             unknown_ratio,
             len(evidence),
         )
 
-        # Base + evidence quality - uncertainty penalty
-        confidence = 0.2 + (0.7 * avg_score) - (0.3 * unknown_ratio)
+        confidence = (
+            0.10
+            + (0.40 * avg_score)
+            + (0.25 * avg_cred)
+            + (0.25 * support_ratio)
+            + (0.10 * count_factor)
+            - (0.25 * unknown_ratio)
+        )
         return max(0.05, min(0.98, confidence))
 
     def _build_default_evidence_map(self, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -843,21 +874,22 @@ class VerdictGenerator:
             q = re.search(r"\b(rich in|low in|high in|with|without|deficient in)\b", first, flags=re.IGNORECASE)
             subject_root = _clean_spaces(first[: q.start()]) if q else _clean_spaces(" ".join(first.split()[:2]))
             qualifier_prefix = (first[: q.end()].strip() + " ") if q else ""
-
             out: List[str] = []
             for idx, item in enumerate(items):
                 phrase = item
-                if idx > 0 and len(item.split()) <= 4:
-                    if qualifier_prefix:
-                        phrase = qualifier_prefix + item
-                    elif subject_root:
-                        phrase = f"{subject_root} {item}"
-                elif (
+                if (
                     idx > 0
                     and subject_root
                     and re.match(r"^(rich in|low in|high in|with|without|deficient in)\b", item, flags=re.IGNORECASE)
                 ):
                     phrase = f"{subject_root} {item}"
+                elif idx > 0 and len(item.split()) <= 4:
+                    if qualifier_prefix and subject_root:
+                        phrase = f"{subject_root} {qualifier_prefix}{item}"
+                    elif subject_root:
+                        phrase = f"{subject_root} {item}"
+                    elif qualifier_prefix:
+                        phrase = qualifier_prefix + item
 
                 seg = _clean_spaces(f"{phrase} {tail}")
                 if self._is_meaningful_segment(seg):
