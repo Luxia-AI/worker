@@ -116,3 +116,16 @@ def test_adaptive_coverage_relaxed_threshold():
 
     coverage = policy.calculate_coverage(subclaims, evidence)
     assert coverage > 0.0
+
+
+def test_simplify_query_for_serper_fallback_removes_strict_operators():
+    ts = _init_trusted_search()
+    q = (
+        'intitle:"meta-analysis" '
+        '("diet rich fruits helps prevent noncommuni" OR "diet rich fruits") '
+        '"noncommunicable diseases" statistics filetype:pdf'
+    )
+    simplified = ts._simplify_query_for_fallback(q)
+    assert "intitle:" not in simplified
+    assert "filetype:" not in simplified
+    assert "(" not in simplified and ")" not in simplified

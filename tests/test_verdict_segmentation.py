@@ -95,3 +95,48 @@ def test_confidence_high_with_strong_supported_evidence():
     ]
     conf = vg._calculate_confidence(evidence, claim_breakdown)
     assert conf >= 0.75
+
+
+def test_confidence_high_with_strong_contradicting_evidence():
+    vg = _vg()
+    evidence = [
+        {"final_score": 0.84, "credibility": 0.95, "source_url": "https://nih.gov/a"},
+        {"final_score": 0.80, "credibility": 0.92, "source_url": "https://cdc.gov/b"},
+        {"final_score": 0.78, "credibility": 0.90, "source_url": "https://who.int/c"},
+    ]
+    claim_breakdown = [
+        {"status": "INVALID"},
+        {"status": "PARTIALLY_INVALID"},
+    ]
+    conf = vg._calculate_confidence(evidence, claim_breakdown)
+    assert conf >= 0.75
+
+
+def test_parse_verdict_result_normalizes_duplicated_segment_prefix():
+    vg = _vg()
+    claim = "A diet rich in fruits, vegetables, and low in saturated fats helps prevent NCDs."
+    evidence = [
+        {
+            "statement": "A diet rich in vegetables helps reduce noncommunicable disease risk.",
+            "source_url": "https://nih.gov/example",
+            "final_score": 0.8,
+            "credibility": 0.9,
+        }
+    ]
+    llm_result = {
+        "verdict": "PARTIALLY_TRUE",
+        "confidence": 0.5,
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": "A diet A diet rich in vegetables helps prevent NCDs",
+                "status": "PARTIALLY_VALID",
+                "supporting_fact": "A diet rich in vegetables helps reduce noncommunicable disease risk.",
+                "source_url": "https://nih.gov/example",
+            }
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm_result, claim, evidence)
+    segments = [b.get("claim_segment", "").lower() for b in out["claim_breakdown"]]
+    assert all("a diet a diet" not in s for s in segments)

@@ -166,9 +166,9 @@ class RelationExtractor:
                     try:
                         if not isinstance(rt, dict):
                             continue
-                        subj = rt.get("subject", "").strip()
-                        rel = rt.get("relation", "").strip()
-                        obj = rt.get("object", "").strip()
+                        subj = (rt.get("subject") or "").strip()
+                        rel = (rt.get("relation") or "").strip()
+                        obj = (rt.get("object") or "").strip()
                         conf = float(rt.get("confidence", 0.0))
 
                         if not subj or not rel or not obj:

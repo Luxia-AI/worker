@@ -218,11 +218,14 @@ class TrustedSearch:
 
         # Extract meaningful health patterns (better than generic bigrams).
         pattern_candidates = re.findall(
-            r"\b(?:diet|intake|consumption|levels?)\s+(?:rich in|low in|high in)\s+[a-zA-Z][a-zA-Z\-\s]{2,30}",
+            r"\b(?:diet|intake|consumption|levels?)\s+(?:rich in|low in|high in)\s+(?:[a-zA-Z\-]+\s*){1,4}",
             text_l,
         )
         for p in pattern_candidates:
-            p = " ".join(self._tokenize_words(p))
+            p_tokens = self._tokenize_words(p)
+            while p_tokens and p_tokens[-1] in self._ACTION_WORDS:
+                p_tokens.pop()
+            p = " ".join(p_tokens)
             if len(p.split()) >= 3 and p not in phrases:
                 phrases.append(p)
 
@@ -246,6 +249,40 @@ class TrustedSearch:
                 break
 
         return phrases[:4]
+
+    def _sanitize_query(self, query: str) -> str:
+        """Normalize query syntax and drop malformed quote-heavy fragments."""
+        q = re.sub(r"\s+", " ", (query or "").strip())
+        if not q:
+            return ""
+        # Remove unmatched quotes to avoid zero-result failures.
+        if q.count('"') % 2 == 1:
+            q = q.replace('"', "")
+        # Keep query compact and avoid over-constraining.
+        tokens = q.split()
+        q = " ".join(tokens[:18]).strip()
+        return q
+
+    def _simplify_query_for_fallback(self, query: str) -> str:
+        """
+        Simplify operator-heavy Google query for Serper fallback.
+        Serper often underperforms with strict intitle/filetype/operator chains.
+        """
+        q = self._sanitize_query(query)
+        if not q:
+            return ""
+        q = re.sub(r'\bintitle:"[^"]+"\s*', "", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bfiletype:\w+\b", "", q, flags=re.IGNORECASE)
+        q = q.replace("(", " ").replace(")", " ")
+        q = re.sub(r"\bOR\b", " ", q, flags=re.IGNORECASE)
+        q = re.sub(r"\s+", " ", q).strip()
+        # Preserve at least one quoted phrase only.
+        if q.count('"') >= 4:
+            first = re.search(r'"([^"]+)"', q)
+            keep = f'"{first.group(1)}" ' if first else ""
+            no_quotes = re.sub(r'"[^"]+"', "", q).strip()
+            q = (keep + no_quotes).strip()
+        return q
 
     def _build_phrase_variants(self, phrase: str) -> List[str]:
         """
@@ -407,11 +444,19 @@ class TrustedSearch:
 
     def _filter_queries(self, queries: List[str], key_terms: List[str], key_numbers: List[str]) -> List[str]:
         filtered: List[str] = []
+        generic_suffixes = {
+            "medical evidence",
+            "scientific research",
+            "clinical verification",
+            "factual analysis",
+        }
         for q in queries:
             if not isinstance(q, str):
                 continue
             q = q.strip().lower()
             if not q:
+                continue
+            if any(q.endswith(sfx) for sfx in generic_suffixes):
                 continue
             if not self._query_has_key_terms(q, key_terms, key_numbers):
                 continue
@@ -500,7 +545,8 @@ FAILED ENTITIES:
             # HIGH priority: Query reformulation is crucial for good search results
             result = await self.llm_client.ainvoke(prompt, response_format="json", priority=LLMPriority.HIGH)
             queries = result.get("queries", [])
-            cleaned = [q.strip().lower() for q in queries if isinstance(q, str)]
+            cleaned = [self._sanitize_query(q.strip().lower()) for q in queries if isinstance(q, str)]
+            cleaned = [q for q in cleaned if q]
             merged = [direct_query] + cleaned if direct_query else cleaned
             filtered = self._filter_queries(merged, key_terms, key_numbers)
             return dedupe_list(filtered)  # dedupe but preserve order
@@ -509,6 +555,7 @@ FAILED ENTITIES:
             logger.error(f"[TrustedSearch] LLM query reformulation failed: {e}")
             # fallback -> old heuristic (plus direct query)
             fallback = self._fallback_queries(text, failed_entities)
+            fallback = [self._sanitize_query(q) for q in fallback if q]
             merged = [direct_query] + fallback if direct_query else fallback
             filtered = self._filter_queries(merged, key_terms, key_numbers)
             return dedupe_list(filtered)
@@ -659,10 +706,14 @@ FAILED ENTITIES:
         """
         Search with automatic fallback: Google CSE -> Serper.dev
         """
+        query = self._sanitize_query(query)
+        if not query:
+            return []
+
         # If Google quota already exceeded, go straight to Serper
         if self.google_quota_exceeded:
             if self.serper_available:
-                return await self.search_query_serper(session, query)
+                return await self.search_query_serper(session, self._simplify_query_for_fallback(query))
             return []
 
         # Try Google first
@@ -674,7 +725,7 @@ FAILED ENTITIES:
                 logger.warning("[TrustedSearch] Google CSE quota exceeded! " "Switching to Serper.dev fallback...")
 
                 if self.serper_available:
-                    return await self.search_query_serper(session, query)
+                    return await self.search_query_serper(session, self._simplify_query_for_fallback(query))
                 else:
                     logger.error(
                         "[TrustedSearch] No SERPER_API_KEY configured. "
@@ -686,7 +737,7 @@ FAILED ENTITIES:
 
         # No Google, try Serper directly
         if self.serper_available:
-            return await self.search_query_serper(session, query)
+            return await self.search_query_serper(session, self._simplify_query_for_fallback(query))
 
         return []
 
@@ -781,7 +832,7 @@ FAILED ENTITIES:
 
         key_terms, key_numbers = self._collect_key_terms(texts=[post_text] + merged_subclaims, entities=entities)
 
-        # 2) Build deterministic direct + operator-rich research queries per subclaim (highest priority)
+        # 2) Build deterministic direct + operator-rich research queries per subclaim
         direct_queries = []
         advanced_queries = []
         question_queries = []
@@ -798,27 +849,31 @@ FAILED ENTITIES:
         advanced_queries = self._filter_queries(advanced_queries, key_terms, key_numbers)
         question_queries = self._filter_queries(question_queries, key_terms, key_numbers)
 
-        # 3) Site-specific variants for top direct/operator queries
-        site_queries: List[str] = []
-        for q in direct_queries[:1] + advanced_queries[:1]:
-            site_queries.extend(self._generate_site_queries(q))
-
-        all_queries = dedupe_list(direct_queries + advanced_queries + question_queries + site_queries)
-
-        # 4) If budget remains, add LLM reformulated queries
-        if len(all_queries) < max_queries:
+        # 3) Add LLM reformulated queries early, but only if they pass strict filters.
+        llm_queries: List[str] = []
+        if len(direct_queries) < max_queries:
             llm_queries = await self.reformulate_queries(
                 post_text,
                 failed_entities,
                 entities=entities,
                 subclaims=merged_subclaims,
             )
+            llm_queries = [self._sanitize_query(q) for q in llm_queries if q]
             llm_queries = self._filter_queries(llm_queries, key_terms, key_numbers)
-            for q in llm_queries:
-                if q not in all_queries:
-                    all_queries.append(q)
+
+        # 4) Site-specific variants for top direct/LLM/operator queries
+        site_queries: List[str] = []
+        site_bases = []
+        site_bases.extend(direct_queries[:1])
+        site_bases.extend(llm_queries[:1])
+        site_bases.extend(advanced_queries[:1])
+        for q in dedupe_list(site_bases):
+            site_queries.extend(self._generate_site_queries(q))
+
+        all_queries = dedupe_list(direct_queries + llm_queries + advanced_queries + question_queries + site_queries)
 
         # Final validation (strictly direct to claim terms) and budget cap
+        all_queries = [self._sanitize_query(q) for q in all_queries if q]
         all_queries = self._filter_queries(all_queries, key_terms, key_numbers)
         all_queries = dedupe_list(all_queries)[:max_queries]
         logger.info(f"[TrustedSearch] Generated {len(all_queries)} queries for quota-optimized search")

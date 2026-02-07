@@ -458,6 +458,23 @@ class VerdictGenerator:
         claim_breakdown = llm_result.get("claim_breakdown", [])
         if self._should_rebuild_claim_breakdown(claim_breakdown):
             claim_breakdown = self._build_deterministic_claim_breakdown(claim, evidence)
+        else:
+            normalized_breakdown: List[Dict[str, Any]] = []
+            seen_segments = set()
+            for item in claim_breakdown:
+                seg = self._normalize_segment_text(item.get("claim_segment") or "")
+                if not self._is_meaningful_segment(seg):
+                    continue
+                key = seg.lower()
+                if key in seen_segments:
+                    continue
+                seen_segments.add(key)
+                item["claim_segment"] = seg
+                normalized_breakdown.append(item)
+            if normalized_breakdown:
+                claim_breakdown = normalized_breakdown
+            elif evidence:
+                claim_breakdown = self._build_deterministic_claim_breakdown(claim, evidence)
 
         # Guardrail: prevent hallucinated support (source_url / supporting_fact must map to provided evidence)
         ev_urls = set((e.get("source_url") or e.get("source") or "") for e in evidence)
@@ -572,6 +589,23 @@ class VerdictGenerator:
         if low_quality > 0:
             return True
         return unknown_count >= max(1, int(0.8 * len(claim_breakdown)))
+
+    def _normalize_segment_text(self, segment: str) -> str:
+        """Normalize duplicated prefixes (e.g., 'A diet A diet rich in ...')."""
+        s = re.sub(r"\s+", " ", (segment or "")).strip(" ,.").strip()
+        if not s:
+            return ""
+        words = s.split()
+        for n in (3, 2, 1):
+            if len(words) >= 2 * n:
+                left = " ".join(words[:n]).lower()
+                right = " ".join(words[n : (2 * n)]).lower()
+                if left == right:
+                    s = " ".join(words[n:])
+                    break
+        if s.lower().startswith("a diet a diet "):
+            s = s[len("A diet ") :]
+        return re.sub(r"\s+", " ", s).strip(" ,.").strip()
 
     def _build_deterministic_claim_breakdown(self, claim: str, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -749,8 +783,8 @@ class VerdictGenerator:
 
     def _calculate_confidence(self, evidence: List[Dict[str, Any]], claim_breakdown: List[Dict[str, Any]]) -> float:
         """
-        Heuristic confidence score derived from evidence quality and breakdown certainty.
-        This avoids static LLM confidence outputs across different claims.
+        Confidence means certainty in the estimated truthfulness score, not positivity.
+        High confidence is valid even when truthfulness is low if evidence is strong/consistent.
         """
         scores = []
         for ev in evidence[:5]:
@@ -765,11 +799,22 @@ class VerdictGenerator:
         avg_score = sum(scores) / max(1, len(scores))
 
         unknown_ratio = 0.0
-        support_ratio = 0.0
+        certainty_ratio = 0.0
+        conflict_ratio = 0.0
         if claim_breakdown:
             statuses = [s.get("status", "UNKNOWN").upper() for s in claim_breakdown]
             unknown_ratio = sum(1 for s in statuses if s == "UNKNOWN") / max(1, len(statuses))
-            support_ratio = sum(1 for s in statuses if s in {"VALID", "PARTIALLY_VALID"}) / max(1, len(statuses))
+            certainty_weight = {
+                "VALID": 1.0,
+                "INVALID": 1.0,
+                "PARTIALLY_VALID": 0.7,
+                "PARTIALLY_INVALID": 0.7,
+                "UNKNOWN": 0.0,
+            }
+            certainty_ratio = sum(certainty_weight.get(s, 0.0) for s in statuses) / max(1, len(statuses))
+            has_support = any(s in {"VALID", "PARTIALLY_VALID"} for s in statuses)
+            has_contra = any(s in {"INVALID", "PARTIALLY_INVALID"} for s in statuses)
+            conflict_ratio = 0.25 if (has_support and has_contra) else 0.0
 
         cred_scores = []
         for ev in evidence[:5]:
@@ -782,24 +827,34 @@ class VerdictGenerator:
 
         count_factor = min(len(evidence), 5) / 5.0
 
+        domains = set()
+        for ev in evidence[:5]:
+            src = ev.get("source_url") or ev.get("source") or ""
+            try:
+                domain = src.split("/")[2].lower()
+                if domain.startswith("www."):
+                    domain = domain[4:]
+                if domain:
+                    domains.add(domain)
+            except Exception:
+                continue
+        diversity = min(1.0, len(domains) / max(1, min(len(evidence), 5)))
+        evidence_strength = (0.55 * avg_score) + (0.30 * avg_cred) + (0.15 * count_factor)
+        certainty = (0.75 * certainty_ratio) + (0.25 * diversity)
+
         logger.debug(
             "[VerdictGenerator] Confidence inputs: avg_score=%.3f avg_cred=%.3f "
-            "support_ratio=%.2f unknown_ratio=%.2f evidence_n=%d",
+            "certainty_ratio=%.2f unknown_ratio=%.2f conflict_ratio=%.2f diversity=%.2f evidence_n=%d",
             avg_score,
             avg_cred,
-            support_ratio,
+            certainty_ratio,
             unknown_ratio,
+            conflict_ratio,
+            diversity,
             len(evidence),
         )
 
-        confidence = (
-            0.10
-            + (0.40 * avg_score)
-            + (0.25 * avg_cred)
-            + (0.25 * support_ratio)
-            + (0.10 * count_factor)
-            - (0.25 * unknown_ratio)
-        )
+        confidence = 0.05 + (0.55 * evidence_strength) + (0.35 * certainty) - (0.30 * unknown_ratio) - conflict_ratio
         return max(0.05, min(0.98, confidence))
 
     def _build_default_evidence_map(self, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
