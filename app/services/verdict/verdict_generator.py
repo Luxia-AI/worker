@@ -348,7 +348,11 @@ class VerdictGenerator:
             # HIGH priority - verdict generation is critical
             # Use low temperature for consistent claim segmentation/breakdown
             result = await self.llm_service.ainvoke(
-                prompt, response_format="json", priority=LLMPriority.HIGH, temperature=LLM_TEMPERATURE_VERDICT
+                prompt,
+                response_format="json",
+                priority=LLMPriority.HIGH,
+                temperature=LLM_TEMPERATURE_VERDICT,
+                call_tag="verdict_generation",
             )
 
             # Validate and parse result
@@ -385,6 +389,7 @@ class VerdictGenerator:
                                 response_format="json",
                                 priority=LLMPriority.HIGH,
                                 temperature=LLM_TEMPERATURE_VERDICT,
+                                call_tag="verdict_generation",
                             )
                             verdict_result = self._parse_verdict_result(enriched_result, claim, enriched_evidence)
                             logger.info(
@@ -480,38 +485,71 @@ class VerdictGenerator:
         # Guardrail: prevent hallucinated support (source_url / supporting_fact must map to provided evidence)
         ev_urls = set((e.get("source_url") or e.get("source") or "") for e in evidence)
         ev_text = " ".join((e.get("statement") or e.get("text") or "") for e in evidence).lower()
+        stop_words = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+        }
+
+        def _best_evidence_match(
+            segment: str, supporting_fact: str, source_url: str
+        ) -> tuple[int, Dict[str, Any] | None]:
+            seg_tokens = {
+                w for w in re.findall(r"\b\w+\b", (segment or "").lower()) if w and w not in stop_words and len(w) > 2
+            }
+            fact_tokens = {
+                w
+                for w in re.findall(r"\b\w+\b", (supporting_fact or "").lower())
+                if w and w not in stop_words and len(w) > 2
+            }
+            best_idx = -1
+            best_score = -1.0
+            best_ev: Dict[str, Any] | None = None
+            src_norm = (source_url or "").strip().lower()
+
+            for idx, ev in enumerate(evidence):
+                stmt = (ev.get("statement") or ev.get("text") or "").strip()
+                if not stmt:
+                    continue
+                stmt_tokens = {
+                    w for w in re.findall(r"\b\w+\b", stmt.lower()) if w and w not in stop_words and len(w) > 2
+                }
+                src = (ev.get("source_url") or ev.get("source") or "").strip().lower()
+                if src_norm and src_norm == src:
+                    score = 1.0
+                else:
+                    seg_overlap = len(seg_tokens & stmt_tokens) / max(1, len(seg_tokens))
+                    fact_overlap = len(fact_tokens & stmt_tokens) / max(1, len(fact_tokens)) if fact_tokens else 0.0
+                    rel = float(ev.get("final_score") or ev.get("score") or ev.get("sem_score") or 0.0)
+                    score = 0.55 * seg_overlap + 0.35 * fact_overlap + 0.10 * rel
+                if score > best_score:
+                    best_score = score
+                    best_idx = idx
+                    best_ev = ev
+            return best_idx, best_ev
 
         def _overlap_ok(fact: str, ev_text: str) -> bool:
             if not fact:
                 return True
-            stop = {
-                "the",
-                "a",
-                "an",
-                "and",
-                "or",
-                "but",
-                "to",
-                "for",
-                "of",
-                "in",
-                "on",
-                "with",
-                "by",
-                "at",
-                "is",
-                "are",
-                "was",
-                "were",
-                "be",
-                "been",
-                "being",
-                "could",
-                "would",
-                "should",
-                "can",
-            }
-            fw = [w for w in re.findall(r"\b\w+\b", fact.lower()) if w not in stop]
+            fw = [w for w in re.findall(r"\b\w+\b", fact.lower()) if w not in stop_words]
             if len(fw) < 3:
                 return True  # don't over-penalize short facts
             hits = sum(1 for w in set(fw) if w in ev_text)
@@ -546,10 +584,25 @@ class VerdictGenerator:
             seg_text = seg.get("claim_segment") or ""
             src = seg.get("source_url") or ""
             fact = (seg.get("supporting_fact") or "").strip()
+            best_idx, best_ev = _best_evidence_match(seg_text, fact, src)
+            if best_ev is not None:
+                best_src = (best_ev.get("source_url") or best_ev.get("source") or "").strip()
+                best_stmt = (best_ev.get("statement") or best_ev.get("text") or "").strip()
+                if fact and not src and best_src:
+                    seg["source_url"] = best_src
+                    src = best_src
+                if src and not fact and best_stmt:
+                    seg["supporting_fact"] = best_stmt
+                    fact = best_stmt
+                if status != "UNKNOWN":
+                    seg["evidence_used_ids"] = [best_idx] if best_idx >= 0 else []
+            else:
+                seg["evidence_used_ids"] = []
             if (src and src not in ev_urls) or (fact and not _overlap_ok(fact, ev_text)):
                 seg["status"] = "UNKNOWN"
                 seg["supporting_fact"] = ""
                 seg["source_url"] = ""
+                seg["evidence_used_ids"] = []
                 continue
 
             # Polarity guardrail: a negating fact cannot validate an affirmative segment.
@@ -730,7 +783,8 @@ class VerdictGenerator:
             best = None
             best_score = 0.0
             best_neg = False
-            for ev in evidence[:8]:
+            best_idx = -1
+            for idx, ev in enumerate(evidence[:8]):
                 stmt = (ev.get("statement") or ev.get("text") or "").strip()
                 if not stmt:
                     continue
@@ -773,6 +827,7 @@ class VerdictGenerator:
                     best_score = score
                     best = ev
                     best_neg = stmt_neg
+                    best_idx = idx
 
             if best and best_score >= 0.55 and (best_neg == seg_neg):
                 status = "VALID"
@@ -791,6 +846,7 @@ class VerdictGenerator:
                     "status": status,
                     "supporting_fact": (best.get("statement") if best and status != "UNKNOWN" else "") or "",
                     "source_url": (best.get("source_url") if best and status != "UNKNOWN" else "") or "",
+                    "evidence_used_ids": ([best_idx] if best and status != "UNKNOWN" and best_idx >= 0 else []),
                 }
             )
         return out

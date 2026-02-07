@@ -36,7 +36,40 @@ _STOP_WORDS = {
 
 
 def _tokens(text: str) -> List[str]:
-    return [w for w in re.findall(r"\b[\w\-]+\b", (text or "").lower()) if w and w not in _STOP_WORDS]
+    toks = [w for w in re.findall(r"\b[\w\-]+\b", (text or "").lower()) if w and w not in _STOP_WORDS]
+    normalized: List[str] = []
+    for t in toks:
+        n = _lemma_token(t)
+        if n:
+            normalized.append(n)
+    return normalized
+
+
+def _lemma_token(token: str) -> str:
+    t = (token or "").lower().strip()
+    if not t:
+        return ""
+    # Lightweight normalization without external NLP dependencies.
+    if len(t) > 5 and t.endswith("ies"):
+        t = t[:-3] + "y"
+    elif len(t) > 4 and t.endswith("ing"):
+        t = t[:-3]
+    elif len(t) > 4 and t.endswith("ed"):
+        t = t[:-2]
+    elif len(t) > 4 and t.endswith("es"):
+        t = t[:-2]
+    elif len(t) > 3 and t.endswith("s"):
+        t = t[:-1]
+    synonyms = {
+        "metabolic": "metabolism",
+        "detoxifies": "detox",
+        "detoxification": "detox",
+        "hydrated": "hydration",
+        "hydrate": "hydration",
+        "hepatic": "liver",
+        "citrus": "lemon",
+    }
+    return synonyms.get(t, t)
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:

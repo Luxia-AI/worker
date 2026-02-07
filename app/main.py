@@ -73,6 +73,26 @@ async def process_jobs():
                     "timestamp": asyncio.get_event_loop().time(),
                 },
             )
+            stage_started_at = time.time()
+
+            completed_stage_emitted = False
+
+            async def _emit_stage_event(stage: str, payload: dict | None = None) -> None:
+                nonlocal completed_stage_emitted
+                if stage == "completed":
+                    completed_stage_emitted = True
+                event = {
+                    "job_id": job_id,
+                    "post_id": post_id,
+                    "room_id": room_id,
+                    "status": "processing",
+                    "event_type": "job.stage",
+                    "job": {"stage": stage},
+                    "stage_started_at": stage_started_at,
+                    "stage_timestamp": time.time(),
+                    "payload": payload or {},
+                }
+                await _kafka_producer.send("jobs.results", event)
 
             # Run the actual RAG pipeline
             try:
@@ -83,6 +103,7 @@ async def process_jobs():
                         domain=domain,
                         round_id=job_id,
                         top_k=5,
+                        stage_callback=_emit_stage_event,
                     )
 
                     # Extract key results
@@ -90,19 +111,25 @@ async def process_jobs():
                     facts_count = len(result.get("facts", []))
                     status = result.get("status", "completed")
                     verdict_result = result.get("verdict", {})
+                    llm_meta = result.get("llm", {})
 
                     # Build response with evidence and verdict
                     vdb_signal_count = sum(1 for e in ranked_evidence if float(e.get("sem_score", 0.0) or 0.0) > 0.0)
-                    kg_signal_count = sum(1 for e in ranked_evidence if float(e.get("kg_score", 0.0) or 0.0) > 0.0)
+                    kg_signal_count = int(result.get("kg_signal_count", 0)) or sum(
+                        1 for e in ranked_evidence if float(e.get("kg_score", 0.0) or 0.0) > 0.0
+                    )
                     vdb_signal_sum = sum(float(e.get("sem_score", 0.0) or 0.0) for e in ranked_evidence[:5])
-                    kg_signal_sum = sum(float(e.get("kg_score", 0.0) or 0.0) for e in ranked_evidence[:5])
+                    kg_signal_sum = float(result.get("kg_signal_sum_top5", 0.0)) or sum(
+                        float(e.get("kg_score", 0.0) or 0.0) for e in ranked_evidence[:5]
+                    )
 
                     response = {
                         "job_id": job_id,
                         "post_id": post_id,
                         "room_id": room_id,
                         "status": "completed",
-                        "pipeline_status": status,
+                        "pipeline_status": "completed",
+                        "result_status": status,
                         "claim": claim_text,
                         # Verdict (RAG Generation result)
                         "verdict": verdict_result.get("verdict", "UNVERIFIABLE"),
@@ -120,6 +147,9 @@ async def process_jobs():
                         "kg_signal_count": kg_signal_count,
                         "vdb_signal_sum_top5": round(vdb_signal_sum, 3),
                         "kg_signal_sum_top5": round(kg_signal_sum, 3),
+                        "debug_counts": result.get("debug_counts", {}),
+                        "degraded_mode": bool(llm_meta.get("degraded_mode", False)),
+                        "llm": llm_meta,
                         "evidence": [
                             {
                                 "statement": e.get("statement", ""),
@@ -202,6 +232,8 @@ async def process_jobs():
                 }
 
             # Send result
+            if response.get("status") == "completed" and not completed_stage_emitted:
+                await _emit_stage_event("completed", {"pipeline_status": response.get("result_status", "completed")})
             await _kafka_producer.send("jobs.results", response)
             logger.info(f"Completed job: {job_id}")
 

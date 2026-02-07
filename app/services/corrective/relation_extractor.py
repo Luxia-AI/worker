@@ -100,7 +100,10 @@ class RelationExtractor:
             )
             try:
                 retry_result = await self.llm_service.ainvoke(
-                    retry_prompt, response_format="json", priority=LLMPriority.LOW
+                    retry_prompt,
+                    response_format="json",
+                    priority=LLMPriority.LOW,
+                    call_tag="relation_extraction",
                 )
                 parsed = self._try_parse_result(retry_result)
                 if parsed is not None:
@@ -140,7 +143,12 @@ class RelationExtractor:
 
         try:
             # Single batched LLM call for ALL facts
-            result = await self.llm_service.ainvoke(prompt, response_format="json", priority=LLMPriority.LOW)
+            result = await self.llm_service.ainvoke(
+                prompt,
+                response_format="json",
+                priority=LLMPriority.LOW,
+                call_tag="relation_extraction",
+            )
 
             # Parse with retry logic
             parsed = await self._parse_llm_response(result, prompt, required_format)

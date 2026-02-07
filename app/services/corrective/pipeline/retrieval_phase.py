@@ -27,7 +27,11 @@ async def retrieve_candidates(
     lexical_index: Optional[LexicalIndex] = None,
     log_manager: Optional[LogManager] = None,
     query_text: str = "",
-) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    include_metrics: bool = False,
+) -> (
+    tuple[List[Dict[str, Any]], List[Dict[str, Any]]]
+    | tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]
+):
     """
     Retrieve semantic and KG candidates.
 
@@ -197,4 +201,12 @@ async def retrieve_candidates(
         f"kg_with_score={kg_with_positive_score}, max_kg_score={kg_max_score:.3f}"
     )
 
+    metrics = {
+        "sem_raw": len(semantic_candidates),
+        "sem_filtered": len(dedup_sem),
+        "kg_raw": len(kg_candidates),
+        "kg_with_score": kg_with_positive_score,
+    }
+    if include_metrics:
+        return dedup_sem, kg_candidates, metrics
     return dedup_sem, kg_candidates

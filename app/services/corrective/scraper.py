@@ -80,7 +80,9 @@ class Scraper:
         }
         self.domain_failure_skip_threshold = 2
         self.domain_failure_skip_seconds = 900  # 15 minutes
+        self.domain_403_cooldown_seconds = 24 * 60 * 60
         self._domain_failures: Dict[str, Dict[str, float]] = {}
+        self._attempted_urls: set[str] = set()
 
     def _get_headers(self) -> Dict[str, str]:
         """Get browser-like headers with random User-Agent."""
@@ -169,34 +171,55 @@ class Scraper:
         if domain in self._domain_failures:
             self._domain_failures.pop(domain, None)
 
+    def reset_job_attempts(self) -> None:
+        self._attempted_urls.clear()
+
+    def _mark_attempted(self, url: str) -> bool:
+        if url in self._attempted_urls:
+            return False
+        self._attempted_urls.add(url)
+        return True
+
+    def _block_domain_for_cooldown(self, url: str, seconds: int, reason: str) -> None:
+        domain = self._extract_domain(url)
+        if not domain:
+            return
+        state = self._domain_failures.setdefault(domain, {"count": 0.0, "last": 0.0, "blocked_until": 0.0})
+        state["blocked_until"] = time.time() + seconds
+        state["last"] = time.time()
+        logger.warning(
+            "[Scraper][DomainPolicy] Domain blocked: %s for %.0fs reason=%s",
+            domain,
+            float(seconds),
+            reason,
+        )
+
     # ---------------------------------------------------------------------
     # Primary HTTP Fetcher
     # ---------------------------------------------------------------------
     @throttled(limit=30, period=60.0, name="web_scraper")
-    async def fetch_html(self, session: aiohttp.ClientSession, url: str) -> tuple[str | None, bool]:
+    async def fetch_html(self, session: aiohttp.ClientSession, url: str) -> tuple[str | None, bool, int | None]:
         """
         Fetch HTML content from URL.
 
         Returns:
-            tuple: (html_content, should_fallback)
+            tuple: (html_content, should_fallback, status_code)
             - html_content: The HTML string or None if fetch failed
             - should_fallback: True if Playwright fallback might help, False if not
-              (e.g., 403/404 errors should NOT trigger fallback)
+            - status_code: HTTP status when available
         """
         try:
             if self._should_skip_domain(url):
-                return None, False
+                return None, False, None
 
             headers = self._get_headers()
             http_timeout = self._http_timeout_for_url(url)
             async with session.get(url, timeout=http_timeout, headers=headers) as resp:
                 if resp.status != 200:
-                    logger.warning(f"[Scraper] Non-200 status: {url} — {resp.status}")
-                    # 4xx client errors (403, 404, etc.) won't be fixed by Playwright
-                    # Only network issues or empty content should trigger fallback
-                    should_fallback = resp.status >= 500  # Only server errors
+                    logger.warning(f"[Scraper] Non-200 status: {url} ? {resp.status}")
+                    should_fallback = resp.status == 403 or resp.status >= 500
                     self._record_domain_failure(url, stage="http_status", reason=f"status={resp.status}")
-                    return None, should_fallback
+                    return None, should_fallback, int(resp.status)
 
                 content_type = (resp.headers.get("Content-Type") or "").lower()
                 if "application/pdf" in content_type or url.lower().endswith(".pdf"):
@@ -204,19 +227,19 @@ class Scraper:
                     pdf_text = self._extract_pdf_text(pdf_bytes)
                     if pdf_text:
                         self._record_domain_success(url)
-                        return f"[[PDF_TEXT]]{pdf_text}", False
+                        return f"[[PDF_TEXT]]{pdf_text}", False, int(resp.status)
                     self._record_domain_failure(url, stage="pdf_extract", reason="empty_pdf_text")
-                    return None, False
+                    return None, False, int(resp.status)
 
                 html = await resp.text(errors="ignore")
                 if html:
                     self._record_domain_success(url)
-                return html, True  # Success, but fallback OK if extraction fails
+                return html, True, int(resp.status)
 
         except Exception as e:
             logger.error(f"[Scraper] HTTP fetch failed for {url}: {e}")
             self._record_domain_failure(url, stage="http_exception", reason=str(e))
-            return None, True  # Network error - Playwright might help
+            return None, True, None
 
     # ---------------------------------------------------------------------
     # Trafilatura Extraction
@@ -297,49 +320,50 @@ class Scraper:
     # ---------------------------------------------------------------------
     async def scrape_one(self, session: aiohttp.ClientSession, url: str) -> Dict[str, Any]:
         logger.info(f"[Scraper] Scraping URL: {url}")
+        if not self._mark_attempted(url):
+            logger.info(f"[Scraper] Skipping duplicate URL attempted in this job: {url}")
+            return {"url": url, "content": None, "source": None, "published_at": None}
         if self._should_skip_domain(url):
             logger.warning(f"[Scraper] Skipped by domain policy: {url}")
             return {"url": url, "content": None, "source": None, "published_at": None}
         is_who = "who.int" in url.lower()
 
-        # Step 1: Try normal HTTP fetch
-        html, should_fallback = await self.fetch_html(session, url)
+        html, should_fallback, status_code = await self.fetch_html(session, url)
 
-        # If HTML missing and fallback is appropriate → Playwright fallback
-        # Do NOT fallback for 4xx errors (403, 404, etc.) - they won't be fixed by JS rendering
         if html is None and should_fallback:
             logger.info(f"[Scraper] Falling back to Playwright: {url}")
-            timeout_override = self.who_playwright_timeout if is_who else None
+            timeout_override = self.who_playwright_timeout if is_who else max(self.playwright_timeout, 12000)
             html = await self.playwright_fallback(url, timeout_override=timeout_override)
         elif html is None:
             logger.info(f"[Scraper] Skipping Playwright fallback (client error): {url}")
+
+        if html is None and status_code == 403:
+            self._block_domain_for_cooldown(url, self.domain_403_cooldown_seconds, reason="persistent_403")
 
         if not isinstance(html, str) or not html:
             logger.warning(f"[Scraper] No HTML content for {url}")
             self._record_domain_failure(url, stage="empty_html", reason="no_html_content")
             return {"url": url, "content": None, "source": None, "published_at": None}
 
-        # Step 2: Extract text (Trafilatura or pre-extracted PDF text)
         if html.startswith("[[PDF_TEXT]]"):
-            text = html[len("[[PDF_TEXT]]") :].strip()
+            text_content = html[len("[[PDF_TEXT]]") :].strip()
         else:
-            text = self.extract_text(html)
+            text_content = self.extract_text(html)
 
-        if not text:
+        if not text_content:
             logger.warning(f"[Scraper] No extractable text for {url}")
             self._record_domain_failure(url, stage="extract_text", reason="empty_extracted_text")
             return {"url": url, "content": None, "source": None, "published_at": None}
 
-        # Step 3: Metadata parsing
         source = self._extract_domain(url)
         published_at = self._extract_publish_date(html)
 
-        logger.info(f"[Scraper] Extracted {len(text)} chars from {url}")
+        logger.info(f"[Scraper] Extracted {len(text_content)} chars from {url}")
         self._record_domain_success(url)
 
         return {
             "url": url,
-            "content": text,
+            "content": text_content,
             "source": source,
             "published_at": published_at,
         }
@@ -347,7 +371,9 @@ class Scraper:
     # ---------------------------------------------------------------------
     # Scrape multiple URLs in parallel
     # ---------------------------------------------------------------------
-    async def scrape_all(self, urls: List[str]) -> List[Dict[str, Any]]:
+    async def scrape_all(self, urls: List[str], reset_attempts: bool = False) -> List[Dict[str, Any]]:
+        if reset_attempts:
+            self.reset_job_attempts()
         logger.info(f"[Scraper] Starting scrape for {len(urls)} URLs")
 
         async with aiohttp.ClientSession(

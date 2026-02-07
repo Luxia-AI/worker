@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import os
 import re
 import urllib.parse
 from typing import Any, Dict, List, Tuple
@@ -44,6 +46,22 @@ class TrustedSearch:
 
     SEARCH_URL = GOOGLE_CSE_SEARCH_URL
     SERPER_URL = "https://google.serper.dev/search"
+    STRICT_TRUSTED_DOMAIN_BASE = {
+        "who.int",
+        "nih.gov",
+        "nlm.nih.gov",
+        "ncbi.nlm.nih.gov",
+        "pubmed.ncbi.nlm.nih.gov",
+        "cdc.gov",
+        "mayoclinic.org",
+        "clevelandclinic.org",
+        "health.harvard.edu",
+        "medlineplus.gov",
+        "fda.gov",
+        "hhs.gov",
+        "nhs.uk",
+        "nice.org.uk",
+    }
 
     def __init__(self) -> None:
         # Allow initialization even without Google API if Serper is available
@@ -57,11 +75,25 @@ class TrustedSearch:
         self.google_available = has_google
         self.serper_available = has_serper
         self.google_quota_exceeded = False
+        self.min_allowlist_pass = max(1, int(os.getenv("TRUSTED_SEARCH_MIN_ALLOWLIST_PASS", "3")))
+        extra_allowlist = {
+            d.strip().lower().removeprefix("www.")
+            for d in (os.getenv("TRUSTED_SEARCH_EXTRA_ALLOWLIST", "") or "").split(",")
+            if d.strip()
+        }
+        trusted_base = {d.lower().removeprefix("www.") for d in TRUSTED_DOMAINS}
+        self.strict_allowlist = set(self.STRICT_TRUSTED_DOMAIN_BASE) | trusted_base | extra_allowlist
+        allowlist_fingerprint = hashlib.sha256("|".join(sorted(self.strict_allowlist)).encode("utf-8")).hexdigest()[:12]
 
         if has_google:
             logger.info("[TrustedSearch] Google CSE configured")
         if has_serper:
             logger.info("[TrustedSearch] Serper.dev fallback configured")
+        logger.info(
+            "[TrustedSearch] Trusted domain allowlist loaded: count=%d checksum=%s",
+            len(self.strict_allowlist),
+            allowlist_fingerprint,
+        )
 
         self.llm_client = HybridLLMService()
 
@@ -702,7 +734,12 @@ FAILED ENTITIES:
 
         try:
             # HIGH priority: Query reformulation is crucial for good search results
-            result = await self.llm_client.ainvoke(prompt, response_format="json", priority=LLMPriority.HIGH)
+            result = await self.llm_client.ainvoke(
+                prompt,
+                response_format="json",
+                priority=LLMPriority.HIGH,
+                call_tag="query_reformulation",
+            )
             queries = result.get("queries", [])
             cleaned = [self._sanitize_query(q.strip().lower()) for q in queries if isinstance(q, str)]
             cleaned = [q for q in cleaned if q]
@@ -765,9 +802,8 @@ FAILED ENTITIES:
                     error_msg = data["error"].get("message", str(data["error"]))
                     logger.error(f"[TrustedSearch:Google] API error: {error_msg}")
 
-                    # Detect quota exceeded
                     if "quota" in error_msg.lower() or "limit" in error_msg.lower():
-                        return [], True  # Signal quota exceeded
+                        return [], True
 
                     return [], False
 
@@ -780,13 +816,15 @@ FAILED ENTITIES:
                 all_urls = [item.get("link", "N/A") for item in data["items"]]
                 logger.info(f"[TrustedSearch:Google] '{query}' raw: {all_urls[:3]}...")
 
-                urls = []
-                for item in data["items"]:
-                    link = item.get("link")
-                    if link and self.is_trusted(link) and not self._is_low_signal_url(link):
-                        urls.append(link)
-                        logger.info(f"[TrustedSearch] ✓ {link}")
-
+                items = [
+                    {
+                        "link": item.get("link"),
+                        "title": item.get("title", ""),
+                        "snippet": item.get("snippet", ""),
+                    }
+                    for item in data["items"]
+                ]
+                urls, _ = self._filter_trusted_urls(items, provider="Google", query=query)
                 logger.info(f"[TrustedSearch:Google] '{query}' -> {len(urls)}/{len(data['items'])} trusted")
                 return urls, False
 
@@ -832,7 +870,6 @@ FAILED ENTITIES:
 
                 data = await resp.json()
 
-                # Serper returns results in "organic" array
                 organic = data.get("organic", [])
                 if not organic:
                     logger.warning(f"[TrustedSearch:Serper] No results for '{query}'")
@@ -841,13 +878,15 @@ FAILED ENTITIES:
                 all_urls = [r.get("link", "N/A") for r in organic]
                 logger.info(f"[TrustedSearch:Serper] '{query}' raw: {all_urls[:3]}...")
 
-                urls = []
-                for result in organic:
-                    link = result.get("link")
-                    if link and self.is_trusted(link) and not self._is_low_signal_url(link):
-                        urls.append(link)
-                        logger.info(f"[TrustedSearch] ✓ {link}")
-
+                items = [
+                    {
+                        "link": result.get("link"),
+                        "title": result.get("title", ""),
+                        "snippet": result.get("snippet", ""),
+                    }
+                    for result in organic
+                ]
+                urls, _ = self._filter_trusted_urls(items, provider="Serper", query=query)
                 logger.info(f"[TrustedSearch:Serper] '{query}' -> {len(urls)}/{len(organic)} trusted")
                 return urls
 
@@ -921,7 +960,21 @@ FAILED ENTITIES:
                     )
                     return []
 
-            return urls
+            if len(urls) >= self.min_allowlist_pass:
+                return urls
+            logger.info(
+                "[TrustedSearch] Google trusted results below threshold (%d < %d), merging Serper fallback",
+                len(urls),
+                self.min_allowlist_pass,
+            )
+            if self.serper_available:
+                serper_urls = await self.search_query_serper(session, self._simplify_query_for_fallback(query))
+                if serper_urls:
+                    merged = dedupe_list(urls + serper_urls)
+                    return merged
+            if urls:
+                return urls
+            return await self.search_query_pubmed(session, query)
 
         # No Google, try Serper directly
         if self.serper_available:
@@ -937,32 +990,26 @@ FAILED ENTITIES:
     # ---------------------------------------------------------------------
     def is_trusted(self, url: str) -> bool:
         """
-        Returns True if domain is in trusted domain list or is a .gov/.edu domain.
+        Returns True if domain is in strict trusted domain allowlist.
         """
         if not is_accessible_url(url):
             return False
         try:
-            domain = url.split("/")[2].lower()
+            parsed = urllib.parse.urlparse(url)
+            domain = (parsed.netloc or "").lower()
             if "@" in domain:
                 domain = domain.split("@")[-1]
             if ":" in domain:
                 domain = domain.split(":")[0]
-            if domain.startswith("www."):
-                domain = domain[4:]
-
-            # Check exact domain match
-            trusted_norm = {d.lower().removeprefix("www.") for d in TRUSTED_DOMAINS}
-            if domain in trusted_norm:
+            domain = domain.removeprefix("www.")
+            if not domain:
+                return False
+            if domain in self.strict_allowlist:
                 return True
 
-            # Check if any trusted domain is a suffix (handles subdomains)
-            for trusted in trusted_norm:
-                if domain.endswith(trusted) or domain.endswith("." + trusted):
+            for trusted in self.strict_allowlist:
+                if domain == trusted or domain.endswith("." + trusted):
                     return True
-
-            # Accept any .gov or .edu domain (very trustworthy)
-            if domain.endswith(".gov") or domain.endswith(".edu"):
-                return True
 
             return False
         except Exception:
@@ -978,6 +1025,66 @@ FAILED ENTITIES:
             "/study/nct",  # trial registry pages often contain template metadata only
         ]
         return any(p in u for p in low_signal_patterns)
+
+    def _url_quality_reject_reason(self, url: str, title: str = "", snippet: str = "") -> str | None:
+        u = (url or "").strip()
+        low = u.lower()
+        if not u:
+            return "empty_url"
+        if "data:text" in low:
+            return "data_text_scheme"
+        if "pano=" in low:
+            return "pano_param"
+        if re.search(r"[A-Za-z0-9+/]{32,}={0,2}", u):
+            return "base64_blob"
+        if self._is_low_signal_url(u):
+            return "low_signal_pattern"
+        parsed = urllib.parse.urlparse(u)
+        query = parsed.query or ""
+        params = urllib.parse.parse_qsl(query, keep_blank_values=True)
+        if len(query) > 450 or len(params) > 12:
+            return "querystring_too_long"
+        if params and all(k.lower().startswith(("utm_", "gclid", "fbclid", "mc_")) for k, _ in params):
+            return "tracking_only"
+        path = (parsed.path or "").strip("/")
+        shell_paths = {"", "index", "home", "search", "category", "tags", "about", "contact", "sitemap"}
+        if path.lower() in shell_paths and not (title or snippet):
+            return "site_shell_page"
+        return None
+
+    def _filter_trusted_urls(
+        self, items: List[Dict[str, Any]], provider: str, query: str
+    ) -> Tuple[List[str], Dict[str, int]]:
+        urls: List[str] = []
+        rejected_allowlist = 0
+        rejected_quality = 0
+        for item in items:
+            link = item.get("link")
+            if not link:
+                continue
+            if not self.is_trusted(link):
+                rejected_allowlist += 1
+                continue
+            reason = self._url_quality_reject_reason(link, item.get("title", ""), item.get("snippet", ""))
+            if reason is not None:
+                rejected_quality += 1
+                continue
+            urls.append(link)
+
+        logger.info(
+            "[TrustedSearch:%s] query='%s' count_rejected_by_allowlist=%d count_rejected_by_quality=%d "
+            "final_trusted_count=%d",
+            provider,
+            query,
+            rejected_allowlist,
+            rejected_quality,
+            len(urls),
+        )
+        return urls, {
+            "count_rejected_by_allowlist": rejected_allowlist,
+            "count_rejected_by_quality": rejected_quality,
+            "final_trusted_count": len(urls),
+        }
 
     # ---------------------------------------------------------------------
     # Site-Specific Query Generation
@@ -1278,7 +1385,12 @@ FAILED ENTITIES:
 
         try:
             # HIGH priority: Reinforcement query generation is crucial for finding evidence
-            result = await self.llm_client.ainvoke(prompt, response_format="json", priority=LLMPriority.HIGH)
+            result = await self.llm_client.ainvoke(
+                prompt,
+                response_format="json",
+                priority=LLMPriority.HIGH,
+                call_tag="query_reformulation",
+            )
             queries = result.get("queries", [])
 
             # safety: ensure list[str]

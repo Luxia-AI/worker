@@ -134,7 +134,10 @@ class FactExtractor:
             )
             try:
                 retry_result = await self.llm_service.ainvoke(
-                    retry_prompt, response_format="json", priority=LLMPriority.LOW
+                    retry_prompt,
+                    response_format="json",
+                    priority=LLMPriority.LOW,
+                    call_tag="fact_extraction",
                 )
                 parsed = self._try_parse_result(retry_result)
                 if parsed is not None:
@@ -186,7 +189,12 @@ class FactExtractor:
 
         try:
             # Single batched LLM call for ALL pages
-            result = await self.llm_service.ainvoke(prompt, response_format="json", priority=LLMPriority.LOW)
+            result = await self.llm_service.ainvoke(
+                prompt,
+                response_format="json",
+                priority=LLMPriority.LOW,
+                call_tag="fact_extraction",
+            )
 
             # Parse with retry logic
             parsed = await self._parse_llm_response(result, prompt, required_format)
@@ -236,7 +244,12 @@ class FactExtractor:
             prompt = FACT_EXTRACTION_PROMPT.format(content=content_chunk)
 
             try:
-                result = await self.llm_service.ainvoke(prompt, response_format="json", priority=LLMPriority.LOW)
+                result = await self.llm_service.ainvoke(
+                    prompt,
+                    response_format="json",
+                    priority=LLMPriority.LOW,
+                    call_tag="fact_extraction",
+                )
                 extracted = result.get("facts", [])
 
                 for fact in extracted:

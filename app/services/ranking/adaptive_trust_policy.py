@@ -10,6 +10,7 @@ This module implements an adaptive trust evaluation system that:
 
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, List
 
@@ -29,10 +30,13 @@ class AdaptiveTrustPolicy:
 
     def __init__(self):
         # Gating rule thresholds
-        self.COVERAGE_THRESHOLD_HIGH = 0.6  # High coverage requirement
-        self.COVERAGE_THRESHOLD_MEDIUM = 0.4  # Medium coverage with diversity bonus
-        self.DIVERSITY_THRESHOLD_HIGH = 0.7  # High diversity threshold
-        self.AGREEMENT_THRESHOLD_HIGH = 0.8  # High agreement threshold
+        self.COVERAGE_THRESHOLD_HIGH = float(os.getenv("ADAPTIVE_COVERAGE_THRESHOLD_HIGH", "0.60"))
+        self.COVERAGE_THRESHOLD_MEDIUM = float(os.getenv("ADAPTIVE_COVERAGE_THRESHOLD_MEDIUM", "0.40"))
+        self.DIVERSITY_THRESHOLD_HIGH = float(os.getenv("ADAPTIVE_DIVERSITY_THRESHOLD_HIGH", "0.70"))
+        self.AGREEMENT_THRESHOLD_HIGH = float(os.getenv("ADAPTIVE_AGREEMENT_THRESHOLD_HIGH", "0.80"))
+        self.MIN_EVIDENCE_COUNT = int(os.getenv("ADAPTIVE_MIN_EVIDENCE_COUNT", "3"))
+        self.HIGH_DIVERSITY_FOR_LOW_COUNT = float(os.getenv("ADAPTIVE_HIGH_DIVERSITY_FOR_LOW_COUNT", "0.85"))
+        self.HIGH_RELEVANCE_FOR_LOW_COUNT = float(os.getenv("ADAPTIVE_HIGH_RELEVANCE_FOR_LOW_COUNT", "0.75"))
 
         # Scoring weights
         self.COVERAGE_WEIGHT = 0.5
@@ -353,7 +357,12 @@ class AdaptiveTrustPolicy:
         return agreement
 
     def apply_gating_rules(
-        self, coverage: float, diversity: float, agreement: float, evidence_count: int | None = None
+        self,
+        coverage: float,
+        diversity: float,
+        agreement: float,
+        evidence_count: int | None = None,
+        avg_relevance: float | None = None,
     ) -> bool:
         """
         Apply adaptive gating rules to determine if evidence is sufficient.
@@ -371,9 +380,25 @@ class AdaptiveTrustPolicy:
         Returns:
             True if evidence is sufficient, False otherwise
         """
-        if evidence_count is not None and evidence_count < 3:
-            logger.info(f"Gating: FAIL - insufficient evidence count ({evidence_count} < 3)")
-            return False
+        if evidence_count is not None and evidence_count < self.MIN_EVIDENCE_COUNT:
+            if (
+                avg_relevance is not None
+                and diversity >= self.HIGH_DIVERSITY_FOR_LOW_COUNT
+                and avg_relevance >= self.HIGH_RELEVANCE_FOR_LOW_COUNT
+            ):
+                logger.info(
+                    "Gating: LOW-COUNT override PASS (count=%d, diversity=%.2f, avg_relevance=%.2f)",
+                    evidence_count,
+                    diversity,
+                    avg_relevance,
+                )
+            else:
+                logger.info(
+                    "Gating: FAIL - insufficient evidence count (%d < %d)",
+                    evidence_count,
+                    self.MIN_EVIDENCE_COUNT,
+                )
+                return False
 
         if coverage >= self.COVERAGE_THRESHOLD_HIGH and agreement >= self.AGREEMENT_THRESHOLD_HIGH:
             logger.info(
@@ -419,9 +444,24 @@ class AdaptiveTrustPolicy:
         coverage = self.calculate_coverage(subclaims, top_evidence)
         diversity = self.calculate_diversity(top_evidence)
         agreement = self.calculate_agreement(top_evidence)
+        avg_relevance = (
+            sum(
+                max(float(getattr(e, "semantic_score", 0.0) or 0.0), float(getattr(e, "trust", 0.0) or 0.0))
+                for e in top_evidence
+            )
+            / max(1, len(top_evidence))
+            if top_evidence
+            else 0.0
+        )
 
         # Apply gating rules
-        is_sufficient = self.apply_gating_rules(coverage, diversity, agreement, evidence_count=len(top_evidence))
+        is_sufficient = self.apply_gating_rules(
+            coverage,
+            diversity,
+            agreement,
+            evidence_count=len(top_evidence),
+            avg_relevance=avg_relevance,
+        )
 
         # Compute adaptive trust score
         if not top_evidence:
@@ -476,6 +516,9 @@ class AdaptiveTrustPolicy:
                 "coverage_threshold_medium": self.COVERAGE_THRESHOLD_MEDIUM,
                 "diversity_threshold_high": self.DIVERSITY_THRESHOLD_HIGH,
                 "agreement_threshold_high": self.AGREEMENT_THRESHOLD_HIGH,
+                "min_evidence_count": self.MIN_EVIDENCE_COUNT,
+                "low_count_diversity_override": self.HIGH_DIVERSITY_FOR_LOW_COUNT,
+                "low_count_relevance_override": self.HIGH_RELEVANCE_FOR_LOW_COUNT,
             },
         }
 

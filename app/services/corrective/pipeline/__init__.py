@@ -25,7 +25,7 @@ This approach MAXIMIZES quota efficiency by:
 """
 
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from app.constants.config import (
     PIPELINE_CONF_THRESHOLD,
@@ -48,7 +48,7 @@ from app.services.corrective.trusted_search import TrustedSearch
 from app.services.kg.kg_ingest import KGIngest
 from app.services.kg.kg_retrieval import KGRetrieval
 from app.services.kg.neo4j_client import Neo4jClient
-from app.services.llms.hybrid_service import reset_groq_counter
+from app.services.llms.hybrid_service import get_groq_job_metadata, reset_groq_counter
 from app.services.logging.log_handler import LogManagerHandler
 from app.services.ranking.trust_ranker import EvidenceItem, TrustRankingModule
 from app.services.retrieval.lexical_index import LexicalIndex
@@ -116,6 +116,7 @@ class CorrectivePipeline:
         failed_entities: Optional[List[str]] = None,
         round_id: Optional[str] = None,
         top_k: int = 5,
+        stage_callback: Optional[Callable[[str, Dict[str, Any]], Awaitable[None] | None]] = None,
     ) -> Dict[str, Any]:
         """
         Execute the OPTIMIZED corrective retrieval pipeline.
@@ -132,10 +133,21 @@ class CorrectivePipeline:
         round_id = round_id or str(uuid.uuid4())
         failed_entities = failed_entities or []
 
-        # Reset Groq call counter for this new request
-        reset_groq_counter()
+        # Reset Groq call counter for this new request (per-job)
+        reset_groq_counter(job_id=round_id)
+        self.scraper.reset_job_attempts()
 
         logger.info(f"[CorrectivePipeline:{round_id}] Start for post: {post_text}")
+
+        async def _emit_stage(stage: str, payload: Dict[str, Any] | None = None) -> None:
+            if not stage_callback:
+                return
+            body = {"round_id": round_id, **(payload or {})}
+            maybe = stage_callback(stage, body)
+            if maybe is not None:
+                await maybe
+
+        await _emit_stage("started", {"claim_preview": post_text[:120], "domain": domain})
 
         if self.log_manager:
             await self.log_manager.add_log(
@@ -161,7 +173,7 @@ class CorrectivePipeline:
 
         retrieval_queries = self._build_retrieval_queries(post_text)
         raw_retrieval_top_k = max(PIPELINE_RETRIEVAL_TOP_K, top_k * 3)
-        dedup_sem, kg_candidates = await retrieve_candidates(
+        dedup_sem, kg_candidates, retrieval_metrics = await retrieve_candidates(
             self.vdb_retriever,
             self.kg_retriever,
             retrieval_queries,
@@ -172,6 +184,23 @@ class CorrectivePipeline:
             self.lexical_index,
             self.log_manager,
             post_text,
+            include_metrics=True,
+        )
+        debug_counts = {
+            "kg_raw": int(retrieval_metrics.get("kg_raw", len(kg_candidates))),
+            "kg_with_score": int(retrieval_metrics.get("kg_with_score", 0)),
+            "kg_in_ranked": 0,
+            "sem_raw": int(retrieval_metrics.get("sem_raw", 0)),
+            "sem_filtered": int(retrieval_metrics.get("sem_filtered", len(dedup_sem))),
+            "sem_in_ranked": 0,
+        }
+        await _emit_stage(
+            "retrieval_done",
+            {
+                "semantic_candidates_count": len(dedup_sem),
+                "kg_candidates_count": len(kg_candidates),
+                "debug_counts": debug_counts,
+            },
         )
 
         logger.info(
@@ -192,6 +221,16 @@ class CorrectivePipeline:
                 round_id,
                 self.log_manager,
             )
+        debug_counts["kg_in_ranked"] = sum(1 for r in top_ranked if float(r.get("kg_score", 0.0) or 0.0) > 0.0)
+        debug_counts["sem_in_ranked"] = sum(1 for r in top_ranked if float(r.get("sem_score", 0.0) or 0.0) > 0.0)
+        await _emit_stage(
+            "ranking_done",
+            {
+                "ranked_count": len(top_ranked),
+                "kg_in_ranked": debug_counts["kg_in_ranked"],
+                "sem_in_ranked": debug_counts["sem_in_ranked"],
+            },
+        )
 
         # Compute trust scores for evidence
 
@@ -242,6 +281,10 @@ class CorrectivePipeline:
                 f"[CorrectivePipeline:{round_id}] Verdict (cache-sufficient): {verdict_result['verdict']} "
                 f"(confidence: {verdict_result['confidence']:.2f})"
             )
+            await _emit_stage("search_done", {"search_api_calls": 0, "queries_total": 0})
+            await _emit_stage("extraction_done", {"facts": 0, "triples": 0})
+            await _emit_stage("ingestion_done", {"facts_ingested": 0, "triples_ingested": 0})
+            await _emit_stage("completed", {"status": "completed_from_cache"})
             return {
                 "round_id": round_id,
                 "status": "completed_from_cache",
@@ -270,6 +313,13 @@ class CorrectivePipeline:
                 "num_subclaims": adaptive_trust["num_subclaims"],
                 "verdict": verdict_result,
                 "cache_sufficient": True,
+                "debug_counts": debug_counts,
+                "kg_signal_count": debug_counts["kg_in_ranked"],
+                "kg_signal_sum_top5": round(
+                    sum(float(e.get("kg_score", 0.0) or 0.0) for e in top_ranked[:5]),
+                    3,
+                ),
+                "llm": get_groq_job_metadata(),
             }
 
         # ====================================================================
@@ -301,6 +351,10 @@ class CorrectivePipeline:
                 top_k=top_k,
                 used_web_search=False,
             )
+            await _emit_stage("search_done", {"search_api_calls": 0, "queries_total": 0})
+            await _emit_stage("extraction_done", {"facts": 0, "triples": 0})
+            await _emit_stage("ingestion_done", {"facts_ingested": 0, "triples_ingested": 0})
+            await _emit_stage("completed", {"status": "no_queries_generated"})
 
             return {
                 "round_id": round_id,
@@ -327,6 +381,13 @@ class CorrectivePipeline:
                 "diversity": adaptive_trust["diversity"],
                 "num_subclaims": adaptive_trust["num_subclaims"],
                 "verdict": verdict_result,
+                "debug_counts": debug_counts,
+                "kg_signal_count": debug_counts["kg_in_ranked"],
+                "kg_signal_sum_top5": round(
+                    sum(float(e.get("kg_score", 0.0) or 0.0) for e in top_ranked[:5]),
+                    3,
+                ),
+                "llm": get_groq_job_metadata(),
             }
 
         # Get already-processed URLs from VDB to avoid re-scraping
@@ -360,6 +421,15 @@ class CorrectivePipeline:
             search_api_calls += 1
             query_urls = await self.search_agent.execute_single_query(query)
             queries_executed.append(query)
+            await _emit_stage(
+                "search_done",
+                {
+                    "query_index": query_idx + 1,
+                    "queries_executed": len(queries_executed),
+                    "search_api_calls": search_api_calls,
+                    "urls_found": len(query_urls),
+                },
+            )
 
             if not query_urls:
                 logger.info(
@@ -412,6 +482,15 @@ class CorrectivePipeline:
                 round_id,
                 self.log_manager,
             )
+            await _emit_stage(
+                "extraction_done",
+                {
+                    "query_index": query_idx + 1,
+                    "facts": len(query_facts),
+                    "entities": len(query_entities),
+                    "triples": len(query_triples),
+                },
+            )
 
             if not query_facts:
                 logger.info(f"[CorrectivePipeline:{round_id}] No facts extracted from query {query_idx + 1}")
@@ -436,11 +515,19 @@ class CorrectivePipeline:
                 round_id,
                 self.log_manager,
             )
+            await _emit_stage(
+                "ingestion_done",
+                {
+                    "query_index": query_idx + 1,
+                    "facts_ingested": len(query_facts),
+                    "triples_ingested": len(query_triples),
+                },
+            )
 
             # Step 5: Re-retrieve and re-rank with new evidence
             # Keep retrieval anchored to claim entities to avoid topic drift from scraped-page artifacts.
             retrieval_entities = list(set(claim_entities + failed_entities))
-            dedup_sem, kg_candidates = await retrieve_candidates(
+            dedup_sem, kg_candidates, retrieval_metrics = await retrieve_candidates(
                 self.vdb_retriever,
                 self.kg_retriever,
                 queries_executed,
@@ -451,7 +538,12 @@ class CorrectivePipeline:
                 self.lexical_index,
                 self.log_manager,
                 post_text,
+                include_metrics=True,
             )
+            debug_counts["kg_raw"] = int(retrieval_metrics.get("kg_raw", len(kg_candidates)))
+            debug_counts["kg_with_score"] = int(retrieval_metrics.get("kg_with_score", 0))
+            debug_counts["sem_raw"] = int(retrieval_metrics.get("sem_raw", 0))
+            debug_counts["sem_filtered"] = int(retrieval_metrics.get("sem_filtered", len(dedup_sem)))
 
             top_ranked = await rank_candidates(
                 dedup_sem,
@@ -461,6 +553,17 @@ class CorrectivePipeline:
                 top_k,
                 round_id,
                 self.log_manager,
+            )
+            debug_counts["kg_in_ranked"] = sum(1 for r in top_ranked if float(r.get("kg_score", 0.0) or 0.0) > 0.0)
+            debug_counts["sem_in_ranked"] = sum(1 for r in top_ranked if float(r.get("sem_score", 0.0) or 0.0) > 0.0)
+            await _emit_stage(
+                "ranking_done",
+                {
+                    "query_index": query_idx + 1,
+                    "ranked_count": len(top_ranked),
+                    "kg_in_ranked": debug_counts["kg_in_ranked"],
+                    "sem_in_ranked": debug_counts["sem_in_ranked"],
+                },
             )
 
             # Compute trust scores
@@ -592,6 +695,7 @@ class CorrectivePipeline:
                     "rationale": verdict_result.get("rationale", ""),
                 },
             )
+        await _emit_stage("completed", {"status": final_status, "search_api_calls": search_api_calls})
 
         return {
             "round_id": round_id,
@@ -622,6 +726,13 @@ class CorrectivePipeline:
             "trust_grade": final_trust_post.get("grade", "D"),
             "agreement_ratio": final_trust_post.get("agreement_ratio", 0.0),
             "verdict": verdict_result,
+            "debug_counts": debug_counts,
+            "kg_signal_count": debug_counts["kg_in_ranked"],
+            "kg_signal_sum_top5": round(
+                sum(float(e.get("kg_score", 0.0) or 0.0) for e in top_ranked[:5]),
+                3,
+            ),
+            "llm": get_groq_job_metadata(),
         }
 
     async def _extract_claim_entities(self, claim: str, round_id: str) -> List[str]:

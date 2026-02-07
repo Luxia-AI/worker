@@ -49,7 +49,12 @@ class EntityExtractor:
         try:
             logger.info("[EntityExtractor] Calling LLM for entity extraction...")
             # HIGH priority: Entity extraction is in critical path, needs to be fast
-            result = await self.llm.ainvoke(prompt, response_format="json", priority=LLMPriority.HIGH)
+            result = await self.llm.ainvoke(
+                prompt,
+                response_format="json",
+                priority=LLMPriority.HIGH,
+                call_tag="entity_extraction",
+            )
             logger.info(f"[EntityExtractor] LLM returned: {result}")
             ents = result.get("entities", [])
             cleaned = [e.lower().strip() for e in ents if isinstance(e, str)]
@@ -107,7 +112,12 @@ class EntityExtractor:
                 required_format=required_format, original_prompt=original_prompt[:500]
             )
             try:
-                retry_result = await self.llm.ainvoke(retry_prompt, response_format="json", priority=LLMPriority.HIGH)
+                retry_result = await self.llm.ainvoke(
+                    retry_prompt,
+                    response_format="json",
+                    priority=LLMPriority.HIGH,
+                    call_tag="entity_extraction",
+                )
                 parsed = self._try_parse_result(retry_result)
                 if parsed is not None:
                     logger.info(f"[EntityExtractor] Retry {attempt + 1} succeeded")
@@ -132,7 +142,12 @@ class EntityExtractor:
 
         try:
             # Single LLM call for all facts
-            result = await self.llm.ainvoke(prompt, response_format="json", priority=LLMPriority.HIGH)
+            result = await self.llm.ainvoke(
+                prompt,
+                response_format="json",
+                priority=LLMPriority.HIGH,
+                call_tag="entity_extraction",
+            )
 
             # Parse with retry logic
             parsed = await self._parse_llm_response(result, prompt, required_format)
