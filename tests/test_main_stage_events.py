@@ -69,7 +69,7 @@ class _FakePipeline:
 
 
 @pytest.mark.asyncio
-async def test_single_completed_event(monkeypatch):
+async def test_socket_completed_emitted_once(monkeypatch):
     fake_consumer = _FakeConsumer(
         [
             {
@@ -87,17 +87,9 @@ async def test_single_completed_event(monkeypatch):
 
     await worker_main.process_jobs()
 
-    completed_results = [
-        payload
-        for _, payload in fake_producer.sent
-        if payload.get("status") == "completed" and payload.get("event_type") != "job.stage"
-    ]
-    completed_stages = [
-        payload
-        for _, payload in fake_producer.sent
-        if payload.get("event_type") == "job.stage" and payload.get("job", {}).get("stage") == "completed"
-    ]
+    completed_events = [payload for _, payload in fake_producer.sent if payload.get("event_type") == "completed"]
+    stage_events = [payload for _, payload in fake_producer.sent if payload.get("event_type") == "stage"]
 
-    assert len(completed_results) == 1
-    assert len(completed_stages) == 1
-    assert completed_results[0]["pipeline_status"] == "completed"
+    assert len(completed_events) == 1
+    assert len(stage_events) >= 1
+    assert completed_events[0]["result"]["pipeline_status"] == "completed"

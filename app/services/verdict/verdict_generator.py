@@ -15,6 +15,7 @@ previously-ingested facts are found even when full-claim semantic
 similarity favors other topics.
 """
 
+import os
 import re
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -26,11 +27,12 @@ from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
-from app.services.ranking.subclaim_coverage import compute_subclaim_coverage
+from app.services.ranking.subclaim_coverage import compute_subclaim_coverage, evaluate_anchor_match
 from app.services.retrieval.metadata_enricher import TopicClassifier
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 
 logger = get_logger(__name__)
+_SEGMENT_EVIDENCE_MIN_OVERLAP = float(os.getenv("SEGMENT_EVIDENCE_MIN_OVERLAP", "0.20"))
 
 
 class Verdict(Enum):
@@ -456,6 +458,7 @@ class VerdictGenerator:
         evidence_map = llm_result.get("evidence_map", [])
         if not evidence_map:
             evidence_map = self._build_default_evidence_map(evidence)
+        evidence_map = self._normalize_evidence_map(claim, evidence_map, evidence)
 
         # Extract key findings
         key_findings = llm_result.get("key_findings", [])
@@ -481,6 +484,7 @@ class VerdictGenerator:
                 claim_breakdown = normalized_breakdown
             elif evidence:
                 claim_breakdown = self._build_deterministic_claim_breakdown(claim, evidence)
+        claim_breakdown = self._align_segments_with_evidence(claim_breakdown, evidence_map, evidence)
 
         # Guardrail: prevent hallucinated support (source_url / supporting_fact must map to provided evidence)
         ev_urls = set((e.get("source_url") or e.get("source") or "") for e in evidence)
@@ -630,6 +634,130 @@ class VerdictGenerator:
             "claim": claim,
             "evidence_count": len(evidence),
         }
+
+    def _segment_anchor_overlap(self, segment: str, statement: str) -> float:
+        eval_result = evaluate_anchor_match(segment, statement)
+        groups = eval_result.get("anchor_groups", []) or []
+        matched = int(eval_result.get("matched_groups", 0) or 0)
+        total = len(groups)
+        if total <= 0:
+            return 0.0
+        return max(0.0, min(1.0, matched / total))
+
+    def _normalize_evidence_map(
+        self,
+        claim: str,
+        evidence_map: List[Dict[str, Any]],
+        evidence: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        normalized: List[Dict[str, Any]] = []
+        evidence_by_id: Dict[int, Dict[str, Any]] = {idx: ev for idx, ev in enumerate(evidence)}
+
+        for item in evidence_map or []:
+            if not isinstance(item, dict):
+                continue
+            ev_id = item.get("evidence_id")
+            try:
+                ev_idx = int(ev_id)
+            except Exception:
+                ev_idx = -1
+            ev = evidence_by_id.get(ev_idx, {})
+            statement = (item.get("statement") or ev.get("statement") or ev.get("text") or "").strip()
+            source_url = (item.get("source_url") or ev.get("source_url") or ev.get("source") or "").strip()
+            relevance_score = float(item.get("relevance_score", ev.get("final_score", ev.get("score", 0.0))) or 0.0)
+            anchor_score = float(ev.get("anchor_match_score", self._segment_anchor_overlap(claim, statement)) or 0.0)
+            relevance = str(item.get("relevance", "NEUTRAL") or "NEUTRAL").upper()
+            if anchor_score < 0.2:
+                relevance = "NEUTRAL"
+                relevance_score *= 0.6
+            normalized.append(
+                {
+                    "evidence_id": ev_idx if ev_idx >= 0 else len(normalized),
+                    "statement": statement,
+                    "relevance": relevance,
+                    "relevance_score": max(0.0, min(1.0, relevance_score)),
+                    "source_url": source_url,
+                    "anchor_match_score": anchor_score,
+                }
+            )
+        return normalized
+
+    def _align_segments_with_evidence(
+        self,
+        claim_breakdown: List[Dict[str, Any]],
+        evidence_map: List[Dict[str, Any]],
+        evidence: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        if not claim_breakdown:
+            return claim_breakdown
+
+        evidence_by_id: Dict[int, Dict[str, Any]] = {idx: ev for idx, ev in enumerate(evidence)}
+        allowed_rel = {"SUPPORTS", "CONTRADICTS", "PARTIAL", "PARTIALLY_SUPPORTS", "PARTIALLY_CONTRADICTS"}
+
+        for seg in claim_breakdown:
+            segment = (seg.get("claim_segment") or "").strip()
+            best_item: Dict[str, Any] | None = None
+            best_score = -1.0
+            for em in evidence_map:
+                rel = str(em.get("relevance", "NEUTRAL") or "NEUTRAL").upper()
+                if rel not in allowed_rel:
+                    continue
+                statement = (em.get("statement") or "").strip()
+                if not statement:
+                    continue
+                anchor_overlap = self._segment_anchor_overlap(segment, statement)
+                if anchor_overlap < _SEGMENT_EVIDENCE_MIN_OVERLAP:
+                    continue
+                rel_score = float(em.get("relevance_score", 0.0) or 0.0)
+                score = (0.8 * rel_score) + (0.2 * anchor_overlap)
+                if score > best_score:
+                    best_item = em
+                    best_score = score
+
+            if best_item is None:
+                # Fallback to segment-retrieved evidence pool.
+                for idx, ev in enumerate(evidence):
+                    seg_q = (ev.get("_segment_query") or "").strip().lower()
+                    statement = (ev.get("statement") or ev.get("text") or "").strip()
+                    if not statement:
+                        continue
+                    if seg_q and seg_q not in segment.lower():
+                        continue
+                    anchor_overlap = self._segment_anchor_overlap(segment, statement)
+                    if anchor_overlap < _SEGMENT_EVIDENCE_MIN_OVERLAP:
+                        continue
+                    score = (0.7 * float(ev.get("final_score", ev.get("score", 0.0)) or 0.0)) + (0.3 * anchor_overlap)
+                    if score > best_score:
+                        best_score = score
+                        best_item = {
+                            "evidence_id": idx,
+                            "statement": statement,
+                            "source_url": ev.get("source_url") or ev.get("source") or "",
+                            "relevance_score": float(ev.get("final_score", ev.get("score", 0.0)) or 0.0),
+                        }
+
+            if best_item is not None:
+                ev_id = int(best_item.get("evidence_id", -1) or -1)
+                ev = evidence_by_id.get(ev_id, {})
+                statement = (best_item.get("statement") or ev.get("statement") or ev.get("text") or "").strip()
+                source_url = (best_item.get("source_url") or ev.get("source_url") or ev.get("source") or "").strip()
+                if statement:
+                    seg["supporting_fact"] = statement
+                if statement and source_url:
+                    seg["source_url"] = source_url
+                seg["evidence_used_ids"] = [ev_id] if ev_id >= 0 else []
+                seg["alignment_debug"] = {
+                    "reason": "mapped_from_evidence_map",
+                    "anchor_overlap": round(self._segment_anchor_overlap(segment, statement), 3),
+                    "score": round(best_score, 3),
+                }
+            else:
+                seg.setdefault("evidence_used_ids", [])
+                seg["alignment_debug"] = {
+                    "reason": "no_relevant_evidence",
+                    "min_overlap": _SEGMENT_EVIDENCE_MIN_OVERLAP,
+                }
+        return claim_breakdown
 
     def _log_subclaim_coverage(
         self,
@@ -1090,13 +1218,22 @@ class VerdictGenerator:
         """Build default evidence map when LLM doesn't provide one."""
         evidence_map = []
         for i, ev in enumerate(evidence):
+            score = float(ev.get("final_score", ev.get("score", 0.0)) or 0.0)
+            anchor_score = float(ev.get("anchor_match_score", 0.0) or 0.0)
+            if score >= 0.65 and anchor_score >= 0.20:
+                relevance = "SUPPORTS"
+            elif score >= 0.45 and anchor_score >= 0.20:
+                relevance = "PARTIAL"
+            else:
+                relevance = "NEUTRAL"
             evidence_map.append(
                 {
                     "evidence_id": i,
                     "statement": ev.get("statement", ""),
-                    "relevance": "NEUTRAL",  # Default when unknown
-                    "relevance_score": ev.get("final_score", ev.get("score", 0)),
+                    "relevance": relevance,
+                    "relevance_score": score,
                     "source_url": ev.get("source_url", ""),
+                    "anchor_match_score": anchor_score,
                 }
             )
         return evidence_map

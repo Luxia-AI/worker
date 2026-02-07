@@ -147,8 +147,10 @@ def evaluate_anchor_match(text: str, statement: str) -> Dict[str, Any]:
     ok = matched >= required if required > 0 else True
     return {
         "anchor_groups": groups,
+        "anchors_per_subclaim": len(groups),
         "required_groups": required,
         "matched_groups": matched,
+        "anchor_overlap": (matched / max(1, len(groups))) if groups else 0.0,
         "anchor_ok": ok,
     }
 
@@ -157,19 +159,25 @@ def _relevance(subclaim: str, evidence: Any) -> Dict[str, Any]:
     stmt = _as_statement(evidence)
     sub_toks = set(_tokens(subclaim))
     stmt_toks = set(_tokens(stmt))
-    overlap = len(sub_toks & stmt_toks) / max(1, len(sub_toks))
+    lexical_overlap = len(sub_toks & stmt_toks) / max(1, len(sub_toks))
     base_sem = _as_score(evidence)
+    anchor_eval = evaluate_anchor_match(subclaim, stmt)
+    anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
+    overlap = max(lexical_overlap, anchor_overlap)
     relevance = 0.6 * max(0.0, min(1.0, base_sem)) + 0.4 * max(0.0, min(1.0, overlap))
 
-    anchor_eval = evaluate_anchor_match(subclaim, stmt)
     if not anchor_eval["anchor_ok"]:
-        relevance = min(relevance, 0.20)
+        # Penalize weak anchor alignment, but avoid collapsing to zero.
+        relevance = min(relevance, 0.45 if anchor_overlap > 0.0 else 0.25)
 
     return {
         "relevance_score": max(0.0, min(1.0, relevance)),
         "overlap": overlap,
+        "lexical_overlap": lexical_overlap,
+        "anchor_overlap": anchor_overlap,
         "anchors_matched": int(anchor_eval["matched_groups"]),
         "anchors_required": int(anchor_eval["required_groups"]),
+        "anchors_per_subclaim": int(anchor_eval.get("anchors_per_subclaim", 0)),
         "anchor_ok": bool(anchor_eval["anchor_ok"]),
     }
 
@@ -204,10 +212,11 @@ def compute_subclaim_coverage(
                 best_idx = ev_idx
 
         overlap = float(best.get("overlap", 0.0))
-        if best["relevance_score"] >= strong_threshold and best["anchor_ok"] and overlap >= 0.35:
+        anchor_hits = int(best.get("anchors_matched", 0))
+        if best["relevance_score"] >= strong_threshold and overlap >= 0.30 and anchor_hits >= 1:
             status = "STRONGLY_VALID"
             weight = 1.0
-        elif best["relevance_score"] >= partial_threshold and best["anchor_ok"] and overlap >= 0.28:
+        elif best["relevance_score"] >= partial_threshold and overlap >= 0.18 and anchor_hits >= 1:
             status = "PARTIALLY_VALID"
             weight = partial_weight
         else:
@@ -224,8 +233,11 @@ def compute_subclaim_coverage(
                 "best_evidence_id": best_idx,
                 "relevance_score": round(best["relevance_score"], 4),
                 "overlap": round(best["overlap"], 4),
+                "lexical_overlap": round(float(best.get("lexical_overlap", 0.0)), 4),
+                "anchor_overlap": round(float(best.get("anchor_overlap", 0.0)), 4),
                 "anchors_matched": best["anchors_matched"],
                 "anchors_required": best["anchors_required"],
+                "anchors_per_subclaim": best.get("anchors_per_subclaim", 0),
             }
         )
 

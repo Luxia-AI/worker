@@ -162,8 +162,25 @@ class TestAdaptiveTrustPolicy:
         assert not policy.apply_gating_rules(coverage=0.3, diversity=0.4, agreement=0.8)
 
     def test_apply_gating_rules_requires_minimum_evidence_count(self, policy):
-        """Even strong ratios should fail when evidence count is too small."""
-        assert not policy.apply_gating_rules(coverage=0.8, diversity=0.8, agreement=0.9, evidence_count=2)
+        """Low coverage should still fail on evidence-count gate."""
+        assert not policy.apply_gating_rules(
+            coverage=0.10,
+            diversity=0.8,
+            agreement=0.9,
+            evidence_count=2,
+            avg_relevance=0.30,
+            strong_covered=0,
+        )
+
+    def test_adaptive_gate_passes_with_high_diversity(self, policy):
+        assert policy.apply_gating_rules(
+            coverage=0.25,
+            diversity=1.0,
+            agreement=1.0,
+            evidence_count=2,
+            avg_relevance=0.50,
+            strong_covered=0,
+        )
 
     def test_compute_adaptive_trust_single_claim(self, policy, sample_evidence):
         """Test adaptive trust computation for single-part claim."""

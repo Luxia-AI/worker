@@ -29,6 +29,48 @@ _kafka_producer: AIOKafkaProducer | None = None
 _pipeline: CorrectivePipeline | None = None
 _scraper: WHOScraper | None = None
 _neo4j_client: Neo4jClient | None = None
+_completed_emit_guard: dict[str, float] = {}
+_COMPLETED_GUARD_TTL_SECONDS = 3600.0
+
+
+def _gc_completed_emit_guard(now: float) -> None:
+    expired = [job for job, ts in _completed_emit_guard.items() if now - ts > _COMPLETED_GUARD_TTL_SECONDS]
+    for job in expired:
+        _completed_emit_guard.pop(job, None)
+
+
+async def emit_job_event(
+    room_id: str | None,
+    job_id: str | None,
+    event_type: str,
+    payload: dict,
+) -> bool:
+    """
+    Unified job event emitter.
+    event_type: stage | progress | completed | error
+    Returns True if emitted, False when dropped by idempotency guard.
+    """
+    global _kafka_producer
+    if not _kafka_producer or not job_id:
+        return False
+
+    now = time.time()
+    _gc_completed_emit_guard(now)
+    if event_type == "completed":
+        if job_id in _completed_emit_guard:
+            logger.warning("[Job %s] Completed event already emitted; dropping duplicate", job_id)
+            return False
+        _completed_emit_guard[job_id] = now
+
+    event = {
+        "event_type": event_type,
+        "job_id": job_id,
+        "room_id": room_id,
+        "timestamp": now,
+        **payload,
+    }
+    await _kafka_producer.send("jobs.results", event)
+    return True
 
 
 async def process_jobs():
@@ -62,37 +104,36 @@ async def process_jobs():
             logger.info(f"Claim to verify: {claim_text[:100]}...")
 
             # Send started update (include post_id and room_id for socket routing)
-            await _kafka_producer.send(
-                "jobs.results",
+            await emit_job_event(
+                room_id,
+                job_id,
+                "stage",
                 {
-                    "job_id": job_id,
                     "post_id": post_id,
-                    "room_id": room_id,
                     "status": "processing",
-                    "message": "Starting RAG pipeline...",
-                    "timestamp": asyncio.get_event_loop().time(),
+                    "job": {"stage": "started"},
+                    "payload": {"message": "Starting RAG pipeline..."},
                 },
             )
             stage_started_at = time.time()
 
-            completed_stage_emitted = False
-
             async def _emit_stage_event(stage: str, payload: dict | None = None) -> None:
-                nonlocal completed_stage_emitted
+                # completed is emitted only once from final result block below
                 if stage == "completed":
-                    completed_stage_emitted = True
-                event = {
-                    "job_id": job_id,
-                    "post_id": post_id,
-                    "room_id": room_id,
-                    "status": "processing",
-                    "event_type": "job.stage",
-                    "job": {"stage": stage},
-                    "stage_started_at": stage_started_at,
-                    "stage_timestamp": time.time(),
-                    "payload": payload or {},
-                }
-                await _kafka_producer.send("jobs.results", event)
+                    return
+                await emit_job_event(
+                    room_id,
+                    job_id,
+                    "stage",
+                    {
+                        "post_id": post_id,
+                        "status": "processing",
+                        "job": {"stage": stage},
+                        "stage_started_at": stage_started_at,
+                        "stage_timestamp": time.time(),
+                        "payload": payload or {},
+                    },
+                )
 
             # Run the actual RAG pipeline
             try:
@@ -231,10 +272,42 @@ async def process_jobs():
                     "timestamp": asyncio.get_event_loop().time(),
                 }
 
-            # Send result
-            if response.get("status") == "completed" and not completed_stage_emitted:
-                await _emit_stage_event("completed", {"pipeline_status": response.get("result_status", "completed")})
-            await _kafka_producer.send("jobs.results", response)
+            # Send result with idempotent completion contract
+            if response.get("status") == "completed" and response.get("result_status", "completed") == "completed":
+                await emit_job_event(
+                    room_id,
+                    job_id,
+                    "completed",
+                    {
+                        "post_id": post_id,
+                        "status": "completed",
+                        "pipeline_status": "completed",
+                        "result": response,
+                    },
+                )
+            elif response.get("status") == "completed":
+                await emit_job_event(
+                    room_id,
+                    job_id,
+                    "progress",
+                    {
+                        "post_id": post_id,
+                        "status": "processing",
+                        "pipeline_status": response.get("pipeline_status", "fallback"),
+                        "result": response,
+                    },
+                )
+            else:
+                await emit_job_event(
+                    room_id,
+                    job_id,
+                    "error",
+                    {
+                        "post_id": post_id,
+                        "status": "error",
+                        "result": response,
+                    },
+                )
             logger.info(f"Completed job: {job_id}")
 
     except Exception as e:

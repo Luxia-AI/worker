@@ -350,6 +350,7 @@ def hybrid_rank(
 
         claim_overlap = _claim_overlap_score(query_text, item["statement"])
         anchor_eval = evaluate_anchor_match(query_text, item["statement"])
+        anchor_match_score = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
         if not anchor_eval["anchor_ok"]:
             claim_overlap = min(claim_overlap, 0.20)
         stmt_lq = item["statement"].lower()
@@ -378,6 +379,12 @@ def hybrid_rank(
             final_score += 0.10
         if item.get("candidate_type") == "KG" and kg_raw >= 0.40 and anchor_eval.get("anchor_ok", True):
             final_score += 0.08
+        candidate_type = str(item.get("candidate_type", "VDB"))
+        if anchor_match_score < 0.20:
+            if candidate_type == "KG":
+                final_score *= 0.30
+            else:
+                final_score *= 0.70
         is_backfill = bool(item.get("is_backfill", False))
         if is_backfill and not (ent_s >= 0.25 or kg_s >= 0.55 or kg_raw >= 0.55):
             final_score *= 0.85
@@ -400,8 +407,9 @@ def hybrid_rank(
             "claim_overlap": claim_overlap,
             "anchors_matched": int(anchor_eval.get("matched_groups", 0)),
             "anchors_required": int(anchor_eval.get("required_groups", 0)),
+            "anchor_match_score": anchor_match_score,
             "anchor_ok": bool(anchor_eval.get("anchor_ok", True)),
-            "candidate_type": item.get("candidate_type", "VDB"),
+            "candidate_type": candidate_type,
             "is_backfill": is_backfill,
             "recency": recency_s,
             "credibility": cred_s,

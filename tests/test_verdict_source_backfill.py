@@ -2,7 +2,7 @@ from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
 from app.services.verdict.verdict_generator import VerdictGenerator
 
 
-def test_claim_breakdown_source_url_backfilled_from_evidence():
+def test_claim_breakdown_backfills_source_url():
     vg = object.__new__(VerdictGenerator)
     vg.trust_policy = AdaptiveTrustPolicy()
 

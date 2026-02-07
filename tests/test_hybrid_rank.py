@@ -110,3 +110,26 @@ def test_missing_fields_handled_gracefully():
     ranked = hybrid_rank(sem, [])
     assert len(ranked) == 2  # nosec
     assert all("final_score" in r for r in ranked)  # nosec
+
+
+def test_kg_anchor_penalty():
+    query = "warm lemon water improves metabolism"
+    sem = [
+        {
+            "statement": "Lemon water intake is associated with hydration and metabolic support in some studies.",
+            "score": 0.65,
+            "entities": ["lemon", "water", "metabolism"],
+            "source_url": "https://who.int/a",
+        }
+    ]
+    kg = [
+        {
+            "statement": "HIET significantly improves metabolism in sedentary adults.",
+            "score": 0.95,
+            "entities": ["exercise", "metabolism"],
+            "source_url": "https://pubmed.ncbi.nlm.nih.gov/123/",
+            "candidate_type": "KG",
+        }
+    ]
+    ranked = hybrid_rank(sem, kg, query_text=query, query_entities=["lemon", "water", "metabolism"])
+    assert ranked[0]["statement"].lower().startswith("lemon water")

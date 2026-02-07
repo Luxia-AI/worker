@@ -234,14 +234,15 @@ class AdaptiveTrustPolicy:
         logger.info("Coverage: weighted=%.2f/%d = %.2f", weighted, len(subclaims), coverage)
         for d in cov.get("details", []):
             logger.info(
-                "[AdaptiveTrustPolicy][Coverage] subclaim=%d best_evidence_id=%s "
-                "relevance=%.3f overlap=%.3f anchors=%d/%d status=%s",
+                "[AdaptiveTrustPolicy][Coverage] subclaim=%d chosen_evidence_id=%s "
+                "relevance=%.3f overlap=%.3f anchors=%d/%d anchors_per_subclaim=%d status=%s",
                 d.get("subclaim_id"),
                 d.get("best_evidence_id"),
                 float(d.get("relevance_score", 0.0)),
                 float(d.get("overlap", 0.0)),
                 int(d.get("anchors_matched", 0)),
                 int(d.get("anchors_required", 0)),
+                int(d.get("anchors_per_subclaim", 0)),
                 d.get("status"),
             )
         return coverage
@@ -363,6 +364,7 @@ class AdaptiveTrustPolicy:
         agreement: float,
         evidence_count: int | None = None,
         avg_relevance: float | None = None,
+        strong_covered: int = 0,
     ) -> bool:
         """
         Apply adaptive gating rules to determine if evidence is sufficient.
@@ -380,7 +382,7 @@ class AdaptiveTrustPolicy:
         Returns:
             True if evidence is sufficient, False otherwise
         """
-        if evidence_count is not None and evidence_count < self.MIN_EVIDENCE_COUNT:
+        if evidence_count is not None and evidence_count < self.MIN_EVIDENCE_COUNT and coverage < 0.20:
             if (
                 avg_relevance is not None
                 and diversity >= self.HIGH_DIVERSITY_FOR_LOW_COUNT
@@ -399,6 +401,21 @@ class AdaptiveTrustPolicy:
                     self.MIN_EVIDENCE_COUNT,
                 )
                 return False
+
+        if (
+            (coverage >= 0.25 and diversity >= 0.75)
+            or strong_covered >= 1
+            or (avg_relevance is not None and avg_relevance >= 0.55)
+        ):
+            logger.info(
+                "Gating: PASS - adaptive override (coverage=%.2f, diversity=%.2f, "
+                "strong_covered=%d, avg_relevance=%.2f)",
+                coverage,
+                diversity,
+                strong_covered,
+                float(avg_relevance or 0.0),
+            )
+            return True
 
         if coverage >= self.COVERAGE_THRESHOLD_HIGH and agreement >= self.AGREEMENT_THRESHOLD_HIGH:
             logger.info(
@@ -444,14 +461,11 @@ class AdaptiveTrustPolicy:
         coverage = self.calculate_coverage(subclaims, top_evidence)
         diversity = self.calculate_diversity(top_evidence)
         agreement = self.calculate_agreement(top_evidence)
+        cov = compute_subclaim_coverage(subclaims, top_evidence, partial_weight=0.5)
+        details = cov.get("details", [])
+        strong_covered = sum(1 for d in details if (d.get("status") or "").upper() == "STRONGLY_VALID")
         avg_relevance = (
-            sum(
-                max(float(getattr(e, "semantic_score", 0.0) or 0.0), float(getattr(e, "trust", 0.0) or 0.0))
-                for e in top_evidence
-            )
-            / max(1, len(top_evidence))
-            if top_evidence
-            else 0.0
+            sum(float(d.get("relevance_score", 0.0) or 0.0) for d in details) / max(1, len(details)) if details else 0.0
         )
 
         # Apply gating rules
@@ -461,6 +475,12 @@ class AdaptiveTrustPolicy:
             agreement,
             evidence_count=len(top_evidence),
             avg_relevance=avg_relevance,
+            strong_covered=strong_covered,
+        )
+        gate_reason = (
+            "adaptive_override"
+            if ((coverage >= 0.25 and diversity >= 0.75) or strong_covered >= 1 or avg_relevance >= 0.55)
+            else "strict"
         )
 
         # Compute adaptive trust score
@@ -469,8 +489,7 @@ class AdaptiveTrustPolicy:
         else:
             # Get individual evidence trust scores
             subclaim_trusts = []
-            cov = compute_subclaim_coverage(subclaims, top_evidence, partial_weight=0.5)
-            for d in cov.get("details", []):
+            for d in details:
                 best_idx = int(d.get("best_evidence_id", -1))
                 if best_idx < 0 or best_idx >= len(top_evidence):
                     continue
@@ -520,11 +539,17 @@ class AdaptiveTrustPolicy:
                 "low_count_diversity_override": self.HIGH_DIVERSITY_FOR_LOW_COUNT,
                 "low_count_relevance_override": self.HIGH_RELEVANCE_FOR_LOW_COUNT,
             },
+            "gate_reason": gate_reason,
+            "strong_covered": strong_covered,
+            "avg_relevance": avg_relevance,
         }
 
         logger.info(
-            f"Adaptive trust result: trust_post={trust_post:.3f}, "
-            f"coverage={coverage:.2f}, sufficient={is_sufficient}"
+            "Adaptive trust result: trust_post=%.3f final_coverage=%.2f sufficient=%s gate_reason=%s",
+            trust_post,
+            coverage,
+            is_sufficient,
+            gate_reason,
         )
 
         # Hard relevance floor: don't skip web if evidence is weak overall
