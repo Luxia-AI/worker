@@ -50,6 +50,7 @@ from app.services.kg.kg_retrieval import KGRetrieval
 from app.services.kg.neo4j_client import Neo4jClient
 from app.services.llms.hybrid_service import get_groq_job_metadata, reset_groq_counter
 from app.services.logging.log_handler import LogManagerHandler
+from app.services.pipeline_debug_report import PipelineDebugReporter
 from app.services.ranking.trust_ranker import EvidenceItem, TrustRankingModule
 from app.services.retrieval.lexical_index import LexicalIndex
 from app.services.retrieval.metadata_enricher import TopicClassifier
@@ -136,6 +137,8 @@ class CorrectivePipeline:
         # Reset Groq call counter for this new request (per-job)
         reset_groq_counter(job_id=round_id)
         self.scraper.reset_job_attempts()
+        debug_reporter = PipelineDebugReporter(run_id=round_id)
+        await debug_reporter.initialize(post_text)
 
         logger.info(f"[CorrectivePipeline:{round_id}] Start for post: {post_text}")
 
@@ -163,6 +166,12 @@ class CorrectivePipeline:
         # PHASE 1: Extract entities from claim (1 LLM call)
         # ====================================================================
         claim_entities = await self._extract_claim_entities(post_text, round_id)
+        await debug_reporter.log_step(
+            step_name="Claim entities identified",
+            description="Entity extraction on incoming claim",
+            input_data={"claim": post_text},
+            output_data={"claim_entities": claim_entities},
+        )
         logger.info(f"[CorrectivePipeline:{round_id}] Claim entities: {claim_entities}")
 
         # ====================================================================
@@ -172,6 +181,12 @@ class CorrectivePipeline:
         logger.info(f"[CorrectivePipeline:{round_id}] Claim topics: {claim_topics} (conf={topic_conf:.2f})")
 
         retrieval_queries = self._build_retrieval_queries(post_text)
+        await debug_reporter.log_step(
+            step_name="Subclaims identified",
+            description="Claim decomposition and retrieval query seed construction",
+            input_data={"claim": post_text},
+            output_data={"retrieval_queries": retrieval_queries},
+        )
         raw_retrieval_top_k = max(PIPELINE_RETRIEVAL_TOP_K, top_k * 3)
         dedup_sem, kg_candidates, retrieval_metrics = await retrieve_candidates(
             self.vdb_retriever,
@@ -205,6 +220,17 @@ class CorrectivePipeline:
 
         logger.info(
             f"[CorrectivePipeline:{round_id}] Retrieved {len(dedup_sem)} VDB + {len(kg_candidates)} KG candidates"
+        )
+        await debug_reporter.log_step(
+            step_name="Outputs of each VB/KG retrieval",
+            description="Raw retrieval output before ranking",
+            input_data={"retrieval_queries": retrieval_queries, "claim_entities": claim_entities},
+            output_data={
+                "semantic_candidates_count": len(dedup_sem),
+                "kg_candidates_count": len(kg_candidates),
+                "semantic_candidates": dedup_sem,
+                "kg_candidates": kg_candidates,
+            },
         )
 
         # ====================================================================
@@ -285,6 +311,13 @@ class CorrectivePipeline:
             await _emit_stage("extraction_done", {"facts": 0, "triples": 0})
             await _emit_stage("ingestion_done", {"facts_ingested": 0, "triples_ingested": 0})
             await _emit_stage("completed", {"status": "completed_from_cache"})
+            await debug_reporter.log_step(
+                step_name="Pipeline completed from cache",
+                description="Final output emitted without web search",
+                input_data={"used_web_search": False},
+                output_data={"ranked_count": len(top_ranked), "status": "completed_from_cache"},
+            )
+            await debug_reporter.close()
             return {
                 "round_id": round_id,
                 "status": "completed_from_cache",
@@ -340,6 +373,12 @@ class CorrectivePipeline:
             subclaims=merged_subclaims,
             entities=claim_entities,
         )
+        await debug_reporter.log_step(
+            step_name="Google search queries generated",
+            description="Query generation before web search execution",
+            input_data={"raw_subclaims": raw_subclaims, "entities": claim_entities},
+            output_data={"queries": queries, "query_count": len(queries)},
+        )
 
         if not queries:
             logger.warning(f"[CorrectivePipeline:{round_id}] No search queries generated")
@@ -355,6 +394,13 @@ class CorrectivePipeline:
             await _emit_stage("extraction_done", {"facts": 0, "triples": 0})
             await _emit_stage("ingestion_done", {"facts_ingested": 0, "triples_ingested": 0})
             await _emit_stage("completed", {"status": "no_queries_generated"})
+            await debug_reporter.log_step(
+                step_name="Pipeline halted: no queries generated",
+                description="No search queries available after decomposition/reformulation",
+                input_data={"claim": post_text},
+                output_data={"status": "no_queries_generated", "ranked_count": len(top_ranked)},
+            )
+            await debug_reporter.close()
 
             return {
                 "round_id": round_id,
@@ -421,6 +467,12 @@ class CorrectivePipeline:
             search_api_calls += 1
             query_urls = await self.search_agent.execute_single_query(query)
             queries_executed.append(query)
+            await debug_reporter.log_step(
+                step_name="Number of URLs per search query",
+                description="Search output for one query",
+                input_data={"query_index": query_idx + 1, "query": query},
+                output_data={"url_count": len(query_urls), "urls": query_urls},
+            )
             await _emit_stage(
                 "search_done",
                 {
@@ -464,7 +516,13 @@ class CorrectivePipeline:
                     f"from {len(new_urls)} candidates for this query"
                 )
                 new_urls = new_urls[: self.MAX_URLS_PER_QUERY]
-            scraped_pages = await scrape_pages(self.scraper, new_urls, round_id, self.log_manager)
+            scraped_pages = await scrape_pages(
+                self.scraper,
+                new_urls,
+                round_id,
+                self.log_manager,
+                debug_reporter=debug_reporter,
+            )
             processed_urls.extend(new_urls)
             # Add to already_processed set to avoid re-scraping in subsequent queries
             already_processed_urls.update(new_urls)
@@ -481,6 +539,7 @@ class CorrectivePipeline:
                 scraped_pages,
                 round_id,
                 self.log_manager,
+                debug_reporter=debug_reporter,
             )
             await _emit_stage(
                 "extraction_done",
@@ -544,6 +603,17 @@ class CorrectivePipeline:
             debug_counts["kg_with_score"] = int(retrieval_metrics.get("kg_with_score", 0))
             debug_counts["sem_raw"] = int(retrieval_metrics.get("sem_raw", 0))
             debug_counts["sem_filtered"] = int(retrieval_metrics.get("sem_filtered", len(dedup_sem)))
+            await debug_reporter.log_step(
+                step_name="Outputs of each VB/KG retrieval",
+                description="Retrieval rerun after ingestion for current query",
+                input_data={"query_index": query_idx + 1, "queries_executed": queries_executed},
+                output_data={
+                    "semantic_candidates_count": len(dedup_sem),
+                    "kg_candidates_count": len(kg_candidates),
+                    "semantic_candidates": dedup_sem,
+                    "kg_candidates": kg_candidates,
+                },
+            )
 
             top_ranked = await rank_candidates(
                 dedup_sem,
@@ -696,6 +766,18 @@ class CorrectivePipeline:
                 },
             )
         await _emit_stage("completed", {"status": final_status, "search_api_calls": search_api_calls})
+        await debug_reporter.log_step(
+            step_name="Pipeline completed",
+            description="Final ranked output and verdict summary",
+            input_data={"queries_executed": queries_executed, "search_api_calls": search_api_calls},
+            output_data={
+                "status": final_status,
+                "ranked_count": len(top_ranked),
+                "verdict": verdict_result.get("verdict"),
+                "confidence": verdict_result.get("confidence"),
+            },
+        )
+        await debug_reporter.close()
 
         return {
             "round_id": round_id,

@@ -10,6 +10,7 @@ from app.services.corrective.fact_extractor import FactExtractor
 from app.services.corrective.relation_extractor import RelationExtractor
 from app.services.corrective.scraper import Scraper
 from app.services.logging.log_manager import LogManager
+from app.services.pipeline_debug_report import PipelineDebugReporter
 
 logger = get_logger(__name__)
 
@@ -19,6 +20,7 @@ async def scrape_pages(
     urls: List[str],
     round_id: str,
     log_manager: Optional[LogManager] = None,
+    debug_reporter: Optional[PipelineDebugReporter] = None,
 ) -> List[Dict[str, Any]]:
     """
     Scrape pages from list of URLs.
@@ -35,6 +37,23 @@ async def scrape_pages(
         return []
 
     scraped_pages = await scraper.scrape_all(urls)
+    if debug_reporter:
+        scrape_report = []
+        for p in scraped_pages:
+            scrape_report.append(
+                {
+                    "url": p.get("url"),
+                    "was_scraping_skipped": not bool(p.get("content")),
+                    "content_preview": (p.get("content", "")[:500] if p.get("content") else ""),
+                    "source": p.get("source"),
+                }
+            )
+        await debug_reporter.log_step(
+            step_name="Scraping results",
+            description="Was scraping skipped for each URL and scraped content preview",
+            input_data={"urls": urls},
+            output_data=scrape_report,
+        )
     # Filter out pages with no content
     valid_pages = [p for p in scraped_pages if p.get("content")]
     logger.info(f"[ExtractionPhase:{round_id}] Scraped {len(valid_pages)} pages from {len(urls)} URLs")
@@ -59,6 +78,7 @@ async def extract_all(
     scraped_pages: List[Dict[str, Any]],
     round_id: str,
     log_manager: Optional[LogManager] = None,
+    debug_reporter: Optional[PipelineDebugReporter] = None,
 ) -> tuple[List[Dict[str, Any]], List[str], List[Dict[str, Any]]]:
     """
     Extract facts, entities, and relations from scraped pages.
@@ -75,6 +95,13 @@ async def extract_all(
     """
     # 3) Fact extraction
     extracted_facts = await fact_extractor.extract(scraped_pages)
+    if debug_reporter:
+        await debug_reporter.log_step(
+            step_name="LLM-identified facts",
+            description="Facts extracted from scraped contents",
+            input_data={"scraped_pages_count": len(scraped_pages)},
+            output_data=extracted_facts,
+        )
     logger.info(f"[ExtractionPhase:{round_id}] Extracted {len(extracted_facts)} facts")
 
     if log_manager:
@@ -107,6 +134,13 @@ async def extract_all(
 
     # 5) Relation extraction
     triples = await relation_extractor.extract_relations(extracted_facts, all_entities)
+    if debug_reporter:
+        await debug_reporter.log_step(
+            step_name="Knowledge graph tuples identified",
+            description="Triples extracted from facts",
+            input_data={"facts_count": len(extracted_facts), "entities_count": len(all_entities)},
+            output_data=triples,
+        )
     logger.info(f"[ExtractionPhase:{round_id}] Extracted {len(triples)} triples")
 
     if log_manager:
