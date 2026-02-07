@@ -47,7 +47,7 @@ PIPELINE_MIN_NEW_URLS = 2
 PIPELINE_MAX_SEARCH_QUERIES = 6
 
 # Maximum URLs to scrape per search query (limits extraction cost)
-PIPELINE_MAX_URLS_PER_QUERY = 5
+PIPELINE_MAX_URLS_PER_QUERY = 3
 
 # ============================================================================
 # RETRIEVAL FILTERS

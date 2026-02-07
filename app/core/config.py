@@ -1,6 +1,6 @@
 from typing import ClassVar, Optional
 
-from pydantic import Field
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,7 +19,8 @@ class Settings(BaseSettings):
     GROQ_API_KEY: Optional[str] = Field(default=None)
 
     NEO4J_URI: Optional[str] = Field(default=None)
-    NEO4J_USER: Optional[str] = Field(default=None)
+    # Accept both NEO4J_USER and legacy NEO4J_USERNAME env vars
+    NEO4J_USER: Optional[str] = Field(default=None, validation_alias=AliasChoices("NEO4J_USER", "NEO4J_USERNAME"))
     NEO4J_PASSWORD: Optional[str] = Field(default=None)
 
     # Logging system (Redis + SQLite)

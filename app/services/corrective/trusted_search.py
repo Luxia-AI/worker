@@ -104,6 +104,42 @@ class TrustedSearch:
         "roughly",
         "approximately",
     }
+    _ACTION_WORDS = {
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "do",
+        "does",
+        "did",
+        "have",
+        "has",
+        "had",
+        "how",
+        "what",
+        "when",
+        "where",
+        "why",
+        "which",
+        "can",
+        "could",
+        "should",
+        "would",
+        "may",
+        "might",
+        "must",
+    }
+    _CONSTRAINT_KEYWORDS = [
+        "statistics",
+        "prevalence",
+        "incidence",
+        "guideline",
+        "systematic review",
+        "meta-analysis",
+    ]
     _MERGE_PREFIXES = ("and ", "or ", "but ", "however ", "although ", "while ")
 
     def merge_subclaims(self, subclaims: List[str]) -> List[str]:
@@ -173,6 +209,114 @@ class TrustedSearch:
                     key_terms.append(w)
 
         return key_terms, key_numbers
+
+    def _extract_phrase_candidates(self, text: str, entities: List[str] | None = None) -> List[str]:
+        entities = entities or []
+        tokens = [t for t in self._tokenize_words(text) if t not in self._STOPWORDS and t not in self._ACTION_WORDS]
+        phrases: List[str] = []
+
+        # Add non-trivial entities as exact phrases.
+        for ent in entities:
+            ent_clean = " ".join(self._tokenize_words(ent))
+            if len(ent_clean.split()) >= 2 and ent_clean not in phrases:
+                phrases.append(ent_clean)
+
+        # Backfill with token bigrams (noun-focused approximation).
+        for i in range(len(tokens) - 1):
+            bg = f"{tokens[i]} {tokens[i + 1]}"
+            if bg not in phrases and len(bg) >= 8:
+                phrases.append(bg)
+            if len(phrases) >= 4:
+                break
+
+        return phrases[:4]
+
+    def _build_phrase_variants(self, phrase: str) -> List[str]:
+        """
+        Build lightweight lexical variants from an input phrase without
+        domain- or claim-specific hardcoded synonym dictionaries.
+        """
+        norm = " ".join(self._tokenize_words(phrase))
+        if not norm:
+            return []
+
+        words = norm.split()
+        variants = [norm]
+
+        # Singular/plural variant on last token.
+        if words:
+            last = words[-1]
+            if last.endswith("s") and len(last) > 3:
+                singular = " ".join(words[:-1] + [last[:-1]])
+                if singular not in variants:
+                    variants.append(singular)
+            elif not last.endswith("s"):
+                plural = " ".join(words[:-1] + [last + "s"])
+                if plural not in variants:
+                    variants.append(plural)
+
+        # Hyphen/space normalization variant.
+        if "-" in norm:
+            dehyphen = norm.replace("-", " ")
+            if dehyphen not in variants:
+                variants.append(dehyphen)
+
+        # Keep unique, short list for query compactness.
+        out: List[str] = []
+        for v in variants:
+            if v not in out:
+                out.append(v)
+            if len(out) >= 3:
+                break
+        return out
+
+    def _build_boolean_synonym_block(self, text: str, entities: List[str] | None = None) -> str:
+        entities = entities or []
+        phrases = self._extract_phrase_candidates(text, entities=entities)
+        if not phrases:
+            return ""
+        best_phrase = phrases[0]
+        variants = self._build_phrase_variants(best_phrase)
+        if len(variants) < 2:
+            return ""
+        quoted = [f'"{term}"' for term in variants]
+        return "(" + " OR ".join(quoted) + ")"
+
+    def _build_negative_filters(self, text: str) -> List[str]:
+        t = (text or "").lower()
+        negatives: List[str] = []
+        if "adult" in t or "adults" in t:
+            negatives.extend(["-fetal", "-pediatric"])
+        if "human" in t:
+            negatives.extend(["-veterinary"])
+        return negatives
+
+    def _build_research_instruction_query(self, text: str, entities: List[str] | None = None) -> str:
+        entities = entities or []
+        phrases = self._extract_phrase_candidates(text, entities=entities)
+        bool_block = self._build_boolean_synonym_block(text, entities=entities)
+        negatives = self._build_negative_filters(text)
+        numbers = self._extract_numbers_raw(text)[:2]
+
+        parts: List[str] = []
+        if bool_block:
+            parts.append(bool_block)
+        for p in phrases[:2]:
+            parts.append(f'"{p}"')
+        for n in numbers:
+            parts.append(n)
+
+        # Add one strong research/data constraint to reduce noisy results.
+        text_lower = (text or "").lower()
+        chosen_constraint = "statistics"
+        for c in self._CONSTRAINT_KEYWORDS:
+            if c in text_lower:
+                chosen_constraint = c
+                break
+        parts.append(chosen_constraint)
+
+        parts.extend(negatives[:2])
+        return " ".join(parts).strip()
 
     def _build_direct_query(self, text: str, entities: List[str] | None = None) -> str:
         if not text:
@@ -288,6 +432,19 @@ class TrustedSearch:
             queries.append("unique tongue prints individuals")
 
         return dedupe_list(queries)
+
+    def _build_advanced_operator_queries(self, subclaim: str, entities: List[str] | None = None) -> List[str]:
+        entities = entities or []
+        base = self._build_research_instruction_query(subclaim, entities=entities)
+        if not base:
+            return []
+
+        adv = [base]
+        # Research-paper style query.
+        adv.append(f"{base} filetype:pdf")
+        # Strong title constraint variant.
+        adv.append(f'intitle:"meta-analysis" {base}')
+        return dedupe_list(adv)
 
     async def reformulate_queries(
         self,
@@ -596,26 +753,29 @@ FAILED ENTITIES:
 
         key_terms, key_numbers = self._collect_key_terms(texts=[post_text] + merged_subclaims, entities=entities)
 
-        # 2) Build deterministic direct queries per subclaim (highest priority)
+        # 2) Build deterministic direct + operator-rich research queries per subclaim (highest priority)
         direct_queries = []
+        advanced_queries = []
         question_queries = []
         for sub in merged_subclaims:
             q = self._build_direct_query(sub, entities=entities)
             if q:
                 direct_queries.append(q)
+            advanced_queries.extend(self._build_advanced_operator_queries(sub, entities=entities))
             q_questions = self._build_question_queries(sub)
             if q_questions:
                 question_queries.append(q_questions[0])  # keep 1 best question per subclaim
 
         direct_queries = self._filter_queries(direct_queries, key_terms, key_numbers)
+        advanced_queries = self._filter_queries(advanced_queries, key_terms, key_numbers)
         question_queries = self._filter_queries(question_queries, key_terms, key_numbers)
 
-        # 3) Site-specific variants for top 2 direct queries
+        # 3) Site-specific variants for top direct/operator queries
         site_queries: List[str] = []
-        for q in direct_queries[:2]:
+        for q in direct_queries[:1] + advanced_queries[:1]:
             site_queries.extend(self._generate_site_queries(q))
 
-        all_queries = dedupe_list(direct_queries + question_queries + site_queries)
+        all_queries = dedupe_list(advanced_queries + direct_queries + question_queries + site_queries)
 
         # 4) If budget remains, add LLM reformulated queries
         if len(all_queries) < max_queries:

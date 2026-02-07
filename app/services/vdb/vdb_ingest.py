@@ -39,7 +39,12 @@ class VDBIngest:
                 # Fetch metadata for these IDs
                 try:
                     fetch_response = self.index.fetch(ids=ids_batch, namespace=self.namespace)
-                    vectors = fetch_response.get("vectors", {})
+                    if hasattr(fetch_response, "vectors"):
+                        vectors = fetch_response.vectors or {}
+                    elif isinstance(fetch_response, dict):
+                        vectors = fetch_response.get("vectors", {})
+                    else:
+                        vectors = {}
 
                     for vec_id, vec_data in vectors.items():
                         metadata = vec_data.get("metadata", {})
@@ -98,7 +103,7 @@ class VDBIngest:
 
         if skipped_count > 0:
             logger.info(
-                f"[VDBIngest] Filtered {len(facts)} facts → {len(trusted_facts)} trusted, {skipped_count} skipped"
+                f"[VDBIngest] Filtered {len(facts)} facts -> {len(trusted_facts)} trusted, {skipped_count} skipped"
             )
 
         # Enrich trusted facts with metadata before embedding

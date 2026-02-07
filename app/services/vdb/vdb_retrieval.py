@@ -19,6 +19,18 @@ class VDBRetrieval:
         self.namespace = namespace
         self.language = language
 
+    @staticmethod
+    def _as_dict(response: Any) -> Dict[str, Any]:
+        if isinstance(response, dict):
+            return response
+        to_dict = getattr(response, "to_dict", None)
+        if callable(to_dict):
+            try:
+                return to_dict()
+            except Exception:
+                return {}
+        return {}
+
     async def search(self, query: str, top_k: int = 5, topics: List[str] | None = None) -> List[Dict[str, Any]]:
         """
         Search vector DB for semantically similar facts.
@@ -64,8 +76,10 @@ class VDBRetrieval:
         except Exception as e:
             logger.error(f"[VDBRetrieval] Pinecone query failed: {e}")
             return []
-
-        matches = response.get("matches") or []
+        if hasattr(response, "matches"):
+            matches = response.matches or []
+        else:
+            matches = self._as_dict(response).get("matches") or []
 
         results = []
         dropped = 0
@@ -116,10 +130,21 @@ class VDBRetrieval:
             logger.error(f"[VDBRetrieval] Pinecone fetch failed: {e}")
             return []
 
-        vectors = response.get("vectors") or {}
+        if hasattr(response, "vectors"):
+            vectors = response.vectors or {}
+        else:
+            vectors = self._as_dict(response).get("vectors") or {}
         results = []
         for vec_id, vec_data in vectors.items():
-            metadata = vec_data.get("metadata", {})
+            if hasattr(vec_data, "metadata"):
+                metadata = vec_data.metadata or {}
+                values = getattr(vec_data, "values", None)
+            elif isinstance(vec_data, dict):
+                metadata = vec_data.get("metadata", {})
+                values = vec_data.get("values")
+            else:
+                metadata = {}
+                values = None
             result = {
                 "id": vec_id,
                 "statement": metadata.get("statement", ""),
@@ -135,7 +160,7 @@ class VDBRetrieval:
                 "count_value": metadata.get("count_value"),
             }
             if include_values:
-                result["values"] = vec_data.get("values")
+                result["values"] = values
             if result["statement"]:
                 results.append(result)
 

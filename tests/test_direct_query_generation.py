@@ -38,6 +38,36 @@ async def test_direct_queries_cover_key_terms_and_numbers():
         assert any(term in q for term in must_have), f"Query not direct to claim: {q}"
 
 
+@pytest.mark.asyncio
+async def test_advanced_queries_include_boolean_and_operator_constraints():
+    ts = _init_trusted_search()
+    claim = "The human heart beats around 100,000 times per day in adults."
+
+    subclaims = AdaptiveTrustPolicy().decompose_claim(claim)
+    merged = ts.merge_subclaims(subclaims)
+    queries = await ts.generate_search_queries(
+        post_text=claim,
+        failed_entities=[],
+        max_queries=6,
+        subclaims=merged,
+        entities=["human heart", "adults"],
+    )
+
+    assert any(" or " in q.lower() for q in queries), f"Missing boolean synonym query: {queries}"
+    assert any("filetype:pdf" in q for q in queries), f"Missing filetype query: {queries}"
+    assert any("intitle:" in q for q in queries), f"Missing intitle query: {queries}"
+
+
+def test_research_instruction_query_adds_exclusion_filters_for_adult_population():
+    ts = _init_trusted_search()
+    q = ts._build_research_instruction_query(
+        "Adult human heart rate statistics",
+        entities=["heart rate", "adult human"],
+    )
+    assert "-fetal" in q
+    assert "-pediatric" in q
+
+
 def test_merge_subclaims_conjunction():
     ts = _init_trusted_search()
     parts = [
