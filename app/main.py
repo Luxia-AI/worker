@@ -5,10 +5,27 @@ import traceback
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer
 from fastapi import FastAPI
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.core.observability import (
+    get_trace_context,
+    metrics_payload,
+    setup_tracing,
+    stage_timer,
+    worker_external_calls_total,
+    worker_fallback_total,
+    worker_job_duration_seconds,
+    worker_jobs_completed_total,
+    worker_jobs_consumed_total,
+    worker_jobs_failed_total,
+    worker_jobs_in_flight,
+    worker_kafka_consume_failures_total,
+    worker_kafka_send_failures_total,
+    worker_queue_estimate,
+)
 from app.routers.admin import router as admin_router
 from app.routers.admin import set_log_manager
 from app.routers.pinecone import router as pinecone_router
@@ -69,8 +86,15 @@ async def emit_job_event(
         "timestamp": now,
         **payload,
     }
-    await _kafka_producer.send("jobs.results", event)
-    return True
+    trace_meta = {k: v for k, v in get_trace_context().items() if v}
+    if trace_meta:
+        event["meta"] = {**(event.get("meta", {}) or {}), **trace_meta}
+    try:
+        await _kafka_producer.send("jobs.results", event)
+        return True
+    except Exception:
+        worker_kafka_send_failures_total.inc()
+        raise
 
 
 async def process_jobs():
@@ -90,8 +114,12 @@ async def process_jobs():
 
     try:
         async for message in _kafka_consumer:
+            worker_jobs_consumed_total.inc()
+            worker_jobs_in_flight.inc()
             job_data = message.value
             job_id = job_data.get("job_id")
+            inbound_meta = job_data.get("meta", {}) or {}
+            worker_queue_estimate.set(max((message.offset or 0), 0))
 
             # Extract post data from the job envelope (sent by dispatcher)
             post_data = job_data.get("post", {})
@@ -116,6 +144,7 @@ async def process_jobs():
                 },
             )
             stage_started_at = time.time()
+            job_started_at = time.perf_counter()
 
             async def _emit_stage_event(stage: str, payload: dict | None = None) -> None:
                 # completed is emitted only once from final result block below
@@ -139,13 +168,14 @@ async def process_jobs():
             try:
                 if _pipeline and claim_text:
                     logger.info(f"[Job {job_id}] Running CorrectivePipeline...")
-                    result = await _pipeline.run(
-                        post_text=claim_text,
-                        domain=domain,
-                        round_id=job_id,
-                        top_k=5,
-                        stage_callback=_emit_stage_event,
-                    )
+                    with stage_timer("pipeline"):
+                        result = await _pipeline.run(
+                            post_text=claim_text,
+                            domain=domain,
+                            round_id=job_id,
+                            top_k=5,
+                            stage_callback=_emit_stage_event,
+                        )
 
                     # Extract key results
                     ranked_evidence = result.get("ranked", [])
@@ -235,6 +265,8 @@ async def process_jobs():
                         ),
                         "timestamp": asyncio.get_event_loop().time(),
                     }
+                    if inbound_meta:
+                        response["meta"] = inbound_meta
 
                     logger.info(
                         f"[Job {job_id}] Pipeline completed: verdict={verdict_result.get('verdict', 'N/A')}, "
@@ -242,10 +274,13 @@ async def process_jobs():
                         f"confidence={verdict_result.get('confidence', 0):.2f}, "
                         f"{len(ranked_evidence)} evidence found"
                     )
+                    worker_jobs_completed_total.inc()
+                    worker_external_calls_total.labels(provider="pipeline", status="success").inc()
 
                 else:
                     # Fallback if pipeline not available
                     logger.warning(f"[Job {job_id}] Pipeline not available, using fallback")
+                    worker_fallback_total.inc()
                     response = {
                         "job_id": job_id,
                         "post_id": post_id,
@@ -257,11 +292,15 @@ async def process_jobs():
                         "message": "RAG pipeline not available - claim not verified",
                         "timestamp": asyncio.get_event_loop().time(),
                     }
+                    if inbound_meta:
+                        response["meta"] = inbound_meta
 
             except Exception as e:
                 # Log full traceback to identify exact source of error
                 logger.error(f"[Job {job_id}] Pipeline error: {e}")
                 logger.error(f"[Job {job_id}] Full traceback:\n{traceback.format_exc()}")
+                worker_jobs_failed_total.inc()
+                worker_external_calls_total.labels(provider="pipeline", status="error").inc()
                 response = {
                     "job_id": job_id,
                     "post_id": post_id,
@@ -271,6 +310,8 @@ async def process_jobs():
                     "claim": claim_text,
                     "timestamp": asyncio.get_event_loop().time(),
                 }
+                if inbound_meta:
+                    response["meta"] = inbound_meta
 
             # Send result with idempotent completion contract.
             # Treat terminal pipeline outcomes as completed for socket contract.
@@ -320,9 +361,12 @@ async def process_jobs():
                         "result": response,
                     },
                 )
+            worker_job_duration_seconds.observe(time.perf_counter() - job_started_at)
+            worker_jobs_in_flight.dec()
             logger.info(f"Completed job: {job_id}")
 
     except Exception as e:
+        worker_kafka_consume_failures_total.inc()
         logger.error(f"Error processing jobs: {e}")
 
 
@@ -413,6 +457,7 @@ async def shutdown_event() -> None:
 
 
 app = FastAPI(title="Luxia Worker Service", version="1.0.0")
+setup_tracing(app)
 
 # Register startup/shutdown events
 app.add_event_handler("startup", startup_event)
@@ -460,12 +505,13 @@ async def verify_claim(request: ClaimRequest):
     try:
         logger.info(f"[HTTP] Processing claim: {request.claim[:100]}...")
 
-        result = await _pipeline.run(
-            post_text=request.claim,
-            domain=request.domain,
-            round_id=job_id,
-            top_k=5,
-        )
+        with stage_timer("http_verify"):
+            result = await _pipeline.run(
+                post_text=request.claim,
+                domain=request.domain,
+                round_id=job_id,
+                top_k=5,
+            )
 
         # Extract key results
         ranked_evidence = result.get("ranked", [])
@@ -541,6 +587,7 @@ async def verify_claim(request: ClaimRequest):
         return response
 
     except Exception as e:
+        worker_jobs_failed_total.inc()
         logger.error(f"[HTTP] Pipeline error: {e}")
         logger.error(f"[HTTP] Full traceback:\n{traceback.format_exc()}")
         return {
@@ -551,3 +598,20 @@ async def verify_claim(request: ClaimRequest):
             "error": str(e),
             "claim": request.claim,
         }
+
+
+@app.get("/metrics", tags=["Observability"])
+async def metrics():
+    payload, content_type = metrics_payload()
+    return Response(content=payload, media_type=content_type)
+
+
+@app.get("/health", tags=["Observability"])
+async def health():
+    return {
+        "status": "ok",
+        "kafka_consumer": _kafka_consumer is not None,
+        "kafka_producer": _kafka_producer is not None,
+        "redis_url_configured": bool(settings.REDIS_URL),
+        "neo4j_configured": bool(settings.NEO4J_URI),
+    }
