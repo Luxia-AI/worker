@@ -272,8 +272,20 @@ async def process_jobs():
                     "timestamp": asyncio.get_event_loop().time(),
                 }
 
-            # Send result with idempotent completion contract
-            if response.get("status") == "completed" and response.get("result_status", "completed") == "completed":
+            # Send result with idempotent completion contract.
+            # Treat terminal pipeline outcomes as completed for socket contract.
+            terminal_result_statuses = {
+                "completed",
+                "completed_from_cache",
+                "no_facts_extracted",
+                "no_search_results",
+                "no_queries_generated",
+                "fallback",
+            }
+            result_status = str(
+                response.get("result_status", response.get("pipeline_status", "completed")) or "completed"
+            )
+            if response.get("status") == "completed" and result_status in terminal_result_statuses:
                 await emit_job_event(
                     room_id,
                     job_id,
@@ -281,7 +293,7 @@ async def process_jobs():
                     {
                         "post_id": post_id,
                         "status": "completed",
-                        "pipeline_status": "completed",
+                        "pipeline_status": result_status,
                         "result": response,
                     },
                 )
