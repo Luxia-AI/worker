@@ -1,9 +1,11 @@
+import asyncio
 import os
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import FastAPI
 from prometheus_client import Counter
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from shared.metrics import install_metrics
 
 SERVICE_NAME = "worker"
@@ -19,16 +21,20 @@ rag_jobs_failed_total = Counter(
     "Total failed RAG jobs",
 )
 
+app = FastAPI(title="Luxia Worker", version=SERVICE_VERSION)
+install_metrics(app, service_name=SERVICE_NAME, version=SERVICE_VERSION, env=SERVICE_ENV)
+
+_pipeline_lock = asyncio.Lock()
+_pipeline: Any | None = None
+
 
 class VerifyRequest(BaseModel):
     job_id: str
     claim: str
     room_id: str | None = None
     source: str | None = None
-
-
-app = FastAPI(title="Luxia Worker", version=SERVICE_VERSION)
-install_metrics(app, service_name=SERVICE_NAME, version=SERVICE_VERSION, env=SERVICE_ENV)
+    domain: str = Field(default="general")
+    top_k: int = Field(default=5, ge=1, le=20)
 
 
 def _mock_verdict_for_claim(claim: str) -> tuple[str, float, float, str]:
@@ -47,6 +53,108 @@ def _mock_verdict_for_claim(claim: str) -> tuple[str, float, float, str]:
     return ("UNVERIFIABLE", 0.58, 50.0, "Insufficient evidence context for deterministic verification.")
 
 
+async def _get_pipeline() -> Any:
+    global _pipeline
+    if _pipeline is not None:
+        return _pipeline
+
+    async with _pipeline_lock:
+        if _pipeline is None:
+            from app.services.corrective.pipeline import CorrectivePipeline
+
+            _pipeline = CorrectivePipeline()
+    return _pipeline
+
+
+def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -> dict[str, Any]:
+    ranked_evidence = result.get("ranked", []) or []
+    verdict_result = result.get("verdict", {}) or {}
+    llm_meta = result.get("llm", {}) or {}
+    status = str(result.get("status", "completed") or "completed")
+
+    return {
+        "status": "completed",
+        "job_id": payload.job_id,
+        "room_id": payload.room_id,
+        "claim": payload.claim,
+        "pipeline_status": status,
+        "result_status": status,
+        "verdict": verdict_result.get("verdict", "UNVERIFIABLE"),
+        "verdict_confidence": verdict_result.get("confidence", 0.0),
+        "truthfulness_percent": verdict_result.get("truthfulness_percent", 0.0),
+        "verdict_rationale": verdict_result.get("rationale", ""),
+        "key_findings": verdict_result.get("key_findings", []),
+        "claim_breakdown": verdict_result.get("claim_breakdown", []),
+        "evidence_map": verdict_result.get("evidence_map", []),
+        "evidence_count": len(ranked_evidence),
+        "facts_extracted": len(result.get("facts", []) or []),
+        "semantic_candidates_count": int(result.get("semantic_candidates_count", 0) or 0),
+        "kg_candidates_count": int(result.get("kg_candidates_count", 0) or 0),
+        "vdb_signal_count": int(result.get("vdb_signal_count", 0) or 0),
+        "kg_signal_count": int(result.get("kg_signal_count", 0) or 0),
+        "vdb_signal_sum_top5": float(result.get("vdb_signal_sum_top5", 0) or 0),
+        "kg_signal_sum_top5": float(result.get("kg_signal_sum_top5", 0) or 0),
+        "top_ranking_score": float(result.get("ranking_top_score", 0) or 0),
+        "avg_ranking_score": float(result.get("ranking_avg_score", 0) or 0),
+        "trust_threshold": result.get("trust_threshold", 0.70),
+        "trust_threshold_met": bool(result.get("trust_threshold_met", False)),
+        "used_web_search": bool(result.get("used_web_search", False)),
+        "data_source": result.get("data_source", "cache"),
+        "degraded_mode": bool(llm_meta.get("degraded_mode", False)),
+        "llm": llm_meta,
+        "evidence": [
+            {
+                "statement": e.get("statement", ""),
+                "source_url": e.get("source_url", ""),
+                "score": round(float(e.get("final_score", 0) or 0), 3),
+                "sem_score": round(float(e.get("sem_score", 0.0) or 0.0), 3),
+                "kg_score": round(float(e.get("kg_score", 0.0) or 0.0), 3),
+                "credibility": e.get("credibility"),
+                "grade": e.get("grade", "N/A"),
+            }
+            for e in ranked_evidence[:5]
+        ],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "worker_service": SERVICE_NAME,
+    }
+
+
+def _format_fallback_response(payload: VerifyRequest, error_message: str) -> dict[str, Any]:
+    verdict, confidence, truthfulness, rationale = _mock_verdict_for_claim(payload.claim)
+    return {
+        "status": "completed",
+        "job_id": payload.job_id,
+        "room_id": payload.room_id,
+        "claim": payload.claim,
+        "pipeline_status": "fallback",
+        "result_status": "fallback",
+        "verdict": verdict,
+        "verdict_confidence": confidence,
+        "truthfulness_percent": truthfulness,
+        "verdict_rationale": f"{rationale} (fallback reason: {error_message})",
+        "key_findings": ["Fallback mode used due to pipeline error."],
+        "claim_breakdown": [],
+        "evidence_map": [],
+        "evidence": [],
+        "evidence_count": 0,
+        "facts_extracted": 0,
+        "semantic_candidates_count": 0,
+        "kg_candidates_count": 0,
+        "vdb_signal_count": 0,
+        "kg_signal_count": 0,
+        "vdb_signal_sum_top5": 0.0,
+        "kg_signal_sum_top5": 0.0,
+        "top_ranking_score": 0.0,
+        "avg_ranking_score": 0.0,
+        "trust_threshold": 0.70,
+        "trust_threshold_met": False,
+        "used_web_search": False,
+        "data_source": "fallback",
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "worker_service": SERVICE_NAME,
+    }
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok", "service": SERVICE_NAME}
@@ -61,50 +169,22 @@ async def worker_test() -> dict[str, object]:
 @app.post("/worker/verify")
 async def worker_verify(payload: VerifyRequest) -> dict[str, object]:
     try:
-        verdict, confidence, truthfulness, rationale = _mock_verdict_for_claim(payload.claim)
+        pipeline = await _get_pipeline()
+        result = await pipeline.run(
+            post_text=payload.claim,
+            domain=payload.domain,
+            round_id=payload.job_id,
+            top_k=payload.top_k,
+        )
+        response = _format_completed_response(payload, result)
         rag_jobs_completed_total.inc()
-        return {
-            "status": "completed",
-            "job_id": payload.job_id,
-            "room_id": payload.room_id,
-            "claim": payload.claim,
-            "verdict": verdict,
-            "verdict_confidence": confidence,
-            "truthfulness_percent": truthfulness,
-            "verdict_rationale": rationale,
-            "key_findings": [
-                "Automated worker compatibility flow active.",
-                "Real retrieval/ranking can be attached behind this endpoint.",
-            ],
-            "claim_breakdown": [],
-            "evidence": [],
-            "evidence_count": 0,
-            "facts_extracted": 0,
-            "semantic_candidates_count": 0,
-            "kg_candidates_count": 0,
-            "vdb_signal_count": 0,
-            "kg_signal_count": 0,
-            "vdb_signal_sum_top5": 0.0,
-            "kg_signal_sum_top5": 0.0,
-            "top_ranking_score": 0.0,
-            "avg_ranking_score": 0.0,
-            "trust_threshold": 0.70,
-            "trust_threshold_met": False,
-            "used_web_search": False,
-            "data_source": "cache",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "worker_service": SERVICE_NAME,
-        }
+        return response
     except Exception as exc:
         rag_jobs_failed_total.inc()
-        return {
-            "status": "error",
-            "job_id": payload.job_id,
-            "room_id": payload.room_id,
-            "claim": payload.claim,
-            "message": f"Worker verification failed: {exc}",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        # Preserve API availability if the full pipeline fails at runtime.
+        fallback = _format_fallback_response(payload, str(exc))
+        rag_jobs_completed_total.inc()
+        return fallback
 
 
 @app.get("/")
