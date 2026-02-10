@@ -1,0 +1,90 @@
+{
+  "overall": {
+    "claims": 1,
+    "avg_subclaim_coverage": 0.0,
+    "avg_first_page_precision": 0.0,
+    "avg_first_page_allowlist_precision": 0.0
+  },
+  "claims": [
+    {
+      "claim": "dim light may cause eye strain but does not cause permanent damage.",
+      "queries": [
+        {
+          "query": "\"eye strain\" \"dim light\" systematic review",
+          "results": 0,
+          "relevant": 0,
+          "precision": 0.0,
+          "trusted_results": 0,
+          "allowlist_precision": 0.0,
+          "avg_relevance_score": 0.0,
+          "error": "api_error:Quota exceeded for quota metric 'Queries' and limit 'Queries per day' of service 'customsearch.googleapis.com' for consumer 'project_number:844897720276'."
+        },
+        {
+          "query": "\"permanent damage\" permanent systematic review",
+          "results": 0,
+          "relevant": 0,
+          "precision": 0.0,
+          "trusted_results": 0,
+          "allowlist_precision": 0.0,
+          "avg_relevance_score": 0.0,
+          "error": "api_error:Quota exceeded for quota metric 'Queries' and limit 'Queries per day' of service 'customsearch.googleapis.com' for consumer 'project_number:844897720276'."
+        },
+        {
+          "query": "\"eye strain\" \"dim light\" meta-analysis",
+          "results": 0,
+          "relevant": 0,
+          "precision": 0.0,
+          "trusted_results": 0,
+          "allowlist_precision": 0.0,
+          "avg_relevance_score": 0.0,
+          "error": "api_error:Quota exceeded for quota metric 'Queries' and limit 'Queries per day' of service 'customsearch.googleapis.com' for consumer 'project_number:844897720276'."
+        },
+        {
+          "query": "\"eye strain\" \"dim light\" causal association",
+          "results": 0,
+          "relevant": 0,
+          "precision": 0.0,
+          "trusted_results": 0,
+          "allowlist_precision": 0.0,
+          "avg_relevance_score": 0.0,
+          "error": "api_error:Quota exceeded for quota metric 'Queries' and limit 'Queries per day' of service 'customsearch.googleapis.com' for consumer 'project_number:844897720276'."
+        },
+        {
+          "query": "site:pubmed.ncbi.nlm.nih.gov \"eye strain\" \"dim light\" systematic review",
+          "results": 0,
+          "relevant": 0,
+          "precision": 0.0,
+          "trusted_results": 0,
+          "allowlist_precision": 0.0,
+          "avg_relevance_score": 0.0,
+          "error": "api_error:Quota exceeded for quota metric 'Queries' and limit 'Queries per day' of service 'customsearch.googleapis.com' for consumer 'project_number:844897720276'."
+        },
+        {
+          "query": "\"permanent damage\" permanent meta-analysis",
+          "results": 0,
+          "relevant": 0,
+          "precision": 0.0,
+          "trusted_results": 0,
+          "allowlist_precision": 0.0,
+          "avg_relevance_score": 0.0,
+          "error": "api_error:Quota exceeded for quota metric 'Queries' and limit 'Queries per day' of service 'customsearch.googleapis.com' for consumer 'project_number:844897720276'."
+        }
+      ],
+      "queries_generated": 6,
+      "subclaims": [
+        "dim light may cause eye strain",
+        "but does not cause permanent damage"
+      ],
+      "subclaim_coverage": 0.0,
+      "first_page_precision": 0.0,
+      "avg_query_precision": 0.0,
+      "first_page_allowlist_precision": 0.0,
+      "avg_query_allowlist_precision": 0.0,
+      "uncovered_subclaims": [
+        "dim light may cause eye strain",
+        "but does not cause permanent damage"
+      ]
+    }
+  ],
+  "cse_id": "3326f393eaed144c1"
+}

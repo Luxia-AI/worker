@@ -201,7 +201,17 @@ class HybridLLMService:
         is_verdict_call = tag == "verdict_generation"
         is_fact_extraction_call = tag == "fact_extraction"
         remaining = state.max_calls - state.calls_used
-        if not is_verdict_call and not is_fact_extraction_call and remaining <= reserve_pool:
+        allow_high_critical = (
+            priority == LLMPriority.HIGH
+            and tag in {"entity_extraction", "query_reformulation"}
+            and remaining > reserved_for_verdict
+        )
+        if (
+            not is_verdict_call
+            and not is_fact_extraction_call
+            and remaining <= reserve_pool
+            and not allow_high_critical
+        ):
             logger.warning(
                 "[HybridLLMService] Preserving critical reserved slots for job=%s "
                 "(used=%d/%d, remaining=%d, reserve_pool=%d, verdict_reserved=%d, "

@@ -230,3 +230,26 @@ def test_merge_subclaims_expands_do_not_cure_fragment():
     assert len(merged) == 2
     assert merged[0] == "Antibiotics do not cure colds"
     assert merged[1].lower() == "antibiotics do not cure the flu"
+
+
+def test_subclaim_anchors_do_not_bleed_unrelated_claim_entities():
+    ts = _init_trusted_search()
+    subclaim = "dim light may cause eye strain"
+    # "permanent damage" belongs to a different subclaim and should not bleed in.
+    anchors = ts._extract_subclaim_anchors(
+        subclaim,
+        entities=["eye strain", "permanent damage", "light"],
+    )
+    joined = " | ".join(anchors).lower()
+    assert "eye strain" in joined
+    assert "permanent damage" not in joined
+
+
+def test_negation_tokens_not_emitted_as_raw_anchor_terms():
+    ts = _init_trusted_search()
+    subclaim = "detox diets are not scientifically supported"
+    anchors = ts._extract_subclaim_anchors(subclaim, entities=["detox diets", "scientifically supported"])
+    joined = " | ".join(anchors).lower()
+    assert "not" not in anchors
+    assert "no" not in anchors
+    assert "detox diets" in joined

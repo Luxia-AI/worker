@@ -224,6 +224,11 @@ class CorrectivePipeline:
         """
         round_id = round_id or str(uuid.uuid4())
         failed_entities = failed_entities or []
+        try:
+            min_internal_top_k = max(3, int(os.getenv("PIPELINE_MIN_INTERNAL_TOP_K", "3")))
+        except Exception:
+            min_internal_top_k = 3
+        internal_top_k = max(int(top_k or 1), min_internal_top_k)
 
         # Reset Groq call counter for this new request (per-job)
         reset_groq_counter(job_id=round_id)
@@ -334,7 +339,7 @@ class CorrectivePipeline:
                 kg_candidates,
                 claim_entities,
                 post_text,
-                top_k,
+                internal_top_k,
                 round_id,
                 self.log_manager,
             )
@@ -354,8 +359,8 @@ class CorrectivePipeline:
         top_ranked_evidence = self._build_evidence_items(post_text, top_ranked)
 
         # Use adaptive trust policy for multi-part claims
-        adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(post_text, top_ranked_evidence, top_k)
-        initial_fixed_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, top_k)
+        adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(post_text, top_ranked_evidence, internal_top_k)
+        initial_fixed_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, internal_top_k)
         initial_fixed_trust_score = float(initial_fixed_post.get("trust_post", 0.0) or 0.0)
         initial_fixed_payload = self._trust_payload_fixed(initial_fixed_trust_score, self.CONF_THRESHOLD)
         is_sufficient = adaptive_trust["is_sufficient"]
@@ -375,7 +380,7 @@ class CorrectivePipeline:
             verdict_result = await self.verdict_generator.generate_verdict(
                 claim=post_text,
                 ranked_evidence=top_ranked,
-                top_k=top_k,
+                top_k=internal_top_k,
                 used_web_search=False,
                 cache_sufficient=True,
             )
@@ -740,7 +745,7 @@ class CorrectivePipeline:
                 kg_candidates,
                 retrieval_entities,
                 post_text,
-                top_k,
+                internal_top_k,
                 round_id,
                 self.log_manager,
             )
@@ -759,7 +764,9 @@ class CorrectivePipeline:
             # Compute trust scores
             top_ranked_evidence = self._build_evidence_items(post_text, top_ranked)
 
-            adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(post_text, top_ranked_evidence, top_k)
+            adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(
+                post_text, top_ranked_evidence, internal_top_k
+            )
             is_sufficient = adaptive_trust["is_sufficient"]
 
             logger.info(
@@ -822,9 +829,9 @@ class CorrectivePipeline:
         final_top_ranked_evidence = self._build_evidence_items(post_text, top_ranked)
 
         final_adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(
-            post_text, final_top_ranked_evidence, top_k
+            post_text, final_top_ranked_evidence, internal_top_k
         )
-        final_trust_post = self.trust_ranker.compute_post_trust(final_top_ranked_evidence, top_k)
+        final_trust_post = self.trust_ranker.compute_post_trust(final_top_ranked_evidence, internal_top_k)
         final_trust_score = final_trust_post["trust_post"]
         adaptive_payload = self._trust_payload_adaptive(final_adaptive_trust)
         fixed_payload = self._trust_payload_fixed(final_trust_score, self.CONF_THRESHOLD)
@@ -832,7 +839,7 @@ class CorrectivePipeline:
         verdict_result = await self.verdict_generator.generate_verdict(
             claim=post_text,
             ranked_evidence=top_ranked,
-            top_k=top_k,
+            top_k=internal_top_k,
             used_web_search=search_api_calls > 0,
         )
 

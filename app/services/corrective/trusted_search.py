@@ -215,6 +215,29 @@ class TrustedSearch:
         "roughly",
         "population",
     }
+    _ANCHOR_DROP_TOKENS = {
+        "no",
+        "not",
+        "cause",
+        "causes",
+        "caused",
+        "causing",
+        "through",
+        "itself",
+        "scientifically",
+        "supported",
+        "support",
+        "claim",
+        "claims",
+        "reported",
+        "reports",
+        "update",
+        "updated",
+        "show",
+        "shows",
+        "study",
+        "studies",
+    }
     _MERGE_PREFIXES = ("and ", "or ", "but ", "however ", "although ", "while ")
 
     def _expand_conjunction_fragment(self, previous_subclaim: str, fragment_subclaim: str) -> str:
@@ -565,28 +588,51 @@ class TrustedSearch:
     def _extract_subclaim_anchors(self, subclaim: str, entities: List[str] | None = None) -> List[str]:
         entities = entities or []
         anchors: List[str] = []
+        sub_tokens = {
+            t
+            for t in self._tokenize_words(subclaim)
+            if t not in self._STOPWORDS
+            and t not in self._ACTION_WORDS
+            and t not in self._JUNK_QUERY_TOKENS
+            and t not in self._ANCHOR_DROP_TOKENS
+        }
 
         def _add(anchor: str) -> None:
             normalized = " ".join(self._tokenize_words(anchor))
             if not normalized:
                 return
+            norm_tokens = self._tokenize_words(normalized)
+            if any(t in self._ANCHOR_DROP_TOKENS for t in norm_tokens):
+                return
             if normalized not in anchors:
                 anchors.append(normalized)
 
         # Prefer meaningful multi-word anchors first.
-        for phrase in self._extract_phrase_candidates(subclaim, entities=entities)[:4]:
+        for phrase in self._extract_phrase_candidates(subclaim, entities=[])[:4]:
             _add(phrase)
 
         for ent in entities:
-            ent_n = " ".join(
-                t for t in self._tokenize_words(ent) if t not in self._STOPWORDS and t not in self._JUNK_QUERY_TOKENS
-            )
+            ent_tokens = [
+                t
+                for t in self._tokenize_words(ent)
+                if t not in self._STOPWORDS and t not in self._JUNK_QUERY_TOKENS and t not in self._ANCHOR_DROP_TOKENS
+            ]
+            ent_n = " ".join(ent_tokens)
             if ent_n:
+                # Prevent cross-subclaim entity bleed: only keep entity anchors that
+                # overlap this subclaim's content.
+                if not (set(ent_tokens) & sub_tokens):
+                    continue
                 _add(ent_n)
 
         freq: Dict[str, int] = {}
         for tok in self._tokenize_words(subclaim):
-            if tok in self._STOPWORDS or tok in self._ACTION_WORDS or tok in self._JUNK_QUERY_TOKENS:
+            if (
+                tok in self._STOPWORDS
+                or tok in self._ACTION_WORDS
+                or tok in self._JUNK_QUERY_TOKENS
+                or tok in self._ANCHOR_DROP_TOKENS
+            ):
                 continue
             freq[tok] = freq.get(tok, 0) + 1
         ranked_tokens = sorted(freq.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
@@ -662,9 +708,13 @@ class TrustedSearch:
         number_anchors = [a for a in ranked_anchors if any(ch.isdigit() for ch in a)]
 
         core_terms: List[str] = []
+        phrase_tokens: set[str] = set()
         for p in phrase_anchors[:2]:
             core_terms.append(f'"{p}"')
+            phrase_tokens.update(self._tokenize_words(p))
         for t in term_anchors[:3]:
+            if t in phrase_tokens:
+                continue
             core_terms.append(t)
         for n in number_anchors[:2]:
             core_terms.append(n)

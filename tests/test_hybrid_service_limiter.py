@@ -132,8 +132,9 @@ async def test_fact_extraction_can_use_reserved_critical_pool(monkeypatch):
 
     await svc.ainvoke("q1", priority=hybrid_module.LLMPriority.HIGH, call_tag="query_reformulation")
     await svc.ainvoke("q2", priority=hybrid_module.LLMPriority.HIGH, call_tag="query_reformulation")
-    with pytest.raises(RuntimeError, match="reserved for fact extraction and verdict"):
-        await svc.ainvoke("q3", priority=hybrid_module.LLMPriority.HIGH, call_tag="query_reformulation")
+    # Low-priority non-critical extraction should be blocked once reserve pool is reached.
+    skipped = await svc.ainvoke("rels", priority=hybrid_module.LLMPriority.LOW, call_tag="relation_extraction")
+    assert skipped.get("_degraded_skip") is True
 
     # Fact extraction remains allowed from reserved critical budget.
     result = await svc.ainvoke(
@@ -147,4 +148,27 @@ async def test_fact_extraction_can_use_reserved_critical_pool(monkeypatch):
 
     meta = hybrid_module.get_groq_job_metadata()
     assert meta["reserved_fact_extraction_calls"] == 1
+    assert fake.calls == 4
+
+
+@pytest.mark.asyncio
+async def test_high_priority_entity_extraction_can_consume_non_verdict_reserved_slot(monkeypatch):
+    monkeypatch.setenv("ALLOW_GROQ_BURST", "false")
+    monkeypatch.setenv("GROQ_MAX_CALLS_PER_JOB", "4")
+    monkeypatch.setenv("GROQ_RESERVED_VERDICT_CALLS", "1")
+    monkeypatch.setenv("GROQ_RESERVED_FACT_EXTRACTION_CALLS", "1")
+    monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
+
+    fake = _FakeGroqService()
+    monkeypatch.setattr(hybrid_module, "GroqService", lambda: fake)
+
+    svc = hybrid_module.HybridLLMService()
+    hybrid_module.reset_groq_counter(job_id="job-entity-critical", max_calls=4)
+
+    await svc.ainvoke("q1", priority=hybrid_module.LLMPriority.HIGH, call_tag="query_reformulation")
+    await svc.ainvoke("q2", priority=hybrid_module.LLMPriority.HIGH, call_tag="query_reformulation")
+    # Remaining slots now equal reserve_pool (2). High-priority entity extraction should still run.
+    await svc.ainvoke("entities", priority=hybrid_module.LLMPriority.HIGH, call_tag="entity_extraction")
+    await svc.ainvoke("verdict", priority=hybrid_module.LLMPriority.HIGH, call_tag="verdict_generation")
+
     assert fake.calls == 4
