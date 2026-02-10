@@ -1,4 +1,5 @@
 import json
+import re
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -50,6 +51,76 @@ class RelationExtractor:
 
     def __init__(self) -> None:
         self.llm_service = HybridLLMService()
+
+    @staticmethod
+    def _normalize_relation(relation: str) -> str:
+        return re.sub(r"\s+", " ", (relation or "").replace("_", " ").strip().lower())
+
+    def _is_causal_relation(self, relation: str) -> bool:
+        rel = self._normalize_relation(relation)
+        causal_markers = {
+            "cause",
+            "causes",
+            "caused",
+            "causing",
+            "induce",
+            "induces",
+            "induced",
+            "trigger",
+            "triggers",
+            "triggered",
+            "associate",
+            "associated",
+            "association",
+            "linked",
+            "link",
+            "increase risk",
+            "increases risk",
+            "lead to",
+            "leads to",
+        }
+        return any(marker in rel for marker in causal_markers)
+
+    def _is_negated_statement(self, statement: str) -> bool:
+        text = (statement or "").lower()
+        negation_patterns = [
+            r"\b(?:do|does|did|is|are|was|were|can|could|may|might|must|should|would|will)\s+not\b",
+            r"\bno\s+(?:evidence|link|association|causal link)\b",
+            r"\bnot\s+(?:associated|linked|causal)\b",
+            r"\bunrelated to\b",
+            r"\b(?:myth|debunked|false claim|no link)\b",
+        ]
+        return any(re.search(pat, text) for pat in negation_patterns)
+
+    def _negated_relation_label(self, relation: str) -> Optional[str]:
+        rel = self._normalize_relation(relation)
+        if "cause" in rel:
+            return "does_not_cause"
+        if "associat" in rel:
+            return "not_associated_with"
+        if "link" in rel:
+            return "not_linked_to"
+        if "increase risk" in rel:
+            return "does_not_increase_risk_of"
+        return None
+
+    def _apply_negation_guard(
+        self,
+        statement: str,
+        relation: str,
+    ) -> Optional[str]:
+        """
+        Prevent positive causal triples from negated fact statements.
+        Returns normalized/inverted relation or None when triple should be dropped.
+        """
+        if not self._is_causal_relation(relation):
+            return relation
+        if not self._is_negated_statement(statement):
+            return relation
+        negated = self._negated_relation_label(relation)
+        if negated:
+            return negated
+        return None
 
     def _try_parse_result(self, result: Any) -> Optional[Dict[str, Any]]:
         """Try to parse LLM result into expected format. No retries, just parsing."""
@@ -182,14 +253,19 @@ class RelationExtractor:
                         if not subj or not rel or not obj:
                             continue
 
+                        normalized_relation = self._apply_negation_guard(fact.get("statement", ""), rel)
+                        if not normalized_relation:
+                            continue
+
                         triple = {
                             "id": str(uuid.uuid4()),
                             "subject": subj,
-                            "relation": rel,
+                            "relation": normalized_relation,
                             "object": obj,
                             "confidence": max(0.0, min(conf, 1.0)),
                             "source_url": src,
                             "fact_id": fact.get("fact_id"),
+                            "source_statement": fact.get("statement", ""),
                         }
                         all_triples.append(triple)
                     except Exception as e:

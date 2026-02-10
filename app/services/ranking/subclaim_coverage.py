@@ -34,6 +34,26 @@ _STOP_WORDS = {
     "according",
 }
 
+_GENERIC_WEAK_ANCHORS = {
+    "do",
+    "does",
+    "did",
+    "not",
+    "no",
+    "never",
+    "cause",
+    "causes",
+    "caused",
+    "cause",
+    "link",
+    "links",
+    "linked",
+    "associate",
+    "associates",
+    "associated",
+    "association",
+}
+
 
 def _tokens(text: str) -> List[str]:
     toks = [w for w in re.findall(r"\b[\w\-]+\b", (text or "").lower()) if w and w not in _STOP_WORDS]
@@ -126,11 +146,17 @@ def derive_anchor_groups(text: str) -> List[List[str]]:
     if _contains_any(t, ["hydration", "hydrate", "hydrated"]):
         groups.append(["hydration", "hydrate", "hydrated", "water intake"])
 
-    # Generic anchor group from content tokens if no concept groups detected.
+    # Generic anchors: use independent concept tokens (not one "any-of" bucket).
+    # This prevents one token (e.g., "vaccines") from satisfying unrelated subclaims
+    # like "autism" and "flu" simultaneously.
     if not groups:
-        generic = [w for w in _tokens(t) if len(w) > 3][:4]
-        if generic:
-            groups.append(generic)
+        generic = [w for w in _tokens(t) if len(w) > 2 and w not in _GENERIC_WEAK_ANCHORS][:4]
+        seen = set()
+        for token in generic:
+            if token in seen:
+                continue
+            seen.add(token)
+            groups.append([token])
     return groups
 
 
@@ -213,10 +239,20 @@ def compute_subclaim_coverage(
 
         overlap = float(best.get("overlap", 0.0))
         anchor_hits = int(best.get("anchors_matched", 0))
-        if best["relevance_score"] >= strong_threshold and overlap >= 0.30 and anchor_hits >= 1:
+        if (
+            best["relevance_score"] >= strong_threshold
+            and overlap >= 0.30
+            and anchor_hits >= 1
+            and bool(best.get("anchor_ok", False))
+        ):
             status = "STRONGLY_VALID"
             weight = 1.0
-        elif best["relevance_score"] >= partial_threshold and overlap >= 0.18 and anchor_hits >= 1:
+        elif (
+            best["relevance_score"] >= partial_threshold
+            and overlap >= 0.18
+            and anchor_hits >= 1
+            and bool(best.get("anchor_ok", False))
+        ):
             status = "PARTIALLY_VALID"
             weight = partial_weight
         else:

@@ -299,7 +299,7 @@ class VerdictGenerator:
             web_boost = await self._fetch_web_evidence_for_unknown_segments(segments)
             if not web_boost:
                 return self._unverifiable_result(claim, "No evidence retrieved (VDB/KG empty and web boost failed)")
-            ranked_evidence = web_boost
+            ranked_evidence = sorted(web_boost, key=self._deterministic_evidence_sort_key)
 
         # Step 1) Start with VDB/KG evidence + (optional) segment retrieval
         segment_evidence: List[Dict[str, Any]] = []
@@ -338,7 +338,10 @@ class VerdictGenerator:
                     logger.warning("[VerdictGenerator] Web boost returned no facts.")
                     break
                 logger.info(f"[VerdictGenerator] Web boost facts: {len(web_boost)}")
-                pre_evidence = (pre_evidence + web_boost)[: min(len(pre_evidence + web_boost), 18)]
+                merged_with_web = pre_evidence + web_boost
+                merged_with_web.sort(key=self._deterministic_evidence_sort_key)
+                pre_evidence = merged_with_web[: min(len(merged_with_web), 18)]
+        pre_evidence.sort(key=self._deterministic_evidence_sort_key)
         top_evidence = pre_evidence[: min(len(pre_evidence), top_k, 12)]
 
         # Format evidence for prompt
@@ -1418,6 +1421,27 @@ class VerdictGenerator:
         )
         return all_segment_evidence
 
+    @staticmethod
+    def _normalize_statement_key(statement: str) -> str:
+        return re.sub(r"\s+", " ", (statement or "").strip().lower())
+
+    @staticmethod
+    def _deterministic_evidence_sort_key(ev: Dict[str, Any]) -> tuple[float, str, str]:
+        score = ev.get("final_score")
+        if score is None:
+            score = ev.get("score")
+        if score is None:
+            score = ev.get("sem_score")
+        if score is None:
+            score = ev.get("semantic_score")
+        try:
+            score_f = float(score or 0.0)
+        except Exception:
+            score_f = 0.0
+        source = str(ev.get("source_url") or ev.get("source") or "").strip().lower()
+        stmt = re.sub(r"\s+", " ", str(ev.get("statement") or ev.get("text") or "").strip().lower())
+        return (-score_f, source, stmt)
+
     def _merge_evidence(
         self,
         ranked_evidence: List[Dict[str, Any]],
@@ -1432,14 +1456,18 @@ class VerdictGenerator:
         """
         # Filter ranked evidence - keep only items with valid statements
         merged: List[Dict[str, Any]] = [ev for ev in ranked_evidence if ev.get("statement") or ev.get("text")]
-        seen_statements: set = {ev.get("statement") or ev.get("text", "") for ev in merged}
+        seen_statements: set[str] = {
+            self._normalize_statement_key(str(ev.get("statement") or ev.get("text") or "")) for ev in merged
+        }
 
         for seg_ev in segment_evidence:
             stmt = seg_ev.get("statement") or seg_ev.get("text", "")
-            if stmt and stmt not in seen_statements:
-                seen_statements.add(stmt)
+            stmt_key = self._normalize_statement_key(str(stmt))
+            if stmt and stmt_key and stmt_key not in seen_statements:
+                seen_statements.add(stmt_key)
                 merged.append(seg_ev)
 
+        merged.sort(key=self._deterministic_evidence_sort_key)
         return merged
 
     def _get_unknown_segments(self, verdict_result: Dict[str, Any]) -> List[str]:

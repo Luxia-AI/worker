@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 from typing import Any, Dict, List
 
 from app.core.logger import get_logger
@@ -33,6 +34,34 @@ class KGIngest:
 
     def __init__(self) -> None:
         self.client = Neo4jClient()
+
+    @staticmethod
+    def _normalize_relation(relation: str) -> str:
+        return re.sub(r"\s+", " ", (relation or "").replace("_", " ").strip().lower())
+
+    @staticmethod
+    def _is_negated_statement(statement: str) -> bool:
+        text = (statement or "").lower()
+        negation_patterns = [
+            r"\b(?:do|does|did|is|are|was|were|can|could|may|might|must|should|would|will)\s+not\b",
+            r"\bno\s+(?:evidence|link|association|causal link)\b",
+            r"\bnot\s+(?:associated|linked|causal)\b",
+            r"\bunrelated to\b",
+            r"\b(?:myth|debunked|false claim|no link)\b",
+        ]
+        return any(re.search(pat, text) for pat in negation_patterns)
+
+    def _should_skip_triple(self, triple: Dict[str, Any]) -> bool:
+        relation = self._normalize_relation(triple.get("relation", ""))
+        if not relation:
+            return True
+        if relation.startswith(("does_not_", "not_")):
+            return False
+        causal_markers = ("cause", "associat", "link", "increase risk", "lead to")
+        if not any(marker in relation for marker in causal_markers):
+            return False
+        statement = str(triple.get("source_statement", "") or "")
+        return bool(statement and self._is_negated_statement(statement))
 
     async def ingest_triples(self, triples: List[Dict[str, Any]]) -> Dict[str, int]:
         """
@@ -66,6 +95,10 @@ class KGIngest:
         try:
             async with self.client.session() as session:
                 for triple in triples:
+                    if self._should_skip_triple(triple):
+                        logger.warning(f"[KGIngest] Skipped negated/unsafe triple: {triple}")
+                        failed += 1
+                        continue
                     subj_name = triple.get("subject", "").strip()
                     rel_predicate = triple.get("relation", "").strip()
                     obj_name = triple.get("object", "").strip()

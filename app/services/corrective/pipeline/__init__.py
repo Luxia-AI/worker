@@ -141,6 +141,16 @@ class CorrectivePipeline:
         if not bool(adaptive_trust.get("is_sufficient", False)):
             return False
 
+        # Deterministic gate from adaptive trust metrics (not LLM phrasing).
+        coverage = float(adaptive_trust.get("coverage", 0.0) or 0.0)
+        num_subclaims = int(adaptive_trust.get("num_subclaims", 0) or 0)
+        strong_covered = int(adaptive_trust.get("strong_covered", 0) or 0)
+        if num_subclaims > 0:
+            if strong_covered >= num_subclaims and coverage >= 0.99:
+                return True
+            if coverage < 0.99:
+                return False
+
         if "required_segments_resolved" in verdict_result:
             return bool(verdict_result.get("required_segments_resolved", False))
 
@@ -745,7 +755,7 @@ class CorrectivePipeline:
             if is_sufficient:
                 remaining_queries = len(queries) - query_idx - 1
                 logger.info(
-                    f"[CorrectivePipeline:{round_id}] ✅ ADAPTIVE THRESHOLD MET after query {query_idx + 1}! "
+                    f"[CorrectivePipeline:{round_id}] ADAPTIVE THRESHOLD MET after query {query_idx + 1}! "
                     f"Saved {remaining_queries} search API calls!"
                 )
                 break
