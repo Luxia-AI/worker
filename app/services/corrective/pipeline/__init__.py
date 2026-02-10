@@ -893,6 +893,27 @@ class CorrectivePipeline:
         """Extract entities from the claim text using LLM (1 call) with a deterministic fallback."""
         import re
 
+        forbidden_entity_tokens = {
+            "not",
+            "no",
+            "never",
+            "cause",
+            "causes",
+            "caused",
+            "causing",
+            "do",
+            "does",
+            "did",
+            "can",
+            "could",
+            "may",
+            "might",
+            "must",
+            "should",
+            "would",
+            "will",
+        }
+
         def _fallback_entities(text: str) -> List[str]:
             stop = {
                 "the",
@@ -925,26 +946,9 @@ class CorrectivePipeline:
                 "times",
             }
             negation_or_verbs = {
-                "not",
-                "no",
-                "never",
+                *forbidden_entity_tokens,
                 "none",
-                "cause",
-                "causes",
-                "caused",
-                "causing",
-                "do",
-                "does",
-                "did",
                 "done",
-                "can",
-                "could",
-                "may",
-                "might",
-                "must",
-                "should",
-                "would",
-                "will",
             }
             junk = {
                 "according",
@@ -986,6 +990,11 @@ class CorrectivePipeline:
                 }
                 cleaned = [e for e in entities if isinstance(e, str) and e.strip()]
                 cleaned = [e for e in cleaned if e.strip().lower() not in generic]
+                cleaned = [
+                    e
+                    for e in cleaned
+                    if not any(t in forbidden_entity_tokens for t in re.findall(r"\b[a-zA-Z]+\b", e.lower()))
+                ]
                 llm_entities = cleaned
         except Exception as e:
             logger.warning(f"[CorrectivePipeline:{round_id}] Entity extraction from claim failed: {e}")
