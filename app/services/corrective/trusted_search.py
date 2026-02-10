@@ -196,7 +196,7 @@ class TrustedSearch:
     _MERGE_PREFIXES = ("and ", "or ", "but ", "however ", "although ", "while ")
 
     def merge_subclaims(self, subclaims: List[str]) -> List[str]:
-        """Merge short or conjunction-leading subclaims into the previous segment."""
+        """Merge only explicit conjunction-leading fragments into the previous segment."""
         merged: List[str] = []
         for raw in subclaims or []:
             s = (raw or "").strip()
@@ -206,8 +206,7 @@ class TrustedSearch:
                 merged.append(s)
                 continue
             lower = s.lower()
-            short = len(s) < 40 or len(s.split()) < 6
-            if lower.startswith(self._MERGE_PREFIXES) or short:
+            if lower.startswith(self._MERGE_PREFIXES):
                 merged[-1] = f"{merged[-1].rstrip(', ')} {s}".strip()
             else:
                 merged.append(s)

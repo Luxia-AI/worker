@@ -16,3 +16,5 @@ def test_adaptive_threshold_uses_is_sufficient_flag():
     assert payload["trust_metric_name"] == "adaptive_is_sufficient"
     assert payload["trust_metric_value"] == 0.41
     assert payload["trust_threshold_met"] is True
+    assert payload["adaptive_is_sufficient"] is True
+    assert payload["trust_post_adaptive"] == 0.41

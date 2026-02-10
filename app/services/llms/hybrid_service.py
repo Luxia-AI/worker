@@ -10,6 +10,14 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional
 
+from app.constants.config import (
+    LLM_MAX_TOKENS_DEFAULT,
+    LLM_MAX_TOKENS_ENTITY_EXTRACTION,
+    LLM_MAX_TOKENS_FACT_EXTRACTION,
+    LLM_MAX_TOKENS_QUERY_REFORMULATION,
+    LLM_MAX_TOKENS_RELATION_EXTRACTION,
+    LLM_MAX_TOKENS_VERDICT_GENERATION,
+)
 from app.core.logger import get_logger
 from app.services.llms.groq_service import GroqService, RateLimitError
 
@@ -57,6 +65,13 @@ def _env_max_calls() -> int:
         return 5
 
 
+def _env_reserved_verdict_calls() -> int:
+    try:
+        return max(0, int(os.getenv("GROQ_RESERVED_VERDICT_CALLS", "1")))
+    except Exception:
+        return 1
+
+
 def reset_groq_counter(job_id: str | None = None, max_calls: int | None = None) -> None:
     """Reset per-job Groq counters and degradation metadata."""
     state = GroqJobState(
@@ -87,6 +102,7 @@ def get_groq_job_metadata() -> Dict[str, Any]:
         "groq_calls_used": state.calls_used,
         "groq_calls_max": state.max_calls,
         "allow_groq_burst": state.burst_enabled,
+        "reserved_verdict_calls": _env_reserved_verdict_calls(),
         "degraded_mode": state.degraded_mode,
         "skipped_calls": skipped,
         "fallback_to_local": state.fallback_to_local,
@@ -149,17 +165,45 @@ class HybridLLMService:
             "call_tag": call_tag,
         }
 
-    def _consume_groq_budget(self) -> tuple[bool, int, int]:
+    def _consume_groq_budget(self, call_tag: str, priority: LLMPriority) -> tuple[bool, int, int, str]:
         state = _groq_job_state.get()
-        if state.burst_enabled:
-            state.calls_used += 1
-            _groq_job_state.set(state)
-            return True, state.calls_used, state.max_calls
         if state.calls_used >= state.max_calls:
-            return False, state.calls_used, state.max_calls
+            return False, state.calls_used, state.max_calls, "hard_cap"
+
+        # Keep one high-priority slot for verdict synthesis by default.
+        reserved_for_verdict = min(_env_reserved_verdict_calls(), state.max_calls)
+        is_verdict_call = (call_tag or "").strip().lower() == "verdict_generation"
+        remaining = state.max_calls - state.calls_used
+        if not is_verdict_call and remaining <= reserved_for_verdict:
+            logger.warning(
+                "[HybridLLMService] Preserving reserved verdict slot for job=%s " "(used=%d/%d, priority=%s, tag=%s)",
+                state.job_id,
+                state.calls_used,
+                state.max_calls,
+                priority.value,
+                call_tag or "unknown",
+            )
+            return False, state.calls_used, state.max_calls, "reserved_for_verdict"
+
         state.calls_used += 1
         _groq_job_state.set(state)
-        return True, state.calls_used, state.max_calls
+        return True, state.calls_used, state.max_calls, "ok"
+
+    @staticmethod
+    def _max_tokens_for_call(call_tag: str, response_format: str) -> int:
+        tag = (call_tag or "").strip().lower()
+        mapping = {
+            "entity_extraction": LLM_MAX_TOKENS_ENTITY_EXTRACTION,
+            "relation_extraction": LLM_MAX_TOKENS_RELATION_EXTRACTION,
+            "fact_extraction": LLM_MAX_TOKENS_FACT_EXTRACTION,
+            "query_reformulation": LLM_MAX_TOKENS_QUERY_REFORMULATION,
+            "verdict_generation": LLM_MAX_TOKENS_VERDICT_GENERATION,
+        }
+        base = int(mapping.get(tag, LLM_MAX_TOKENS_DEFAULT))
+        # JSON payloads need a small floor to avoid malformed truncation on short caps.
+        if response_format == "json":
+            return max(192, base)
+        return max(64, base)
 
     async def _invoke_local(
         self,
@@ -192,42 +236,52 @@ class HybridLLMService:
             temperature: Override default temperature (0.0-1.0, lower = more deterministic)
 
         Strategy:
-        - Groq with per-job hard cap (unless ALLOW_GROQ_BURST=true)
+        - Groq with per-job hard cap and reserved verdict-generation slot
+        - Per-call output token caps by call type (TPM protection)
         - Local fallback when available
         - If local unavailable and call is non-critical, return degraded skip marker
         """
-        can_use_groq, call_num, max_calls = self._consume_groq_budget()
+        can_use_groq, call_num, max_calls, budget_reason = self._consume_groq_budget(call_tag, priority)
 
         if not can_use_groq:
             logger.warning(
-                "[HybridLLMService] Groq quota exceeded for job=%s (%d/%d), priority=%s, tag=%s",
+                "[HybridLLMService] Groq budget unavailable for job=%s (%d/%d, reason=%s), priority=%s, tag=%s",
                 _groq_job_state.get().job_id,
                 call_num,
                 max_calls,
+                budget_reason,
                 priority.value,
                 call_tag or "unknown",
             )
             if self.local_available and self.local_service:
-                logger.info("[HybridLLMService] Falling back to local LLM (quota exceeded)")
+                logger.info("[HybridLLMService] Falling back to local LLM (budget unavailable)")
                 return await self._invoke_local(prompt, response_format, temperature)
             if priority == LLMPriority.LOW:
                 return self._mark_degraded_skip(call_tag or "non_critical")
+            if budget_reason == "reserved_for_verdict":
+                raise RuntimeError("Groq budget reserved for verdict generation")
             raise RuntimeError("Groq quota exceeded and no fallback available for critical call")
 
         # Try Groq first
         if self.groq_available and self.groq_service:
             try:
+                max_tokens = self._max_tokens_for_call(call_tag, response_format)
                 logger.info(
-                    "[HybridLLMService] Groq call: job=%s call=%d/%d priority=%s tag=%s",
+                    "[HybridLLMService] Groq call: job=%s call=%d/%d priority=%s tag=%s max_tokens=%d",
                     _groq_job_state.get().job_id,
                     call_num,
                     max_calls,
                     priority.value,
                     call_tag or "unspecified",
+                    max_tokens,
                 )
                 async with self._groq_semaphore:
                     result = await self.groq_service.ainvoke(
-                        prompt, response_format, max_retries=2, temperature=temperature
+                        prompt,
+                        response_format,
+                        max_retries=2,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
                     )
                 logger.debug(f"[HybridLLMService] Groq succeeded (call {call_num})")
                 return result

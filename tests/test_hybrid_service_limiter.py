@@ -1,14 +1,17 @@
 import pytest
 
+from app.constants.config import LLM_MAX_TOKENS_QUERY_REFORMULATION, LLM_MAX_TOKENS_VERDICT_GENERATION
 from app.services.llms import hybrid_service as hybrid_module
 
 
 class _FakeGroqService:
     def __init__(self):
         self.calls = 0
+        self.max_tokens_seen = []
 
     async def ainvoke(self, *args, **kwargs):  # noqa: ANN002, ANN003
         self.calls += 1
+        self.max_tokens_seen.append(kwargs.get("max_tokens"))
         return {"text": "ok"}
 
 
@@ -16,6 +19,7 @@ class _FakeGroqService:
 async def test_groq_never_exceeds_per_job_limit(monkeypatch):
     monkeypatch.setenv("ALLOW_GROQ_BURST", "false")
     monkeypatch.setenv("GROQ_MAX_CALLS_PER_JOB", "2")
+    monkeypatch.setenv("GROQ_RESERVED_VERDICT_CALLS", "0")
     monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
 
     fake = _FakeGroqService()
@@ -58,3 +62,54 @@ async def test_groq_limit_is_per_job(monkeypatch):
     await svc.ainvoke("critical", priority=hybrid_module.LLMPriority.HIGH, call_tag="verdict_generation")
 
     assert fake.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_reserve_one_verdict_call_budget(monkeypatch):
+    monkeypatch.setenv("ALLOW_GROQ_BURST", "false")
+    monkeypatch.setenv("GROQ_MAX_CALLS_PER_JOB", "2")
+    monkeypatch.setenv("GROQ_RESERVED_VERDICT_CALLS", "1")
+    monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
+
+    fake = _FakeGroqService()
+    monkeypatch.setattr(hybrid_module, "GroqService", lambda: fake)
+
+    svc = hybrid_module.HybridLLMService()
+    hybrid_module.reset_groq_counter(job_id="job-reserve", max_calls=2)
+
+    await svc.ainvoke("q1", priority=hybrid_module.LLMPriority.HIGH, call_tag="query_reformulation")
+    with pytest.raises(RuntimeError, match="reserved for verdict"):
+        await svc.ainvoke("q2", priority=hybrid_module.LLMPriority.HIGH, call_tag="query_reformulation")
+    await svc.ainvoke("verdict", priority=hybrid_module.LLMPriority.HIGH, call_tag="verdict_generation")
+
+    assert fake.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_call_tag_specific_max_tokens_are_forwarded(monkeypatch):
+    monkeypatch.setenv("ALLOW_GROQ_BURST", "false")
+    monkeypatch.setenv("GROQ_MAX_CALLS_PER_JOB", "3")
+    monkeypatch.setenv("GROQ_RESERVED_VERDICT_CALLS", "1")
+    monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
+
+    fake = _FakeGroqService()
+    monkeypatch.setattr(hybrid_module, "GroqService", lambda: fake)
+
+    svc = hybrid_module.HybridLLMService()
+    hybrid_module.reset_groq_counter(job_id="job-tokens", max_calls=3)
+
+    await svc.ainvoke(
+        "reformulate",
+        response_format="json",
+        priority=hybrid_module.LLMPriority.HIGH,
+        call_tag="query_reformulation",
+    )
+    await svc.ainvoke(
+        "verdict",
+        response_format="json",
+        priority=hybrid_module.LLMPriority.HIGH,
+        call_tag="verdict_generation",
+    )
+
+    assert fake.max_tokens_seen[0] == LLM_MAX_TOKENS_QUERY_REFORMULATION
+    assert fake.max_tokens_seen[1] == LLM_MAX_TOKENS_VERDICT_GENERATION

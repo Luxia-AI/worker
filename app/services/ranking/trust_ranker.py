@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import random
+import re
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Protocol
@@ -95,22 +96,122 @@ class StanceClassifier(Protocol):
 class DummyStanceClassifier:
     """Dummy implementation of stance classifier for testing/development."""
 
+    _TARGET_STOPWORDS = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "of",
+        "in",
+        "on",
+        "to",
+        "for",
+        "with",
+        "by",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "do",
+        "does",
+        "did",
+        "not",
+        "no",
+        "never",
+        "may",
+        "might",
+        "can",
+        "could",
+        "will",
+        "would",
+        "should",
+        "that",
+        "this",
+        "these",
+        "those",
+        "it",
+        "its",
+        "their",
+    }
+
+    @classmethod
+    def _extract_causal_targets(cls, text: str, negated: bool) -> List[set[str]]:
+        if not text:
+            return []
+
+        if negated:
+            pattern = re.compile(
+                r"\b(?:do|does|did|can|could|may|might|must|should|would|will|is|are|was|were)?\s*"
+                r"(?:not|never|no)\s+cause(?:s|d|ing)?\s+([^.;:!?]+)",
+                flags=re.IGNORECASE,
+            )
+            matches = [m.group(1) for m in pattern.finditer(text)]
+        else:
+            pattern = re.compile(r"\bcause(?:s|d|ing)?\s+([^.;:!?]+)", flags=re.IGNORECASE)
+            matches = []
+            for m in pattern.finditer(text):
+                prefix = text[max(0, m.start() - 20) : m.start()].lower()
+                if re.search(r"\b(?:not|never|no)\s*$", prefix):
+                    continue
+                matches.append(m.group(1))
+
+        targets: List[set[str]] = []
+        for raw in matches:
+            chunks = re.split(r"\bor\b|\band\b|,", raw, flags=re.IGNORECASE)
+            for chunk in chunks:
+                phrase = chunk.strip().lower()
+                if not phrase:
+                    continue
+                if not negated and phrase.startswith(("not ", "no ", "never ")):
+                    continue
+                words = re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", phrase)
+                normalized = {w for w in words if w not in cls._TARGET_STOPWORDS}
+                if normalized:
+                    targets.append(normalized)
+        return targets
+
+    @staticmethod
+    def _targets_overlap(left: List[set[str]], right: List[set[str]]) -> bool:
+        for lset in left:
+            for rset in right:
+                if lset & rset:
+                    return True
+        return False
+
     def classify_stance(self, claim: str, evidence: str) -> str:
         """Simple heuristic-based stance classification."""
         evidence_lower = evidence.lower()
         claim_lower = claim.lower()
 
-        # Simple heuristics
+        claim_neg_targets = self._extract_causal_targets(claim_lower, negated=True)
+        claim_pos_targets = self._extract_causal_targets(claim_lower, negated=False)
+        evidence_neg_targets = self._extract_causal_targets(evidence_lower, negated=True)
+        evidence_pos_targets = self._extract_causal_targets(evidence_lower, negated=False)
+
+        # Explicit contradiction handling for negated-vs-positive causal claims.
+        if self._targets_overlap(claim_neg_targets, evidence_pos_targets) or self._targets_overlap(
+            claim_pos_targets, evidence_neg_targets
+        ):
+            return "contradicts"
+        if self._targets_overlap(claim_neg_targets, evidence_neg_targets) or self._targets_overlap(
+            claim_pos_targets, evidence_pos_targets
+        ):
+            return "entails"
+
+        # Fallback lexical heuristics.
         if any(word in evidence_lower for word in ["not", "false", "incorrect", "debunked"]) and any(
             word in evidence_lower for word in claim_lower.split()
         ):
             return "contradicts"
-        elif any(word in evidence_lower for word in ["supports", "confirms", "true", "accurate"]) and any(
+        if any(word in evidence_lower for word in ["supports", "confirms", "true", "accurate"]) and any(
             word in evidence_lower for word in claim_lower.split()
         ):
             return "entails"
-        else:
-            return "neutral"
+        return "neutral"
 
 
 class TrustRankingModule:

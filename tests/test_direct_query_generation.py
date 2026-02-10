@@ -33,7 +33,7 @@ async def test_direct_queries_cover_key_terms_and_numbers():
     )
 
     assert len(queries) == 6
-    must_have = ["206", "106", "54", "52", "25", "100000", "tongue", "bones", "cells", "heart"]
+    must_have = ["206", "106", "54", "52", "25", "100000", "tongue", "bones", "cells", "heart", "canada"]
     for q in queries:
         assert any(term in q for term in must_have), f"Query not direct to claim: {q}"
 
@@ -77,6 +77,18 @@ def test_merge_subclaims_conjunction():
     merged = ts.merge_subclaims(parts)
     assert len(merged) == 1
     assert "hands and feet" in merged[0].lower()
+
+
+def test_merge_subclaims_keeps_distinct_short_claims():
+    ts = _init_trusted_search()
+    parts = [
+        "Vaccines do not cause autism",
+        "Vaccines do not cause the flu",
+    ]
+    merged = ts.merge_subclaims(parts)
+    assert len(merged) == 2
+    assert merged[0] == parts[0]
+    assert merged[1] == parts[1]
 
 
 def test_truthfulness_segment_based_high_support():

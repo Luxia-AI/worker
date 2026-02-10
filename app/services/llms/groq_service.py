@@ -4,7 +4,7 @@ from typing import Any, Dict
 
 from groq import AsyncGroq
 
-from app.constants.config import LLM_MODEL_NAME, LLM_TEMPERATURE
+from app.constants.config import LLM_MAX_TOKENS_DEFAULT, LLM_MODEL_NAME, LLM_TEMPERATURE
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.core.rate_limit import throttled
@@ -35,6 +35,7 @@ class GroqService:
         response_format: str = "text",
         max_retries: int = 1,
         temperature: float | None = None,
+        max_tokens: int | None = None,
     ) -> Dict[str, Any]:
         """
         Calls Groq async chat completion endpoint with retry logic for rate limits.
@@ -54,6 +55,7 @@ class GroqService:
             "model": self.model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": temperature if temperature is not None else LLM_TEMPERATURE,
+            "max_tokens": int(max_tokens if max_tokens is not None else LLM_MAX_TOKENS_DEFAULT),
         }
 
         if response_format == "json":

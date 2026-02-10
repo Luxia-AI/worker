@@ -120,6 +120,8 @@ class CorrectivePipeline:
             "trust_metric_value": trust_post,
             "trust_threshold": "adaptive",
             "trust_threshold_met": is_sufficient,
+            "adaptive_is_sufficient": is_sufficient,
+            "trust_post_adaptive": trust_post,
         }
 
     @staticmethod
@@ -146,6 +148,46 @@ class CorrectivePipeline:
         if not claim_breakdown:
             return False
         return all((seg.get("status") or "UNKNOWN").upper() != "UNKNOWN" for seg in claim_breakdown)
+
+    @staticmethod
+    def _stance_score_components(stance: str) -> tuple[float, float]:
+        stance_raw = {"entails": 1.0, "neutral": 0.0, "contradicts": -1.0}.get((stance or "neutral").lower(), 0.0)
+        stance_mapped = (stance_raw + 1.0) / 2.0
+        return stance_raw, stance_mapped
+
+    def _build_evidence_items(self, claim: str, ranked: List[Dict[str, Any]]) -> List[EvidenceItem]:
+        evidence_items = [
+            EvidenceItem(
+                statement=item.get("statement", item.get("fact", "")),
+                semantic_score=item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
+                source_url=item.get("source_url", item.get("source", "")),
+                published_at=item.get("published_at", item.get("publish_date")),
+                trust=item.get("final_score", item.get("score", 0.0)),
+                stance="neutral",
+                score_components={
+                    "semantic": item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
+                    "source": 0.5,
+                    "recency": 0.5,
+                    "stance_raw": 0.0,
+                    "stance_mapped": 0.5,
+                    "trust": item.get("final_score", item.get("score", 0.0)),
+                },
+            )
+            for item in ranked
+        ]
+        try:
+            self.trust_ranker.classify_stance_for_evidence(claim, evidence_items)
+        except Exception as e:
+            logger.warning("[CorrectivePipeline] stance classification failed; continuing with neutral stance: %s", e)
+            return evidence_items
+
+        for ev in evidence_items:
+            stance_raw, stance_mapped = self._stance_score_components(ev.stance)
+            components = ev.score_components or {}
+            components["stance_raw"] = stance_raw
+            components["stance_mapped"] = stance_mapped
+            ev.score_components = components
+        return evidence_items
 
     async def run(
         self,
@@ -297,28 +339,13 @@ class CorrectivePipeline:
 
         # Compute trust scores for evidence
 
-        top_ranked_evidence = [
-            EvidenceItem(
-                statement=item.get("statement", item.get("fact", "")),
-                semantic_score=item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
-                source_url=item.get("source_url", item.get("source", "")),
-                published_at=item.get("published_at", item.get("publish_date")),
-                trust=item.get("final_score", item.get("score", 0.0)),  # Use final_score as trust
-                stance="neutral",  # Default stance
-                score_components={
-                    "semantic": item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
-                    "source": 0.5,  # Default source credibility
-                    "recency": 0.5,  # Default recency
-                    "stance_raw": 0.0,  # Neutral stance
-                    "stance_mapped": 0.5,  # Neutral mapped to 0.5
-                    "trust": item.get("final_score", item.get("score", 0.0)),
-                },
-            )
-            for item in top_ranked
-        ]
+        top_ranked_evidence = self._build_evidence_items(post_text, top_ranked)
 
         # Use adaptive trust policy for multi-part claims
         adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(post_text, top_ranked_evidence, top_k)
+        initial_fixed_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, top_k)
+        initial_fixed_trust_score = float(initial_fixed_post.get("trust_post", 0.0) or 0.0)
+        initial_fixed_payload = self._trust_payload_fixed(initial_fixed_trust_score, self.CONF_THRESHOLD)
         is_sufficient = adaptive_trust["is_sufficient"]
         adaptive_payload = self._trust_payload_adaptive(adaptive_trust)
 
@@ -378,11 +405,16 @@ class CorrectivePipeline:
                         else 0.0
                     ),
                     "trust_post": adaptive_trust["trust_post"],
+                    "trust_post_adaptive": adaptive_trust["trust_post"],
+                    "trust_post_fixed": initial_fixed_trust_score,
                     "trust_grade": "adaptive",  # Adaptive grading
                     "agreement_ratio": adaptive_trust["agreement"],
                     "coverage": adaptive_trust["coverage"],
                     "diversity": adaptive_trust["diversity"],
                     "num_subclaims": adaptive_trust["num_subclaims"],
+                    "adaptive_is_sufficient": bool(adaptive_trust.get("is_sufficient", False)),
+                    "fixed_trust_threshold": self.CONF_THRESHOLD,
+                    "fixed_trust_threshold_met": bool(initial_fixed_payload.get("trust_threshold_met", False)),
                     "verdict": verdict_result,
                     "cache_sufficient": True,
                     "debug_counts": debug_counts,
@@ -414,12 +446,12 @@ class CorrectivePipeline:
 
         # Generate all search queries upfront (1 LLM call only)
         raw_subclaims = self.trust_ranker.adaptive_policy.decompose_claim(post_text)
-        merged_subclaims = self.search_agent.merge_subclaims(raw_subclaims)
+        query_subclaims = [s.strip() for s in raw_subclaims if s and s.strip()]
         queries = await self.search_agent.generate_search_queries(
             post_text,
             failed_entities,
             max_queries=self.MAX_SEARCH_QUERIES,
-            subclaims=merged_subclaims,
+            subclaims=query_subclaims,
             entities=claim_entities,
         )
         await debug_reporter.log_step(
@@ -470,9 +502,15 @@ class CorrectivePipeline:
                     if top_ranked
                     else 0.0
                 ),
+                "trust_post": adaptive_trust["trust_post"],
+                "trust_post_adaptive": adaptive_trust["trust_post"],
+                "trust_post_fixed": initial_fixed_trust_score,
                 "coverage": adaptive_trust["coverage"],
                 "diversity": adaptive_trust["diversity"],
                 "num_subclaims": adaptive_trust["num_subclaims"],
+                "adaptive_is_sufficient": bool(adaptive_trust.get("is_sufficient", False)),
+                "fixed_trust_threshold": self.CONF_THRESHOLD,
+                "fixed_trust_threshold_met": bool(initial_fixed_payload.get("trust_threshold_met", False)),
                 "verdict": verdict_result,
                 "debug_counts": debug_counts,
                 "vdb_signal_count": debug_counts["sem_in_ranked"],
@@ -690,25 +728,7 @@ class CorrectivePipeline:
             )
 
             # Compute trust scores
-            top_ranked_evidence = [
-                EvidenceItem(
-                    statement=item.get("statement", item.get("fact", "")),
-                    semantic_score=item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
-                    source_url=item.get("source_url", item.get("source", "")),
-                    published_at=item.get("published_at", item.get("publish_date")),
-                    trust=item.get("final_score", item.get("score", 0.0)),  # Use final_score as trust
-                    stance="neutral",  # Default stance
-                    score_components={
-                        "semantic": item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
-                        "source": 0.5,  # Default source credibility
-                        "recency": 0.5,  # Default recency
-                        "stance_raw": 0.0,  # Neutral stance
-                        "stance_mapped": 0.5,  # Neutral mapped to 0.5
-                        "trust": item.get("final_score", item.get("score", 0.0)),
-                    },
-                )
-                for item in top_ranked
-            ]
+            top_ranked_evidence = self._build_evidence_items(post_text, top_ranked)
 
             adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(post_text, top_ranked_evidence, top_k)
             is_sufficient = adaptive_trust["is_sufficient"]
@@ -770,28 +790,14 @@ class CorrectivePipeline:
         logger.info(f"[CorrectivePipeline:{round_id}] Generating verdict with RAG...")
 
         # Compute final trust scores
-        final_top_ranked_evidence = [
-            EvidenceItem(
-                statement=item.get("statement", item.get("fact", "")),
-                semantic_score=item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
-                source_url=item.get("source_url", item.get("source", "")),
-                published_at=item.get("published_at", item.get("publish_date")),
-                trust=item.get("final_score", item.get("score", 0.0)),  # Use final_score as trust
-                stance="neutral",  # Default stance
-                score_components={
-                    "semantic": item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
-                    "source": 0.5,  # Default source credibility
-                    "recency": 0.5,  # Default recency
-                    "stance_raw": 0.0,  # Neutral stance
-                    "stance_mapped": 0.5,  # Neutral mapped to 0.5
-                    "trust": item.get("final_score", item.get("score", 0.0)),
-                },
-            )
-            for item in top_ranked
-        ]
+        final_top_ranked_evidence = self._build_evidence_items(post_text, top_ranked)
 
+        final_adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(
+            post_text, final_top_ranked_evidence, top_k
+        )
         final_trust_post = self.trust_ranker.compute_post_trust(final_top_ranked_evidence, top_k)
         final_trust_score = final_trust_post["trust_post"]
+        adaptive_payload = self._trust_payload_adaptive(final_adaptive_trust)
         fixed_payload = self._trust_payload_fixed(final_trust_score, self.CONF_THRESHOLD)
 
         verdict_result = await self.verdict_generator.generate_verdict(
@@ -856,9 +862,17 @@ class CorrectivePipeline:
                 if top_ranked
                 else 0.0
             ),
-            "trust_post": final_trust_score,
+            "trust_post": final_adaptive_trust["trust_post"],
+            "trust_post_adaptive": final_adaptive_trust["trust_post"],
+            "trust_post_fixed": final_trust_score,
             "trust_grade": final_trust_post.get("grade", "D"),
-            "agreement_ratio": final_trust_post.get("agreement_ratio", 0.0),
+            "agreement_ratio": final_adaptive_trust.get("agreement", final_trust_post.get("agreement_ratio", 0.0)),
+            "coverage": final_adaptive_trust.get("coverage", 0.0),
+            "diversity": final_adaptive_trust.get("diversity", 0.0),
+            "num_subclaims": final_adaptive_trust.get("num_subclaims", 1),
+            "adaptive_is_sufficient": bool(final_adaptive_trust.get("is_sufficient", False)),
+            "fixed_trust_threshold": self.CONF_THRESHOLD,
+            "fixed_trust_threshold_met": bool(fixed_payload.get("trust_threshold_met", False)),
             "verdict": verdict_result,
             "debug_counts": debug_counts,
             "vdb_signal_count": debug_counts["sem_in_ranked"],
@@ -872,7 +886,7 @@ class CorrectivePipeline:
                 3,
             ),
             "llm": get_groq_job_metadata(),
-            **fixed_payload,
+            **adaptive_payload,
         }
 
     async def _extract_claim_entities(self, claim: str, round_id: str) -> List[str]:
@@ -910,6 +924,28 @@ class CorrectivePipeline:
                 "per",
                 "times",
             }
+            negation_or_verbs = {
+                "not",
+                "no",
+                "never",
+                "none",
+                "cause",
+                "causes",
+                "caused",
+                "causing",
+                "do",
+                "does",
+                "did",
+                "done",
+                "can",
+                "could",
+                "may",
+                "might",
+                "must",
+                "should",
+                "would",
+                "will",
+            }
             junk = {
                 "according",
                 "significantly",
@@ -925,30 +961,12 @@ class CorrectivePipeline:
             tokens = [t.lower() for t in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", text)]
             tokens = [t for t in tokens if t not in stop]
             tokens = [t for t in tokens if t not in junk]
+            tokens = [t for t in tokens if t not in negation_or_verbs]
             freq: dict[str, int] = {}
             for t in tokens:
                 freq[t] = freq.get(t, 0) + 1
-            bigrams: List[str] = []
-            for i in range(len(tokens) - 1):
-                w1, w2 = tokens[i], tokens[i + 1]
-                if w1 in stop or w2 in stop:
-                    continue
-                bigrams.append(f"{w1} {w2}")
             ranked_unigrams = sorted(freq.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
-            unigram_entities = [w for w, _ in ranked_unigrams[:6]]
-            bigram_entities: List[str] = []
-            for bg in bigrams:
-                if any(part in junk for part in bg.split()):
-                    continue
-                if bg.split()[0] in unigram_entities and bg.split()[1] in unigram_entities:
-                    bigram_entities.append(bg)
-                if len(bigram_entities) >= 4:
-                    break
-            out: List[str] = []
-            for item in bigram_entities + unigram_entities:
-                if item not in out:
-                    out.append(item)
-            return out[:10]
+            return [w for w, _ in ranked_unigrams[:8]]
 
         llm_entities: List[str] = []
         try:
