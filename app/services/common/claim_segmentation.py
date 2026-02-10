@@ -26,6 +26,10 @@ _CLAUSE_VERB_RE = re.compile(
     flags=re.IGNORECASE,
 )
 _LIST_BULLETS_RE = re.compile(r"\s*[-*•]\s+")
+_CONTRAST_VERB_RE = re.compile(
+    r"\b(kills?|cures?|treats?|prevents?|causes?|contains?|targets?|affects?|works?)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _clean(text: str, keep_conj_prefix: bool = True) -> str:
@@ -148,6 +152,54 @@ def _split_on_comparatives(text: str) -> List[str]:
     return []
 
 
+def _base_verb(verb: str) -> str:
+    v = (verb or "").lower().strip()
+    if not v:
+        return ""
+    irregular = {"is": "be", "are": "be", "was": "be", "were": "be", "has": "have", "does": "do"}
+    if v in irregular:
+        return irregular[v]
+    if len(v) > 4 and v.endswith("ies"):
+        return v[:-3] + "y"
+    if len(v) > 4 and v.endswith("es"):
+        return v[:-2]
+    if len(v) > 3 and v.endswith("s"):
+        return v[:-1]
+    return v
+
+
+def _split_on_contrast_not(text: str) -> List[str]:
+    """
+    Split contrast clauses like "X, not Y" into two verifiable segments.
+    """
+    sentence = _clean(text, keep_conj_prefix=False)
+    if not sentence:
+        return []
+
+    m = re.search(r"^(?P<left>.+?),\s*not\s+(?P<right>.+)$", sentence, flags=re.IGNORECASE)
+    if not m:
+        return []
+
+    left = _clean(m.group("left"), keep_conj_prefix=False)
+    right = _clean(m.group("right"), keep_conj_prefix=False)
+    if not left or not right:
+        return []
+
+    if _looks_independent_clause(right):
+        return [left, right]
+
+    clause = re.match(r"^(?P<subject>.+?)\s+(?P<verb>\w+)\s+.+$", left)
+    if clause and _CONTRAST_VERB_RE.search(clause.group("verb")):
+        subject = _clean(clause.group("subject"), keep_conj_prefix=False)
+        verb = _base_verb(clause.group("verb"))
+        aux = "does not" if subject.lower() in {"he", "she", "it", "this", "that"} else "do not"
+        rebuilt = _clean(f"{subject} {aux} {verb} {right}", keep_conj_prefix=False)
+        if rebuilt:
+            return [left, rebuilt]
+
+    return [left, _clean(f"not {right}", keep_conj_prefix=False)]
+
+
 def _split_on_conjunctives(text: str) -> List[str]:
     for conj in _CONJUNCTIVES:
         low = (text or "").lower()
@@ -201,6 +253,11 @@ def split_claim_into_segments(claim: str, min_segment_chars: int = 10) -> List[s
         by_comparatives = _split_on_comparatives(sentence)
         if by_comparatives:
             raw_segments.extend(by_comparatives)
+            continue
+
+        by_contrast_not = _split_on_contrast_not(sentence)
+        if by_contrast_not:
+            raw_segments.extend(by_contrast_not)
             continue
 
         by_conjunctive = _split_on_conjunctives(sentence)

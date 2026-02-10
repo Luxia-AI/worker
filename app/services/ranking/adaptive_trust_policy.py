@@ -326,6 +326,7 @@ class AdaptiveTrustPolicy:
         evidence_count: int | None = None,
         avg_relevance: float | None = None,
         strong_covered: int = 0,
+        contradicted_count: int = 0,
     ) -> bool:
         """
         Apply adaptive gating rules to determine if evidence is sufficient.
@@ -363,7 +364,7 @@ class AdaptiveTrustPolicy:
                 )
                 return False
 
-        if (
+        if contradicted_count == 0 and (
             (coverage >= 0.25 and diversity >= 0.75)
             or strong_covered >= 1
             or (avg_relevance is not None and avg_relevance >= 0.55)
@@ -377,6 +378,16 @@ class AdaptiveTrustPolicy:
                 float(avg_relevance or 0.0),
             )
             return True
+
+        if contradicted_count > 0:
+            logger.info(
+                "Gating: contradiction-aware strict mode (contradicted_subclaims=%d) "
+                "coverage=%.2f diversity=%.2f agreement=%.2f",
+                contradicted_count,
+                coverage,
+                diversity,
+                agreement,
+            )
 
         if coverage >= self.COVERAGE_THRESHOLD_HIGH and agreement >= self.AGREEMENT_THRESHOLD_HIGH:
             logger.info(
@@ -425,9 +436,13 @@ class AdaptiveTrustPolicy:
         cov = compute_subclaim_coverage(subclaims, top_evidence, partial_weight=0.5)
         details = cov.get("details", [])
         strong_covered = sum(1 for d in details if (d.get("status") or "").upper() == "STRONGLY_VALID")
+        contradicted_count = sum(1 for d in details if bool(d.get("contradicted", False)))
         avg_relevance = (
             sum(float(d.get("relevance_score", 0.0) or 0.0) for d in details) / max(1, len(details)) if details else 0.0
         )
+        if contradicted_count > 0:
+            contradiction_penalty = 0.10 * (contradicted_count / max(1, len(details)))
+            avg_relevance = max(0.0, avg_relevance - contradiction_penalty)
 
         # Apply gating rules
         is_sufficient = self.apply_gating_rules(
@@ -437,12 +452,14 @@ class AdaptiveTrustPolicy:
             evidence_count=len(top_evidence),
             avg_relevance=avg_relevance,
             strong_covered=strong_covered,
+            contradicted_count=contradicted_count,
         )
-        gate_reason = (
-            "adaptive_override"
-            if ((coverage >= 0.25 and diversity >= 0.75) or strong_covered >= 1 or avg_relevance >= 0.55)
-            else "strict"
+        adaptive_override_possible = contradicted_count == 0 and (
+            (coverage >= 0.25 and diversity >= 0.75) or strong_covered >= 1 or avg_relevance >= 0.55
         )
+        gate_reason = "adaptive_override" if adaptive_override_possible else "strict"
+        if contradicted_count > 0 and gate_reason == "strict":
+            gate_reason = "strict_contradiction"
 
         # Compute adaptive trust score
         if not top_evidence:
@@ -503,6 +520,7 @@ class AdaptiveTrustPolicy:
             "gate_reason": gate_reason,
             "strong_covered": strong_covered,
             "avg_relevance": avg_relevance,
+            "contradicted_subclaims": contradicted_count,
         }
 
         logger.info(

@@ -281,3 +281,68 @@ def test_flu_segment_cannot_be_marked_valid_from_autism_only_evidence():
         or "influenza" in str(item.get("claim_segment", "")).lower()
     )
     assert str(flu_item.get("status", "")).upper() == "UNKNOWN"
+
+
+def test_valid_segment_is_flipped_when_supporting_fact_is_may_cause():
+    vg = _vg()
+    claim = "Vaccines do not cause autism."
+    evidence = [
+        {
+            "statement": "Some studies suggest vaccines may cause autism in children.",
+            "source_url": "https://example.org/contradict",
+            "final_score": 0.9,
+            "credibility": 0.9,
+        }
+    ]
+    llm_result = {
+        "verdict": "TRUE",
+        "confidence": 0.9,
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": "Vaccines do not cause autism",
+                "status": "VALID",
+                "supporting_fact": "Some studies suggest vaccines may cause autism in children.",
+                "source_url": "https://example.org/contradict",
+            }
+        ],
+        "evidence_map": [],
+        "key_findings": [],
+    }
+
+    parsed = vg._parse_verdict_result(llm_result, claim, evidence)
+    assert parsed["claim_breakdown"][0]["status"] in {"INVALID", "PARTIALLY_INVALID"}
+    assert parsed["verdict"] in {"FALSE", "PARTIALLY_TRUE"}
+
+
+def test_confidence_is_capped_when_subclaims_unresolved_and_policy_not_sufficient():
+    vg = _vg()
+    claim = "Vaccines do not cause autism or the flu."
+    evidence = [
+        {
+            "statement": "Childhood vaccines do not cause autism.",
+            "source_url": "https://who.int/autism",
+            "final_score": 0.93,
+            "credibility": 0.95,
+        }
+    ]
+    llm_result = {
+        "verdict": "TRUE",
+        "confidence": 0.98,
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": "Vaccines do not cause autism",
+                "status": "VALID",
+                "supporting_fact": "Childhood vaccines do not cause autism.",
+                "source_url": "https://who.int/autism",
+            }
+        ],
+        "evidence_map": [],
+        "key_findings": [],
+    }
+
+    parsed = vg._parse_verdict_result(llm_result, claim, evidence)
+    assert parsed["unresolved_segments"] >= 1
+    assert parsed["policy_sufficient"] is False
+    assert parsed["confidence"] <= 0.56

@@ -216,7 +216,10 @@ class TrustedSearch:
             return ""
 
         neg_causal = re.match(
-            r"^(?P<head>.+?\b(?:do|does|did|can|could|may|might|must|should|would|will)?\s*not\s+cause)\s+.+$",
+            (
+                r"^(?P<head>.+?\b(?:do|does|did|can|could|may|might|must|should|would|will)?\s*not\s+"
+                r"(?:cause|cure|treat|prevent|trigger))\s+.+$"
+            ),
             prev,
             flags=re.IGNORECASE,
         )
@@ -245,8 +248,28 @@ class TrustedSearch:
                 # Keep old merge behavior for list-continuation fragments.
                 fragment = re.sub(r"^\s*(?:and|or|but|however|although|while)\s+", "", lower).strip()
                 fragment_tokens = [t for t in self._tokenize_words(fragment) if t not in self._STOPWORDS]
+                medical_tokens = {
+                    "flu",
+                    "influenza",
+                    "autism",
+                    "vaccine",
+                    "vaccines",
+                    "antibiotic",
+                    "antibiotics",
+                    "virus",
+                    "viruses",
+                    "sugar",
+                    "hyperactivity",
+                    "adhd",
+                    "cholesterol",
+                    "heart",
+                }
+                has_medical_anchor = any(t in medical_tokens for t in fragment_tokens)
                 if len(fragment_tokens) <= 4:
-                    merged[-1] = f"{merged[-1].rstrip(', ')} {s}".strip()
+                    if has_medical_anchor:
+                        merged.append(s)
+                    else:
+                        merged[-1] = f"{merged[-1].rstrip(', ')} {s}".strip()
                 else:
                     merged.append(s)
             else:
@@ -569,6 +592,11 @@ class TrustedSearch:
         anchor_text = " ".join(anchors).lower()
         has_vaccine = any(t in anchor_text for t in ["vaccine", "vaccines", "vaccination"])
         has_flu = any(t in anchor_text for t in ["flu", "influenza"])
+        has_antibiotic = any(t in anchor_text for t in ["antibiotic", "antibiotics", "antibacterial"])
+        has_cold = any(t in anchor_text for t in ["cold", "colds", "common cold"])
+        has_virus = any(t in anchor_text for t in ["virus", "viruses", "viral"])
+        has_sugar = any(t in anchor_text for t in ["sugar", "sucrose", "glucose", "fructose"])
+        has_hyperactivity = any(t in anchor_text for t in ["hyperactivity", "adhd", "attention"])
 
         if has_lemon_water and has_liver:
             detox_part = "(detox OR detoxification)" if has_detox else "liver function"
@@ -585,6 +613,21 @@ class TrustedSearch:
             q.append('site:cdc.gov "flu vaccine" "cannot cause flu"')
             q.append('site:who.int "influenza vaccine" "does not cause influenza"')
             q.append("site:pubmed.ncbi.nlm.nih.gov influenza vaccine influenza infection risk")
+
+        # Explicit templates for antibiotics claims on colds/flu/viruses.
+        if has_antibiotic and (has_cold or has_flu or has_virus):
+            q.append('"antibiotics" "do not work against viruses"')
+            q.append("site:cdc.gov antibiotics viruses cold flu")
+            q.append("site:nhs.uk antibiotics colds flu")
+            q.append("site:medlineplus.gov antibiotics viral infection")
+            q.append("site:pubmed.ncbi.nlm.nih.gov antibiotics common cold influenza review")
+
+        # Explicit templates for sugar-hyperactivity claims.
+        if has_sugar and has_hyperactivity:
+            q.append('"sugar" "hyperactivity" children meta-analysis')
+            q.append("site:nih.gov sugar hyperactivity children")
+            q.append("site:pubmed.ncbi.nlm.nih.gov sugar hyperactivity randomized trial")
+            q.append("site:mayoclinic.org sugar hyperactivity myth")
 
         # Generic anchored fallback for any other subclaim
         if not q:

@@ -29,6 +29,7 @@ from app.services.corrective.trusted_search import TrustedSearch
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
 from app.services.ranking.subclaim_coverage import compute_subclaim_coverage, evaluate_anchor_match
+from app.services.ranking.trust_ranker import DummyStanceClassifier
 from app.services.retrieval.metadata_enricher import TopicClassifier
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 
@@ -145,6 +146,7 @@ class VerdictGenerator:
         self.fact_extractor = FactExtractor()
         self.scraper = Scraper()
         self.trust_policy = AdaptiveTrustPolicy()
+        self.stance_classifier = DummyStanceClassifier()
         self.topic_classifier = TopicClassifier()
         self.MAX_WEB_ROUNDS_PRE_VERDICT = 2
         self.WEB_SEGMENTS_LIMIT = 3
@@ -189,6 +191,7 @@ class VerdictGenerator:
     def _policy_says_insufficient(self, claim: str, evidence: List[Dict[str, Any]]) -> bool:
         if not evidence:
             return True
+        trust_policy = getattr(self, "trust_policy", None) or AdaptiveTrustPolicy()
 
         class _Ev:
             __slots__ = ("statement", "source_url", "semantic_score", "stance", "trust")
@@ -205,7 +208,12 @@ class VerdictGenerator:
                 )
 
         adapted = [_Ev(d) for d in evidence if (d.get("statement") or d.get("text"))]
-        metrics = self.trust_policy.compute_adaptive_trust(claim, adapted, top_k=min(10, len(adapted)))
+        metrics = trust_policy.compute_adaptive_trust(claim, adapted, top_k=min(10, len(adapted)))
+        coverage = float(metrics.get("coverage", 0.0) or 0.0)
+        num_subclaims = int(metrics.get("num_subclaims", 0) or 0)
+        # Keep verdict calibration conservative: unresolved multi-part claims remain insufficient.
+        if num_subclaims > 1 and coverage < 0.99:
+            return True
         return not bool(metrics.get("is_sufficient", False))
 
     def _needs_web_boost(self, evidence: List[Dict[str, Any]], claim: str = "") -> bool:
@@ -546,7 +554,7 @@ class VerdictGenerator:
 
         def _best_evidence_match(
             segment: str, supporting_fact: str, source_url: str
-        ) -> tuple[int, Dict[str, Any] | None]:
+        ) -> tuple[int, Dict[str, Any] | None, float]:
             seg_tokens = {
                 w for w in re.findall(r"\b\w+\b", (segment or "").lower()) if w and w not in stop_words and len(w) > 2
             }
@@ -579,7 +587,7 @@ class VerdictGenerator:
                     best_score = score
                     best_idx = idx
                     best_ev = ev
-            return best_idx, best_ev
+            return best_idx, best_ev, max(0.0, best_score)
 
         def _overlap_ok(fact: str, ev_text: str) -> bool:
             if not fact:
@@ -612,14 +620,14 @@ class VerdictGenerator:
             tokens = {w.lower() for w in re.findall(r"\b[\w']+\b", text)}
             return any(t in tokens for t in neg_terms)
 
+        stance_classifier = getattr(self, "stance_classifier", None) or DummyStanceClassifier()
+
         for seg in claim_breakdown:
             status = (seg.get("status") or "UNKNOWN").upper()
-            if status == "UNKNOWN":
-                continue
             seg_text = seg.get("claim_segment") or ""
             src = seg.get("source_url") or ""
             fact = (seg.get("supporting_fact") or "").strip()
-            best_idx, best_ev = _best_evidence_match(seg_text, fact, src)
+            best_idx, best_ev, best_match_score = _best_evidence_match(seg_text, fact, src)
             if best_ev is not None:
                 best_src = (best_ev.get("source_url") or best_ev.get("source") or "").strip()
                 best_stmt = (best_ev.get("statement") or best_ev.get("text") or "").strip()
@@ -640,11 +648,39 @@ class VerdictGenerator:
                 seg["evidence_used_ids"] = []
                 continue
 
-            # Polarity guardrail: a negating fact cannot validate an affirmative segment.
+            # Polarity guardrails (hard): contradiction cannot be labeled VALID/PARTIALLY_VALID.
             seg_neg = _has_negation(seg_text)
             fact_neg = _has_negation(fact)
+            stance = "neutral"
+            if best_ev is not None:
+                stance = str(best_ev.get("stance") or "neutral")
+            if fact:
+                try:
+                    stance = stance_classifier.classify_stance(seg_text, fact)
+                except Exception:
+                    stance = stance or "neutral"
+            polarity = self._segment_polarity(seg_text, fact, stance=stance)
+            anchor_overlap = self._segment_anchor_overlap(seg_text, fact or "")
+
             if status in {"VALID", "PARTIALLY_VALID"} and fact and fact_neg and not seg_neg:
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
+            if status in {"VALID", "PARTIALLY_VALID"} and polarity == "contradicts":
+                seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
+
+            # UNKNOWN minimization ladder:
+            # deterministically upgrade UNKNOWN only when alignment is strong and polarity is clear.
+            if status == "UNKNOWN" and best_ev is not None and fact:
+                deterministic_score = (0.70 * best_match_score) + (0.30 * anchor_overlap)
+                if deterministic_score >= 0.55 and anchor_overlap >= 0.34 and polarity in {"entails", "contradicts"}:
+                    seg["status"] = "PARTIALLY_VALID" if polarity == "entails" else "PARTIALLY_INVALID"
+                    seg["supporting_fact"] = fact
+                    seg["source_url"] = src
+                    seg["evidence_used_ids"] = [best_idx] if best_idx >= 0 else []
+                else:
+                    seg["status"] = "UNKNOWN"
+                    seg["supporting_fact"] = ""
+                    seg["source_url"] = ""
+                    seg["evidence_used_ids"] = []
 
         # Calculate truthfulness from evidence (deterministic, claim-aware)
         truthfulness_percent = self._calculate_truthfulness_from_evidence(claim, evidence)
@@ -655,6 +691,10 @@ class VerdictGenerator:
         self._log_subclaim_coverage(claim, evidence, claim_breakdown)
         reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
         verdict_str = reconciled["verdict"]
+        policy_insufficient = self._policy_says_insufficient(claim, evidence)
+        truthfulness_cap = float(reconciled.get("truthfulness_cap", 100.0) or 100.0)
+        truthfulness_percent = min(float(truthfulness_percent or 0.0), truthfulness_cap)
+        confidence = self._cap_confidence_with_contract(confidence, reconciled, policy_insufficient, verdict_str)
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
         if llm_verdict == Verdict.TRUE.value and verdict_str != Verdict.TRUE.value:
             try:
@@ -676,6 +716,9 @@ class VerdictGenerator:
             "resolved_segments_count": reconciled["resolved_segments_count"],
             "required_segments_resolved": reconciled["required_segments_resolved"],
             "unresolved_segments": reconciled["unresolved_segments"],
+            "status_weighted_truth": reconciled.get("weighted_truth", 0.0),
+            "truthfulness_cap": reconciled.get("truthfulness_cap", 100.0),
+            "policy_sufficient": not policy_insufficient,
             "verdict_reconciled": bool(verdict_str != llm_verdict),
         }
 
@@ -688,15 +731,132 @@ class VerdictGenerator:
             return 0.0
         return max(0.0, min(1.0, matched / total))
 
-    def _segment_topic_guard_ok(self, segment: str, statement: str) -> bool:
+    @staticmethod
+    def _topic_tokens(text: str) -> set[str]:
+        weak = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "do",
+            "does",
+            "did",
+            "not",
+            "no",
+            "never",
+            "cause",
+            "causes",
+            "caused",
+            "link",
+            "linked",
+            "associate",
+            "associated",
+        }
+        return {w for w in re.findall(r"\b[\w'-]+\b", (text or "").lower()) if len(w) > 2 and w not in weak}
+
+    @staticmethod
+    def _concept_aliases() -> Dict[str, List[str]]:
+        return {
+            "vaccine": ["vaccine", "vaccines", "vaccination"],
+            "flu": ["flu", "influenza"],
+            "autism": ["autism", "asd", "spectrum disorder"],
+            "antibiotic": ["antibiotic", "antibiotics", "antibacterial"],
+            "cold": ["cold", "colds", "common cold"],
+            "virus": ["virus", "viruses", "viral"],
+            "sugar": ["sugar", "sucrose", "glucose", "fructose"],
+            "hyperactivity": ["hyperactivity", "adhd", "attention deficit"],
+            "egg": ["egg", "eggs"],
+            "heart": ["heart", "cardiovascular", "cvd", "cholesterol"],
+        }
+
+    def _concept_hits(self, text: str) -> set[str]:
+        low = (text or "").lower()
+        hits: set[str] = set()
+        for concept, aliases in self._concept_aliases().items():
+            if any(alias in low for alias in aliases):
+                hits.add(concept)
+        return hits
+
+    def _segment_polarity(self, segment: str, statement: str, stance: str = "neutral") -> str:
+        stance_l = (stance or "neutral").lower()
+        if stance_l in {"entails", "contradicts"}:
+            return stance_l
         seg = (segment or "").lower()
         stmt = (statement or "").lower()
-        seg_has_vaccine = any(t in seg for t in ["vaccine", "vaccines", "vaccination"])
-        seg_has_flu = any(t in seg for t in ["flu", "influenza"])
-        if seg_has_vaccine and seg_has_flu:
-            stmt_has_vaccine = any(t in stmt for t in ["vaccine", "vaccines", "vaccination"])
-            stmt_has_flu = any(t in stmt for t in ["flu", "influenza"])
-            return stmt_has_vaccine and stmt_has_flu
+        if not seg or not stmt:
+            return "neutral"
+        neg_causal_re = re.compile(
+            (
+                r"\b(?:do|does|did|can|could|may|might|must|should|would|will|is|are|was|were)?\s*"
+                r"(?:not|never|no)\s+(?:cause|causes|caused|causing|link(?:ed)?|associate(?:d)?|"
+                r"result(?:s|ed|ing)?\s+in|lead(?:s|ing)?\s+to)\b"
+            ),
+            flags=re.IGNORECASE,
+        )
+        pos_causal_re = re.compile(
+            (
+                r"\b(?:cause|causes|caused|causing|contribut(?:e|es|ed|ing)\s+to|"
+                r"link(?:ed)?\s+to|associate(?:d)?\s+with|lead(?:s|ing)?\s+to|"
+                r"result(?:s|ed|ing)?\s+in)\b"
+            ),
+            flags=re.IGNORECASE,
+        )
+        hedge_pos_re = re.compile(
+            r"\b(?:may|might|can|could|possibly|suggest(?:s|ed)?)\b.{0,25}\b(?:cause|linked?|associate)\b",
+            flags=re.IGNORECASE,
+        )
+        no_link_re = re.compile(r"\bno\s+link\b|\bnot\s+associated\b", flags=re.IGNORECASE)
+
+        seg_neg = bool(neg_causal_re.search(seg) or no_link_re.search(seg))
+        stmt_neg = bool(neg_causal_re.search(stmt) or no_link_re.search(stmt))
+        seg_pos = bool(pos_causal_re.search(seg)) and not seg_neg
+        stmt_pos = bool(pos_causal_re.search(stmt)) and not stmt_neg
+        stmt_hedged_pos = bool(hedge_pos_re.search(stmt)) and not stmt_neg
+
+        if seg_neg and (stmt_pos or stmt_hedged_pos) and not stmt_neg:
+            return "contradicts"
+        if seg_pos and stmt_neg:
+            return "contradicts"
+        if seg_neg and stmt_neg:
+            return "entails"
+        if seg_pos and stmt_pos and not stmt_hedged_pos:
+            return "entails"
+        return "neutral"
+
+    def _segment_topic_guard_ok(self, segment: str, statement: str) -> bool:
+        seg_concepts = self._concept_hits(segment)
+        stmt_concepts = self._concept_hits(statement)
+        if {"vaccine", "flu"}.issubset(seg_concepts) and not {"vaccine", "flu"}.issubset(stmt_concepts):
+            return False
+        if "antibiotic" in seg_concepts and ({"cold", "flu", "virus"} & seg_concepts):
+            if "antibiotic" not in stmt_concepts:
+                return False
+            if not ({"cold", "flu", "virus"} & stmt_concepts):
+                return False
+        if {"sugar", "hyperactivity"}.issubset(seg_concepts) and not {"sugar", "hyperactivity"}.issubset(stmt_concepts):
+            return False
+
+        seg_tokens = self._topic_tokens(segment)
+        stmt_tokens = self._topic_tokens(statement)
+        if len(seg_tokens) >= 3 and len(seg_tokens & stmt_tokens) == 0 and not (seg_concepts & stmt_concepts):
+            return False
         return True
 
     @staticmethod
@@ -1106,13 +1266,74 @@ class VerdictGenerator:
                 matched_statuses.append("UNKNOWN")
         return matched_statuses
 
-    def _reconcile_verdict_with_breakdown(self, claim: str, claim_breakdown: List[Dict[str, Any]]) -> Dict[str, Any]:
+    @staticmethod
+    def _status_truth_weight(status: str) -> float:
+        weights = {
+            "VALID": 1.0,
+            "PARTIALLY_VALID": 0.65,
+            "PARTIALLY_INVALID": 0.35,
+            "INVALID": 0.0,
+            "UNKNOWN": 0.0,
+        }
+        return float(weights.get((status or "UNKNOWN").upper(), 0.0))
+
+    def _status_contract(self, claim: str, claim_breakdown: List[Dict[str, Any]]) -> Dict[str, Any]:
         statuses = self._match_required_segment_statuses(claim, claim_breakdown)
-        required_segments_count = len(statuses)
-        unresolved_segments = sum(1 for s in statuses if s == "UNKNOWN")
-        resolved_segments_count = required_segments_count - unresolved_segments
-        has_support = any(s in {"VALID", "PARTIALLY_VALID"} for s in statuses)
-        has_invalid = any(s in {"INVALID", "PARTIALLY_INVALID"} for s in statuses)
+        total = len(statuses)
+        unresolved = sum(1 for s in statuses if (s or "").upper() == "UNKNOWN")
+        resolved = total - unresolved
+        weighted_truth = sum(self._status_truth_weight(s) for s in statuses) / max(1, total)
+        weighted_truth = max(0.0, min(1.0, weighted_truth))
+        resolved_ratio = resolved / max(1, total)
+        has_support = any((s or "").upper() in {"VALID", "PARTIALLY_VALID"} for s in statuses)
+        has_invalid = any((s or "").upper() in {"INVALID", "PARTIALLY_INVALID"} for s in statuses)
+        truthfulness_cap = min(100.0, (weighted_truth * 100.0) + 5.0)
+        if unresolved > 0:
+            truthfulness_cap = min(truthfulness_cap, 65.0)
+        if resolved == 0:
+            truthfulness_cap = min(truthfulness_cap, 20.0)
+        return {
+            "statuses": statuses,
+            "required_segments_count": total,
+            "resolved_segments_count": resolved,
+            "required_segments_resolved": unresolved == 0,
+            "unresolved_segments": unresolved,
+            "weighted_truth": weighted_truth,
+            "resolved_ratio": resolved_ratio,
+            "truthfulness_cap": max(0.0, truthfulness_cap),
+            "has_support": has_support,
+            "has_invalid": has_invalid,
+        }
+
+    def _cap_confidence_with_contract(
+        self,
+        confidence: float,
+        contract: Dict[str, Any],
+        policy_insufficient: bool,
+        verdict: str,
+    ) -> float:
+        cap = 0.98
+        unresolved = int(contract.get("unresolved_segments", 0) or 0)
+        resolved_ratio = float(contract.get("resolved_ratio", 0.0) or 0.0)
+        weighted_truth = float(contract.get("weighted_truth", 0.0) or 0.0)
+        if unresolved > 0:
+            cap = min(cap, 0.40 + (0.35 * resolved_ratio))
+        if policy_insufficient:
+            cap = min(cap, 0.62 if unresolved == 0 else 0.55)
+        if verdict == Verdict.UNVERIFIABLE.value:
+            cap = min(cap, 0.35)
+        if unresolved > 0 and weighted_truth <= 0.35:
+            cap = min(cap, 0.48)
+        return max(0.05, min(float(confidence or 0.0), cap))
+
+    def _reconcile_verdict_with_breakdown(self, claim: str, claim_breakdown: List[Dict[str, Any]]) -> Dict[str, Any]:
+        contract = self._status_contract(claim, claim_breakdown)
+        statuses = contract["statuses"]
+        required_segments_count = int(contract["required_segments_count"] or 0)
+        unresolved_segments = int(contract["unresolved_segments"] or 0)
+        resolved_segments_count = int(contract["resolved_segments_count"] or 0)
+        has_support = bool(contract["has_support"])
+        has_invalid = bool(contract["has_invalid"])
         all_valid = bool(statuses) and all(s == "VALID" for s in statuses)
         all_invalid = bool(statuses) and all(s == "INVALID" for s in statuses)
 
@@ -1132,6 +1353,11 @@ class VerdictGenerator:
             "required_segments_resolved": unresolved_segments == 0,
             "unresolved_segments": unresolved_segments,
             "matched_statuses": statuses,
+            "weighted_truth": contract["weighted_truth"],
+            "truthfulness_cap": contract["truthfulness_cap"],
+            "resolved_ratio": contract["resolved_ratio"],
+            "has_support": has_support,
+            "has_invalid": has_invalid,
         }
 
     def _rewrite_rationale_from_breakdown(

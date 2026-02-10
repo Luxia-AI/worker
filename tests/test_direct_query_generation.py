@@ -189,3 +189,41 @@ def test_domain_specific_queries_for_nutrition_claim():
     joined = " | ".join(qs).lower()
     assert "fruit and vegetable intake" in joined
     assert "saturated fat" in joined
+
+
+def test_antibiotics_cold_flu_subclaim_templates_are_generated():
+    ts = _init_trusted_search()
+    subclaim = "Antibiotics do not cure colds because they do not kill viruses that cause cold and flu."
+    qs = ts._build_subclaim_anchor_queries(
+        subclaim,
+        entities=["antibiotics", "cold", "flu", "viruses"],
+    )
+    joined = " | ".join(qs).lower()
+    assert "antibiotics" in joined
+    assert ("do not work against viruses" in joined) or ("site:cdc.gov" in joined)
+    assert ("flu" in joined) or ("influenza" in joined)
+
+
+def test_sugar_hyperactivity_subclaim_templates_are_generated():
+    ts = _init_trusted_search()
+    subclaim = "Studies show no link between sugar consumption and hyperactivity."
+    qs = ts._build_subclaim_anchor_queries(
+        subclaim,
+        entities=["sugar", "hyperactivity", "children"],
+    )
+    joined = " | ".join(qs).lower()
+    assert "sugar" in joined
+    assert ("hyperactivity" in joined) or ("adhd" in joined)
+    assert ("site:nih.gov" in joined) or ("pubmed" in joined)
+
+
+def test_merge_subclaims_expands_do_not_cure_fragment():
+    ts = _init_trusted_search()
+    parts = [
+        "Antibiotics do not cure colds",
+        "or the flu",
+    ]
+    merged = ts.merge_subclaims(parts)
+    assert len(merged) == 2
+    assert merged[0] == "Antibiotics do not cure colds"
+    assert merged[1].lower() == "antibiotics do not cure the flu"

@@ -29,3 +29,14 @@ def test_adaptive_and_verdict_use_identical_segments():
     adaptive = AdaptiveTrustPolicy().decompose_claim(claim)
     verdict_segments = _vg()._split_claim_into_segments(claim)
     assert adaptive == verdict_segments
+
+
+def test_contrast_not_clause_is_split_into_two_verifiable_segments():
+    claim = "They kill bacteria, not the viruses that cause cold and flu."
+    segments = split_claim_into_segments(claim)
+
+    assert len(segments) == 2
+    joined = " | ".join(segments).lower()
+    assert "kill bacteria" in joined
+    assert "virus" in joined
+    assert "not" in joined

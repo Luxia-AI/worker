@@ -122,6 +122,62 @@ def _as_score(evidence: Any) -> float:
     )
 
 
+def _as_stance(evidence: Any) -> str:
+    if isinstance(evidence, dict):
+        return str(evidence.get("stance") or "neutral").lower()
+    return str(getattr(evidence, "stance", "neutral") or "neutral").lower()
+
+
+def _infer_polarity(subclaim: str, statement: str) -> str:
+    """
+    Lightweight polarity alignment:
+    - contradiction when negated causal claim is paired with positive/hedged causal statement
+    - entails when both are aligned on causal polarity
+    """
+    sub = (subclaim or "").lower()
+    stmt = (statement or "").lower()
+    if not sub or not stmt:
+        return "neutral"
+
+    neg_causal_re = re.compile(
+        (
+            r"\b(?:do|does|did|can|could|may|might|must|should|would|will|is|are|was|were)?\s*"
+            r"(?:not|never|no)\s+(?:cause|causes|caused|causing|link(?:ed)?|associate(?:d)?|"
+            r"result(?:s|ed|ing)?\s+in|lead(?:s|ing)?\s+to)\b"
+        ),
+        flags=re.IGNORECASE,
+    )
+    pos_causal_re = re.compile(
+        (
+            r"\b(?:cause|causes|caused|causing|contribut(?:e|es|ed|ing)\s+to|"
+            r"link(?:ed)?\s+to|associate(?:d)?\s+with|lead(?:s|ing)?\s+to|"
+            r"result(?:s|ed|ing)?\s+in)\b"
+        ),
+        flags=re.IGNORECASE,
+    )
+    hedge_pos_re = re.compile(
+        r"\b(?:may|might|can|could|possibly|suggest(?:s|ed)?)\b.{0,25}\b(?:cause|linked?|associate)\b",
+        flags=re.IGNORECASE,
+    )
+    no_link_re = re.compile(r"\bno\s+link\b|\bnot\s+associated\b", flags=re.IGNORECASE)
+
+    sub_neg = bool(neg_causal_re.search(sub) or no_link_re.search(sub))
+    stmt_neg = bool(neg_causal_re.search(stmt) or no_link_re.search(stmt))
+    sub_pos = bool(pos_causal_re.search(sub)) and not sub_neg
+    stmt_pos = bool(pos_causal_re.search(stmt)) and not stmt_neg
+    stmt_hedged_pos = bool(hedge_pos_re.search(stmt)) and not stmt_neg
+
+    if sub_neg and (stmt_pos or stmt_hedged_pos) and not stmt_neg:
+        return "contradicts"
+    if sub_pos and stmt_neg:
+        return "contradicts"
+    if sub_neg and stmt_neg:
+        return "entails"
+    if sub_pos and stmt_pos and not stmt_hedged_pos:
+        return "entails"
+    return "neutral"
+
+
 def _contains_any(text: str, terms: Sequence[str]) -> bool:
     low = (text or "").lower()
     return any(t in low for t in terms)
@@ -187,6 +243,8 @@ def _relevance(subclaim: str, evidence: Any) -> Dict[str, Any]:
     stmt_toks = set(_tokens(stmt))
     lexical_overlap = len(sub_toks & stmt_toks) / max(1, len(sub_toks))
     base_sem = _as_score(evidence)
+    stance = _as_stance(evidence)
+    polarity = _infer_polarity(subclaim, stmt)
     anchor_eval = evaluate_anchor_match(subclaim, stmt)
     anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
     overlap = max(lexical_overlap, anchor_overlap)
@@ -195,6 +253,12 @@ def _relevance(subclaim: str, evidence: Any) -> Dict[str, Any]:
     if not anchor_eval["anchor_ok"]:
         # Penalize weak anchor alignment, but avoid collapsing to zero.
         relevance = min(relevance, 0.45 if anchor_overlap > 0.0 else 0.25)
+
+    # Polarity-aware adjustment so contradictory statements do not inflate coverage.
+    if stance == "contradicts" or polarity == "contradicts":
+        relevance *= 0.35
+    elif stance == "entails" or polarity == "entails":
+        relevance = min(1.0, relevance * 1.05)
 
     return {
         "relevance_score": max(0.0, min(1.0, relevance)),
@@ -205,6 +269,8 @@ def _relevance(subclaim: str, evidence: Any) -> Dict[str, Any]:
         "anchors_required": int(anchor_eval["required_groups"]),
         "anchors_per_subclaim": int(anchor_eval.get("anchors_per_subclaim", 0)),
         "anchor_ok": bool(anchor_eval["anchor_ok"]),
+        "stance": stance,
+        "polarity": polarity,
     }
 
 
@@ -230,7 +296,15 @@ def compute_subclaim_coverage(
     weighted_sum = 0.0
     for idx, subclaim in enumerate(subclaims):
         best_idx = -1
-        best = {"relevance_score": 0.0, "overlap": 0.0, "anchors_matched": 0, "anchors_required": 0, "anchor_ok": False}
+        best = {
+            "relevance_score": 0.0,
+            "overlap": 0.0,
+            "anchors_matched": 0,
+            "anchors_required": 0,
+            "anchor_ok": False,
+            "stance": "neutral",
+            "polarity": "neutral",
+        }
         for ev_idx, ev in enumerate(evidence):
             ev_score = _relevance(subclaim, ev)
             if ev_score["relevance_score"] > best["relevance_score"]:
@@ -239,7 +313,14 @@ def compute_subclaim_coverage(
 
         overlap = float(best.get("overlap", 0.0))
         anchor_hits = int(best.get("anchors_matched", 0))
-        if (
+        contradicted = (
+            str(best.get("stance", "neutral")).lower() == "contradicts"
+            or str(best.get("polarity", "neutral")).lower() == "contradicts"
+        )
+        if contradicted and overlap >= 0.18 and anchor_hits >= 1:
+            status = "UNKNOWN"
+            weight = 0.0
+        elif (
             best["relevance_score"] >= strong_threshold
             and overlap >= 0.30
             and anchor_hits >= 1
@@ -274,6 +355,9 @@ def compute_subclaim_coverage(
                 "anchors_matched": best["anchors_matched"],
                 "anchors_required": best["anchors_required"],
                 "anchors_per_subclaim": best.get("anchors_per_subclaim", 0),
+                "stance": best.get("stance", "neutral"),
+                "polarity": best.get("polarity", "neutral"),
+                "contradicted": contradicted,
             }
         )
 

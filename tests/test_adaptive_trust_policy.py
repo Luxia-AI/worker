@@ -182,6 +182,17 @@ class TestAdaptiveTrustPolicy:
             strong_covered=0,
         )
 
+    def test_adaptive_override_is_blocked_when_contradictions_present(self, policy):
+        assert not policy.apply_gating_rules(
+            coverage=0.55,
+            diversity=0.85,
+            agreement=0.7,
+            evidence_count=5,
+            avg_relevance=0.65,
+            strong_covered=1,
+            contradicted_count=1,
+        )
+
     def test_compute_adaptive_trust_single_claim(self, policy, sample_evidence):
         """Test adaptive trust computation for single-part claim."""
         claim = "COVID-19 vaccines are effective."

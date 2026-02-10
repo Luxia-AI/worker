@@ -23,3 +23,21 @@ def test_autism_only_evidence_cannot_fully_cover_autism_and_flu_claim():
     details = coverage["details"]
     assert details[0]["status"] in {"STRONGLY_VALID", "PARTIALLY_VALID"}
     assert details[1]["status"] == "UNKNOWN"
+
+
+def test_contradicting_stance_does_not_count_as_subclaim_coverage():
+    subclaims = ["Vaccines do not cause autism"]
+    evidence = [
+        EvidenceItem(
+            statement="Some studies suggest vaccines may cause autism.",
+            semantic_score=0.92,
+            source_url="https://example.org/claim",
+            stance="contradicts",
+            trust=0.9,
+        )
+    ]
+
+    coverage = compute_subclaim_coverage(subclaims, evidence, partial_weight=0.5)
+    assert coverage["coverage"] == 0.0
+    assert coverage["details"][0]["status"] == "UNKNOWN"
+    assert coverage["details"][0]["contradicted"] is True
