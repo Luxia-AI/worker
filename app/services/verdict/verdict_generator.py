@@ -470,7 +470,7 @@ class VerdictGenerator:
 
         # Extract claim breakdown for client display
         claim_breakdown = llm_result.get("claim_breakdown", [])
-        if self._should_rebuild_claim_breakdown(claim_breakdown):
+        if self._should_rebuild_claim_breakdown(claim, claim_breakdown):
             claim_breakdown = self._build_deterministic_claim_breakdown(claim, evidence)
         else:
             normalized_breakdown: List[Dict[str, Any]] = []
@@ -722,7 +722,10 @@ class VerdictGenerator:
                 statement = (em.get("statement") or "").strip()
                 if not statement:
                     continue
-                anchor_overlap = self._segment_anchor_overlap(segment, statement)
+                anchor_eval = evaluate_anchor_match(segment, statement)
+                if not bool(anchor_eval.get("anchor_ok", False)):
+                    continue
+                anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
                 if anchor_overlap < _SEGMENT_EVIDENCE_MIN_OVERLAP:
                     continue
                 rel_score = float(em.get("relevance_score", 0.0) or 0.0)
@@ -740,7 +743,10 @@ class VerdictGenerator:
                         continue
                     if seg_q and seg_q not in segment.lower():
                         continue
-                    anchor_overlap = self._segment_anchor_overlap(segment, statement)
+                    anchor_eval = evaluate_anchor_match(segment, statement)
+                    if not bool(anchor_eval.get("anchor_ok", False)):
+                        continue
+                    anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
                     if anchor_overlap < _SEGMENT_EVIDENCE_MIN_OVERLAP:
                         continue
                     score = (0.7 * float(ev.get("final_score", ev.get("score", 0.0)) or 0.0)) + (0.3 * anchor_overlap)
@@ -770,6 +776,9 @@ class VerdictGenerator:
                 }
             else:
                 seg.setdefault("evidence_used_ids", [])
+                seg["status"] = "UNKNOWN"
+                seg["supporting_fact"] = ""
+                seg["source_url"] = ""
                 seg["alignment_debug"] = {
                     "reason": "no_relevant_evidence",
                     "min_overlap": _SEGMENT_EVIDENCE_MIN_OVERLAP,
@@ -878,18 +887,25 @@ class VerdictGenerator:
         words = [w for w in re.findall(r"\b\w+\b", segment.lower()) if w not in stop]
         return len(words) >= 2 and len(segment.strip()) >= 12
 
-    def _should_rebuild_claim_breakdown(self, claim_breakdown: List[Dict[str, Any]]) -> bool:
+    def _should_rebuild_claim_breakdown(self, claim: str, claim_breakdown: List[Dict[str, Any]]) -> bool:
         if not claim_breakdown:
             return True
+        required_segments = self._split_claim_into_segments(claim)
+        required_count = len(required_segments) if required_segments else 1
         unknown_count = 0
         low_quality = 0
+        normalized_meaningful_count = 0
         for item in claim_breakdown:
-            seg = (item.get("claim_segment") or "").strip()
+            seg = self._normalize_segment_text(item.get("claim_segment") or "")
             if not self._is_meaningful_segment(seg):
                 low_quality += 1
+            else:
+                normalized_meaningful_count += 1
             if (item.get("status") or "UNKNOWN").upper() == "UNKNOWN":
                 unknown_count += 1
         if low_quality > 0:
+            return True
+        if normalized_meaningful_count != required_count:
             return True
         return unknown_count >= max(1, int(0.8 * len(claim_breakdown)))
 
@@ -1022,12 +1038,16 @@ class VerdictGenerator:
             best_score = 0.0
             best_neg = False
             best_idx = -1
+            best_anchor_ok = False
             for idx, ev in enumerate(evidence[:8]):
                 stmt = (ev.get("statement") or ev.get("text") or "").strip()
                 if not stmt:
                     continue
                 stmt_words = set(re.findall(r"\b\w+\b", stmt.lower()))
                 overlap = len(seg_words & stmt_words) / max(1, len(seg_words))
+                anchor_eval = evaluate_anchor_match(seg, stmt)
+                anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
+                anchor_ok = bool(anchor_eval.get("anchor_ok", False))
                 rel = ev.get("final_score")
                 if rel is None:
                     rel = ev.get("score", 0.0)
@@ -1058,22 +1078,30 @@ class VerdictGenerator:
                 uncertainty_penalty = 0.0
                 if assertive_claim and any(t in stmt_l for t in uncertainty_terms):
                     uncertainty_penalty = 0.18
-                score = (0.6 * max(0.0, min(1.0, rel_f))) + (0.4 * max(0.0, min(1.0, overlap))) - uncertainty_penalty
-                if overlap < 0.20:
+                score = (
+                    (0.50 * max(0.0, min(1.0, rel_f)))
+                    + (0.25 * max(0.0, min(1.0, overlap)))
+                    + (0.25 * max(0.0, min(1.0, anchor_overlap)))
+                    - uncertainty_penalty
+                )
+                if not anchor_ok:
+                    score *= 0.35
+                elif overlap < 0.20:
                     score *= 0.45
                 if score > best_score:
                     best_score = score
                     best = ev
                     best_neg = stmt_neg
                     best_idx = idx
+                    best_anchor_ok = anchor_ok
 
-            if best and best_score >= 0.55 and (best_neg == seg_neg):
+            if best and best_anchor_ok and best_score >= 0.55 and (best_neg == seg_neg):
                 status = "VALID"
-            elif best and best_score >= 0.55 and (best_neg != seg_neg):
+            elif best and best_anchor_ok and best_score >= 0.55 and (best_neg != seg_neg):
                 status = "INVALID"
-            elif best and best_score >= 0.28 and (best_neg == seg_neg):
+            elif best and best_anchor_ok and best_score >= 0.28 and (best_neg == seg_neg):
                 status = "PARTIALLY_VALID"
-            elif best and best_score >= 0.28 and (best_neg != seg_neg):
+            elif best and best_anchor_ok and best_score >= 0.28 and (best_neg != seg_neg):
                 status = "PARTIALLY_INVALID"
             else:
                 status = "UNKNOWN"
@@ -1188,16 +1216,24 @@ class VerdictGenerator:
                 stmt_set = set(stmt_words)
                 overlap = len(seg_set & stmt_set)
                 overlap_ratio = overlap / max(1, len(seg_set))
+                anchor_eval = evaluate_anchor_match(segment, stmt)
+                anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
+                anchor_ok = bool(anchor_eval.get("anchor_ok", False))
+                if not anchor_ok:
+                    continue
                 if overlap_ratio < 0.12 and rel < 0.75:
                     continue
 
                 stmt_has_neg = any(t in stmt_set for t in neg_terms)
+                stance = str(ev.get("stance", "neutral") or "neutral").lower()
                 contradiction = 1.0 if (stmt_has_neg and not seg_has_neg and overlap_ratio >= 0.25) else 0.0
+                if stance == "contradicts" and max(overlap_ratio, anchor_overlap) >= 0.20:
+                    contradiction = max(contradiction, 1.0)
                 uncertainty_penalty = 0.0
                 if claim_assertive and any(t in stmt_set for t in uncertainty_terms):
                     uncertainty_penalty = 0.22
 
-                support = (0.50 * rel) + (0.35 * overlap_ratio) + (0.15 * cred)
+                support = (0.45 * rel) + (0.25 * overlap_ratio) + (0.15 * anchor_overlap) + (0.15 * cred)
                 if overlap_ratio < 0.20:
                     support *= 0.50
                 net = support - (0.60 * contradiction) - uncertainty_penalty

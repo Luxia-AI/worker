@@ -26,11 +26,12 @@ def test_split_claim_into_segments_expands_list_claim_meaningfully():
 
 def test_should_rebuild_claim_breakdown_for_fragmentary_segments():
     vg = _vg()
+    claim = "A diet rich in fruits and vegetables helps prevent disease."
     claim_breakdown = [
         {"claim_segment": "vegetables", "status": "UNKNOWN"},
         {"claim_segment": "low in saturated fats", "status": "PARTIALLY_VALID"},
     ]
-    assert vg._should_rebuild_claim_breakdown(claim_breakdown) is True
+    assert vg._should_rebuild_claim_breakdown(claim, claim_breakdown) is True
 
 
 @pytest.mark.asyncio

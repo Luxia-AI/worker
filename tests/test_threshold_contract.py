@@ -13,8 +13,9 @@ def test_fixed_threshold_uses_trust_post_not_top_score():
 
 def test_adaptive_threshold_uses_is_sufficient_flag():
     payload = CorrectivePipeline._trust_payload_adaptive({"trust_post": 0.41, "is_sufficient": True})
-    assert payload["trust_metric_name"] == "adaptive_is_sufficient"
+    assert payload["trust_metric_name"] == "adaptive_trust_post"
     assert payload["trust_metric_value"] == 0.41
     assert payload["trust_threshold_met"] is True
     assert payload["adaptive_is_sufficient"] is True
+    assert payload["adaptive_trust_post"] == 0.41
     assert payload["trust_post_adaptive"] == 0.41

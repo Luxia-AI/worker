@@ -91,6 +91,42 @@ def test_merge_subclaims_keeps_distinct_short_claims():
     assert merged[1] == parts[1]
 
 
+def test_merge_subclaims_expands_or_fragment_into_distinct_subclaim():
+    ts = _init_trusted_search()
+    parts = [
+        "Vaccines do not cause autism",
+        "or the flu",
+    ]
+    merged = ts.merge_subclaims(parts)
+    assert len(merged) == 2
+    assert merged[0] == "Vaccines do not cause autism"
+    assert merged[1].lower() == "vaccines do not cause the flu"
+
+
+@pytest.mark.asyncio
+async def test_generate_queries_preserve_autism_and_flu_subclaims(monkeypatch):
+    ts = _init_trusted_search()
+    claim = "Vaccines do not cause autism or the flu."
+    subclaims = ["Vaccines do not cause autism", "or the flu"]
+
+    async def _no_llm(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(ts, "reformulate_queries", _no_llm)
+
+    queries = await ts.generate_search_queries(
+        post_text=claim,
+        failed_entities=[],
+        max_queries=6,
+        subclaims=subclaims,
+        entities=["vaccines", "autism", "flu"],
+    )
+
+    joined = " | ".join(queries).lower()
+    assert "autism" in joined
+    assert ("flu" in joined) or ("influenza" in joined)
+
+
 def test_truthfulness_segment_based_high_support():
     vg = VerdictGenerator.__new__(VerdictGenerator)
 

@@ -195,8 +195,39 @@ class TrustedSearch:
     }
     _MERGE_PREFIXES = ("and ", "or ", "but ", "however ", "although ", "while ")
 
+    def _expand_conjunction_fragment(self, previous_subclaim: str, fragment_subclaim: str) -> str:
+        """
+        Expand short conjunction fragments into standalone subclaims when possible.
+        Example: "Vaccines do not cause autism" + "or the flu" ->
+                 "Vaccines do not cause the flu"
+        """
+        prev = re.sub(r"\s+", " ", (previous_subclaim or "")).strip(" ,.").strip()
+        frag = (
+            re.sub(
+                r"^\s*(?:and|or|but|however|although|while)\s+",
+                "",
+                re.sub(r"\s+", " ", (fragment_subclaim or "")).strip(),
+                flags=re.IGNORECASE,
+            )
+            .strip(" ,.")
+            .strip()
+        )
+        if not prev or not frag:
+            return ""
+
+        neg_causal = re.match(
+            r"^(?P<head>.+?\b(?:do|does|did|can|could|may|might|must|should|would|will)?\s*not\s+cause)\s+.+$",
+            prev,
+            flags=re.IGNORECASE,
+        )
+        if neg_causal:
+            expanded = f"{neg_causal.group('head')} {frag}".strip()
+            return re.sub(r"\s+", " ", expanded).strip(" ,.").strip()
+
+        return ""
+
     def merge_subclaims(self, subclaims: List[str]) -> List[str]:
-        """Merge only explicit conjunction-leading fragments into the previous segment."""
+        """Merge conjunction fragments conservatively; preserve distinct medical subclaims."""
         merged: List[str] = []
         for raw in subclaims or []:
             s = (raw or "").strip()
@@ -207,7 +238,17 @@ class TrustedSearch:
                 continue
             lower = s.lower()
             if lower.startswith(self._MERGE_PREFIXES):
-                merged[-1] = f"{merged[-1].rstrip(', ')} {s}".strip()
+                expanded = self._expand_conjunction_fragment(merged[-1], s)
+                if expanded:
+                    merged.append(expanded)
+                    continue
+                # Keep old merge behavior for list-continuation fragments.
+                fragment = re.sub(r"^\s*(?:and|or|but|however|although|while)\s+", "", lower).strip()
+                fragment_tokens = [t for t in self._tokenize_words(fragment) if t not in self._STOPWORDS]
+                if len(fragment_tokens) <= 4:
+                    merged[-1] = f"{merged[-1].rstrip(', ')} {s}".strip()
+                else:
+                    merged.append(s)
             else:
                 merged.append(s)
         return merged
@@ -525,6 +566,9 @@ class TrustedSearch:
         has_liver = "liver" in anchors
         has_detox = "detox" in anchors
         has_metabolism = "metabolism" in anchors
+        anchor_text = " ".join(anchors).lower()
+        has_vaccine = any(t in anchor_text for t in ["vaccine", "vaccines", "vaccination"])
+        has_flu = any(t in anchor_text for t in ["flu", "influenza"])
 
         if has_lemon_water and has_liver:
             detox_part = "(detox OR detoxification)" if has_detox else "liver function"
@@ -534,6 +578,13 @@ class TrustedSearch:
         if has_lemon_water and has_metabolism:
             q.append('"lemon water" (metabolism OR "metabolic rate") randomized trial')
             q.append('site:pubmed.ncbi.nlm.nih.gov "lemon water" metabolism')
+
+        # Explicit templates for vaccine+flu causality subclaims.
+        if has_vaccine and has_flu:
+            q.append('"influenza vaccine" "does not cause flu"')
+            q.append('site:cdc.gov "flu vaccine" "cannot cause flu"')
+            q.append('site:who.int "influenza vaccine" "does not cause influenza"')
+            q.append("site:pubmed.ncbi.nlm.nih.gov influenza vaccine influenza infection risk")
 
         # Generic anchored fallback for any other subclaim
         if not q:
@@ -1143,10 +1194,12 @@ FAILED ENTITIES:
         advanced_queries: List[str] = []
         question_queries: List[str] = []
         anchor_queries: List[str] = []
+        required_per_subclaim: List[str] = []
 
         for idx, sub in enumerate(merged_subclaims):
             sub_query_text = sub
             anchors = self._extract_subclaim_anchors(sub, entities=entities)
+            required_query_for_subclaim = ""
             if claim_has_lemon_water and re.search(
                 r"\b(liver|detox|detoxifies|detoxification|metabolism|metabolic)\b", sub
             ):
@@ -1158,6 +1211,8 @@ FAILED ENTITIES:
             sub_anchor_queries = self._build_subclaim_anchor_queries(sub_query_text, entities=entities)
             for aq in sub_anchor_queries:
                 if self._passes_query_quality(aq, anchors):
+                    if not required_query_for_subclaim:
+                        required_query_for_subclaim = aq
                     anchor_queries.append(aq)
                     qmeta = self._query_quality(aq, anchors)
                     logger.info(
@@ -1171,6 +1226,8 @@ FAILED ENTITIES:
                     )
             q = self._build_direct_query(sub, entities=entities)
             if q and self._passes_query_quality(q, anchors):
+                if not required_query_for_subclaim:
+                    required_query_for_subclaim = q
                 direct_queries.append(q)
             for aq in self._build_advanced_operator_queries(sub, entities=entities):
                 if self._passes_query_quality(aq, anchors):
@@ -1180,6 +1237,10 @@ FAILED ENTITIES:
                 candidate = q_questions[0]
                 if self._passes_query_quality(candidate, anchors):
                     question_queries.append(candidate)
+                    if not required_query_for_subclaim:
+                        required_query_for_subclaim = candidate
+            if required_query_for_subclaim:
+                required_per_subclaim.append(self._sanitize_query(required_query_for_subclaim))
 
         direct_queries = self._filter_queries(direct_queries, key_terms, key_numbers)
         advanced_queries = self._filter_queries(advanced_queries, key_terms, key_numbers)
@@ -1228,7 +1289,21 @@ FAILED ENTITIES:
         # Final validation (strictly direct to claim terms) and budget cap
         all_queries = [self._sanitize_query(q) for q in all_queries if q]
         all_queries = self._filter_queries(all_queries, key_terms, key_numbers)
-        all_queries = dedupe_list(all_queries)[:max_queries]
+        all_queries = dedupe_list(all_queries)
+        required_filtered: List[str] = []
+        for rq in required_per_subclaim:
+            if not rq:
+                continue
+            rq_clean = self._sanitize_query(rq)
+            if not rq_clean:
+                continue
+            if not self._query_has_key_terms(rq_clean, key_terms, key_numbers):
+                continue
+            if rq_clean not in required_filtered:
+                required_filtered.append(rq_clean)
+        # Ensure query planner retains at least one query per detected subclaim when possible.
+        all_queries = required_filtered + [q for q in all_queries if q not in required_filtered]
+        all_queries = all_queries[:max_queries]
         for i, q in enumerate(all_queries):
             qmeta = self._query_quality(q, key_terms)
             logger.info(

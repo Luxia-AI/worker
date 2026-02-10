@@ -116,11 +116,12 @@ class CorrectivePipeline:
         is_sufficient = bool(adaptive_trust.get("is_sufficient", False))
         return {
             "trust_policy_mode": "adaptive",
-            "trust_metric_name": "adaptive_is_sufficient",
+            "trust_metric_name": "adaptive_trust_post",
             "trust_metric_value": trust_post,
             "trust_threshold": "adaptive",
             "trust_threshold_met": is_sufficient,
             "adaptive_is_sufficient": is_sufficient,
+            "adaptive_trust_post": trust_post,
             "trust_post_adaptive": trust_post,
         }
 
@@ -173,7 +174,7 @@ class CorrectivePipeline:
                 source_url=item.get("source_url", item.get("source", "")),
                 published_at=item.get("published_at", item.get("publish_date")),
                 trust=item.get("final_score", item.get("score", 0.0)),
-                stance="neutral",
+                stance=str(item.get("stance", "neutral") or "neutral"),
                 score_components={
                     "semantic": item.get("sem_score", item.get("final_score", item.get("score", 0.0))),
                     "source": 0.5,
