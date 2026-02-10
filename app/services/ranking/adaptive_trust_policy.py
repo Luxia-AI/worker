@@ -15,6 +15,7 @@ import re
 from typing import Any, Dict, List
 
 from app.core.logger import get_logger
+from app.services.common.claim_segmentation import split_claim_into_segments
 from app.services.ranking.subclaim_coverage import compute_subclaim_coverage
 from app.services.ranking.trust_ranker import EvidenceItem
 
@@ -58,49 +59,9 @@ class AdaptiveTrustPolicy:
         Returns:
             List of subclaim strings
         """
-        if not claim or not claim.strip():
-            return []
-
-        claim = claim.strip()
-
-        # Split on sentence boundaries first
-        sentences = re.split(r"(?<=[.!?])\s+", claim)
-
-        subclaims = []
-        for sentence in sentences:
-            sentence = sentence.strip()
-            if not sentence:
-                continue
-
-            # Check for conjunctive decomposition
-            conjunctives = self._split_on_conjunctives(sentence)
-            if conjunctives:
-                subclaims.extend(conjunctives)
-            else:
-                # Check for list-like structures
-                lists = self._split_on_lists(sentence)
-                if lists:
-                    subclaims.extend(lists)
-                else:
-                    # Check for comparative structures
-                    comparatives = self._split_on_comparatives(sentence)
-                    if comparatives:
-                        subclaims.extend(comparatives)
-                    else:
-                        # Single atomic claim
-                        subclaims.append(sentence)
-
-        # Remove duplicates while preserving order
-        seen = set()
-        unique_subclaims = []
-        for subclaim in subclaims:
-            normalized = subclaim.lower().strip()
-            if normalized not in seen and len(normalized) > 10:  # Minimum length filter
-                seen.add(normalized)
-                unique_subclaims.append(subclaim)
-
-        logger.info(f"Decomposed claim into {len(unique_subclaims)} subclaims: {unique_subclaims}")
-        return unique_subclaims
+        subclaims = split_claim_into_segments(claim)
+        logger.info(f"Decomposed claim into {len(subclaims)} subclaims: {subclaims}")
+        return subclaims
 
     def _split_on_conjunctives(self, text: str) -> List[str]:
         """Split on conjunctive words while preserving context."""

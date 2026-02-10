@@ -110,6 +110,43 @@ class CorrectivePipeline:
         # Logging system
         self.log_manager = LogManagerHandler._log_manager
 
+    @staticmethod
+    def _trust_payload_adaptive(adaptive_trust: Dict[str, Any]) -> Dict[str, Any]:
+        trust_post = float(adaptive_trust.get("trust_post", 0.0) or 0.0)
+        is_sufficient = bool(adaptive_trust.get("is_sufficient", False))
+        return {
+            "trust_policy_mode": "adaptive",
+            "trust_metric_name": "adaptive_is_sufficient",
+            "trust_metric_value": trust_post,
+            "trust_threshold": "adaptive",
+            "trust_threshold_met": is_sufficient,
+        }
+
+    @staticmethod
+    def _trust_payload_fixed(trust_post: float, threshold: float) -> Dict[str, Any]:
+        trust_post_f = float(trust_post or 0.0)
+        threshold_f = float(threshold or 0.0)
+        return {
+            "trust_policy_mode": "fixed",
+            "trust_metric_name": "trust_post",
+            "trust_metric_value": trust_post_f,
+            "trust_threshold": threshold_f,
+            "trust_threshold_met": trust_post_f >= threshold_f,
+        }
+
+    @staticmethod
+    def _cache_fast_path_allowed(adaptive_trust: Dict[str, Any], verdict_result: Dict[str, Any]) -> bool:
+        if not bool(adaptive_trust.get("is_sufficient", False)):
+            return False
+
+        if "required_segments_resolved" in verdict_result:
+            return bool(verdict_result.get("required_segments_resolved", False))
+
+        claim_breakdown = verdict_result.get("claim_breakdown", []) or []
+        if not claim_breakdown:
+            return False
+        return all((seg.get("status") or "UNKNOWN").upper() != "UNKNOWN" for seg in claim_breakdown)
+
     async def run(
         self,
         post_text: str,
@@ -283,6 +320,7 @@ class CorrectivePipeline:
         # Use adaptive trust policy for multi-part claims
         adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(post_text, top_ranked_evidence, top_k)
         is_sufficient = adaptive_trust["is_sufficient"]
+        adaptive_payload = self._trust_payload_adaptive(adaptive_trust)
 
         logger.info(
             f"[CorrectivePipeline:{round_id}] Adaptive trust: sufficient={is_sufficient}, "
@@ -307,53 +345,64 @@ class CorrectivePipeline:
                 f"[CorrectivePipeline:{round_id}] Verdict (cache-sufficient): {verdict_result['verdict']} "
                 f"(confidence: {verdict_result['confidence']:.2f})"
             )
-            await _emit_stage("search_done", {"search_api_calls": 0, "queries_total": 0})
-            await _emit_stage("extraction_done", {"facts": 0, "triples": 0})
-            await _emit_stage("ingestion_done", {"facts_ingested": 0, "triples_ingested": 0})
-            await _emit_stage("completed", {"status": "completed_from_cache"})
-            await debug_reporter.log_step(
-                step_name="Pipeline completed from cache",
-                description="Final output emitted without web search",
-                input_data={"used_web_search": False},
-                output_data={"ranked_count": len(top_ranked), "status": "completed_from_cache"},
+            cache_allowed = self._cache_fast_path_allowed(adaptive_trust, verdict_result)
+            if cache_allowed:
+                await _emit_stage("search_done", {"search_api_calls": 0, "queries_total": 0})
+                await _emit_stage("extraction_done", {"facts": 0, "triples": 0})
+                await _emit_stage("ingestion_done", {"facts_ingested": 0, "triples_ingested": 0})
+                await _emit_stage("completed", {"status": "completed_from_cache"})
+                await debug_reporter.log_step(
+                    step_name="Pipeline completed from cache",
+                    description="Final output emitted without web search",
+                    input_data={"used_web_search": False},
+                    output_data={"ranked_count": len(top_ranked), "status": "completed_from_cache"},
+                )
+                await debug_reporter.close()
+                return {
+                    "round_id": round_id,
+                    "status": "completed_from_cache",
+                    "facts": [],  # No new facts extracted
+                    "triples": [],
+                    "queries": [post_text],
+                    "semantic_candidates_count": len(dedup_sem),
+                    "kg_candidates_count": len(kg_candidates),
+                    "ranked": top_ranked,
+                    "used_web_search": False,
+                    "data_source": "CACHE",
+                    "initial_top_score": adaptive_trust["trust_post"],
+                    "ranking_top_score": (top_ranked[0].get("final_score", 0.0) if top_ranked else 0.0),
+                    "ranking_avg_score": (
+                        sum(float(r.get("final_score", 0.0) or 0.0) for r in top_ranked[:5])
+                        / max(1, len(top_ranked[:5]))
+                        if top_ranked
+                        else 0.0
+                    ),
+                    "trust_post": adaptive_trust["trust_post"],
+                    "trust_grade": "adaptive",  # Adaptive grading
+                    "agreement_ratio": adaptive_trust["agreement"],
+                    "coverage": adaptive_trust["coverage"],
+                    "diversity": adaptive_trust["diversity"],
+                    "num_subclaims": adaptive_trust["num_subclaims"],
+                    "verdict": verdict_result,
+                    "cache_sufficient": True,
+                    "debug_counts": debug_counts,
+                    "vdb_signal_count": debug_counts["sem_in_ranked"],
+                    "kg_signal_count": debug_counts["kg_in_ranked"],
+                    "vdb_signal_sum_top5": round(
+                        sum(float(e.get("sem_score", 0.0) or 0.0) for e in top_ranked[:5]),
+                        3,
+                    ),
+                    "kg_signal_sum_top5": round(
+                        sum(float(e.get("kg_score", 0.0) or 0.0) for e in top_ranked[:5]),
+                        3,
+                    ),
+                    "llm": get_groq_job_metadata(),
+                    **adaptive_payload,
+                }
+            logger.info(
+                f"[CorrectivePipeline:{round_id}] Cache evidence insufficient for required segment resolution; "
+                "continuing to web search."
             )
-            await debug_reporter.close()
-            return {
-                "round_id": round_id,
-                "status": "completed_from_cache",
-                "facts": [],  # No new facts extracted
-                "triples": [],
-                "queries": [post_text],
-                "semantic_candidates_count": len(dedup_sem),
-                "kg_candidates_count": len(kg_candidates),
-                "ranked": top_ranked,
-                "used_web_search": False,
-                "data_source": "CACHE",
-                "trust_threshold": "adaptive",  # Now using adaptive policy
-                "trust_threshold_met": True,
-                "initial_top_score": adaptive_trust["trust_post"],
-                "ranking_top_score": (top_ranked[0].get("final_score", 0.0) if top_ranked else 0.0),
-                "ranking_avg_score": (
-                    sum(float(r.get("final_score", 0.0) or 0.0) for r in top_ranked[:5]) / max(1, len(top_ranked[:5]))
-                    if top_ranked
-                    else 0.0
-                ),
-                "trust_post": adaptive_trust["trust_post"],
-                "trust_grade": "adaptive",  # Adaptive grading
-                "agreement_ratio": adaptive_trust["agreement"],
-                "coverage": adaptive_trust["coverage"],
-                "diversity": adaptive_trust["diversity"],
-                "num_subclaims": adaptive_trust["num_subclaims"],
-                "verdict": verdict_result,
-                "cache_sufficient": True,
-                "debug_counts": debug_counts,
-                "kg_signal_count": debug_counts["kg_in_ranked"],
-                "kg_signal_sum_top5": round(
-                    sum(float(e.get("kg_score", 0.0) or 0.0) for e in top_ranked[:5]),
-                    3,
-                ),
-                "llm": get_groq_job_metadata(),
-            }
 
         # ====================================================================
         # PHASE 4: Quota-Optimized Incremental Search (ONE QUERY AT A TIME)
@@ -414,8 +463,6 @@ class CorrectivePipeline:
                 "used_web_search": False,
                 "data_source": "CACHE",
                 "search_api_calls": 0,
-                "trust_threshold": "adaptive",
-                "trust_threshold_met": False,
                 "initial_top_score": adaptive_trust["trust_post"],
                 "ranking_top_score": (top_ranked[0].get("final_score", 0.0) if top_ranked else 0.0),
                 "ranking_avg_score": (
@@ -428,12 +475,18 @@ class CorrectivePipeline:
                 "num_subclaims": adaptive_trust["num_subclaims"],
                 "verdict": verdict_result,
                 "debug_counts": debug_counts,
+                "vdb_signal_count": debug_counts["sem_in_ranked"],
                 "kg_signal_count": debug_counts["kg_in_ranked"],
+                "vdb_signal_sum_top5": round(
+                    sum(float(e.get("sem_score", 0.0) or 0.0) for e in top_ranked[:5]),
+                    3,
+                ),
                 "kg_signal_sum_top5": round(
                     sum(float(e.get("kg_score", 0.0) or 0.0) for e in top_ranked[:5]),
                     3,
                 ),
                 "llm": get_groq_job_metadata(),
+                **adaptive_payload,
             }
 
         # Get already-processed URLs from VDB to avoid re-scraping
@@ -739,6 +792,7 @@ class CorrectivePipeline:
 
         final_trust_post = self.trust_ranker.compute_post_trust(final_top_ranked_evidence, top_k)
         final_trust_score = final_trust_post["trust_post"]
+        fixed_payload = self._trust_payload_fixed(final_trust_score, self.CONF_THRESHOLD)
 
         verdict_result = await self.verdict_generator.generate_verdict(
             claim=post_text,
@@ -795,8 +849,6 @@ class CorrectivePipeline:
             "search_api_calls_saved": len(queries) - search_api_calls,
             "urls_processed": len(processed_urls),
             "urls_skipped_already_processed": len(skipped_urls),
-            "trust_threshold": self.CONF_THRESHOLD,
-            "trust_threshold_met": final_trust_score >= self.CONF_THRESHOLD,
             "initial_top_score": final_trust_score,
             "ranking_top_score": (top_ranked[0].get("final_score", 0.0) if top_ranked else 0.0),
             "ranking_avg_score": (
@@ -809,12 +861,18 @@ class CorrectivePipeline:
             "agreement_ratio": final_trust_post.get("agreement_ratio", 0.0),
             "verdict": verdict_result,
             "debug_counts": debug_counts,
+            "vdb_signal_count": debug_counts["sem_in_ranked"],
             "kg_signal_count": debug_counts["kg_in_ranked"],
+            "vdb_signal_sum_top5": round(
+                sum(float(e.get("sem_score", 0.0) or 0.0) for e in top_ranked[:5]),
+                3,
+            ),
             "kg_signal_sum_top5": round(
                 sum(float(e.get("kg_score", 0.0) or 0.0) for e in top_ranked[:5]),
                 3,
             ),
             "llm": get_groq_job_metadata(),
+            **fixed_payload,
         }
 
     async def _extract_claim_entities(self, claim: str, round_id: str) -> List[str]:
