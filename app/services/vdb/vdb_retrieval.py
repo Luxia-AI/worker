@@ -63,11 +63,10 @@ class VDBRetrieval:
             logger.error(f"[VDBRetrieval] Embedding generation failed: {e}")
             return []
 
-        if not topics:
-            logger.warning("[VDBRetrieval] No topics provided; skipping VDB retrieval")
-            return []
-
-        pinecone_filter: Dict[str, Any] = {"topic": {"$in": list(set(topics + ["other"]))}}
+        topic_list = [t for t in (topics or []) if t]
+        pinecone_filter: Dict[str, Any] = {}
+        if topic_list:
+            pinecone_filter["topic"] = {"$in": list(set(topic_list + ["other"]))}
         if self.language:
             pinecone_filter["language"] = self.language
 
@@ -77,7 +76,7 @@ class VDBRetrieval:
                 top_k=top_k,
                 namespace=self.namespace,
                 include_metadata=True,
-                filter=pinecone_filter,
+                filter=pinecone_filter if pinecone_filter else None,
             )
         except Exception as e:
             logger.error(f"[VDBRetrieval] Pinecone query failed: {e}")
@@ -88,7 +87,7 @@ class VDBRetrieval:
             matches = self._as_dict(response).get("matches") or []
 
         # Fallback: if strict topic filter produced no matches, retry with language-only filter.
-        if not matches:
+        if topic_list and not matches:
             try:
                 fallback_filter: Dict[str, Any] = {}
                 if self.language:

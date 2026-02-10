@@ -772,6 +772,23 @@ class VerdictGenerator:
         return {w for w in re.findall(r"\b[\w'-]+\b", (text or "").lower()) if len(w) > 2 and w not in weak}
 
     @staticmethod
+    def _is_reporting_statement(text: str) -> bool:
+        if not text:
+            return False
+        low = text.lower()
+        reporting_patterns = (
+            r"\bclaim(?:s|ed)?\b",
+            r"\breport(?:s|ed|ing)?\b",
+            r"\baccording to\b",
+            r"\breflects?\s+concern\b",
+            r"\bsearch(?:ed|ing)?\b",
+            r"\bupdated\b",
+            r"\bheadline\b",
+            r"\brumou?r\b",
+        )
+        return any(re.search(p, low) for p in reporting_patterns)
+
+    @staticmethod
     def _concept_aliases() -> Dict[str, List[str]]:
         return {
             "vaccine": ["vaccine", "vaccines", "vaccination"],
@@ -859,17 +876,20 @@ class VerdictGenerator:
             return False
         return True
 
-    @staticmethod
-    def _evidence_score(ev: Dict[str, Any]) -> float:
+    def _evidence_score(self, ev: Dict[str, Any]) -> float:
         score = ev.get("final_score")
         if score is None:
             score = ev.get("score")
         if score is None:
             score = ev.get("sem_score")
         try:
-            return float(score or 0.0)
+            score_f = float(score or 0.0)
         except Exception:
-            return 0.0
+            score_f = 0.0
+        statement = str(ev.get("statement") or ev.get("text") or "")
+        if self._is_reporting_statement(statement):
+            score_f *= 0.40
+        return score_f
 
     def _select_balanced_top_evidence(
         self, claim: str, evidence: List[Dict[str, Any]], top_k: int
@@ -958,6 +978,9 @@ class VerdictGenerator:
             if anchor_score < 0.2:
                 relevance = "NEUTRAL"
                 relevance_score *= 0.6
+            if self._is_reporting_statement(statement):
+                relevance = "NEUTRAL"
+                relevance_score *= 0.35
             normalized.append(
                 {
                     "evidence_id": ev_idx if ev_idx >= 0 else len(normalized),
@@ -1452,11 +1475,15 @@ class VerdictGenerator:
                 uncertainty_penalty = 0.0
                 if assertive_claim and any(t in stmt_l for t in uncertainty_terms):
                     uncertainty_penalty = 0.18
+                reporting_penalty = 0.0
+                if self._is_reporting_statement(stmt):
+                    reporting_penalty = 0.24
                 score = (
                     (0.50 * max(0.0, min(1.0, rel_f)))
                     + (0.25 * max(0.0, min(1.0, overlap)))
                     + (0.25 * max(0.0, min(1.0, anchor_overlap)))
                     - uncertainty_penalty
+                    - reporting_penalty
                 )
                 if not anchor_ok:
                     score *= 0.35
@@ -1608,11 +1635,14 @@ class VerdictGenerator:
                 uncertainty_penalty = 0.0
                 if claim_assertive and any(t in stmt_set for t in uncertainty_terms):
                     uncertainty_penalty = 0.22
+                reporting_penalty = 0.0
+                if self._is_reporting_statement(stmt):
+                    reporting_penalty = 0.24
 
                 support = (0.45 * rel) + (0.25 * overlap_ratio) + (0.15 * anchor_overlap) + (0.15 * cred)
                 if overlap_ratio < 0.20:
                     support *= 0.50
-                net = support - (0.60 * contradiction) - uncertainty_penalty
+                net = support - (0.60 * contradiction) - uncertainty_penalty - reporting_penalty
                 net = max(0.0, min(1.0, net))
 
                 if net > best:
@@ -1803,12 +1833,13 @@ class VerdictGenerator:
         for segment in segments:
             try:
                 topics, _ = await self.topic_classifier.classify(segment, [], None)
+                topic_filter = topics or None
                 if not topics:
                     logger.warning(
-                        f"[VerdictGenerator] No topics for segment '{segment[:30]}...', skipping VDB retrieval"
+                        f"[VerdictGenerator] No topics for segment '{segment[:30]}...'; "
+                        "running VDB retrieval without topic filter"
                     )
-                    continue
-                results = await self.vdb_retriever.search(segment, top_k=top_k, topics=topics)
+                results = await self.vdb_retriever.search(segment, top_k=top_k, topics=topic_filter)
                 for result in results:
                     stmt = result.get("statement", "")
                     # Deduplicate by statement

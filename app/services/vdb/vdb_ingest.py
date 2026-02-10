@@ -18,11 +18,20 @@ class VDBIngest:
         self.metadata_enricher = MetadataEnricher()
         self.lexical_index = LexicalIndex()
 
-    def get_processed_urls(self) -> Set[str]:
+    def get_processed_urls(
+        self,
+        topics: List[str] | None = None,
+        max_urls: int | None = None,
+    ) -> Set[str]:
         """
         Get set of URLs that have already been processed and ingested to VDB.
 
         Uses Pinecone's list operation to get vector IDs and extracts unique source URLs.
+
+        Args:
+            topics: Optional list of claim topics. When provided, only URLs from matching
+                topic metadata are returned (plus "other" as permissive fallback).
+            max_urls: Optional hard cap for number of collected URLs.
 
         Returns:
             Set of source URLs that exist in the VDB namespace
@@ -30,6 +39,9 @@ class VDBIngest:
         try:
             # Get all vector IDs in namespace using pagination
             processed_urls: Set[str] = set()
+            topic_filter = {t.strip().lower() for t in (topics or []) if t and t.strip()}
+            if "other" not in topic_filter and topic_filter:
+                topic_filter.add("other")
 
             # Pinecone's list returns an iterator
             for ids_batch in self.index.list(namespace=self.namespace):
@@ -48,14 +60,31 @@ class VDBIngest:
 
                     for vec_id, vec_data in vectors.items():
                         metadata = vec_data.get("metadata", {})
+                        topic = str(metadata.get("topic") or "").strip().lower()
+                        if topic_filter and topic and topic not in topic_filter:
+                            continue
+                        if topic_filter and not topic:
+                            continue
                         source_url = metadata.get("source_url", "")
                         if source_url:
                             processed_urls.add(source_url)
+                        if max_urls is not None and len(processed_urls) >= max(1, int(max_urls)):
+                            logger.info(
+                                "[VDBIngest] Reached processed URL cap (%d) for namespace=%s",
+                                len(processed_urls),
+                                self.namespace,
+                            )
+                            return processed_urls
                 except Exception as e:
                     logger.warning(f"[VDBIngest] Failed to fetch metadata for batch: {e}")
                     continue
 
-            logger.info(f"[VDBIngest] Found {len(processed_urls)} unique processed URLs in VDB")
+            logger.info(
+                "[VDBIngest] Found %d unique processed URLs in VDB (namespace=%s, topic_filter=%s)",
+                len(processed_urls),
+                self.namespace,
+                sorted(topic_filter) if topic_filter else "none",
+            )
             return processed_urls
 
         except Exception as e:

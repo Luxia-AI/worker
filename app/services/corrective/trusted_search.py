@@ -63,9 +63,25 @@ class TrustedSearch:
         "nice.org.uk",
     }
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        google_api_key: str | None = None,
+        google_cse_id: str | None = None,
+        serper_api_key: str | None = None,
+    ) -> None:
+        # Resolve credentials at runtime so tests/env overrides work after import.
+        self.GOOGLE_API_KEY = (
+            google_api_key if google_api_key is not None else (os.getenv("GOOGLE_API_KEY") or settings.GOOGLE_API_KEY)
+        )
+        self.GOOGLE_CSE_ID = (
+            google_cse_id if google_cse_id is not None else (os.getenv("GOOGLE_CSE_ID") or settings.GOOGLE_CSE_ID)
+        )
+        self.SERPER_API_KEY = (
+            serper_api_key if serper_api_key is not None else (os.getenv("SERPER_API_KEY") or settings.SERPER_API_KEY)
+        )
+
         # Allow initialization even without Google API if Serper is available
-        has_google = self.GOOGLE_API_KEY and self.GOOGLE_CSE_ID
+        has_google = bool(self.GOOGLE_API_KEY and self.GOOGLE_CSE_ID)
         has_serper = bool(self.SERPER_API_KEY)
 
         if not has_google and not has_serper:
@@ -95,7 +111,13 @@ class TrustedSearch:
             allowlist_fingerprint,
         )
 
-        self.llm_client = HybridLLMService()
+        try:
+            self.llm_client = HybridLLMService()
+        except Exception as e:
+            logger.warning(
+                "[TrustedSearch] LLM client unavailable; using deterministic/fallback query planning only: %s", e
+            )
+            self.llm_client = None
 
     # ---------------------------------------------------------------------
     # Deterministic Query Helpers
@@ -543,37 +565,75 @@ class TrustedSearch:
     def _extract_subclaim_anchors(self, subclaim: str, entities: List[str] | None = None) -> List[str]:
         entities = entities or []
         anchors: List[str] = []
-        text = (subclaim or "").lower()
 
-        if "lemon" in text and "water" in text:
-            anchors.append("lemon water")
-        if "liver" in text:
-            anchors.append("liver")
-        if "detox" in text or "detoxifies" in text or "detoxification" in text:
-            anchors.append("detox")
-        if "metabolism" in text or "metabolic" in text:
-            anchors.append("metabolism")
+        def _add(anchor: str) -> None:
+            normalized = " ".join(self._tokenize_words(anchor))
+            if not normalized:
+                return
+            if normalized not in anchors:
+                anchors.append(normalized)
+
+        # Prefer meaningful multi-word anchors first.
+        for phrase in self._extract_phrase_candidates(subclaim, entities=entities)[:4]:
+            _add(phrase)
 
         for ent in entities:
             ent_n = " ".join(
                 t for t in self._tokenize_words(ent) if t not in self._STOPWORDS and t not in self._JUNK_QUERY_TOKENS
             )
-            if not ent_n:
-                continue
-            if ent_n not in anchors:
-                anchors.append(ent_n)
+            if ent_n:
+                _add(ent_n)
 
+        freq: Dict[str, int] = {}
         for tok in self._tokenize_words(subclaim):
             if tok in self._STOPWORDS or tok in self._ACTION_WORDS or tok in self._JUNK_QUERY_TOKENS:
                 continue
-            if tok not in anchors:
-                anchors.append(tok)
+            freq[tok] = freq.get(tok, 0) + 1
+        ranked_tokens = sorted(freq.items(), key=lambda kv: (-kv[1], -len(kv[0]), kv[0]))
+        for tok, _ in ranked_tokens[:8]:
+            _add(tok)
 
         for n in self._extract_numbers_raw(subclaim):
             if n not in anchors:
                 anchors.append(n)
 
-        return anchors[:8]
+        return anchors[:10]
+
+    @staticmethod
+    def _subclaim_intent_constraints(subclaim: str) -> List[str]:
+        text = (subclaim or "").lower()
+
+        has_quantitative = bool(
+            re.search(
+                r"\b(\d{1,3}(?:,\d{3})*(?:\.\d+)?|percent|percentage|rate|rates|statistics|prevalence|incidence)\b",
+                text,
+            )
+        )
+        has_causal = bool(
+            re.search(
+                (
+                    r"\b(cause|causes|caused|causal|link|linked|association|associated|"
+                    r"prevent|prevents|prevented|risk|increase|increases|decrease|decreases|"
+                    r"reduce|reduces|cure|cures|treat|treats)\b"
+                ),
+                text,
+            )
+        )
+        has_recommendation = bool(re.search(r"\b(recommend|recommended|guideline|guidelines|should|must)\b", text))
+        has_negation = bool(re.search(r"\b(no|not|never|without|lack|lacks|lacking)\b", text))
+
+        constraints: List[str] = []
+        if has_quantitative:
+            constraints.extend(["statistics", "prevalence", "incidence"])
+        elif has_causal and has_negation:
+            constraints.extend(["systematic review", "meta-analysis", "no association"])
+        elif has_causal:
+            constraints.extend(["systematic review", "meta-analysis", "causal association"])
+        elif has_recommendation:
+            constraints.extend(["guideline", "consensus statement", "clinical recommendation"])
+        else:
+            constraints.extend(["systematic review", "meta-analysis", "clinical study"])
+        return constraints
 
     def _build_subclaim_anchor_queries(self, subclaim: str, entities: List[str] | None = None) -> List[str]:
         """
@@ -583,75 +643,49 @@ class TrustedSearch:
         anchors = self._extract_subclaim_anchors(subclaim, entities=entities)
         if not anchors:
             return []
-        q: List[str] = []
+        generic = {"them", "this", "that", "those", "these", "located", "studies", "study", "shows", "show"}
 
-        has_lemon_water = "lemon water" in " ".join(anchors)
-        has_liver = "liver" in anchors
-        has_detox = "detox" in anchors
-        has_metabolism = "metabolism" in anchors
-        anchor_text = " ".join(anchors).lower()
-        has_vaccine = any(t in anchor_text for t in ["vaccine", "vaccines", "vaccination"])
-        has_flu = any(t in anchor_text for t in ["flu", "influenza"])
-        has_antibiotic = any(t in anchor_text for t in ["antibiotic", "antibiotics", "antibacterial"])
-        has_cold = any(t in anchor_text for t in ["cold", "colds", "common cold"])
-        has_virus = any(t in anchor_text for t in ["virus", "viruses", "viral"])
-        has_sugar = any(t in anchor_text for t in ["sugar", "sucrose", "glucose", "fructose"])
-        has_hyperactivity = any(t in anchor_text for t in ["hyperactivity", "adhd", "attention"])
+        def _anchor_score(a: str) -> float:
+            score = 0.0
+            if any(ch.isdigit() for ch in a):
+                score += 4.0
+            if " " in a:
+                score += 1.2
+            score += min(2.0, len(a) / 6.0)
+            if a in generic:
+                score -= 2.0
+            return score
 
-        if has_lemon_water and has_liver:
-            detox_part = "(detox OR detoxification)" if has_detox else "liver function"
-            q.append(f'"lemon water" liver {detox_part} systematic review')
-            q.append(f'site:pubmed.ncbi.nlm.nih.gov "lemon water" liver {detox_part}')
+        ranked_anchors = sorted(dedupe_list(anchors), key=lambda a: (-_anchor_score(a), a))
+        phrase_anchors = [a for a in ranked_anchors if " " in a and not any(ch.isdigit() for ch in a)]
+        term_anchors = [a for a in ranked_anchors if " " not in a and not any(ch.isdigit() for ch in a)]
+        number_anchors = [a for a in ranked_anchors if any(ch.isdigit() for ch in a)]
 
-        if has_lemon_water and has_metabolism:
-            q.append('"lemon water" (metabolism OR "metabolic rate") randomized trial')
-            q.append('site:pubmed.ncbi.nlm.nih.gov "lemon water" metabolism')
+        core_terms: List[str] = []
+        for p in phrase_anchors[:2]:
+            core_terms.append(f'"{p}"')
+        for t in term_anchors[:3]:
+            core_terms.append(t)
+        for n in number_anchors[:2]:
+            core_terms.append(n)
+        if len(core_terms) < 2:
+            for a in ranked_anchors:
+                token = f'"{a}"' if " " in a else a
+                if token not in core_terms:
+                    core_terms.append(token)
+                if len(core_terms) >= 2:
+                    break
 
-        # Explicit templates for vaccine+flu causality subclaims.
-        if has_vaccine and has_flu:
-            q.append('"influenza vaccine" "does not cause flu"')
-            q.append('site:cdc.gov "flu vaccine" "cannot cause flu"')
-            q.append('site:who.int "influenza vaccine" "does not cause influenza"')
-            q.append("site:pubmed.ncbi.nlm.nih.gov influenza vaccine influenza infection risk")
+        constraints = self._subclaim_intent_constraints(subclaim)
+        queries: List[str] = []
+        for c in constraints[:3]:
+            queries.append(" ".join(core_terms + [c]).strip())
 
-        # Explicit templates for antibiotics claims on colds/flu/viruses.
-        if has_antibiotic and (has_cold or has_flu or has_virus):
-            q.append('"antibiotics" "do not work against viruses"')
-            q.append("site:cdc.gov antibiotics viruses cold flu")
-            q.append("site:nhs.uk antibiotics colds flu")
-            q.append("site:medlineplus.gov antibiotics viral infection")
-            q.append("site:pubmed.ncbi.nlm.nih.gov antibiotics common cold influenza review")
+        # Include one operator-style variant for high-yield biomedical sources.
+        if core_terms:
+            queries.append(" ".join(["site:pubmed.ncbi.nlm.nih.gov"] + core_terms + [constraints[0]]).strip())
 
-        # Explicit templates for sugar-hyperactivity claims.
-        if has_sugar and has_hyperactivity:
-            q.append('"sugar" "hyperactivity" children meta-analysis')
-            q.append("site:nih.gov sugar hyperactivity children")
-            q.append("site:pubmed.ncbi.nlm.nih.gov sugar hyperactivity randomized trial")
-            q.append("site:mayoclinic.org sugar hyperactivity myth")
-
-        # Generic anchored fallback for any other subclaim
-        if not q:
-            generic = {"them", "this", "that", "those", "these", "located"}
-
-            def _anchor_score(a: str) -> float:
-                score = 0.0
-                if any(ch.isdigit() for ch in a):
-                    score += 4.0
-                score += min(2.0, len(a) / 6.0)
-                if a in generic:
-                    score -= 2.0
-                return score
-
-            ranked_anchors = sorted(dedupe_list(anchors), key=lambda a: (-_anchor_score(a), a))
-            core = []
-            for a in ranked_anchors[:3]:
-                if " " in a:
-                    core.append(f'"{a}"')
-                else:
-                    core.append(a)
-            q.append(" ".join(core + ["systematic review"]).strip())
-
-        return dedupe_list([self._sanitize_query(x) for x in q if x])
+        return dedupe_list([self._sanitize_query(x) for x in queries if x])
 
     def _query_quality(self, query: str, anchors: List[str]) -> Dict[str, Any]:
         q = (query or "").lower()
@@ -771,26 +805,35 @@ class TrustedSearch:
 
     def _build_domain_specific_queries(self, text: str) -> List[str]:
         """
-        Add small, claim-conditioned templates for high-yield biomedical retrieval.
-        Avoid hardcoding test-only values.
+        Build generic claim-level boosters from extracted phrases/anchors.
+        No claim-specific hardcoded templates.
         """
-        t = (text or "").lower()
-        queries: List[str] = []
-        has_fruit_veg = ("fruit" in t or "fruits" in t) and ("vegetable" in t or "vegetables" in t)
-        has_sat_fat = "saturated fat" in t or ("saturated" in t and "fat" in t)
-        has_ncd = "noncommunicable" in t or "ncd" in t
-        has_diabetes = "diabetes" in t
-        has_cancer = "cancer" in t
+        if not text:
+            return []
 
-        if has_fruit_veg and has_ncd:
-            queries.append('"fruit and vegetable intake" "noncommunicable disease" risk reduction')
-        if has_sat_fat:
-            queries.append('"saturated fat intake" "cardiometabolic risk"')
-        if has_sat_fat and has_diabetes:
-            queries.append('"saturated fat" diabetes risk meta-analysis')
-        if has_sat_fat and has_cancer:
-            queries.append('"saturated fat" cancer risk systematic review')
-        return dedupe_list(queries)
+        anchors = self._extract_subclaim_anchors(text, entities=[])
+        if not anchors:
+            return []
+
+        phrase_anchors = [a for a in anchors if " " in a and not any(ch.isdigit() for ch in a)]
+        term_anchors = [a for a in anchors if " " not in a and not any(ch.isdigit() for ch in a)]
+        number_anchors = [a for a in anchors if any(ch.isdigit() for ch in a)]
+
+        core_terms: List[str] = []
+        for p in phrase_anchors[:2]:
+            core_terms.append(f'"{p}"')
+        core_terms.extend(term_anchors[:3])
+        core_terms.extend(number_anchors[:1])
+        core_terms = core_terms[:6]
+        if not core_terms:
+            return []
+
+        constraints = self._subclaim_intent_constraints(text)
+        queries = [
+            " ".join(core_terms + [constraints[0]]).strip(),
+            " ".join(core_terms + [constraints[1]]).strip() if len(constraints) > 1 else "",
+        ]
+        return dedupe_list([self._sanitize_query(q) for q in queries if q])
 
     async def reformulate_queries(
         self,
@@ -808,6 +851,14 @@ class TrustedSearch:
 
         direct_query = self._build_direct_query(text, entities=entities)
         key_terms, key_numbers = self._collect_key_terms(texts=[text] + subclaims, entities=entities)
+
+        if self.llm_client is None:
+            logger.info("[TrustedSearch] LLM unavailable; using fallback reformulation only")
+            fallback = self._fallback_queries(text, failed_entities)
+            fallback = [self._sanitize_query(q) for q in fallback if q]
+            merged = [direct_query] + fallback if direct_query else fallback
+            filtered = self._filter_queries(merged, key_terms, key_numbers)
+            return dedupe_list(filtered)
 
         prompt = f"""
 {QUERY_REFORMULATION_PROMPT}
@@ -1227,8 +1278,6 @@ FAILED ENTITIES:
         if subclaims is None:
             subclaims = AdaptiveTrustPolicy().decompose_claim(post_text)
         merged_subclaims = self.merge_subclaims(subclaims or [])
-        claim_lower = (post_text or "").lower()
-        claim_has_lemon_water = ("lemon" in claim_lower) and ("water" in claim_lower)
 
         key_terms, key_numbers = self._collect_key_terms(texts=[post_text] + merged_subclaims, entities=entities)
 
@@ -1240,18 +1289,9 @@ FAILED ENTITIES:
         required_per_subclaim: List[str] = []
 
         for idx, sub in enumerate(merged_subclaims):
-            sub_query_text = sub
             anchors = self._extract_subclaim_anchors(sub, entities=entities)
             required_query_for_subclaim = ""
-            if claim_has_lemon_water and re.search(
-                r"\b(liver|detox|detoxifies|detoxification|metabolism|metabolic)\b", sub
-            ):
-                if "lemon water" not in anchors:
-                    anchors = ["lemon water"] + anchors
-                if "lemon water" not in sub.lower():
-                    sub_query_text = f"lemon water {sub}"
-
-            sub_anchor_queries = self._build_subclaim_anchor_queries(sub_query_text, entities=entities)
+            sub_anchor_queries = self._build_subclaim_anchor_queries(sub, entities=entities)
             for aq in sub_anchor_queries:
                 if self._passes_query_quality(aq, anchors):
                     if not required_query_for_subclaim:

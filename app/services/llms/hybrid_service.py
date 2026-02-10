@@ -72,6 +72,28 @@ def _env_reserved_verdict_calls() -> int:
         return 1
 
 
+def _env_reserved_fact_calls() -> int:
+    try:
+        return max(0, int(os.getenv("GROQ_RESERVED_FACT_EXTRACTION_CALLS", "1")))
+    except Exception:
+        return 1
+
+
+def _reserved_call_budget(max_calls: int) -> tuple[int, int]:
+    """
+    Compute reserved call slots for critical stages.
+
+    Keep at least one non-reserved slot when budgets are very small so
+    query planning can still happen before critical stages.
+    """
+    safe_max = max(1, int(max_calls or 1))
+    reserved_verdict = min(_env_reserved_verdict_calls(), safe_max)
+    non_verdict_capacity = max(0, safe_max - reserved_verdict)
+    fact_cap = max(0, non_verdict_capacity - 1)
+    reserved_fact = min(_env_reserved_fact_calls(), fact_cap)
+    return reserved_verdict, reserved_fact
+
+
 def reset_groq_counter(job_id: str | None = None, max_calls: int | None = None) -> None:
     """Reset per-job Groq counters and degradation metadata."""
     state = GroqJobState(
@@ -97,12 +119,15 @@ def get_groq_job_metadata() -> Dict[str, Any]:
     """Get per-job Groq limiter/degradation metadata."""
     state = _groq_job_state.get()
     skipped = sorted(state.skipped_calls, key=lambda t: _DEGRADE_ORDER.get(t, 99))
+    reserved_verdict_calls, reserved_fact_calls = _reserved_call_budget(state.max_calls)
     return {
         "job_id": state.job_id,
         "groq_calls_used": state.calls_used,
         "groq_calls_max": state.max_calls,
         "allow_groq_burst": state.burst_enabled,
-        "reserved_verdict_calls": _env_reserved_verdict_calls(),
+        "reserved_verdict_calls": reserved_verdict_calls,
+        "reserved_fact_extraction_calls": reserved_fact_calls,
+        "reserved_critical_calls_total": reserved_verdict_calls + reserved_fact_calls,
         "degraded_mode": state.degraded_mode,
         "skipped_calls": skipped,
         "fallback_to_local": state.fallback_to_local,
@@ -170,17 +195,40 @@ class HybridLLMService:
         if state.calls_used >= state.max_calls:
             return False, state.calls_used, state.max_calls, "hard_cap"
 
-        # Keep one high-priority slot for verdict synthesis by default.
-        reserved_for_verdict = min(_env_reserved_verdict_calls(), state.max_calls)
-        is_verdict_call = (call_tag or "").strip().lower() == "verdict_generation"
+        reserved_for_verdict, reserved_for_fact = _reserved_call_budget(state.max_calls)
+        reserve_pool = reserved_for_verdict + reserved_for_fact
+        tag = (call_tag or "").strip().lower()
+        is_verdict_call = tag == "verdict_generation"
+        is_fact_extraction_call = tag == "fact_extraction"
         remaining = state.max_calls - state.calls_used
-        if not is_verdict_call and remaining <= reserved_for_verdict:
+        if not is_verdict_call and not is_fact_extraction_call and remaining <= reserve_pool:
             logger.warning(
-                "[HybridLLMService] Preserving reserved verdict slot for job=%s " "(used=%d/%d, priority=%s, tag=%s)",
+                "[HybridLLMService] Preserving critical reserved slots for job=%s "
+                "(used=%d/%d, remaining=%d, reserve_pool=%d, verdict_reserved=%d, "
+                "fact_reserved=%d, priority=%s, tag=%s)",
                 state.job_id,
                 state.calls_used,
                 state.max_calls,
+                remaining,
+                reserve_pool,
+                reserved_for_verdict,
+                reserved_for_fact,
                 priority.value,
+                call_tag or "unknown",
+            )
+            reason = "reserved_for_verdict" if reserved_for_fact <= 0 else "reserved_for_critical"
+            return False, state.calls_used, state.max_calls, reason
+
+        # Fact extraction can use its own reserved pool, but must preserve verdict slot(s).
+        if is_fact_extraction_call and remaining <= reserved_for_verdict:
+            logger.warning(
+                "[HybridLLMService] Preserving reserved verdict slot(s) for job=%s "
+                "(used=%d/%d, remaining=%d, verdict_reserved=%d, tag=%s)",
+                state.job_id,
+                state.calls_used,
+                state.max_calls,
+                remaining,
+                reserved_for_verdict,
                 call_tag or "unknown",
             )
             return False, state.calls_used, state.max_calls, "reserved_for_verdict"
@@ -260,6 +308,8 @@ class HybridLLMService:
                 return self._mark_degraded_skip(call_tag or "non_critical")
             if budget_reason == "reserved_for_verdict":
                 raise RuntimeError("Groq budget reserved for verdict generation")
+            if budget_reason == "reserved_for_critical":
+                raise RuntimeError("Groq budget reserved for fact extraction and verdict generation")
             raise RuntimeError("Groq quota exceeded and no fallback available for critical call")
 
         # Try Groq first

@@ -65,9 +65,12 @@ class LexicalIndex:
                     ),
                 )
 
-    def search(self, query: str, topics: List[str], limit: int = LEXICAL_BM25_LIMIT) -> List[Dict[str, Any]]:
-        if not query or not topics:
+    def search(
+        self, query: str, topics: List[str] | None = None, limit: int = LEXICAL_BM25_LIMIT
+    ) -> List[Dict[str, Any]]:
+        if not query:
             return []
+        topics = topics or []
 
         # FTS5 cannot parse raw punctuation like commas; sanitize input
         safe_query = re.sub(r"[^\w\s]", " ", query.lower())
@@ -75,14 +78,22 @@ class LexicalIndex:
         if not safe_query:
             return []
 
-        placeholders = ",".join("?" for _ in topics)
-        sql = (
-            "SELECT fact_id, bm25(facts_fts) as score "
-            "FROM facts_fts WHERE facts_fts MATCH ? "
-            f"AND topic IN ({placeholders}) "
-            "ORDER BY score LIMIT ?"
-        )
-        params = [safe_query] + topics + [limit]
+        if topics:
+            placeholders = ",".join("?" for _ in topics)
+            sql = (
+                "SELECT fact_id, bm25(facts_fts) as score "
+                "FROM facts_fts WHERE facts_fts MATCH ? "
+                f"AND topic IN ({placeholders}) "
+                "ORDER BY score LIMIT ?"
+            )
+            params = [safe_query] + topics + [limit]
+        else:
+            sql = (
+                "SELECT fact_id, bm25(facts_fts) as score "
+                "FROM facts_fts WHERE facts_fts MATCH ? "
+                "ORDER BY score LIMIT ?"
+            )
+            params = [safe_query, limit]
 
         with self._connect() as conn:
             rows = conn.execute(sql, params).fetchall()

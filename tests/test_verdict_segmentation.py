@@ -171,3 +171,78 @@ def test_parse_verdict_result_flips_valid_when_supporting_fact_negates_claim():
 
     out = vg._parse_verdict_result(llm_result, claim, evidence)
     assert out["claim_breakdown"][0]["status"] in {"INVALID", "PARTIALLY_INVALID"}
+
+
+@pytest.mark.asyncio
+async def test_segment_retrieval_falls_back_without_topics():
+    vg = _vg()
+
+    class _NoTopicClassifier:
+        async def classify(self, segment, entities, context):  # noqa: ANN001, ANN201
+            return [], 0.0
+
+    class _RecordingRetriever:
+        def __init__(self) -> None:
+            self.last_topics = "unset"
+
+        async def search(self, query, top_k=2, topics=None):  # noqa: ANN001, ANN201
+            self.last_topics = topics
+            return [
+                {"statement": "Liver and kidneys naturally remove waste products.", "source_url": "https://nih.gov"}
+            ]
+
+    retriever = _RecordingRetriever()
+    vg.topic_classifier = _NoTopicClassifier()
+    vg.vdb_retriever = retriever
+
+    out = await vg._retrieve_segment_evidence_for_segments(
+        ["The body cleanses itself through the liver and kidneys."],
+        top_k=2,
+        max_segments=1,
+    )
+    assert out
+    assert retriever.last_topics is None
+
+
+def test_evidence_score_penalizes_reporting_language():
+    vg = _vg()
+    direct = vg._evidence_score(
+        {
+            "statement": "A randomized trial found no evidence that routine detoxes improve liver function.",
+            "final_score": 0.8,
+        }
+    )
+    reporting = vg._evidence_score(
+        {
+            "statement": "Some articles claim detox practices eliminate toxins from the body.",
+            "final_score": 0.8,
+        }
+    )
+    assert reporting < direct
+
+
+def test_normalize_evidence_map_neutralizes_reporting_statement():
+    vg = _vg()
+    claim = "Detox practices are scientifically supported."
+    evidence = [
+        {
+            "statement": "Some reports claim detox practices eliminate toxins.",
+            "source_url": "https://example.org/report",
+            "final_score": 0.9,
+            "anchor_match_score": 0.9,
+        }
+    ]
+    evidence_map = [
+        {
+            "evidence_id": 0,
+            "statement": "Some reports claim detox practices eliminate toxins.",
+            "relevance": "SUPPORTS",
+            "relevance_score": 0.9,
+            "source_url": "https://example.org/report",
+        }
+    ]
+
+    normalized = vg._normalize_evidence_map(claim, evidence_map, evidence)
+    assert normalized
+    assert normalized[0]["relevance"] == "NEUTRAL"
+    assert normalized[0]["relevance_score"] < 0.5

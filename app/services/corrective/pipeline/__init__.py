@@ -24,6 +24,7 @@ This approach MAXIMIZES quota efficiency by:
     - Never wasting API calls on unused queries
 """
 
+import os
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -538,8 +539,25 @@ class CorrectivePipeline:
                 **adaptive_payload,
             }
 
-        # Get already-processed URLs from VDB to avoid re-scraping
-        already_processed_urls = self.vdb_ingest.get_processed_urls()
+        # Get already-processed URLs from VDB to avoid re-scraping.
+        # Scope by inferred topics and cap size to avoid stale/shared namespace contamination.
+        try:
+            max_vdb_url_skip = max(5, int(os.getenv("PIPELINE_MAX_VDB_URL_SKIP", "30")))
+        except Exception:
+            max_vdb_url_skip = 30
+        already_processed_urls = self.vdb_ingest.get_processed_urls(
+            topics=claim_topics,
+            max_urls=max_vdb_url_skip + 1,
+        )
+        if len(already_processed_urls) > max_vdb_url_skip:
+            logger.warning(
+                "[CorrectivePipeline:%s] Processed URL set exceeded cap (%d > %d); "
+                "disabling VDB URL-skip filter for this run to avoid stale/shared namespace leakage",
+                round_id,
+                len(already_processed_urls),
+                max_vdb_url_skip,
+            )
+            already_processed_urls = set()
         logger.info(
             f"[CorrectivePipeline:{round_id}] Found {len(already_processed_urls)} " "already-processed URLs in VDB"
         )
@@ -923,6 +941,19 @@ class CorrectivePipeline:
             "should",
             "would",
             "will",
+            "through",
+            "itself",
+            "scientifically",
+            "supported",
+            "support",
+            "supports",
+            "claim",
+            "claims",
+            "reported",
+            "reports",
+            "search",
+            "searched",
+            "updated",
         }
 
         def _fallback_entities(text: str) -> List[str]:
@@ -965,6 +996,8 @@ class CorrectivePipeline:
                 "according",
                 "significantly",
                 "significant",
+                "scientifically",
+                "supported",
                 "every",
                 "morning",
                 "drinking",
@@ -972,11 +1005,21 @@ class CorrectivePipeline:
                 "improve",
                 "research",
                 "medical",
+                "through",
+                "itself",
+                "claim",
+                "claims",
+                "reported",
+                "reports",
+                "search",
+                "searched",
+                "updated",
             }
             tokens = [t.lower() for t in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", text)]
             tokens = [t for t in tokens if t not in stop]
             tokens = [t for t in tokens if t not in junk]
             tokens = [t for t in tokens if t not in negation_or_verbs]
+            tokens = [t for t in tokens if not t.endswith("ly")]
             freq: dict[str, int] = {}
             for t in tokens:
                 freq[t] = freq.get(t, 0) + 1

@@ -54,29 +54,30 @@ async def retrieve_candidates(
     query_embeddings: List[List[float]] = []
 
     if not topics:
-        logger.warning(f"[RetrievalPhase:{round_id}] No topics provided; skipping VDB retrieval.")
+        logger.warning(
+            f"[RetrievalPhase:{round_id}] No topics provided; using no-topic fallback for VDB/BM25 retrieval."
+        )
 
     for q in queries:
-        if topics:
-            try:
-                sem_res = await vdb_retriever.search(q, top_k=top_k, topics=topics)
-                semantic_candidates.extend(sem_res or [])
-            except Exception as e:
-                logger.warning(f"[RetrievalPhase:{round_id}] VDB retrieval failed for query='{q}': {e}")
+        try:
+            sem_res = await vdb_retriever.search(q, top_k=top_k, topics=topics or None)
+            semantic_candidates.extend(sem_res or [])
+        except Exception as e:
+            logger.warning(f"[RetrievalPhase:{round_id}] VDB retrieval failed for query='{q}': {e}")
 
-                if log_manager:
-                    await log_manager.add_log(
-                        level="WARNING",
-                        message=f"VDB retrieval failed for query: {q}",
-                        module=__name__,
-                        request_id=f"claim-{round_id}",
-                        round_id=round_id,
-                        context={"query": q, "error": str(e)},
-                    )
+            if log_manager:
+                await log_manager.add_log(
+                    level="WARNING",
+                    message=f"VDB retrieval failed for query: {q}",
+                    module=__name__,
+                    request_id=f"claim-{round_id}",
+                    round_id=round_id,
+                    context={"query": q, "error": str(e)},
+                )
 
-        if lexical_index and topics:
+        if lexical_index:
             try:
-                bm25_hits = lexical_index.search(q, topics=topics)
+                bm25_hits = lexical_index.search(q, topics=topics or None)
                 for hit in bm25_hits:
                     fact_id = hit.get("fact_id")
                     bm25 = float(hit.get("bm25") or 0.0)
@@ -98,7 +99,7 @@ async def retrieve_candidates(
                     )
 
     # Re-rank BM25 shortlist with Pinecone vectors (if available)
-    if bm25_ids and topics:
+    if bm25_ids:
         try:
             if queries and not query_embeddings:
                 try:

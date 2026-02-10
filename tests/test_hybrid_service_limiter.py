@@ -20,6 +20,7 @@ async def test_groq_never_exceeds_per_job_limit(monkeypatch):
     monkeypatch.setenv("ALLOW_GROQ_BURST", "false")
     monkeypatch.setenv("GROQ_MAX_CALLS_PER_JOB", "2")
     monkeypatch.setenv("GROQ_RESERVED_VERDICT_CALLS", "0")
+    monkeypatch.setenv("GROQ_RESERVED_FACT_EXTRACTION_CALLS", "0")
     monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
 
     fake = _FakeGroqService()
@@ -113,3 +114,37 @@ async def test_call_tag_specific_max_tokens_are_forwarded(monkeypatch):
 
     assert fake.max_tokens_seen[0] == LLM_MAX_TOKENS_QUERY_REFORMULATION
     assert fake.max_tokens_seen[1] == LLM_MAX_TOKENS_VERDICT_GENERATION
+
+
+@pytest.mark.asyncio
+async def test_fact_extraction_can_use_reserved_critical_pool(monkeypatch):
+    monkeypatch.setenv("ALLOW_GROQ_BURST", "false")
+    monkeypatch.setenv("GROQ_MAX_CALLS_PER_JOB", "4")
+    monkeypatch.setenv("GROQ_RESERVED_VERDICT_CALLS", "1")
+    monkeypatch.setenv("GROQ_RESERVED_FACT_EXTRACTION_CALLS", "1")
+    monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
+
+    fake = _FakeGroqService()
+    monkeypatch.setattr(hybrid_module, "GroqService", lambda: fake)
+
+    svc = hybrid_module.HybridLLMService()
+    hybrid_module.reset_groq_counter(job_id="job-critical", max_calls=4)
+
+    await svc.ainvoke("q1", priority=hybrid_module.LLMPriority.HIGH, call_tag="query_reformulation")
+    await svc.ainvoke("q2", priority=hybrid_module.LLMPriority.HIGH, call_tag="query_reformulation")
+    with pytest.raises(RuntimeError, match="reserved for fact extraction and verdict"):
+        await svc.ainvoke("q3", priority=hybrid_module.LLMPriority.HIGH, call_tag="query_reformulation")
+
+    # Fact extraction remains allowed from reserved critical budget.
+    result = await svc.ainvoke(
+        "facts",
+        response_format="json",
+        priority=hybrid_module.LLMPriority.LOW,
+        call_tag="fact_extraction",
+    )
+    assert isinstance(result, dict)
+    await svc.ainvoke("verdict", priority=hybrid_module.LLMPriority.HIGH, call_tag="verdict_generation")
+
+    meta = hybrid_module.get_groq_job_metadata()
+    assert meta["reserved_fact_extraction_calls"] == 1
+    assert fake.calls == 4

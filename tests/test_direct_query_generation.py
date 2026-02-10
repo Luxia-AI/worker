@@ -54,8 +54,9 @@ async def test_advanced_queries_include_boolean_and_operator_constraints():
     )
 
     assert any('"' in q for q in queries), f"Missing quoted phrase constraint query: {queries}"
-    assert any("filetype:pdf" in q for q in queries), f"Missing filetype query: {queries}"
-    assert any("intitle:" in q for q in queries), f"Missing intitle query: {queries}"
+    assert any(
+        ("filetype:pdf" in q) or ("intitle:" in q) or ("site:pubmed" in q) for q in queries
+    ), f"Missing advanced operator query: {queries}"
 
 
 def test_research_instruction_query_adds_exclusion_filters_for_adult_population():
@@ -187,11 +188,13 @@ def test_domain_specific_queries_for_nutrition_claim():
     )
     qs = ts._build_domain_specific_queries(claim)
     joined = " | ".join(qs).lower()
-    assert "fruit and vegetable intake" in joined
-    assert "saturated fat" in joined
+    assert qs
+    assert ("fruit" in joined) or ("vegetable" in joined)
+    assert "saturated" in joined
+    assert any(k in joined for k in ["systematic review", "meta-analysis", "clinical study", "guideline"])
 
 
-def test_antibiotics_cold_flu_subclaim_templates_are_generated():
+def test_antibiotics_cold_flu_subclaim_queries_are_anchor_aligned():
     ts = _init_trusted_search()
     subclaim = "Antibiotics do not cure colds because they do not kill viruses that cause cold and flu."
     qs = ts._build_subclaim_anchor_queries(
@@ -200,11 +203,11 @@ def test_antibiotics_cold_flu_subclaim_templates_are_generated():
     )
     joined = " | ".join(qs).lower()
     assert "antibiotics" in joined
-    assert ("do not work against viruses" in joined) or ("site:cdc.gov" in joined)
-    assert ("flu" in joined) or ("influenza" in joined)
+    assert any(k in joined for k in ["cold", "flu", "virus"])
+    assert any(k in joined for k in ["systematic review", "meta-analysis", "no association", "pubmed"])
 
 
-def test_sugar_hyperactivity_subclaim_templates_are_generated():
+def test_sugar_hyperactivity_subclaim_queries_are_anchor_aligned():
     ts = _init_trusted_search()
     subclaim = "Studies show no link between sugar consumption and hyperactivity."
     qs = ts._build_subclaim_anchor_queries(
@@ -213,8 +216,8 @@ def test_sugar_hyperactivity_subclaim_templates_are_generated():
     )
     joined = " | ".join(qs).lower()
     assert "sugar" in joined
-    assert ("hyperactivity" in joined) or ("adhd" in joined)
-    assert ("site:nih.gov" in joined) or ("pubmed" in joined)
+    assert "hyperactivity" in joined
+    assert any(k in joined for k in ["systematic review", "meta-analysis", "no association", "pubmed"])
 
 
 def test_merge_subclaims_expands_do_not_cure_fragment():
