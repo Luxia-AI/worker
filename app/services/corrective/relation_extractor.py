@@ -63,12 +63,22 @@ class RelationExtractor:
             "causes",
             "caused",
             "causing",
+            "contribute",
+            "contributes",
+            "contributed",
+            "contributing",
             "induce",
             "induces",
             "induced",
             "trigger",
             "triggers",
             "triggered",
+            "result in",
+            "results in",
+            "resulted in",
+            "lead to",
+            "leads to",
+            "led to",
             "associate",
             "associated",
             "association",
@@ -76,8 +86,6 @@ class RelationExtractor:
             "link",
             "increase risk",
             "increases risk",
-            "lead to",
-            "leads to",
         }
         return any(marker in rel for marker in causal_markers)
 
@@ -95,6 +103,12 @@ class RelationExtractor:
     def _negated_relation_label(self, relation: str) -> Optional[str]:
         rel = self._normalize_relation(relation)
         if "cause" in rel:
+            return "does_not_cause"
+        if "contribut" in rel:
+            return "does_not_cause"
+        if "lead to" in rel:
+            return "does_not_cause"
+        if "result in" in rel:
             return "does_not_cause"
         if "associat" in rel:
             return "not_associated_with"

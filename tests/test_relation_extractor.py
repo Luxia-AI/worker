@@ -42,3 +42,10 @@ def test_negation_guard_drops_unmapped_negated_relation():
     statement = "There is no evidence of a causal link between vaccines and autism."
     relation = ex._apply_negation_guard(statement, "induces pathology in")
     assert relation is None
+
+
+def test_negation_guard_maps_contributes_to_into_negative_causal_relation():
+    ex = _make_extractor()
+    statement = "Large studies show vaccines do not cause autism."
+    relation = ex._apply_negation_guard(statement, "contributes to")
+    assert relation == "does_not_cause"

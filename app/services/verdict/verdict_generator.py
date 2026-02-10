@@ -342,7 +342,7 @@ class VerdictGenerator:
                 merged_with_web.sort(key=self._deterministic_evidence_sort_key)
                 pre_evidence = merged_with_web[: min(len(merged_with_web), 18)]
         pre_evidence.sort(key=self._deterministic_evidence_sort_key)
-        top_evidence = pre_evidence[: min(len(pre_evidence), top_k, 12)]
+        top_evidence = self._select_balanced_top_evidence(claim, pre_evidence, top_k=min(top_k, 12))
 
         # Format evidence for prompt
         evidence_text = self._format_evidence_for_prompt(top_evidence)
@@ -369,43 +369,69 @@ class VerdictGenerator:
                 f"(confidence: {verdict_result['confidence']:.2f})"
             )
 
-            # If UNKNOWN segments remain, iterate a couple times (bounded) to avoid UNKNOWN
-            if not used_web_search and not cache_sufficient:
-                for _ in range(self.MAX_UNKNOWN_ROUNDS_POST_VERDICT):
+            # If UNKNOWN segments remain, run bounded targeted recovery rounds.
+            # Efficient strategy: try segment-targeted VDB retrieval first, then
+            # do a minimal web pass only if required.
+            if not cache_sufficient:
+                unknown_round_budget = self.MAX_UNKNOWN_ROUNDS_POST_VERDICT if not used_web_search else 1
+                for _ in range(max(1, unknown_round_budget)):
                     unknown_segments = self._get_unknown_segments(verdict_result)
                     if not unknown_segments:
                         break
                     logger.info(
-                        f"[VerdictGenerator] Found {len(unknown_segments)} UNKNOWN segments, fetching web evidence..."
+                        "[VerdictGenerator] Found %d UNKNOWN segments, running targeted recovery...",
+                        len(unknown_segments),
                     )
-                    web_evidence = await self._fetch_web_evidence_for_unknown_segments(unknown_segments)
-                    if web_evidence:
-                        logger.info(f"[VerdictGenerator] Retrieved {len(web_evidence)} additional facts from web")
-                        # Merge web evidence with existing evidence
-                        enriched_evidence = top_evidence + web_evidence
-                        # Re-run verdict generation with additional evidence
-                        enriched_evidence_text = self._format_evidence_for_prompt(enriched_evidence)
-                        enriched_prompt = VERDICT_GENERATION_PROMPT.format(
-                            claim=claim, evidence_text=enriched_evidence_text
-                        )
 
-                        try:
-                            enriched_result = await self.llm_service.ainvoke(
-                                enriched_prompt,
-                                response_format="json",
-                                priority=LLMPriority.HIGH,
-                                temperature=LLM_TEMPERATURE_VERDICT,
-                                call_tag="verdict_generation",
-                            )
-                            verdict_result = self._parse_verdict_result(enriched_result, claim, enriched_evidence)
+                    candidate_boost = await self._retrieve_segment_evidence_for_segments(unknown_segments, top_k=2)
+                    if candidate_boost:
+                        logger.info(
+                            "[VerdictGenerator] Retrieved %d targeted facts from VDB for UNKNOWN segments",
+                            len(candidate_boost),
+                        )
+                    else:
+                        web_evidence = await self._fetch_web_evidence_for_unknown_segments(
+                            unknown_segments,
+                            max_queries_per_segment=1 if used_web_search else 2,
+                            max_urls_per_query=1 if used_web_search else 3,
+                        )
+                        candidate_boost = web_evidence
+                        if web_evidence:
                             logger.info(
-                                f"[VerdictGenerator] Re-generated verdict with web evidence: "
-                                f"{verdict_result['verdict']} "
-                                f"(confidence: {verdict_result['confidence']:.2f})"
+                                "[VerdictGenerator] Retrieved %d additional facts from targeted web search",
+                                len(web_evidence),
                             )
-                        except Exception as e:
-                            logger.warning(f"[VerdictGenerator] Failed to re-generate verdict with web evidence: {e}")
-                            break
+
+                    if not candidate_boost:
+                        logger.info(
+                            "[VerdictGenerator] No additional targeted evidence found for UNKNOWN segments; stopping."
+                        )
+                        break
+
+                    enriched_evidence = self._merge_evidence(top_evidence, candidate_boost)
+                    top_evidence = self._select_balanced_top_evidence(claim, enriched_evidence, top_k=min(top_k, 12))
+                    enriched_evidence_text = self._format_evidence_for_prompt(top_evidence)
+                    enriched_prompt = VERDICT_GENERATION_PROMPT.format(
+                        claim=claim, evidence_text=enriched_evidence_text
+                    )
+
+                    try:
+                        enriched_result = await self.llm_service.ainvoke(
+                            enriched_prompt,
+                            response_format="json",
+                            priority=LLMPriority.HIGH,
+                            temperature=LLM_TEMPERATURE_VERDICT,
+                            call_tag="verdict_generation",
+                        )
+                        verdict_result = self._parse_verdict_result(enriched_result, claim, top_evidence)
+                        logger.info(
+                            "[VerdictGenerator] Re-generated verdict after targeted recovery: %s (confidence: %.2f)",
+                            verdict_result["verdict"],
+                            verdict_result["confidence"],
+                        )
+                    except Exception as e:
+                        logger.warning(f"[VerdictGenerator] Failed to re-generate verdict with targeted evidence: {e}")
+                        break
 
             return verdict_result
 
@@ -629,6 +655,7 @@ class VerdictGenerator:
         self._log_subclaim_coverage(claim, evidence, claim_breakdown)
         reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
         verdict_str = reconciled["verdict"]
+        rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
         if llm_verdict == Verdict.TRUE.value and verdict_str != Verdict.TRUE.value:
             try:
                 truthfulness_percent = min(float(truthfulness_percent), 89.9)
@@ -660,6 +687,90 @@ class VerdictGenerator:
         if total <= 0:
             return 0.0
         return max(0.0, min(1.0, matched / total))
+
+    def _segment_topic_guard_ok(self, segment: str, statement: str) -> bool:
+        seg = (segment or "").lower()
+        stmt = (statement or "").lower()
+        seg_has_vaccine = any(t in seg for t in ["vaccine", "vaccines", "vaccination"])
+        seg_has_flu = any(t in seg for t in ["flu", "influenza"])
+        if seg_has_vaccine and seg_has_flu:
+            stmt_has_vaccine = any(t in stmt for t in ["vaccine", "vaccines", "vaccination"])
+            stmt_has_flu = any(t in stmt for t in ["flu", "influenza"])
+            return stmt_has_vaccine and stmt_has_flu
+        return True
+
+    @staticmethod
+    def _evidence_score(ev: Dict[str, Any]) -> float:
+        score = ev.get("final_score")
+        if score is None:
+            score = ev.get("score")
+        if score is None:
+            score = ev.get("sem_score")
+        try:
+            return float(score or 0.0)
+        except Exception:
+            return 0.0
+
+    def _select_balanced_top_evidence(
+        self, claim: str, evidence: List[Dict[str, Any]], top_k: int
+    ) -> List[Dict[str, Any]]:
+        if not evidence:
+            return []
+        candidates = [ev for ev in evidence if (ev.get("statement") or ev.get("text"))]
+        if not candidates:
+            return []
+        candidates = sorted(candidates, key=self._deterministic_evidence_sort_key)
+
+        segments = self._split_claim_into_segments(claim)
+        selected: List[Dict[str, Any]] = []
+        seen: set[str] = set()
+
+        def _add(ev: Dict[str, Any]) -> None:
+            key = self._normalize_statement_key(str(ev.get("statement") or ev.get("text") or ""))
+            if key and key not in seen:
+                seen.add(key)
+                selected.append(ev)
+
+        # First pass: guarantee per-segment representation when possible.
+        for segment in segments:
+            best_ev: Optional[Dict[str, Any]] = None
+            best_score = -1.0
+            for ev in candidates:
+                if str(ev.get("stance", "neutral") or "neutral").lower() == "contradicts":
+                    continue
+                stmt = str(ev.get("statement") or ev.get("text") or "")
+                if not self._segment_topic_guard_ok(segment, stmt):
+                    continue
+                anchor_eval = evaluate_anchor_match(segment, stmt)
+                if not bool(anchor_eval.get("anchor_ok", False)):
+                    continue
+                score = (0.75 * self._evidence_score(ev)) + (
+                    0.25 * float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
+                )
+                if score > best_score:
+                    best_score = score
+                    best_ev = ev
+            if best_ev is not None:
+                _add(best_ev)
+            if len(selected) >= top_k:
+                return selected[:top_k]
+
+        # Second pass: fill with strongest non-contradicting evidence.
+        for ev in candidates:
+            if str(ev.get("stance", "neutral") or "neutral").lower() == "contradicts":
+                continue
+            _add(ev)
+            if len(selected) >= top_k:
+                break
+
+        # Fallback: if everything is contradicting, use deterministic top-ranked.
+        if not selected:
+            for ev in candidates:
+                _add(ev)
+                if len(selected) >= top_k:
+                    break
+
+        return selected[:top_k]
 
     def _normalize_evidence_map(
         self,
@@ -722,6 +833,8 @@ class VerdictGenerator:
                 statement = (em.get("statement") or "").strip()
                 if not statement:
                     continue
+                if not self._segment_topic_guard_ok(segment, statement):
+                    continue
                 anchor_eval = evaluate_anchor_match(segment, statement)
                 if not bool(anchor_eval.get("anchor_ok", False)):
                     continue
@@ -742,6 +855,8 @@ class VerdictGenerator:
                     if not statement:
                         continue
                     if seg_q and seg_q not in segment.lower():
+                        continue
+                    if not self._segment_topic_guard_ok(segment, statement):
                         continue
                     anchor_eval = evaluate_anchor_match(segment, statement)
                     if not bool(anchor_eval.get("anchor_ok", False)):
@@ -1019,6 +1134,37 @@ class VerdictGenerator:
             "matched_statuses": statuses,
         }
 
+    def _rewrite_rationale_from_breakdown(
+        self,
+        original_rationale: str,
+        claim_breakdown: List[Dict[str, Any]],
+        reconciled: Dict[str, Any],
+    ) -> str:
+        statuses = [str(item.get("status", "UNKNOWN") or "UNKNOWN").upper() for item in claim_breakdown]
+        valid_count = sum(1 for s in statuses if s in {"VALID", "PARTIALLY_VALID"})
+        invalid_count = sum(1 for s in statuses if s in {"INVALID", "PARTIALLY_INVALID"})
+        unknown_count = sum(1 for s in statuses if s == "UNKNOWN")
+        total = max(1, len(statuses))
+        verdict = str(reconciled.get("verdict", Verdict.UNVERIFIABLE.value))
+        unresolved = int(reconciled.get("unresolved_segments", unknown_count) or 0)
+
+        if unresolved > 0 or unknown_count > 0:
+            return (
+                f"Evidence supports {valid_count}/{total} segment(s), "
+                f"while {unknown_count} segment(s) remain unresolved. "
+                f"Verdict is {verdict} until segment-level evidence is complete."
+            )
+        if invalid_count > 0 and valid_count > 0:
+            return (
+                f"Evidence is mixed: {valid_count}/{total} segment(s) are supported and "
+                f"{invalid_count}/{total} are contradicted."
+            )
+        if invalid_count == total:
+            return "Evidence contradicts all required claim segments."
+        if valid_count == total and verdict == Verdict.TRUE.value:
+            return original_rationale or "Evidence supports all required claim segments."
+        return original_rationale or "Verdict is based on segment-level evidence evaluation."
+
     def _build_deterministic_claim_breakdown(self, claim: str, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Build a deterministic claim breakdown with meaningful segments.
@@ -1042,6 +1188,8 @@ class VerdictGenerator:
             for idx, ev in enumerate(evidence[:8]):
                 stmt = (ev.get("statement") or ev.get("text") or "").strip()
                 if not stmt:
+                    continue
+                if not self._segment_topic_guard_ok(seg, stmt):
                     continue
                 stmt_words = set(re.findall(r"\b\w+\b", stmt.lower()))
                 overlap = len(seg_words & stmt_words) / max(1, len(seg_words))
@@ -1194,6 +1342,8 @@ class VerdictGenerator:
             for ev in evidence[:8]:
                 stmt = (ev.get("statement") or ev.get("text") or "").strip()
                 if not stmt:
+                    continue
+                if not self._segment_topic_guard_ok(segment, stmt):
                     continue
 
                 s = ev.get("final_score")
@@ -1416,18 +1566,11 @@ class VerdictGenerator:
         logger.debug(f"[VerdictGenerator] Split claim into {len(filtered)} segments")
         return filtered
 
-    async def _retrieve_segment_evidence(self, claim: str, top_k: int = 2) -> List[Dict[str, Any]]:
-        """
-        Query VDB for each claim segment independently.
-
-        OPTIMIZATION: Reduced top_k from 3 to 2 per segment.
-        Uses max 3 segments to limit VDB queries.
-        """
-        segments = self._split_claim_into_segments(claim)
-
-        # OPTIMIZATION: Limit to max 3 segments to control VDB query count
-        segments = segments[:3]
-
+    async def _retrieve_segment_evidence_for_segments(
+        self, segments: List[str], top_k: int = 2, max_segments: int = 3
+    ) -> List[Dict[str, Any]]:
+        """Query VDB for specific segments independently and dedupe by statement."""
+        segments = [s for s in (segments or []) if s][:max_segments]
         all_segment_evidence: List[Dict[str, Any]] = []
         seen_statements: set = set()
 
@@ -1456,6 +1599,16 @@ class VerdictGenerator:
             f"{len(all_segment_evidence)} unique facts"
         )
         return all_segment_evidence
+
+    async def _retrieve_segment_evidence(self, claim: str, top_k: int = 2) -> List[Dict[str, Any]]:
+        """
+        Query VDB for each claim segment independently.
+
+        OPTIMIZATION: Reduced top_k from 3 to 2 per segment.
+        Uses max 3 segments to limit VDB queries.
+        """
+        segments = self._split_claim_into_segments(claim)
+        return await self._retrieve_segment_evidence_for_segments(segments, top_k=top_k, max_segments=3)
 
     @staticmethod
     def _normalize_statement_key(statement: str) -> str:
@@ -1519,7 +1672,12 @@ class VerdictGenerator:
 
         return unknown_segments
 
-    async def _fetch_web_evidence_for_unknown_segments(self, unknown_segments: List[str]) -> List[Dict[str, Any]]:
+    async def _fetch_web_evidence_for_unknown_segments(
+        self,
+        unknown_segments: List[str],
+        max_queries_per_segment: int = 2,
+        max_urls_per_query: int = 3,
+    ) -> List[Dict[str, Any]]:
         """Fetch web evidence for UNKNOWN claim segments."""
         all_web_evidence = []
 
@@ -1531,7 +1689,7 @@ class VerdictGenerator:
                 queries = await self.trusted_search.generate_search_queries(
                     post_text=segment,
                     failed_entities=[],
-                    max_queries=2,
+                    max_queries=max_queries_per_segment,
                     subclaims=[segment],
                     entities=[],
                 )
@@ -1539,7 +1697,7 @@ class VerdictGenerator:
                     logger.warning(f"[VerdictGenerator] No search queries generated for segment: {segment[:30]}...")
                     continue
 
-                for query in queries[:2]:
+                for query in queries[:max_queries_per_segment]:
                     logger.info(f"[VerdictGenerator] Using search query: '{query}'")
 
                     # Perform the search
@@ -1549,7 +1707,7 @@ class VerdictGenerator:
                         continue
 
                     # Extract facts from search results
-                    for result in search_results[:3]:  # Limit to 3 URLs per segment
+                    for result in search_results[:max_urls_per_query]:
                         url = result.get("url", "")
                         if not url:
                             continue

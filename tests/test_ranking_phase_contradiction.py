@@ -41,7 +41,7 @@ async def test_ranking_phase_penalizes_and_deprioritizes_contradicting_evidence(
         log_manager=None,
     )
 
-    assert len(ranked) == 2
+    # Contradicting evidence should be kept out of supporting top-k when
+    # non-contradicting evidence is available.
+    assert len(ranked) == 1
     assert ranked[0]["stance"] == "entails"
-    assert ranked[1]["stance"] == "contradicts"
-    assert ranked[1]["final_score"] < ranked[0]["final_score"]

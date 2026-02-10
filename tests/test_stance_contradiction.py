@@ -8,6 +8,13 @@ def test_dummy_stance_classifier_marks_may_cause_vs_do_not_cause_as_contradictio
     assert classifier.classify_stance(claim, evidence) == "contradicts"
 
 
+def test_dummy_stance_classifier_marks_contributes_to_vs_do_not_cause_as_contradiction():
+    classifier = DummyStanceClassifier()
+    claim = "Vaccines do not cause autism."
+    evidence = "Some claims say vaccines contribute to autism in infants."
+    assert classifier.classify_stance(claim, evidence) == "contradicts"
+
+
 def test_module_classify_stance_for_evidence_updates_items_in_place():
     module = TrustRankingModule()
     evidence = [

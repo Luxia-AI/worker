@@ -143,15 +143,19 @@ class DummyStanceClassifier:
         if not text:
             return []
 
+        causal_verb_group = (
+            r"(?:cause(?:s|d|ing)?|contribut(?:e|es|ed|ing)\s+to|lead(?:s|ing)?\s+to|result(?:s|ed|ing)?\s+in)"
+        )
+
         if negated:
             pattern = re.compile(
                 r"\b(?:do|does|did|can|could|may|might|must|should|would|will|is|are|was|were)?\s*"
-                r"(?:not|never|no)\s+cause(?:s|d|ing)?\s+([^.;:!?]+)",
+                r"(?:not|never|no)\s+" + causal_verb_group + r"\s+([^.;:!?]+)",
                 flags=re.IGNORECASE,
             )
             matches = [m.group(1) for m in pattern.finditer(text)]
         else:
-            pattern = re.compile(r"\bcause(?:s|d|ing)?\s+([^.;:!?]+)", flags=re.IGNORECASE)
+            pattern = re.compile(r"\b" + causal_verb_group + r"\s+([^.;:!?]+)", flags=re.IGNORECASE)
             matches = []
             for m in pattern.finditer(text):
                 prefix = text[max(0, m.start() - 20) : m.start()].lower()

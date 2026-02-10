@@ -237,3 +237,47 @@ def test_combined_valid_breakdown_is_rebuilt_to_two_subclaims_and_not_true():
     assert parsed["verdict"] == "PARTIALLY_TRUE"
     assert parsed["required_segments_resolved"] is False
     assert "UNKNOWN" in statuses
+    assert "unresolved" in parsed["rationale"].lower()
+
+
+def test_flu_segment_cannot_be_marked_valid_from_autism_only_evidence():
+    vg = _vg()
+    claim = "Vaccines do not cause autism or the flu."
+    evidence = [
+        {
+            "statement": "The data show that vaccines do not cause autism.",
+            "source_url": "https://www.statnews.com/example",
+            "final_score": 0.73,
+            "credibility": 0.9,
+        }
+    ]
+    llm_result = {
+        "verdict": "TRUE",
+        "confidence": 0.9,
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": "Vaccines do not cause autism",
+                "status": "VALID",
+                "supporting_fact": "The data show that vaccines do not cause autism.",
+                "source_url": "https://www.statnews.com/example",
+            },
+            {
+                "claim_segment": "Vaccines do not cause the flu",
+                "status": "VALID",
+                "supporting_fact": "The data show that vaccines do not cause autism.",
+                "source_url": "https://www.statnews.com/example",
+            },
+        ],
+        "evidence_map": [],
+        "key_findings": [],
+    }
+
+    parsed = vg._parse_verdict_result(llm_result, claim, evidence)
+    flu_item = next(
+        item
+        for item in parsed["claim_breakdown"]
+        if "flu" in str(item.get("claim_segment", "")).lower()
+        or "influenza" in str(item.get("claim_segment", "")).lower()
+    )
+    assert str(flu_item.get("status", "")).upper() == "UNKNOWN"

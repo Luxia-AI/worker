@@ -90,10 +90,11 @@ async def rank_candidates(
         )
     )
 
-    # Keep contradiction evidence available, but prioritize non-contradicting items in top-k.
+    # Keep contradiction evidence out of supporting top-k unless no non-contradicting
+    # candidates exist (degraded mode).
     non_contradicting = [r for r in ranked if (r.get("stance") or "neutral") != "contradicts"]
     contradicting = [r for r in ranked if (r.get("stance") or "neutral") == "contradicts"]
-    top_ranked = (non_contradicting + contradicting)[:top_k]
+    top_ranked = non_contradicting[:top_k] if non_contradicting else contradicting[:top_k]
 
     # Phase 2: Enrich with trust grades
     graded_results = TrustRanker.enrich_ranked_results(top_ranked)

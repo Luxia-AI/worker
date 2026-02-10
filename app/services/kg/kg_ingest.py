@@ -57,7 +57,15 @@ class KGIngest:
             return True
         if relation.startswith(("does_not_", "not_")):
             return False
-        causal_markers = ("cause", "associat", "link", "increase risk", "lead to")
+        causal_markers = (
+            "cause",
+            "contribut",
+            "associat",
+            "link",
+            "increase risk",
+            "lead to",
+            "result in",
+        )
         if not any(marker in relation for marker in causal_markers):
             return False
         statement = str(triple.get("source_statement", "") or "")
