@@ -468,12 +468,18 @@ class AdaptiveTrustPolicy:
                 return False
 
         if self.confidence_mode and evidence_count is not None and evidence_count >= self.MIN_EVIDENCE_COUNT:
-            if coverage >= self.COVERAGE_THRESHOLD_MEDIUM:
+            if (
+                coverage >= float(os.getenv("ADAPTIVE_CONFIDENCE_GATE_COVERAGE", "0.5"))
+                and diversity >= float(os.getenv("ADAPTIVE_CONFIDENCE_GATE_DIVERSITY", "0.3"))
+                and agreement >= self.AGREEMENT_THRESHOLD_HIGH
+            ):
                 logger.info(
-                    "Gating: PASS - confidence mode relaxed gate (count=%d coverage=%.2f diversity=%.2f)",
+                    "Gating: PASS - confidence mode relaxed gate "
+                    "(count=%d coverage=%.2f diversity=%.2f agreement=%.2f)",
                     evidence_count,
                     coverage,
                     diversity,
+                    agreement,
                 )
                 return True
 
@@ -546,7 +552,7 @@ class AdaptiveTrustPolicy:
         coverage = self.calculate_coverage(subclaims, top_evidence)
         diversity = self.calculate_diversity(top_evidence)
         agreement = self.calculate_agreement(top_evidence)
-        cov = compute_subclaim_coverage(subclaims, top_evidence, partial_weight=0.5)
+        cov = compute_subclaim_coverage(subclaims, top_evidence, partial_weight=self.PARTIAL_WEIGHT)
         details = cov.get("details", [])
         strong_covered = sum(1 for d in details if (d.get("status") or "").upper() == "STRONGLY_VALID")
         contradicted_count = sum(1 for d in details if bool(d.get("contradicted", False)))

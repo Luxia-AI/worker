@@ -128,6 +128,8 @@ class TrustedSearch:
         "does not",
         "not effective",
         "not recommended",
+        "don't work",
+        "won't help",
         "wont help",
         "ineffective",
     ]
@@ -703,6 +705,19 @@ class TrustedSearch:
             f"site:medlineplus.gov {a_term} {b_variants[0]} {negations[2]} {negatives}",
             f"site:nhs.uk {a_term} {b_variants[0]} {negations[2]} {negatives}",
         ]
+
+        # Real-world wording variants for common antibiotic-vs-virus claims.
+        if re.search(r"\bantibiotic[s]?\b", text_low) and re.search(r"\bvirus|viral|infection[s]?\b", text_low):
+            antibiotic_patterns = [
+                f"antibiotics do not treat viral infections {negatives}",
+                f"antibiotics not effective against viruses {negatives}",
+                f"antibiotics don't work for colds flu {negatives}",
+                f"antibiotics won't help viral infection {negatives}",
+                f"site:cdc.gov antibiotics viral infection {negatives}",
+                f"site:medlineplus.gov antibiotics virus {negatives}",
+                f"site:nhs.uk antibiotics viral infection {negatives}",
+            ]
+            queries = antibiotic_patterns + queries
 
         if len(b_variants) > 1 and len(queries) < max_queries:
             queries.append(f"{a_term} {negations[0]} {verb_variants[0]} {b_variants[1]} {negatives}")

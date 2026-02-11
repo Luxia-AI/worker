@@ -63,6 +63,7 @@ class EvidenceItem:
     stance: str = "neutral"  # "entails", "contradicts", "neutral"
     trust: float = 0.0  # Computed trust score
     score_components: Optional[Dict[str, float]] = None  # Breakdown of trust components
+    candidate_type: str = ""  # Optional source type (e.g., VDB, KG)
 
 
 @dataclass

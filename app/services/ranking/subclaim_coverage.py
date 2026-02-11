@@ -55,6 +55,19 @@ _GENERIC_WEAK_ANCHORS = {
     "association",
 }
 
+_ANTIBIOTIC_ANCHORS = {"antibiotic", "antibiotics", "antibacterial"}
+_VIRUS_ANCHORS = {"virus", "viruses", "viral", "viral infection"}
+_NEGATION_CUES = {
+    "do not",
+    "does not",
+    "not effective",
+    "won't",
+    "will not",
+    "ineffective",
+    "do not treat",
+    "does not treat",
+}
+
 
 def _tokens(text: str) -> List[str]:
     toks = [w for w in re.findall(r"\b[\w\-]+\b", (text or "").lower()) if w and w not in _STOP_WORDS]
@@ -184,6 +197,32 @@ def _contains_any(text: str, terms: Sequence[str]) -> bool:
     return any(t in low for t in terms)
 
 
+def _contains_anchor_terms(text: str, terms: set[str]) -> bool:
+    low = (text or "").lower()
+    for term in terms:
+        if " " in term:
+            if term in low:
+                return True
+            continue
+        if re.search(rf"\b{re.escape(term)}\b", low):
+            return True
+    return False
+
+
+def _is_antibiotic_viral_subclaim(subclaim: str) -> bool:
+    low = (subclaim or "").lower()
+    return _contains_anchor_terms(low, _ANTIBIOTIC_ANCHORS) and _contains_anchor_terms(low, _VIRUS_ANCHORS)
+
+
+def _is_kg_candidate(evidence: Any) -> bool:
+    if isinstance(evidence, dict):
+        candidate_type = str(evidence.get("candidate_type") or "").upper()
+        source_type = str(evidence.get("source_type") or "").lower()
+        if candidate_type == "KG" or source_type == "kg":
+            return True
+    return str(getattr(evidence, "candidate_type", "") or "").upper() == "KG"
+
+
 def derive_anchor_groups(text: str) -> List[List[str]]:
     """
     Build concept anchor groups.
@@ -243,6 +282,7 @@ def evaluate_anchor_match(text: str, statement: str) -> Dict[str, Any]:
 
 def _relevance(subclaim: str, evidence: Any) -> Dict[str, Any]:
     stmt = _as_statement(evidence)
+    stmt_low = stmt.lower()
     sub_toks = set(_tokens(subclaim))
     stmt_toks = set(_tokens(stmt))
     lexical_overlap = len(sub_toks & stmt_toks) / max(1, len(sub_toks))
@@ -250,9 +290,28 @@ def _relevance(subclaim: str, evidence: Any) -> Dict[str, Any]:
     stance = _as_stance(evidence)
     polarity = _infer_polarity(subclaim, stmt)
     anchor_eval = evaluate_anchor_match(subclaim, stmt)
+    confidence_mode = (os.getenv("LUXIA_CONFIDENCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+    dual_anchor_required = _is_antibiotic_viral_subclaim(subclaim)
+    has_antibiotic_anchor = _contains_anchor_terms(stmt_low, _ANTIBIOTIC_ANCHORS)
+    has_virus_anchor = _contains_anchor_terms(stmt_low, _VIRUS_ANCHORS)
+    has_dual_anchor = has_antibiotic_anchor and has_virus_anchor
+    has_negation_cue = any(cue in stmt_low for cue in _NEGATION_CUES)
     anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
     overlap = max(lexical_overlap, anchor_overlap)
     relevance = 0.6 * max(0.0, min(1.0, base_sem)) + 0.4 * max(0.0, min(1.0, overlap))
+
+    if confidence_mode and dual_anchor_required:
+        matched_groups = int(has_antibiotic_anchor) + int(has_virus_anchor)
+        anchor_eval["matched_groups"] = matched_groups
+        anchor_eval["required_groups"] = 2
+        anchor_eval["anchors_per_subclaim"] = 2
+        anchor_eval["anchor_overlap"] = matched_groups / 2.0
+        anchor_eval["anchor_ok"] = has_dual_anchor
+        anchor_overlap = float(anchor_eval["anchor_overlap"])
+        overlap = max(lexical_overlap, anchor_overlap)
+        relevance = 0.6 * max(0.0, min(1.0, base_sem)) + 0.4 * max(0.0, min(1.0, overlap))
+        if _is_kg_candidate(evidence) and not has_dual_anchor:
+            relevance = min(relevance, 0.10)
 
     if not anchor_eval["anchor_ok"]:
         # Penalize weak anchor alignment, but avoid collapsing to zero.
@@ -275,6 +334,12 @@ def _relevance(subclaim: str, evidence: Any) -> Dict[str, Any]:
         "anchor_ok": bool(anchor_eval["anchor_ok"]),
         "stance": stance,
         "polarity": polarity,
+        "has_antibiotic_anchor": has_antibiotic_anchor,
+        "has_virus_anchor": has_virus_anchor,
+        "has_dual_anchor": has_dual_anchor,
+        "has_negation_cue": has_negation_cue,
+        "dual_anchor_required": dual_anchor_required,
+        "is_kg_candidate": _is_kg_candidate(evidence),
     }
 
 
@@ -298,7 +363,9 @@ def compute_subclaim_coverage(
 
     details: List[Dict[str, Any]] = []
     weighted_sum = 0.0
+    confidence_mode = (os.getenv("LUXIA_CONFIDENCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
     for idx, subclaim in enumerate(subclaims):
+        requires_dual_anchor = confidence_mode and _is_antibiotic_viral_subclaim(subclaim)
         best_idx = -1
         best = {
             "relevance_score": 0.0,
@@ -308,9 +375,20 @@ def compute_subclaim_coverage(
             "anchor_ok": False,
             "stance": "neutral",
             "polarity": "neutral",
+            "has_dual_anchor": False,
+            "has_negation_cue": False,
+            "is_kg_candidate": False,
         }
         for ev_idx, ev in enumerate(evidence):
             ev_score = _relevance(subclaim, ev)
+            if requires_dual_anchor and not bool(ev_score.get("has_dual_anchor", False)):
+                continue
+            if (
+                requires_dual_anchor
+                and bool(ev_score.get("is_kg_candidate", False))
+                and not bool(ev_score.get("has_dual_anchor", False))
+            ):
+                continue
             if ev_score["relevance_score"] > best["relevance_score"]:
                 best = ev_score
                 best_idx = ev_idx
@@ -343,6 +421,16 @@ def compute_subclaim_coverage(
         else:
             status = "UNKNOWN"
             weight = 0.0
+
+        if (
+            requires_dual_anchor
+            and best_idx >= 0
+            and bool(best.get("has_dual_anchor", False))
+            and bool(best.get("has_negation_cue", False))
+            and status == "UNKNOWN"
+        ):
+            status = "PARTIALLY_VALID"
+            weight = partial_weight
         weighted_sum += weight
 
         details.append(
@@ -362,6 +450,9 @@ def compute_subclaim_coverage(
                 "stance": best.get("stance", "neutral"),
                 "polarity": best.get("polarity", "neutral"),
                 "contradicted": contradicted,
+                "has_dual_anchor": bool(best.get("has_dual_anchor", False)),
+                "has_negation_cue": bool(best.get("has_negation_cue", False)),
+                "dual_anchor_required": requires_dual_anchor,
             }
         )
 

@@ -11,7 +11,7 @@ from app.services.embedding.model import embed_async
 from app.services.kg.kg_retrieval import KGRetrieval
 from app.services.logging.log_manager import LogManager
 from app.services.retrieval.lexical_index import LexicalIndex
-from app.services.vdb.vdb_retrieval import VDBRetrieval
+from app.services.vdb.vdb_retrieval import VDBRetrieval, normalize_query_for_embedding
 
 logger = get_logger(__name__)
 
@@ -52,6 +52,7 @@ async def retrieve_candidates(
     semantic_candidates = []
     bm25_ids: Dict[str, float] = {}
     query_embeddings: List[List[float]] = []
+    normalized_queries: List[str] = []
 
     if not topics:
         logger.warning(
@@ -59,25 +60,29 @@ async def retrieve_candidates(
         )
 
     for q in queries:
+        q_embed = normalize_query_for_embedding(q)
+        if not q_embed:
+            continue
+        normalized_queries.append(q_embed)
         try:
-            sem_res = await vdb_retriever.search(q, top_k=top_k, topics=topics or None)
+            sem_res = await vdb_retriever.search(q_embed, top_k=top_k, topics=topics or None)
             semantic_candidates.extend(sem_res or [])
         except Exception as e:
-            logger.warning(f"[RetrievalPhase:{round_id}] VDB retrieval failed for query='{q}': {e}")
+            logger.warning(f"[RetrievalPhase:{round_id}] VDB retrieval failed for query='{q_embed}': {e}")
 
             if log_manager:
                 await log_manager.add_log(
                     level="WARNING",
-                    message=f"VDB retrieval failed for query: {q}",
+                    message=f"VDB retrieval failed for query: {q_embed}",
                     module=__name__,
                     request_id=f"claim-{round_id}",
                     round_id=round_id,
-                    context={"query": q, "error": str(e)},
+                    context={"query": q_embed, "error": str(e)},
                 )
 
         if lexical_index:
             try:
-                bm25_hits = lexical_index.search(q, topics=topics or None)
+                bm25_hits = lexical_index.search(q_embed, topics=topics or None)
                 for hit in bm25_hits:
                     fact_id = hit.get("fact_id")
                     bm25 = float(hit.get("bm25") or 0.0)
@@ -86,24 +91,24 @@ async def retrieve_candidates(
                         if existing is None or bm25 < existing:
                             bm25_ids[fact_id] = bm25
             except Exception as e:
-                logger.warning(f"[RetrievalPhase:{round_id}] BM25 retrieval failed for query='{q}': {e}")
+                logger.warning(f"[RetrievalPhase:{round_id}] BM25 retrieval failed for query='{q_embed}': {e}")
 
                 if log_manager:
                     await log_manager.add_log(
                         level="WARNING",
-                        message=f"BM25 retrieval failed for query: {q}",
+                        message=f"BM25 retrieval failed for query: {q_embed}",
                         module=__name__,
                         request_id=f"claim-{round_id}",
                         round_id=round_id,
-                        context={"query": q, "error": str(e)},
+                        context={"query": q_embed, "error": str(e)},
                     )
 
     # Re-rank BM25 shortlist with Pinecone vectors (if available)
     if bm25_ids:
         try:
-            if queries and not query_embeddings:
+            if normalized_queries and not query_embeddings:
                 try:
-                    query_embeddings = await embed_async(queries)
+                    query_embeddings = await embed_async(normalized_queries)
                 except Exception as e:
                     logger.warning(f"[RetrievalPhase:{round_id}] Query embedding failed: {e}")
                     query_embeddings = []

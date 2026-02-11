@@ -209,6 +209,7 @@ class CorrectivePipeline:
                     "stance_mapped": 0.5,
                     "trust": item.get("final_score", item.get("score", 0.0)),
                 },
+                candidate_type=str(item.get("candidate_type", "") or ""),
             )
             for item in ranked
         ]
@@ -606,6 +607,9 @@ class CorrectivePipeline:
         skipped_urls: List[str] = []
         search_api_calls = 0
         queries_executed: List[str] = []
+        confidence_target_coverage = float(os.getenv("CONFIDENCE_TARGET_COVERAGE", "0.5"))
+        confidence_max_new_trusted_urls = max(1, int(os.getenv("CONFIDENCE_MAX_NEW_TRUSTED_URLS", "6")))
+        new_trusted_urls_processed = 0
 
         for query_idx, query in enumerate(queries):
             # OPTIMIZATION: Hard limit on search queries to prevent runaway searches
@@ -620,21 +624,8 @@ class CorrectivePipeline:
             logger.info(f"[CorrectivePipeline:{round_id}] Executing: '{query}'")
 
             # Step 1: Execute SINGLE search API call
-            if confidence_mode and query_idx > 0:
-                logger.info(
-                    "[CorrectivePipeline:%s] Confidence mode: claim-level search already executed, skipping remaining "
-                    "query placeholders.",
-                    round_id,
-                )
-                break
             search_api_calls += 1
-            if confidence_mode:
-                query_urls = await self.search_agent.search_for_claim(
-                    post_text,
-                    min_urls=max(3, self.MAX_URLS_PER_QUERY),
-                    max_queries=self.MAX_SEARCH_QUERIES,
-                )
-            elif query_idx == 0:
+            if query_idx == 0 and not confidence_mode:
                 query_urls = await self.search_agent.search_for_claim(
                     post_text,
                     min_urls=1,
@@ -696,6 +687,7 @@ class CorrectivePipeline:
                     f"from {len(new_urls)} candidates for this query"
                 )
                 new_urls = new_urls[: self.MAX_URLS_PER_QUERY]
+            new_trusted_urls_processed += len(new_urls)
             scraped_pages = await scrape_pages(
                 self.scraper,
                 new_urls,
@@ -829,6 +821,7 @@ class CorrectivePipeline:
                 f"[CorrectivePipeline:{round_id}] After query {query_idx + 1}: "
                 f"adaptive_sufficient={is_sufficient}, "
                 f"trust_post={adaptive_trust['trust_post']:.3f}, "
+                f"coverage={adaptive_trust['coverage']:.2f}, "
                 f"total_facts={len(all_facts)}, "
                 f"search_calls={search_api_calls}"
             )
@@ -839,6 +832,24 @@ class CorrectivePipeline:
                 logger.info(
                     f"[CorrectivePipeline:{round_id}] ADAPTIVE THRESHOLD MET after query {query_idx + 1}! "
                     f"Saved {remaining_queries} search API calls!"
+                )
+                break
+
+            if confidence_mode and float(adaptive_trust.get("coverage", 0.0) or 0.0) >= confidence_target_coverage:
+                logger.info(
+                    "[CorrectivePipeline:%s] Confidence mode stop: coverage target reached (%.2f >= %.2f)",
+                    round_id,
+                    float(adaptive_trust.get("coverage", 0.0) or 0.0),
+                    confidence_target_coverage,
+                )
+                break
+
+            if confidence_mode and new_trusted_urls_processed >= confidence_max_new_trusted_urls:
+                logger.info(
+                    "[CorrectivePipeline:%s] Confidence mode stop: processed trusted URL cap reached (%d >= %d)",
+                    round_id,
+                    new_trusted_urls_processed,
+                    confidence_max_new_trusted_urls,
                 )
                 break
 

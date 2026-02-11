@@ -1,3 +1,4 @@
+import re
 from typing import Any, Dict, List
 
 from app.constants.config import PIPELINE_MIN_RANK_CANDIDATES, VDB_BACKFILL_MIN_SCORE, VDB_MIN_SCORE
@@ -6,6 +7,32 @@ from app.services.embedding.model import embed_async
 from app.services.vdb.pinecone_client import get_pinecone_index
 
 logger = get_logger(__name__)
+
+
+def normalize_query_for_embedding(text: str) -> str:
+    """
+    Normalize query text for semantic embedding retrieval.
+
+    Removes web-search operators and noisy filter tokens so only semantic text
+    is embedded and sent to vector retrieval.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    cleaned = raw
+    cleaned = re.sub(
+        r"(?<!\S)-(?:facebook|quora|reddit|pinterest|youtube|testimonial|opinion)\b",
+        " ",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    cleaned = re.sub(r"\bsite:[^\s]+", " ", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.replace('"', " ")
+    cleaned = re.sub(r"[`~!@#$%^&*_=+{}\[\]|\\<>]", " ", cleaned)
+    cleaned = re.sub(r"[(),;:]+", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
 
 
 class VDBRetrieval:
@@ -56,8 +83,12 @@ class VDBRetrieval:
                 - credibility: float [0, 1] (if available in metadata)
                 - source: Optional[str] (alternative to source_url)
         """
+        normalized_query = normalize_query_for_embedding(query)
+        if not normalized_query:
+            return []
+
         try:
-            embedding = await embed_async([query])
+            embedding = await embed_async([normalized_query])
             vector = embedding[0]
         except Exception as e:
             logger.error(f"[VDBRetrieval] Embedding generation failed: {e}")
@@ -183,12 +214,16 @@ class VDBRetrieval:
 
         top_score = f"{results[0]['score']:.3f}" if results else "N/A"
         logger.debug(
-            f"[VDBRetrieval] Query='{query[:50]}...' returned {len(results)} matches " f"(top score: {top_score})"
+            "[VDBRetrieval] Query='%s' normalized='%s' returned %d matches (top score: %s)",
+            query[:50],
+            normalized_query[:50],
+            len(results),
+            top_score,
         )
         logger.info(
             "[VDBRetrieval][Filter] query='%s' pre=%d above_min=%d post=%d "
             "dropped_min=%d dropped_low_signal=%d min=%.2f",
-            query[:80],
+            normalized_query[:80],
             pre_filter_count,
             max(0, pre_filter_count - dropped),
             len(results),
