@@ -38,6 +38,7 @@ from app.shared.anchor_extraction import AnchorExtractor
 
 logger = get_logger(__name__)
 _SEGMENT_EVIDENCE_MIN_OVERLAP = float(os.getenv("SEGMENT_EVIDENCE_MIN_OVERLAP", "0.20"))
+_POLARITY_DEBUG = os.getenv("VERDICT_DEBUG_POLARITY", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class Verdict(Enum):
@@ -221,7 +222,7 @@ class VerdictGenerator:
         coverage = float(metrics.get("coverage", 0.0) or 0.0)
         num_subclaims = int(metrics.get("num_subclaims", 0) or 0)
         # Keep verdict calibration conservative: unresolved multi-part claims remain insufficient.
-        if num_subclaims > 1 and coverage < 0.99:
+        if num_subclaims > 1 and (coverage < 0.99 or len(adapted) < num_subclaims):
             return True
         return not bool(metrics.get("is_sufficient", False))
 
@@ -836,12 +837,102 @@ class VerdictGenerator:
 
     def _segment_polarity(self, segment: str, statement: str, stance: str = "neutral") -> str:
         stance_l = (stance or "neutral").lower()
-        if stance_l in {"entails", "contradicts"}:
-            return stance_l
         seg = (segment or "").lower()
         stmt = (statement or "").lower()
         if not seg or not stmt:
             return "neutral"
+
+        def _sanitize_for_negation(text: str) -> str:
+            cleaned = re.sub(r"\bnot\s+only\b", " ", text, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\bnot\s+necessarily\b", " ", cleaned, flags=re.IGNORECASE)
+            cleaned = re.sub(r"\bno\s+longer\b", " ", cleaned, flags=re.IGNORECASE)
+            return re.sub(r"\s+", " ", cleaned).strip()
+
+        def _has_semantic_negation(text: str) -> bool:
+            low = _sanitize_for_negation(text or "")
+            if not low:
+                return False
+            strong_patterns = (
+                r"\b(?:ineffective|inefficacy|not effective|not recommended|no effect|cannot treat|can't treat)\b",
+                r"\b(?:do|does|did)\s+not\s+(?:work|treat|help|cure|prevent|cause|reduce)\b",
+                r"\b(?:doesn't|don't|didn't)\s+(?:work|treat|help|cure|prevent|cause|reduce)\b",
+                r"\b(?:won't|will not|cannot|can't)\s+(?:work|treat|help|cure|prevent|cause|reduce)\b",
+                r"\b(?:not|no|never)\s+(?:work|treat|help|cure|effective|efficacious)\b",
+                r"\b(?:fails?\s+to|unable\s+to)\s+(?:work|treat|help|cure|prevent|reduce)\b",
+            )
+            if any(re.search(p, low, flags=re.IGNORECASE) for p in strong_patterns):
+                return True
+            return bool(
+                re.search(
+                    r"\b(?:is|are|was|were|can|could|may|might|must|should|would|will|has|have|had)\s+not\b",
+                    low,
+                    flags=re.IGNORECASE,
+                )
+            )
+
+        def _predicate_groups(text: str) -> set[str]:
+            groups = {
+                "efficacy": (
+                    r"\b(?:work|works|working|treat|treats|treated|treating|cure|cures|cured|curing|"
+                    r"help|helps|helped|effective|efficacy|ineffective|inefficacy|efficacious)\b"
+                ),
+                "causal": (
+                    r"\b(?:cause|causes|caused|causing|link|linked|associate|associated|"
+                    r"result|results|resulted|lead|leads|leading)\b"
+                ),
+                "prevention": (
+                    r"\b(?:prevent|prevents|prevented|prevention|reduce|reduces|reduced|reduction|"
+                    r"protect|protects|protected)\b"
+                ),
+            }
+            hits: set[str] = set()
+            for group, pattern in groups.items():
+                if re.search(pattern, text, flags=re.IGNORECASE):
+                    hits.add(group)
+            return hits
+
+        seg_neg = _has_semantic_negation(seg)
+        stmt_neg = _has_semantic_negation(stmt)
+        seg_groups = _predicate_groups(seg)
+        stmt_groups = _predicate_groups(stmt)
+        same_predicate = bool(seg_groups & stmt_groups)
+
+        # Negation symmetry guard (runs before stance fallback):
+        # negative + negative over same predicate => support, not contradiction.
+        if same_predicate and seg_neg and stmt_neg:
+            if _POLARITY_DEBUG:
+                logger.info(
+                    "[VerdictGenerator][Polarity] seg_neg=%s stmt_neg=%s same_predicate=%s stance=%s => entails",
+                    seg_neg,
+                    stmt_neg,
+                    same_predicate,
+                    stance_l,
+                )
+            return "entails"
+        # Same predicate with polarity mismatch => contradiction.
+        if same_predicate and (seg_neg ^ stmt_neg):
+            if _POLARITY_DEBUG:
+                logger.info(
+                    "[VerdictGenerator][Polarity] seg_neg=%s stmt_neg=%s same_predicate=%s stance=%s => contradicts",
+                    seg_neg,
+                    stmt_neg,
+                    same_predicate,
+                    stance_l,
+                )
+            return "contradicts"
+
+        if stance_l in {"entails", "contradicts"}:
+            if _POLARITY_DEBUG:
+                logger.info(
+                    "[VerdictGenerator][Polarity] seg_neg=%s stmt_neg=%s same_predicate=%s stance=%s => %s",
+                    seg_neg,
+                    stmt_neg,
+                    same_predicate,
+                    stance_l,
+                    stance_l,
+                )
+            return stance_l
+
         neg_causal_re = re.compile(
             (
                 r"\b(?:do|does|did|can|could|may|might|must|should|would|will|is|are|was|were)?\s*"
@@ -864,8 +955,8 @@ class VerdictGenerator:
         )
         no_link_re = re.compile(r"\bno\s+link\b|\bnot\s+associated\b", flags=re.IGNORECASE)
 
-        seg_neg = bool(neg_causal_re.search(seg) or no_link_re.search(seg))
-        stmt_neg = bool(neg_causal_re.search(stmt) or no_link_re.search(stmt))
+        seg_neg = bool(neg_causal_re.search(seg) or no_link_re.search(seg) or seg_neg)
+        stmt_neg = bool(neg_causal_re.search(stmt) or no_link_re.search(stmt) or stmt_neg)
         seg_pos = bool(pos_causal_re.search(seg)) and not seg_neg
         stmt_pos = bool(pos_causal_re.search(stmt)) and not stmt_neg
         stmt_hedged_pos = bool(hedge_pos_re.search(stmt)) and not stmt_neg
@@ -878,6 +969,14 @@ class VerdictGenerator:
             return "entails"
         if seg_pos and stmt_pos and not stmt_hedged_pos:
             return "entails"
+        if _POLARITY_DEBUG:
+            logger.info(
+                "[VerdictGenerator][Polarity] seg_neg=%s stmt_neg=%s same_predicate=%s stance=%s => neutral",
+                seg_neg,
+                stmt_neg,
+                same_predicate,
+                stance_l,
+            )
         return "neutral"
 
     def _segment_topic_guard_ok(self, segment: str, statement: str) -> bool:
@@ -1345,6 +1444,8 @@ class VerdictGenerator:
         resolved_ratio = resolved / max(1, total)
         has_support = any((s or "").upper() in {"VALID", "PARTIALLY_VALID"} for s in statuses)
         has_invalid = any((s or "").upper() in {"INVALID", "PARTIALLY_INVALID"} for s in statuses)
+        strong_covered = sum(1 for s in statuses if (s or "").upper() in {"VALID", "STRONGLY_VALID"})
+        contradict_count = sum(1 for s in statuses if (s or "").upper() in {"INVALID", "PARTIALLY_INVALID"})
         truthfulness_cap = min(100.0, (weighted_truth * 100.0) + 5.0)
         if unresolved > 0:
             truthfulness_cap = min(truthfulness_cap, 65.0)
@@ -1361,6 +1462,8 @@ class VerdictGenerator:
             "truthfulness_cap": max(0.0, truthfulness_cap),
             "has_support": has_support,
             "has_invalid": has_invalid,
+            "strong_covered": strong_covered,
+            "contradict_count": contradict_count,
         }
 
     def _cap_confidence_with_contract(
@@ -1390,6 +1493,9 @@ class VerdictGenerator:
         required_segments_count = int(contract["required_segments_count"] or 0)
         unresolved_segments = int(contract["unresolved_segments"] or 0)
         resolved_segments_count = int(contract["resolved_segments_count"] or 0)
+        weighted_truth = float(contract.get("weighted_truth", 0.0) or 0.0)
+        strong_covered = int(contract.get("strong_covered", 0) or 0)
+        contradict_count = int(contract.get("contradict_count", 0) or 0)
         has_support = bool(contract["has_support"])
         has_invalid = bool(contract["has_invalid"])
         all_valid = bool(statuses) and all(s == "VALID" for s in statuses)
@@ -1403,6 +1509,19 @@ class VerdictGenerator:
             verdict = Verdict.FALSE.value
         else:
             verdict = Verdict.PARTIALLY_TRUE.value
+
+        # Safety guard: do not emit FALSE when there is support and no contradiction.
+        if verdict == Verdict.FALSE.value and has_support and contradict_count == 0:
+            verdict = Verdict.PARTIALLY_TRUE.value
+
+        # Narrow override for fully resolved, strongly supported outcomes.
+        if (
+            unresolved_segments == 0
+            and weighted_truth >= 0.8
+            and strong_covered >= required_segments_count
+            and contradict_count == 0
+        ):
+            verdict = Verdict.TRUE.value
 
         return {
             "verdict": verdict,
