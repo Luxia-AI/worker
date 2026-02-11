@@ -709,16 +709,65 @@ class VerdictGenerator:
         # Evidence quality signal (deterministic, claim-aware) is used for confidence calibration.
         evidence_quality_percent = self._calculate_truthfulness_from_evidence(claim, evidence)
 
-        # Re-score confidence from evidence + breakdown when possible
+        # Re-score confidence using truth/coverage/agreement/diversity/trust_post calibration.
+        diversity_score = 0.0
         if evidence:
-            confidence = self._calculate_confidence(evidence, claim_breakdown)
-            confidence = (0.65 * float(confidence)) + (0.35 * (float(evidence_quality_percent) / 100.0))
+            domains = set()
+            for ev in evidence[:10]:
+                src = ev.get("source_url") or ev.get("source") or ""
+                if not src:
+                    continue
+                try:
+                    domain = src.split("/")[2].lower()
+                except Exception:
+                    continue
+                if domain.startswith("www."):
+                    domain = domain[4:]
+                if domain:
+                    domains.add(domain)
+            diversity_score = min(1.0, len(domains) / max(1, min(len(evidence), 10)))
+
         self._log_subclaim_coverage(claim, evidence, claim_breakdown)
         reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
         verdict_str = reconciled["verdict"]
         policy_insufficient = self._policy_says_insufficient(claim, evidence)
         truth_score_percent = self._calculate_truth_score_from_contract(reconciled)
         agreement_ratio = self._calculate_evidence_agreement_ratio(claim, evidence)
+        coverage_score = float(reconciled.get("weighted_truth", 0.0) or 0.0)
+        adaptive_trust_post = 0.0
+        if evidence:
+            try:
+
+                class _Ev:
+                    __slots__ = ("statement", "source_url", "semantic_score", "stance", "trust")
+
+                    def __init__(self, d: Dict[str, Any]):
+                        self.statement = d.get("statement") or d.get("text") or ""
+                        self.source_url = d.get("source_url") or d.get("source") or ""
+                        self.semantic_score = float(
+                            d.get("semantic_score")
+                            or d.get("sem_score")
+                            or d.get("final_score")
+                            or d.get("score")
+                            or 0.0
+                        )
+                        self.stance = d.get("stance") or "unknown"
+                        self.trust = float(
+                            d.get("trust") or d.get("credibility") or d.get("final_score") or d.get("score") or 0.0
+                        )
+
+                adaptive_metrics = self.trust_policy.compute_adaptive_trust(
+                    claim,
+                    [_Ev(d) for d in evidence if (d.get("statement") or d.get("text"))],
+                    top_k=min(10, len(evidence)),
+                )
+                coverage_score = float(adaptive_metrics.get("coverage", coverage_score) or coverage_score)
+                agreement_ratio = float(adaptive_metrics.get("agreement", agreement_ratio) or agreement_ratio)
+                diversity_score = float(adaptive_metrics.get("diversity", diversity_score) or diversity_score)
+                adaptive_trust_post = float(adaptive_metrics.get("trust_post", 0.0) or 0.0)
+            except Exception:
+                adaptive_trust_post = 0.0
+
         if (
             float(reconciled.get("weighted_truth", 0.0) or 0.0) >= 0.8
             and int(reconciled.get("strong_covered", 0) or 0) >= 1
@@ -726,6 +775,21 @@ class VerdictGenerator:
             and agreement_ratio >= 0.8
         ):
             truth_score_percent = max(float(truth_score_percent or 0.0), 85.0)
+        truthfulness = max(0.0, min(1.0, float(truth_score_percent or 0.0) / 100.0))
+        coverage_score = max(0.0, min(1.0, coverage_score))
+        agreement_ratio = max(0.0, min(1.0, agreement_ratio))
+        diversity_score = max(0.0, min(1.0, diversity_score))
+        adaptive_trust_post = max(0.0, min(1.0, adaptive_trust_post))
+        confidence = (
+            0.30 * truthfulness
+            + 0.25 * coverage_score
+            + 0.20 * agreement_ratio
+            + 0.15 * diversity_score
+            + 0.10 * adaptive_trust_post
+        )
+        confidence = min(float(confidence), 0.95)
+        if coverage_score >= 0.8:
+            confidence = max(confidence, truthfulness * 0.75)
         confidence = self._cap_confidence_with_contract(confidence, reconciled, policy_insufficient, verdict_str)
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
         if llm_verdict == Verdict.TRUE.value and verdict_str != Verdict.TRUE.value:
@@ -1971,6 +2035,8 @@ class VerdictGenerator:
         avg_support = sum(segment_scores) / len(segment_scores)
         # Keep diversity as a mild reliability adjustment, not a hard multiplier.
         truthfulness = avg_support * (0.85 + (0.15 * diversity))
+        ceiling = 0.85 + (0.10 * diversity)
+        truthfulness = min(truthfulness, ceiling)
         return round(truthfulness * 100.0, 1)
 
     def _calculate_confidence(self, evidence: List[Dict[str, Any]], claim_breakdown: List[Dict[str, Any]]) -> float:
