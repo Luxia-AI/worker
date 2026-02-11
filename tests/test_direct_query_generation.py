@@ -180,6 +180,44 @@ def test_simplify_query_for_serper_fallback_removes_strict_operators():
     assert "(" not in simplified and ")" not in simplified
 
 
+def test_simplify_query_for_serper_fallback_preserves_two_anchor_phrases():
+    ts = _init_trusted_search()
+    q = '"babies born" "born bones" 300 statistics'
+    simplified = ts._simplify_query_for_fallback(q)
+    assert '"babies born"' in simplified
+    assert '"born bones"' in simplified
+
+
+def test_build_serper_site_boost_queries_adds_trusted_site_filters():
+    ts = _init_trusted_search()
+    ts.serper_site_boost_domains = ["pubmed.ncbi.nlm.nih.gov", "nih.gov"]
+    queries = ts._build_serper_site_boost_queries('"babies born" "born bones" 300 statistics')
+    assert queries
+    assert queries[0].startswith("site:pubmed.ncbi.nlm.nih.gov ")
+    assert queries[1].startswith("site:nih.gov ")
+
+
+@pytest.mark.asyncio
+async def test_serper_site_boost_runs_site_queries_when_generic_results_are_weak():
+    ts = _init_trusted_search()
+    ts.min_allowlist_pass = 3
+    ts.serper_site_boost_domains = ["pubmed.ncbi.nlm.nih.gov", "nih.gov"]
+    calls = []
+
+    async def _fake_search(session, query):
+        calls.append(query)
+        if query.startswith("site:pubmed.ncbi.nlm.nih.gov "):
+            return ["https://pubmed.ncbi.nlm.nih.gov/12345/"]
+        return []
+
+    ts.search_query_serper = _fake_search  # type: ignore[assignment]
+    urls = await ts.search_query_serper_with_site_boost(None, '"babies born" "born bones" 300 statistics')
+    assert urls == ["https://pubmed.ncbi.nlm.nih.gov/12345/"]
+    assert len(calls) >= 2
+    assert calls[0] == '"babies born" "born bones" 300 statistics'
+    assert any(q.startswith("site:pubmed.ncbi.nlm.nih.gov ") for q in calls[1:])
+
+
 def test_domain_specific_queries_for_nutrition_claim():
     ts = _init_trusted_search()
     claim = (

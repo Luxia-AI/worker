@@ -62,6 +62,18 @@ class TrustedSearch:
         "nhs.uk",
         "nice.org.uk",
     }
+    _SERPER_SITE_BOOST_PRIORITY = [
+        "pubmed.ncbi.nlm.nih.gov",
+        "ncbi.nlm.nih.gov",
+        "nih.gov",
+        "cdc.gov",
+        "who.int",
+        "medlineplus.gov",
+        "mayoclinic.org",
+        "clevelandclinic.org",
+        "nhs.uk",
+        "nice.org.uk",
+    ]
 
     def __init__(
         self,
@@ -100,6 +112,18 @@ class TrustedSearch:
         trusted_base = {d.lower().removeprefix("www.") for d in TRUSTED_DOMAINS}
         self.strict_allowlist = set(self.STRICT_TRUSTED_DOMAIN_BASE) | trusted_base | extra_allowlist
         allowlist_fingerprint = hashlib.sha256("|".join(sorted(self.strict_allowlist)).encode("utf-8")).hexdigest()[:12]
+        serper_site_env = [
+            d.strip().lower().removeprefix("www.")
+            for d in (os.getenv("TRUSTED_SEARCH_SERPER_SITE_DOMAINS", "") or "").split(",")
+            if d.strip()
+        ]
+        serper_site_limit = max(1, int(os.getenv("TRUSTED_SEARCH_SERPER_SITE_MAX_DOMAINS", "4")))
+        ordered_site_domains = dedupe_list(
+            serper_site_env
+            + self._SERPER_SITE_BOOST_PRIORITY
+            + sorted(d for d in self.strict_allowlist if d not in self._SERPER_SITE_BOOST_PRIORITY)
+        )
+        self.serper_site_boost_domains = ordered_site_domains[:serper_site_limit]
 
         if has_google:
             logger.info("[TrustedSearch] Google CSE configured")
@@ -109,6 +133,10 @@ class TrustedSearch:
             "[TrustedSearch] Trusted domain allowlist loaded: count=%d checksum=%s",
             len(self.strict_allowlist),
             allowlist_fingerprint,
+        )
+        logger.info(
+            "[TrustedSearch] Serper site-boost domains: %s",
+            self.serper_site_boost_domains,
         )
 
         try:
@@ -437,12 +465,26 @@ class TrustedSearch:
         q = q.replace("(", " ").replace(")", " ")
         q = re.sub(r"\bOR\b", " ", q, flags=re.IGNORECASE)
         q = re.sub(r"\s+", " ", q).strip()
-        # Preserve at least one quoted phrase only.
+        # Preserve up to two quoted anchors so fallback queries don't drift off-topic.
+        # Keeping just one phrase was too lossy for multi-anchor claims.
         if q.count('"') >= 4:
-            first = re.search(r'"([^"]+)"', q)
-            keep = f'"{first.group(1)}" ' if first else ""
+            quoted = re.findall(r'"([^"]+)"', q)
+            keep_parts: List[str] = []
+            seen: set[str] = set()
+            for phrase in quoted:
+                normalized = phrase.strip()
+                if not normalized:
+                    continue
+                dedupe_key = normalized.lower()
+                if dedupe_key in seen:
+                    continue
+                seen.add(dedupe_key)
+                keep_parts.append(f'"{normalized}"')
+                if len(keep_parts) >= 2:
+                    break
+            keep = " ".join(keep_parts)
             no_quotes = re.sub(r'"[^"]+"', "", q).strip()
-            q = (keep + no_quotes).strip()
+            q = " ".join(part for part in [keep, no_quotes] if part).strip()
         return q
 
     def _build_phrase_variants(self, phrase: str) -> List[str]:
@@ -1128,7 +1170,7 @@ FAILED ENTITIES:
         # If Google quota already exceeded, go straight to Serper
         if self.google_quota_exceeded:
             if self.serper_available:
-                serper = await self.search_query_serper(session, self._simplify_query_for_fallback(query))
+                serper = await self.search_query_serper_with_site_boost(session, query)
                 if serper:
                     return serper
                 return await self.search_query_pubmed(session, query)
@@ -1143,7 +1185,7 @@ FAILED ENTITIES:
                 logger.warning("[TrustedSearch] Google CSE quota exceeded! " "Switching to Serper.dev fallback...")
 
                 if self.serper_available:
-                    serper = await self.search_query_serper(session, self._simplify_query_for_fallback(query))
+                    serper = await self.search_query_serper_with_site_boost(session, query)
                     if serper:
                         return serper
                     return await self.search_query_pubmed(session, query)
@@ -1162,7 +1204,7 @@ FAILED ENTITIES:
                 self.min_allowlist_pass,
             )
             if self.serper_available:
-                serper_urls = await self.search_query_serper(session, self._simplify_query_for_fallback(query))
+                serper_urls = await self.search_query_serper_with_site_boost(session, query)
                 if serper_urls:
                     merged = dedupe_list(urls + serper_urls)
                     return merged
@@ -1172,7 +1214,7 @@ FAILED ENTITIES:
 
         # No Google, try Serper directly
         if self.serper_available:
-            serper = await self.search_query_serper(session, self._simplify_query_for_fallback(query))
+            serper = await self.search_query_serper_with_site_boost(session, query)
             if serper:
                 return serper
             return await self.search_query_pubmed(session, query)
@@ -1303,6 +1345,48 @@ FAILED ENTITIES:
                 site_queries.append(f"site:{site} {base_query}")
 
         return site_queries
+
+    def _build_serper_site_boost_queries(self, query: str) -> List[str]:
+        """
+        Build site-scoped Serper queries anchored to trusted domains.
+        """
+        q = self._sanitize_query(query)
+        if not q:
+            return []
+        if "site:" in q.lower():
+            return [q]
+        domains = getattr(self, "serper_site_boost_domains", []) or self._SERPER_SITE_BOOST_PRIORITY[:4]
+        return [f"site:{domain} {q}" for domain in domains if domain]
+
+    async def search_query_serper_with_site_boost(self, session: aiohttp.ClientSession, query: str) -> List[str]:
+        """
+        Serper fallback with trusted-domain site: boosts when generic results are weak.
+        """
+        simplified = self._simplify_query_for_fallback(query)
+        if not simplified:
+            return []
+
+        base_urls = await self.search_query_serper(session, simplified)
+        if len(base_urls) >= self.min_allowlist_pass or "site:" in simplified.lower():
+            return base_urls
+
+        boosted_urls: List[str] = []
+        for site_query in self._build_serper_site_boost_queries(simplified):
+            site_urls = await self.search_query_serper(session, site_query)
+            if site_urls:
+                boosted_urls = dedupe_list(boosted_urls + site_urls)
+            merged_count = len(dedupe_list(base_urls + boosted_urls))
+            if merged_count >= self.min_allowlist_pass:
+                break
+
+        merged = dedupe_list(base_urls + boosted_urls)
+        logger.info(
+            "[TrustedSearch] Serper site-boost merged results: base=%d boosted=%d merged=%d",
+            len(base_urls),
+            len(boosted_urls),
+            len(merged),
+        )
+        return merged
 
     # ---------------------------------------------------------------------
     # Generate All Queries (without executing search)

@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 from typing import Any, Dict
 
 from groq import AsyncGroq
@@ -21,12 +22,45 @@ class RateLimitError(Exception):
 
 class GroqService:
     def __init__(self) -> None:
-        api_key = settings.GROQ_API_KEY
-        if not api_key:
+        primary_api_key = os.getenv("GROQ_API_KEY") or settings.GROQ_API_KEY
+        fallback_api_key = os.getenv("GROQ_API_KEY_FALLBACK") or settings.GROQ_API_KEY_FALLBACK
+        if not primary_api_key and not fallback_api_key:
             raise RuntimeError("Missing GROQ_API_KEY")
-
-        self.client = AsyncGroq(api_key=api_key)
         self.model = LLM_MODEL_NAME
+        self._clients: list[tuple[str, AsyncGroq]] = []
+
+        primary_headers = self._build_headers(
+            os.getenv("GROQ_ORG_ID") or settings.GROQ_ORG_ID,
+            os.getenv("GROQ_PROJECT_ID") or settings.GROQ_PROJECT_ID,
+        )
+        if primary_api_key:
+            self._clients.append(("primary", AsyncGroq(api_key=primary_api_key, default_headers=primary_headers)))
+
+        fallback_headers = self._build_headers(
+            os.getenv("GROQ_ORG_ID_FALLBACK") or settings.GROQ_ORG_ID_FALLBACK,
+            os.getenv("GROQ_PROJECT_ID_FALLBACK") or settings.GROQ_PROJECT_ID_FALLBACK,
+        )
+        if fallback_api_key and fallback_api_key != primary_api_key:
+            self._clients.append(("fallback", AsyncGroq(api_key=fallback_api_key, default_headers=fallback_headers)))
+
+        if not self._clients:
+            raise RuntimeError("Missing Groq client credentials")
+
+    @staticmethod
+    def _build_headers(org_id: str | None, project_id: str | None) -> Dict[str, str] | None:
+        headers: Dict[str, str] = {}
+        if org_id:
+            headers["x-groq-organization"] = org_id
+            headers["groq-organization"] = org_id
+        if project_id:
+            headers["x-groq-project"] = project_id
+            headers["groq-project"] = project_id
+        return headers or None
+
+    @staticmethod
+    def _is_rate_limit_error(error: Exception) -> bool:
+        error_str = str(error or "")
+        return "429" in error_str or "rate_limit" in error_str.lower()
 
     @throttled(limit=10, period=60.0, name="groq_api")
     async def ainvoke(
@@ -61,39 +95,62 @@ class GroqService:
         if response_format == "json":
             kwargs["response_format"] = {"type": "json_object"}
 
-        for attempt in range(max_retries):
-            try:
-                response = await self.client.chat.completions.create(**kwargs)
-                msg = response.choices[0].message
+        last_error: Exception | None = None
+        for client_idx, (client_name, client) in enumerate(self._clients):
+            is_last_client = client_idx == len(self._clients) - 1
+            for attempt in range(max_retries):
+                try:
+                    response = await client.chat.completions.create(**kwargs)
+                    msg = response.choices[0].message
 
-                # JSON response
-                if response_format == "json":
-                    if msg.content:
-                        result: Dict[str, Any] = json.loads(msg.content)
-                        return result
-                    return {}
+                    # JSON response
+                    if response_format == "json":
+                        if msg.content:
+                            result: Dict[str, Any] = json.loads(msg.content)
+                            if client_name == "fallback":
+                                logger.warning("[GroqService] Request served by fallback Groq credentials")
+                            return result
+                        if client_name == "fallback":
+                            logger.warning("[GroqService] Request served by fallback Groq credentials")
+                        return {}
 
-                # Text response
-                return {"text": msg.content}
+                    # Text response
+                    if client_name == "fallback":
+                        logger.warning("[GroqService] Request served by fallback Groq credentials")
+                    return {"text": msg.content}
 
-            except Exception as e:
-                error_str = str(e)
-
-                # Check for rate limit error
-                if "429" in error_str or "rate_limit" in error_str.lower():
-                    if attempt < max_retries - 1:
-                        wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
-                        logger.warning(
-                            f"[GroqService] Rate limit hit. Retrying in {wait_time}s "
-                            f"(attempt {attempt + 1}/{max_retries})"
+                except Exception as e:
+                    last_error = e
+                    if self._is_rate_limit_error(e):
+                        if attempt < max_retries - 1:
+                            wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
+                            logger.warning(
+                                f"[GroqService] Rate limit hit on {client_name} client. Retrying in {wait_time}s "
+                                f"(attempt {attempt + 1}/{max_retries})"
+                            )
+                            await asyncio.sleep(wait_time)
+                            continue
+                        logger.error(
+                            "[GroqService] Rate limit exceeded on %s client after %d attempts: %s",
+                            client_name,
+                            max_retries,
+                            e,
                         )
-                        await asyncio.sleep(wait_time)
-                        continue
-                    else:
-                        logger.error(f"[GroqService] Rate limit exceeded after {max_retries} attempts: {e}")
-                        raise RateLimitError(f"Groq rate limit exceeded: {e}") from e
-                else:
-                    logger.error(f"[GroqService] Groq call failed: {e}")
-                    raise
+                        if not is_last_client:
+                            logger.warning("[GroqService] Switching to fallback Groq credentials after rate limits")
+                        break
+
+                    logger.error(f"[GroqService] Groq call failed on {client_name} client: {e}")
+                    if not is_last_client:
+                        logger.warning("[GroqService] Switching to fallback Groq credentials after failure")
+                    break
+
+            if not is_last_client:
+                continue
+
+        if isinstance(last_error, Exception) and self._is_rate_limit_error(last_error):
+            raise RateLimitError(f"Groq rate limit exceeded: {last_error}") from last_error
+        if isinstance(last_error, Exception):
+            raise last_error
 
         raise RuntimeError("Unexpected error in Groq service")

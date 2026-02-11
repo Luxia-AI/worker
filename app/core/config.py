@@ -17,6 +17,11 @@ class Settings(BaseSettings):
     SERPER_API_KEY: Optional[str] = Field(default=None)
 
     GROQ_API_KEY: Optional[str] = Field(default=None)
+    GROQ_ORG_ID: Optional[str] = Field(default=None)
+    GROQ_PROJECT_ID: Optional[str] = Field(default=None)
+    GROQ_API_KEY_FALLBACK: Optional[str] = Field(default=None)
+    GROQ_ORG_ID_FALLBACK: Optional[str] = Field(default=None)
+    GROQ_PROJECT_ID_FALLBACK: Optional[str] = Field(default=None)
 
     NEO4J_URI: Optional[str] = Field(default=None)
     # Accept both NEO4J_USER and legacy NEO4J_USERNAME env vars
