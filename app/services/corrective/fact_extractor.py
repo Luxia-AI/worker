@@ -1,8 +1,10 @@
 import json
+import os
 import re
 from typing import Any, Dict, List, Optional
 
 from app.constants.llm_prompts import FACT_EXTRACTION_PROMPT
+from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.common.dedup import generate_fact_id
 from app.services.common.text_cleaner import clean_statement, truncate_content
@@ -73,6 +75,33 @@ class FactExtractor:
                 pass
 
         return None
+
+    @staticmethod
+    def _confidence_mode() -> bool:
+        value = os.getenv("LUXIA_CONFIDENCE_MODE")
+        if value is None:
+            return bool(getattr(settings, "LUXIA_CONFIDENCE_MODE", False))
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _chunk_content(content: str, max_chars: int, max_chunks: int) -> List[str]:
+        text = (content or "").strip()
+        if not text:
+            return []
+        if len(text) <= max_chars:
+            return [text]
+        chunks: List[str] = []
+        start = 0
+        overlap = min(240, max_chars // 6)
+        while start < len(text) and len(chunks) < max_chunks:
+            end = min(len(text), start + max_chars)
+            chunk = text[start:end].strip()
+            if chunk:
+                chunks.append(chunk)
+            if end >= len(text):
+                break
+            start = max(0, end - overlap)
+        return chunks or [text[:max_chars]]
 
     def _split_atomic_statement(self, statement: str) -> List[str]:
         text = (statement or "").strip()
@@ -173,17 +202,38 @@ class FactExtractor:
         if not valid_pages:
             return []
 
-        logger.info(f"[FactExtractor] Batch extracting facts from {len(valid_pages)} pages (1 LLM call)")
+        confidence_mode = self._confidence_mode()
+        chunk_chars = int(os.getenv("CONFIDENCE_FACT_CHUNK_CHARS", "2600")) if confidence_mode else 1500
+        max_chunks_per_page = int(os.getenv("CONFIDENCE_MAX_CHUNKS_PER_PAGE", "3")) if confidence_mode else 1
+        target_facts_per_page = int(os.getenv("CONFIDENCE_FACTS_PER_PAGE_TARGET", "20")) if confidence_mode else 8
+
+        logger.info(
+            "[FactExtractor] Batch extracting facts from %d pages (1 LLM call, confidence_mode=%s, "
+            "chunk_chars=%d, max_chunks_per_page=%d, target_facts_per_page=%d)",
+            len(valid_pages),
+            confidence_mode,
+            chunk_chars,
+            max_chunks_per_page,
+            target_facts_per_page,
+        )
 
         # Build batch prompt with all page contents
         sections = []
-        for i, page in enumerate(valid_pages):
+        section_to_page_idx: List[int] = []
+        for page_idx, page in enumerate(valid_pages):
             content = page.get("content", "")
-            content_chunk = truncate_content(content, max_length=1500)  # Smaller chunks for batching
-            sections.append(f"[{i}] {content_chunk}")
+            base_content = truncate_content(content, max_length=chunk_chars * max_chunks_per_page + 200)
+            chunks = self._chunk_content(base_content, max_chars=chunk_chars, max_chunks=max_chunks_per_page)
+            for chunk in chunks:
+                section_index = len(section_to_page_idx)
+                section_to_page_idx.append(page_idx)
+                sections.append(f"[{section_index}] {chunk}")
 
         batch_content = "\n\n".join(sections)
-        prompt = f"{BATCH_FACT_PROMPT}{batch_content}"
+        prompt = (
+            f"{BATCH_FACT_PROMPT}{batch_content}\n\n"
+            f"TARGET_FACTS_PER_SECTION: up to {target_facts_per_page} high-quality atomic facts."
+        )
 
         required_format = '{"results": [{"index": 0, "facts": [{"statement": "...", "confidence": 0.85}]}]}'
 
@@ -199,6 +249,19 @@ class FactExtractor:
             # Parse with retry logic
             parsed = await self._parse_llm_response(result, prompt, required_format)
 
+            if parsed is None and confidence_mode:
+                logger.warning(
+                    "[FactExtractor] Confidence mode retry: overriding Groq reservation to avoid zero-fact extraction"
+                )
+                retry_result = await self.llm_service.ainvoke(
+                    prompt,
+                    response_format="json",
+                    priority=LLMPriority.HIGH,
+                    call_tag="fact_extraction",
+                    allow_quota_override=True,
+                )
+                parsed = await self._parse_llm_response(retry_result, prompt, required_format)
+
             if parsed is None:
                 logger.warning("[FactExtractor] Could not parse LLM response after retries, using fallback")
                 return await self._extract_per_page_fallback(valid_pages)
@@ -210,10 +273,10 @@ class FactExtractor:
                 idx = item.get("index", -1)
                 extracted = item.get("facts", [])
 
-                if idx < 0 or idx >= len(valid_pages):
+                if idx < 0 or idx >= len(section_to_page_idx):
                     continue
 
-                page = valid_pages[idx]
+                page = valid_pages[section_to_page_idx[idx]]
 
                 for fact in extracted:
                     if not isinstance(fact, dict):
@@ -227,16 +290,25 @@ class FactExtractor:
                     facts.append(fact)
 
             facts = self._normalize_atomic_facts(facts)
+            dedup_by_id: Dict[str, Dict[str, Any]] = {}
+            for fact in facts:
+                fact_id = str(fact.get("fact_id", ""))
+                if fact_id and fact_id not in dedup_by_id:
+                    dedup_by_id[fact_id] = fact
+            if dedup_by_id:
+                facts = list(dedup_by_id.values())
             logger.info(f"[FactExtractor] Extracted {len(facts)} facts from {len(valid_pages)} pages (batched)")
             return facts
 
-        except (KeyError, json.JSONDecodeError, TypeError) as e:
+        except Exception as e:
             logger.warning(f"[FactExtractor] Batch extraction failed: {e}, falling back to per-page")
             return await self._extract_per_page_fallback(valid_pages)
 
     async def _extract_per_page_fallback(self, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Fallback: extract facts one page at a time if batch fails."""
         facts: List[Dict[str, Any]] = []
+        confidence_mode = self._confidence_mode()
+        allow_override = confidence_mode
 
         for page in pages:
             content = page.get("content", "")
@@ -247,8 +319,9 @@ class FactExtractor:
                 result = await self.llm_service.ainvoke(
                     prompt,
                     response_format="json",
-                    priority=LLMPriority.LOW,
+                    priority=LLMPriority.HIGH if allow_override else LLMPriority.LOW,
                     call_tag="fact_extraction",
+                    allow_quota_override=allow_override,
                 )
                 extracted = result.get("facts", [])
 
@@ -262,6 +335,8 @@ class FactExtractor:
                     # Use deterministic fact_id based on content hash (prevents duplicates)
                     fact["fact_id"] = generate_fact_id(fact["statement"], fact["source_url"])
                     facts.append(fact)
+                if extracted:
+                    allow_override = False
             except Exception as e:
                 logger.warning(f"[FactExtractor] Failed to extract from {page.get('url')}: {e}")
                 continue

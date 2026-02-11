@@ -25,6 +25,7 @@ This approach MAXIMIZES quota efficiency by:
 """
 
 import os
+import urllib.parse
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -36,6 +37,7 @@ from app.constants.config import (
     PIPELINE_MIN_NEW_URLS,
     PIPELINE_RETRIEVAL_TOP_K,
 )
+from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.corrective.entity_extractor import EntityExtractor
 from app.services.corrective.fact_extractor import FactExtractor
@@ -112,6 +114,13 @@ class CorrectivePipeline:
         self.log_manager = LogManagerHandler._log_manager
 
     @staticmethod
+    def _confidence_mode() -> bool:
+        raw = os.getenv("LUXIA_CONFIDENCE_MODE")
+        if raw is None:
+            return bool(getattr(settings, "LUXIA_CONFIDENCE_MODE", False))
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
     def _trust_payload_adaptive(adaptive_trust: Dict[str, Any]) -> Dict[str, Any]:
         trust_post = float(adaptive_trust.get("trust_post", 0.0) or 0.0)
         is_sufficient = bool(adaptive_trust.get("is_sufficient", False))
@@ -166,6 +175,22 @@ class CorrectivePipeline:
         stance_raw = {"entails": 1.0, "neutral": 0.0, "contradicts": -1.0}.get((stance or "neutral").lower(), 0.0)
         stance_mapped = (stance_raw + 1.0) / 2.0
         return stance_raw, stance_mapped
+
+    @staticmethod
+    def _log_top_domains(round_id: str, ranked: List[Dict[str, Any]]) -> None:
+        domain_counts: Dict[str, int] = {}
+        for item in ranked[:10]:
+            src = str(item.get("source_url") or item.get("source") or "").strip()
+            if not src:
+                continue
+            parsed = urllib.parse.urlparse(src)
+            domain = (parsed.netloc or "").lower().removeprefix("www.")
+            if not domain:
+                continue
+            domain_counts[domain] = domain_counts.get(domain, 0) + 1
+        if domain_counts:
+            top_domains = sorted(domain_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+            logger.info("[CorrectivePipeline:%s] Top evidence domains: %s", round_id, top_domains)
 
     def _build_evidence_items(self, claim: str, ranked: List[Dict[str, Any]]) -> List[EvidenceItem]:
         evidence_items = [
@@ -224,10 +249,13 @@ class CorrectivePipeline:
         """
         round_id = round_id or str(uuid.uuid4())
         failed_entities = failed_entities or []
+        confidence_mode = self._confidence_mode()
         try:
             min_internal_top_k = max(3, int(os.getenv("PIPELINE_MIN_INTERNAL_TOP_K", "3")))
         except Exception:
             min_internal_top_k = 3
+        if confidence_mode:
+            min_internal_top_k = max(min_internal_top_k, int(os.getenv("CONFIDENCE_TOP_K", "10")))
         internal_top_k = max(int(top_k or 1), min_internal_top_k)
 
         # Reset Groq call counter for this new request (per-job)
@@ -353,6 +381,7 @@ class CorrectivePipeline:
                 "sem_in_ranked": debug_counts["sem_in_ranked"],
             },
         )
+        self._log_top_domains(round_id, top_ranked)
 
         # Compute trust scores for evidence
 
@@ -460,6 +489,8 @@ class CorrectivePipeline:
             f"[CorrectivePipeline:{round_id}] Evidence insufficient (coverage={adaptive_trust['coverage']:.2f}, "
             f"diversity={adaptive_trust['diversity']:.2f}), starting quota-optimized search..."
         )
+        if confidence_mode:
+            logger.info("[CorrectivePipeline:%s] CONFIDENCE_MODE active", round_id)
 
         # Generate all search queries upfront (1 LLM call only)
         raw_subclaims = self.trust_ranker.adaptive_policy.decompose_claim(post_text)
@@ -485,7 +516,7 @@ class CorrectivePipeline:
             verdict_result = await self.verdict_generator.generate_verdict(
                 claim=post_text,
                 ranked_evidence=top_ranked,
-                top_k=top_k,
+                top_k=internal_top_k,
                 used_web_search=False,
             )
             await _emit_stage("search_done", {"search_api_calls": 0, "queries_total": 0})
@@ -589,8 +620,21 @@ class CorrectivePipeline:
             logger.info(f"[CorrectivePipeline:{round_id}] Executing: '{query}'")
 
             # Step 1: Execute SINGLE search API call
+            if confidence_mode and query_idx > 0:
+                logger.info(
+                    "[CorrectivePipeline:%s] Confidence mode: claim-level search already executed, skipping remaining "
+                    "query placeholders.",
+                    round_id,
+                )
+                break
             search_api_calls += 1
-            if query_idx == 0:
+            if confidence_mode:
+                query_urls = await self.search_agent.search_for_claim(
+                    post_text,
+                    min_urls=max(3, self.MAX_URLS_PER_QUERY),
+                    max_queries=self.MAX_SEARCH_QUERIES,
+                )
+            elif query_idx == 0:
                 query_urls = await self.search_agent.search_for_claim(
                     post_text,
                     min_urls=1,
@@ -771,6 +815,7 @@ class CorrectivePipeline:
                     "sem_in_ranked": debug_counts["sem_in_ranked"],
                 },
             )
+            self._log_top_domains(round_id, top_ranked)
 
             # Compute trust scores
             top_ranked_evidence = self._build_evidence_items(post_text, top_ranked)

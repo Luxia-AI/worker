@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from typing import Any, Dict, Iterable, List, Sequence
 
@@ -218,6 +219,9 @@ def derive_anchor_groups(text: str) -> List[List[str]]:
 
 def evaluate_anchor_match(text: str, statement: str) -> Dict[str, Any]:
     groups = derive_anchor_groups(text)
+    confidence_mode = (os.getenv("LUXIA_CONFIDENCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+    if confidence_mode and len(groups) > 2:
+        groups = groups[:2]
     stmt = (statement or "").lower()
     matched = 0
     for g in groups:

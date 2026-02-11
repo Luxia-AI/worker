@@ -18,6 +18,7 @@ from app.constants.config import (
     LLM_MAX_TOKENS_RELATION_EXTRACTION,
     LLM_MAX_TOKENS_VERDICT_GENERATION,
 )
+from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.llms.groq_service import GroqService, RateLimitError
 
@@ -40,6 +41,7 @@ class GroqJobState:
     degraded_mode: bool = False
     skipped_calls: list[str] = field(default_factory=list)
     fallback_to_local: bool = False
+    fact_extraction_override_used: bool = False
 
 
 _groq_job_state: contextvars.ContextVar[GroqJobState] = contextvars.ContextVar(
@@ -53,12 +55,31 @@ _DEGRADE_ORDER = {
     "fact_extraction": 3,
 }
 
+_CRITICAL_CALL_TAGS = {
+    "fact_extraction",
+    "entity_extraction",
+    "relation_extraction",
+    "verdict_generation",
+}
+
+
+def _env_confidence_mode() -> bool:
+    value = os.getenv("LUXIA_CONFIDENCE_MODE")
+    if value is None:
+        return bool(getattr(settings, "LUXIA_CONFIDENCE_MODE", False))
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
 
 def _env_allow_groq_burst() -> bool:
     return (os.getenv("ALLOW_GROQ_BURST", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _env_max_calls() -> int:
+    if _env_confidence_mode():
+        try:
+            return max(1, int(os.getenv("GROQ_MAX_CALLS_PER_JOB_CONFIDENCE", "30")))
+        except Exception:
+            return 30
     try:
         return max(1, int(os.getenv("GROQ_MAX_CALLS_PER_JOB", "5")))
     except Exception:
@@ -131,6 +152,8 @@ def get_groq_job_metadata() -> Dict[str, Any]:
         "degraded_mode": state.degraded_mode,
         "skipped_calls": skipped,
         "fallback_to_local": state.fallback_to_local,
+        "confidence_mode": _env_confidence_mode(),
+        "fact_extraction_override_used": state.fact_extraction_override_used,
     }
 
 
@@ -190,9 +213,28 @@ class HybridLLMService:
             "call_tag": call_tag,
         }
 
-    def _consume_groq_budget(self, call_tag: str, priority: LLMPriority) -> tuple[bool, int, int, str]:
+    @staticmethod
+    def _is_critical_call(call_tag: str) -> bool:
+        return (call_tag or "").strip().lower() in _CRITICAL_CALL_TAGS
+
+    def _consume_groq_budget(
+        self, call_tag: str, priority: LLMPriority, allow_quota_override: bool = False
+    ) -> tuple[bool, int, int, str]:
         state = _groq_job_state.get()
+        confidence_mode = _env_confidence_mode()
         if state.calls_used >= state.max_calls:
+            if confidence_mode and allow_quota_override and self._is_critical_call(call_tag):
+                logger.warning(
+                    "[HybridLLMService] Confidence override: allowing critical call beyond hard cap "
+                    "for job=%s (used=%d/%d, tag=%s)",
+                    state.job_id,
+                    state.calls_used,
+                    state.max_calls,
+                    call_tag or "unknown",
+                )
+                state.calls_used += 1
+                _groq_job_state.set(state)
+                return True, state.calls_used, state.max_calls, "confidence_override_hard_cap"
             return False, state.calls_used, state.max_calls, "hard_cap"
 
         reserved_for_verdict, reserved_for_fact = _reserved_call_budget(state.max_calls)
@@ -212,6 +254,9 @@ class HybridLLMService:
             and remaining <= reserve_pool
             and not allow_high_critical
         ):
+            if confidence_mode and is_fact_extraction_call:
+                # unreachable due guard, but keep for defensive safety.
+                pass
             logger.warning(
                 "[HybridLLMService] Preserving critical reserved slots for job=%s "
                 "(used=%d/%d, remaining=%d, reserve_pool=%d, verdict_reserved=%d, "
@@ -227,10 +272,39 @@ class HybridLLMService:
                 call_tag or "unknown",
             )
             reason = "reserved_for_verdict" if reserved_for_fact <= 0 else "reserved_for_critical"
+            if (
+                confidence_mode
+                and allow_quota_override
+                and is_fact_extraction_call
+                and not state.fact_extraction_override_used
+            ):
+                logger.warning(
+                    "[HybridLLMService] Confidence override: bypassing %s for fact extraction " "job=%s (used=%d/%d)",
+                    reason,
+                    state.job_id,
+                    state.calls_used,
+                    state.max_calls,
+                )
+                state.calls_used += 1
+                state.fact_extraction_override_used = True
+                _groq_job_state.set(state)
+                return True, state.calls_used, state.max_calls, f"confidence_override_{reason}"
             return False, state.calls_used, state.max_calls, reason
 
         # Fact extraction can use its own reserved pool, but must preserve verdict slot(s).
         if is_fact_extraction_call and remaining <= reserved_for_verdict:
+            if confidence_mode and allow_quota_override and not state.fact_extraction_override_used:
+                logger.warning(
+                    "[HybridLLMService] Confidence override: bypassing reserved_for_verdict "
+                    "for fact extraction job=%s (used=%d/%d)",
+                    state.job_id,
+                    state.calls_used,
+                    state.max_calls,
+                )
+                state.calls_used += 1
+                state.fact_extraction_override_used = True
+                _groq_job_state.set(state)
+                return True, state.calls_used, state.max_calls, "confidence_override_reserved_for_verdict"
             logger.warning(
                 "[HybridLLMService] Preserving reserved verdict slot(s) for job=%s "
                 "(used=%d/%d, remaining=%d, verdict_reserved=%d, tag=%s)",
@@ -258,6 +332,8 @@ class HybridLLMService:
             "verdict_generation": LLM_MAX_TOKENS_VERDICT_GENERATION,
         }
         base = int(mapping.get(tag, LLM_MAX_TOKENS_DEFAULT))
+        if _env_confidence_mode() and tag == "fact_extraction":
+            base = max(base, int(os.getenv("CONFIDENCE_FACT_EXTRACTION_MAX_TOKENS", "1500")))
         # JSON payloads need a small floor to avoid malformed truncation on short caps.
         if response_format == "json":
             return max(192, base)
@@ -283,6 +359,7 @@ class HybridLLMService:
         priority: LLMPriority = LLMPriority.HIGH,
         temperature: float | None = None,
         call_tag: str = "",
+        allow_quota_override: bool = False,
     ) -> Dict[str, Any]:
         """
         Calls LLM with priority-based routing and automatic fallback.
@@ -299,7 +376,13 @@ class HybridLLMService:
         - Local fallback when available
         - If local unavailable and call is non-critical, return degraded skip marker
         """
-        can_use_groq, call_num, max_calls, budget_reason = self._consume_groq_budget(call_tag, priority)
+        confidence_mode = _env_confidence_mode()
+        critical_call = self._is_critical_call(call_tag)
+        can_use_groq, call_num, max_calls, budget_reason = self._consume_groq_budget(
+            call_tag,
+            priority,
+            allow_quota_override=allow_quota_override,
+        )
 
         if not can_use_groq:
             logger.warning(
@@ -311,6 +394,24 @@ class HybridLLMService:
                 priority.value,
                 call_tag or "unknown",
             )
+            if confidence_mode and critical_call and self.groq_available and self.groq_service:
+                if getattr(self.groq_service, "has_fallback_client", False):
+                    logger.warning(
+                        "[HybridLLMService] Confidence mode: retrying critical call with fallback credentials "
+                        "(budget reason=%s, tag=%s)",
+                        budget_reason,
+                        call_tag or "unknown",
+                    )
+                    max_tokens = self._max_tokens_for_call(call_tag, response_format)
+                    async with self._groq_semaphore:
+                        return await self.groq_service.ainvoke(
+                            prompt,
+                            response_format,
+                            max_retries=1,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            force_client="fallback",
+                        )
             if self.local_available and self.local_service:
                 logger.info("[HybridLLMService] Falling back to local LLM (budget unavailable)")
                 return await self._invoke_local(prompt, response_format, temperature)
@@ -327,7 +428,7 @@ class HybridLLMService:
             try:
                 max_tokens = self._max_tokens_for_call(call_tag, response_format)
                 logger.info(
-                    "[HybridLLMService] Groq call: job=%s call=%d/%d priority=%s tag=%s max_tokens=%d",
+                    "[HybridLLMService] Groq call: job=%s call=%d/%d priority=%s tag=%s max_tokens=%d key=primary",
                     _groq_job_state.get().job_id,
                     call_num,
                     max_calls,
@@ -339,7 +440,7 @@ class HybridLLMService:
                     result = await self.groq_service.ainvoke(
                         prompt,
                         response_format,
-                        max_retries=2,
+                        max_retries=1 if confidence_mode and critical_call else 2,
                         temperature=temperature,
                         max_tokens=max_tokens,
                     )
@@ -347,8 +448,55 @@ class HybridLLMService:
                 return result
             except RateLimitError as e:
                 logger.warning(f"[HybridLLMService] Groq rate limited: {e}")
+                if confidence_mode and critical_call and getattr(self.groq_service, "has_fallback_client", False):
+                    try:
+                        logger.warning(
+                            "[HybridLLMService] Retrying critical call with fallback credentials after rate limit "
+                            "(tag=%s)",
+                            call_tag or "unknown",
+                        )
+                        max_tokens = self._max_tokens_for_call(call_tag, response_format)
+                        async with self._groq_semaphore:
+                            return await self.groq_service.ainvoke(
+                                prompt,
+                                response_format,
+                                max_retries=1,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                force_client="fallback",
+                            )
+                    except Exception as fallback_error:
+                        logger.warning("[HybridLLMService] Fallback credential retry failed: %s", fallback_error)
             except Exception as e:
                 logger.warning(f"[HybridLLMService] Groq failed: {e}")
+                msg = str(e).lower()
+                should_retry_fallback = any(
+                    token in msg for token in ("quota", "hard_cap", "budget unavailable", "reserved_for", "rate")
+                )
+                if (
+                    confidence_mode
+                    and critical_call
+                    and should_retry_fallback
+                    and getattr(self.groq_service, "has_fallback_client", False)
+                ):
+                    try:
+                        logger.warning(
+                            "[HybridLLMService] Retrying critical call with fallback credentials after primary "
+                            "failure (tag=%s)",
+                            call_tag or "unknown",
+                        )
+                        max_tokens = self._max_tokens_for_call(call_tag, response_format)
+                        async with self._groq_semaphore:
+                            return await self.groq_service.ainvoke(
+                                prompt,
+                                response_format,
+                                max_retries=1,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                force_client="fallback",
+                            )
+                    except Exception as fallback_error:
+                        logger.warning("[HybridLLMService] Fallback credential retry failed: %s", fallback_error)
 
         if self.local_available and self.local_service:
             logger.info("[HybridLLMService] Falling back to local LLM after Groq failure")

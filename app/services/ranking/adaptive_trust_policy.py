@@ -14,6 +14,7 @@ import os
 import re
 from typing import Any, Dict, List
 
+from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.common.claim_segmentation import split_claim_into_segments
 from app.services.ranking.subclaim_coverage import compute_subclaim_coverage
@@ -30,6 +31,7 @@ class AdaptiveTrustPolicy:
     """
 
     def __init__(self):
+        self.confidence_mode = self._is_confidence_mode()
         # Gating rule thresholds
         self.COVERAGE_THRESHOLD_HIGH = float(os.getenv("ADAPTIVE_COVERAGE_THRESHOLD_HIGH", "0.60"))
         self.COVERAGE_THRESHOLD_MEDIUM = float(os.getenv("ADAPTIVE_COVERAGE_THRESHOLD_MEDIUM", "0.40"))
@@ -38,10 +40,85 @@ class AdaptiveTrustPolicy:
         self.MIN_EVIDENCE_COUNT = int(os.getenv("ADAPTIVE_MIN_EVIDENCE_COUNT", "3"))
         self.HIGH_DIVERSITY_FOR_LOW_COUNT = float(os.getenv("ADAPTIVE_HIGH_DIVERSITY_FOR_LOW_COUNT", "0.85"))
         self.HIGH_RELEVANCE_FOR_LOW_COUNT = float(os.getenv("ADAPTIVE_HIGH_RELEVANCE_FOR_LOW_COUNT", "0.75"))
+        self.PARTIAL_WEIGHT = float(os.getenv("ADAPTIVE_PARTIAL_WEIGHT", "0.5"))
+        self.STRONG_THRESHOLD = float(os.getenv("ADAPTIVE_STRONG_THRESHOLD", "0.55"))
+        self.PARTIAL_THRESHOLD = float(os.getenv("ADAPTIVE_PARTIAL_THRESHOLD", "0.30"))
+
+        if self.confidence_mode:
+            self.MIN_EVIDENCE_COUNT = int(os.getenv("ADAPTIVE_MIN_EVIDENCE_COUNT_CONFIDENCE", "1"))
+            self.COVERAGE_THRESHOLD_HIGH = float(os.getenv("ADAPTIVE_COVERAGE_THRESHOLD_HIGH_CONFIDENCE", "0.35"))
+            self.COVERAGE_THRESHOLD_MEDIUM = float(os.getenv("ADAPTIVE_COVERAGE_THRESHOLD_MEDIUM_CONFIDENCE", "0.20"))
+            self.PARTIAL_WEIGHT = float(os.getenv("ADAPTIVE_PARTIAL_WEIGHT_CONFIDENCE", "0.7"))
+            self.STRONG_THRESHOLD = float(os.getenv("ADAPTIVE_STRONG_THRESHOLD_CONFIDENCE", "0.45"))
+            self.PARTIAL_THRESHOLD = float(os.getenv("ADAPTIVE_PARTIAL_THRESHOLD_CONFIDENCE", "0.18"))
 
         # Scoring weights
         self.COVERAGE_WEIGHT = 0.5
         self.BASE_WEIGHT = 0.5
+
+    @staticmethod
+    def _is_confidence_mode() -> bool:
+        value = os.getenv("LUXIA_CONFIDENCE_MODE")
+        if value is None:
+            return bool(getattr(settings, "LUXIA_CONFIDENCE_MODE", False))
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+
+    @staticmethod
+    def _token_set(text: str) -> set[str]:
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "can",
+            "could",
+            "should",
+            "would",
+            "may",
+            "might",
+        }
+        return {w for w in re.findall(r"\b[\w']+\b", (text or "").lower()) if w not in stop}
+
+    def _lexical_partial_coverage(self, subclaim: str, evidence_list: List[EvidenceItem]) -> bool:
+        tokens = self._token_set(subclaim)
+        if not tokens:
+            return False
+        neg_terms = {"no", "not", "never", "without", "ineffective", "inefficacy", "doesnt", "doesn't"}
+        has_neg = any(t in tokens for t in neg_terms)
+        focus_tokens = [t for t in tokens if t not in neg_terms]
+        if not focus_tokens:
+            return False
+        left = set(focus_tokens[: max(1, len(focus_tokens) // 2)])
+        right = set(focus_tokens[max(1, len(focus_tokens) // 2) :]) or left
+
+        for ev in evidence_list:
+            statement = str(getattr(ev, "statement", "") or "")
+            ev_tokens = self._token_set(statement)
+            if not ev_tokens:
+                continue
+            left_ok = bool(left & ev_tokens)
+            right_ok = bool(right & ev_tokens)
+            neg_ok = (not has_neg) or bool(neg_terms & ev_tokens)
+            if left_ok and right_ok and neg_ok:
+                return True
+        return False
 
     def decompose_claim(self, claim: str) -> List[str]:
         """
@@ -189,11 +266,37 @@ class AdaptiveTrustPolicy:
         if not subclaims:
             return 0.0
 
-        cov = compute_subclaim_coverage(subclaims, evidence_list, partial_weight=0.5)
+        cov = compute_subclaim_coverage(
+            subclaims,
+            evidence_list,
+            strong_threshold=self.STRONG_THRESHOLD,
+            partial_threshold=self.PARTIAL_THRESHOLD,
+            partial_weight=self.PARTIAL_WEIGHT,
+        )
         coverage = float(cov.get("coverage", 0.0))
         weighted = float(cov.get("weighted_covered", 0.0))
+        details = cov.get("details", [])
+
+        if self.confidence_mode and subclaims:
+            lexical_partial_hits = 0
+            for detail in details:
+                status = str(detail.get("status") or "UNKNOWN").upper()
+                if status != "UNKNOWN":
+                    continue
+                subclaim = str(detail.get("subclaim") or "")
+                if self._lexical_partial_coverage(subclaim, evidence_list):
+                    lexical_partial_hits += 1
+            if lexical_partial_hits > 0:
+                weighted += lexical_partial_hits * self.PARTIAL_WEIGHT
+                coverage = min(1.0, weighted / max(1, len(subclaims)))
+                logger.info(
+                    "[AdaptiveTrustPolicy][Coverage] Confidence lexical partial upgrades=%d -> coverage=%.2f",
+                    lexical_partial_hits,
+                    coverage,
+                )
+
         logger.info("Coverage: weighted=%.2f/%d = %.2f", weighted, len(subclaims), coverage)
-        for d in cov.get("details", []):
+        for d in details:
             logger.info(
                 "[AdaptiveTrustPolicy][Coverage] subclaim=%d chosen_evidence_id=%s "
                 "relevance=%.3f overlap=%.3f anchors=%d/%d anchors_per_subclaim=%d status=%s",
@@ -203,7 +306,7 @@ class AdaptiveTrustPolicy:
                 float(d.get("overlap", 0.0)),
                 int(d.get("anchors_matched", 0)),
                 int(d.get("anchors_required", 0)),
-                int(d.get("anchors_per_subclaim", 0)),
+                (2 if self.confidence_mode else int(d.get("anchors_per_subclaim", 0))),
                 d.get("status"),
             )
         return coverage
@@ -363,6 +466,16 @@ class AdaptiveTrustPolicy:
                     self.MIN_EVIDENCE_COUNT,
                 )
                 return False
+
+        if self.confidence_mode and evidence_count is not None and evidence_count >= self.MIN_EVIDENCE_COUNT:
+            if coverage >= self.COVERAGE_THRESHOLD_MEDIUM:
+                logger.info(
+                    "Gating: PASS - confidence mode relaxed gate (count=%d coverage=%.2f diversity=%.2f)",
+                    evidence_count,
+                    coverage,
+                    diversity,
+                )
+                return True
 
         if contradicted_count == 0 and (
             (coverage >= 0.25 and diversity >= 0.75)

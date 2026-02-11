@@ -58,6 +58,7 @@ class TrustedSearch:
         "pubmed.ncbi.nlm.nih.gov",
         "cdc.gov",
         "clinicaltrials.gov",
+        "medlineplus.gov",
         "cochranelibrary.com",
         "plos.org",
         "nature.com",
@@ -66,6 +67,7 @@ class TrustedSearch:
         "bmj.com",
         "nejm.org",
         "thelancet.com",
+        "sciencedirect.com",
         "nhs.uk",
         "nice.org.uk",
         "ema.europa.eu",
@@ -99,6 +101,7 @@ class TrustedSearch:
         "who.int",
         "fda.gov",
         "hhs.gov",
+        "medlineplus.gov",
         "nhs.uk",
         "nice.org.uk",
         "clinicaltrials.gov",
@@ -110,6 +113,30 @@ class TrustedSearch:
         "bmj.com",
         "nejm.org",
         "thelancet.com",
+    ]
+    _CONFIDENCE_NEGATIVE_TERMS = [
+        "-facebook",
+        "-quora",
+        "-reddit",
+        "-pinterest",
+        "-opinion",
+        "-youtube",
+        "-testimonial",
+    ]
+    _CONFIDENCE_NEGATION_VARIANTS = [
+        "do not",
+        "does not",
+        "not effective",
+        "not recommended",
+        "wont help",
+        "ineffective",
+    ]
+    _CONFIDENCE_VERB_VARIANTS = [
+        "treat",
+        "work",
+        "cure",
+        "help",
+        "effective against",
     ]
 
     def __init__(
@@ -140,13 +167,29 @@ class TrustedSearch:
         self.google_available = has_google
         self.serper_available = has_serper
         self.google_quota_exceeded = False
+        confidence_raw = os.getenv("LUXIA_CONFIDENCE_MODE")
+        if confidence_raw is None:
+            self.confidence_mode = bool(getattr(settings, "LUXIA_CONFIDENCE_MODE", False))
+        else:
+            self.confidence_mode = confidence_raw.strip().lower() in {"1", "true", "yes", "on"}
         self.min_allowlist_pass = max(1, int(os.getenv("TRUSTED_SEARCH_MIN_ALLOWLIST_PASS", "3")))
         extra_allowlist = {
             d.strip().lower().removeprefix("www.")
             for d in (os.getenv("TRUSTED_SEARCH_EXTRA_ALLOWLIST", "") or "").split(",")
             if d.strip()
         }
-        trusted_base = {d.lower().removeprefix("www.") for d in TRUSTED_DOMAINS}
+        include_trusted_domains = (os.getenv("TRUSTED_SEARCH_INCLUDE_TRUSTED_DOMAINS", "false") or "").strip().lower()
+        trusted_base = (
+            {d.lower().removeprefix("www.") for d in TRUSTED_DOMAINS}
+            if include_trusted_domains
+            in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            else set()
+        )
         self.strict_allowlist = set(self.STRICT_TRUSTED_DOMAIN_BASE) | trusted_base | extra_allowlist
         allowlist_fingerprint = hashlib.sha256("|".join(sorted(self.strict_allowlist)).encode("utf-8")).hexdigest()[:12]
         serper_site_env = [
@@ -176,6 +219,7 @@ class TrustedSearch:
             "[TrustedSearch] Serper site-boost domains: %s",
             self.serper_site_boost_domains,
         )
+        logger.info("[TrustedSearch] Confidence mode: %s", self.confidence_mode)
 
         try:
             self.llm_client = HybridLLMService()
@@ -585,6 +629,88 @@ class TrustedSearch:
         if "human" in t:
             negatives.extend(["-veterinary"])
         return negatives
+
+    @staticmethod
+    def _extract_confidence_anchor_parts(claim: str, entity_obj: ClaimEntities) -> tuple[str, str]:
+        anchors = [a.strip() for a in (entity_obj.anchors or entity_obj.topic or []) if str(a).strip()]
+        if not anchors:
+            tokens = re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (claim or "").lower())
+            stop = {
+                "the",
+                "and",
+                "with",
+                "from",
+                "that",
+                "this",
+                "these",
+                "those",
+                "does",
+                "doesnt",
+                "not",
+                "have",
+                "has",
+                "for",
+                "are",
+                "is",
+            }
+            anchors = [t for t in tokens if t not in stop][:4]
+        if not anchors:
+            return "health claim", "outcome"
+        if len(anchors) == 1:
+            return anchors[0], anchors[0]
+        return anchors[0], anchors[1]
+
+    def _build_confidence_mode_queries(
+        self,
+        claim: str,
+        entity_obj: ClaimEntities,
+        max_queries: int = 10,
+    ) -> List[str]:
+        claim_clean = self._sanitize_query(claim)
+        if not claim_clean:
+            return []
+        a_term, b_term = self._extract_confidence_anchor_parts(claim_clean, entity_obj)
+        text_low = claim_clean.lower()
+
+        negations = list(self._CONFIDENCE_NEGATION_VARIANTS)
+        if not re.search(r"\b(no|not|never|without|ineffective|doesn't|doesnt)\b", text_low):
+            negations = ["not effective", "not recommended", "ineffective", "do not"]
+
+        verb_variants = list(self._CONFIDENCE_VERB_VARIANTS)
+        if re.search(r"\bprevent|protec|reduce|work|treat|cure|help\b", text_low):
+            verb_variants = [
+                "work",
+                "help",
+                "effective against",
+                "treat",
+                "prevent",
+            ]
+
+        b_variants = [b_term]
+        if "virus" in text_low or "viral" in text_low or "infection" in text_low:
+            for v in ["virus", "viral infection", "infection"]:
+                if v not in b_variants:
+                    b_variants.append(v)
+
+        negatives = " ".join(self._CONFIDENCE_NEGATIVE_TERMS)
+        queries: List[str] = [
+            f'"{claim_clean}" {negatives}',
+            f"{a_term} {negations[0]} {verb_variants[0]} {b_variants[0]} {negatives}",
+            f"{a_term} {b_variants[0]} {negations[1]} {negatives}",
+            f'"{a_term}" "{b_variants[0]}" guideline OR advice OR recommend {negatives}',
+            f"site:cdc.gov {a_term} {b_variants[0]} {negations[2]} {negatives}",
+            f"site:who.int {a_term} {b_variants[0]} {negations[2]} {negatives}",
+            f"site:medlineplus.gov {a_term} {b_variants[0]} {negations[2]} {negatives}",
+            f"site:nhs.uk {a_term} {b_variants[0]} {negations[2]} {negatives}",
+        ]
+
+        if len(b_variants) > 1 and len(queries) < max_queries:
+            queries.append(f"{a_term} {negations[0]} {verb_variants[0]} {b_variants[1]} {negatives}")
+        if len(negations) > 3 and len(queries) < max_queries:
+            queries.append(f"{a_term} {b_variants[0]} {negations[3]} {negatives}")
+
+        cleaned = [self._sanitize_query(q) for q in queries if q]
+        return dedupe_list([q for q in cleaned if q])[: max(1, max_queries)]
 
     def _build_research_instruction_query(self, text: str, entities: List[str] | None = None) -> str:
         entities = entities or []
@@ -1615,6 +1741,24 @@ FAILED ENTITIES:
         """
         entities = entities or []
 
+        if self.confidence_mode:
+            try:
+                plan = build_plan(post_text)
+                entity_obj = plan.extracted_entities
+            except Exception:
+                entity_obj = ClaimEntities(anchors=entities[:10], topic=entities[:6])
+            confidence_queries = self._build_confidence_mode_queries(
+                claim=post_text,
+                entity_obj=entity_obj,
+                max_queries=max_queries,
+            )
+            logger.info(
+                "[TrustedSearch][ConfidenceMode] Generated %d deterministic queries (max=%d)",
+                len(confidence_queries),
+                max_queries,
+            )
+            return confidence_queries
+
         # 1) Determine subclaims and merge fragments for better query quality
         if subclaims is None:
             subclaims = AdaptiveTrustPolicy().decompose_claim(post_text)
@@ -1793,18 +1937,26 @@ FAILED ENTITIES:
         min_urls = max(1, int(min_urls))
         max_queries = max(1, int(max_queries))
         selected_urls: List[str] = []
+        deterministic_queries: List[str]
+        if self.confidence_mode:
+            deterministic_queries = self._build_confidence_mode_queries(
+                claim=plan.claim,
+                entity_obj=plan.extracted_entities,
+                max_queries=max_queries,
+            )
+        else:
+            deterministic_queries = [self._sanitize_query(spec.q) for spec in plan.queries[:max_queries] if spec.q]
 
         logger.info(
             "[TrustedSearch] search_for_claim: claim_type=%s queries=%d min_urls=%d max_queries=%d",
             plan.claim_type,
-            len(plan.queries),
+            len(deterministic_queries),
             min_urls,
             max_queries,
         )
 
         async with aiohttp.ClientSession() as session:
-            for idx, query_spec in enumerate(plan.queries[:max_queries], start=1):
-                query = self._sanitize_query(query_spec.q)
+            for idx, query in enumerate(deterministic_queries, start=1):
                 if not query:
                     continue
                 logger.info("[TrustedSearch] Executing claim query %d/%d: '%s'", idx, max_queries, query)
@@ -1819,6 +1971,39 @@ FAILED ENTITIES:
                     selected_urls = dedupe_list(selected_urls + urls)
                 if len(selected_urls) >= min_urls:
                     break
+
+            if self.confidence_mode and len(selected_urls) < 3 and self.llm_client is not None:
+                logger.info(
+                    "[TrustedSearch][ConfidenceMode] Deterministic queries returned %d trusted URLs (<3), "
+                    "running LLM reformulation fallback",
+                    len(selected_urls),
+                )
+                reformulated = await self.reformulate_queries(
+                    plan.claim,
+                    failed_entities=plan.extracted_entities.anchors[:6],
+                    entities=plan.extracted_entities.anchors[:8],
+                    subclaims=AdaptiveTrustPolicy().decompose_claim(plan.claim),
+                )
+                for idx, query in enumerate(reformulated[:max_queries], start=1):
+                    if not query:
+                        continue
+                    logger.info(
+                        "[TrustedSearch][ConfidenceMode] Executing reformulated query %d/%d: '%s'",
+                        idx,
+                        max_queries,
+                        query,
+                    )
+                    urls = await self.search_query(
+                        session,
+                        query,
+                        claim=plan.claim,
+                        claim_type=plan.claim_type,
+                        entities=plan.extracted_entities,
+                    )
+                    if urls:
+                        selected_urls = dedupe_list(selected_urls + urls)
+                    if len(selected_urls) >= min_urls:
+                        break
 
         return dedupe_list(selected_urls)
 

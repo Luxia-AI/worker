@@ -18,9 +18,11 @@ similarity favors other topics.
 import os
 import re
 from enum import Enum
+from hashlib import sha1
 from typing import Any, Dict, List, Optional
 
 from app.constants.config import LLM_TEMPERATURE_VERDICT
+from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.common.claim_segmentation import split_claim_into_segments
 from app.services.corrective.fact_extractor import FactExtractor
@@ -151,6 +153,11 @@ class VerdictGenerator:
         self.MAX_WEB_ROUNDS_PRE_VERDICT = 2
         self.WEB_SEGMENTS_LIMIT = 3
         self.MAX_UNKNOWN_ROUNDS_POST_VERDICT = 2
+        env_flag = os.getenv("LUXIA_CONFIDENCE_MODE")
+        if env_flag is None:
+            self.confidence_mode = bool(getattr(settings, "LUXIA_CONFIDENCE_MODE", False))
+        else:
+            self.confidence_mode = env_flag.strip().lower() in {"1", "true", "yes", "on"}
 
     def _quick_web_score(self, segment: str, fact_stmt: str, conf: float) -> float:
         stop = {
@@ -293,6 +300,8 @@ class VerdictGenerator:
                 - evidence_map: List of evidence with relevance annotations
                 - key_findings: List of key findings
         """
+        if self.confidence_mode:
+            top_k = max(top_k, int(os.getenv("CONFIDENCE_VERDICT_TOP_K", "10")))
         if not ranked_evidence:
             if used_web_search:
                 logger.warning(
@@ -315,7 +324,10 @@ class VerdictGenerator:
             self._needs_web_boost(ranked_evidence[: min(len(ranked_evidence), 6)], claim=claim)
             or self._policy_says_insufficient(claim, ranked_evidence[: min(len(ranked_evidence), 10)])
         ):
-            segment_evidence = await self._retrieve_segment_evidence(claim, top_k=2)
+            segment_evidence = await self._retrieve_segment_evidence(
+                claim,
+                top_k=3 if self.confidence_mode else 2,
+            )
 
         enriched_evidence = self._merge_evidence(ranked_evidence, segment_evidence)
 
@@ -328,7 +340,7 @@ class VerdictGenerator:
             logger.info(f"[VerdictGenerator] Using {len(ranked_evidence)} ranked evidence (segment retrieval skipped)")
 
         # Step 2) PRE-VERDICT web-boost loop driven by *sufficiency*
-        pre_evidence = enriched_evidence[: min(len(enriched_evidence), max(top_k, 8), 12)]
+        pre_evidence = enriched_evidence[: min(len(enriched_evidence), max(top_k, 12), 20)]
         if not used_web_search and not cache_sufficient:
             for round_i in range(self.MAX_WEB_ROUNDS_PRE_VERDICT):
                 insufficient = self._policy_says_insufficient(claim, pre_evidence)
@@ -350,7 +362,7 @@ class VerdictGenerator:
                 merged_with_web.sort(key=self._deterministic_evidence_sort_key)
                 pre_evidence = merged_with_web[: min(len(merged_with_web), 18)]
         pre_evidence.sort(key=self._deterministic_evidence_sort_key)
-        top_evidence = self._select_balanced_top_evidence(claim, pre_evidence, top_k=min(top_k, 12))
+        top_evidence = self._select_balanced_top_evidence(claim, pre_evidence, top_k=min(top_k, 20))
 
         # Format evidence for prompt
         evidence_text = self._format_evidence_for_prompt(top_evidence)
@@ -391,7 +403,10 @@ class VerdictGenerator:
                         len(unknown_segments),
                     )
 
-                    candidate_boost = await self._retrieve_segment_evidence_for_segments(unknown_segments, top_k=2)
+                    candidate_boost = await self._retrieve_segment_evidence_for_segments(
+                        unknown_segments,
+                        top_k=3 if self.confidence_mode else 2,
+                    )
                     if candidate_boost:
                         logger.info(
                             "[VerdictGenerator] Retrieved %d targeted facts from VDB for UNKNOWN segments",
@@ -417,7 +432,7 @@ class VerdictGenerator:
                         break
 
                     enriched_evidence = self._merge_evidence(top_evidence, candidate_boost)
-                    top_evidence = self._select_balanced_top_evidence(claim, enriched_evidence, top_k=min(top_k, 12))
+                    top_evidence = self._select_balanced_top_evidence(claim, enriched_evidence, top_k=min(top_k, 20))
                     enriched_evidence_text = self._format_evidence_for_prompt(top_evidence)
                     enriched_prompt = VERDICT_GENERATION_PROMPT.format(
                         claim=claim, evidence_text=enriched_evidence_text
@@ -441,6 +456,12 @@ class VerdictGenerator:
                         logger.warning(f"[VerdictGenerator] Failed to re-generate verdict with targeted evidence: {e}")
                         break
 
+            self._log_low_confidence_unverifiable_reason(
+                claim=claim,
+                ranked_evidence=ranked_evidence,
+                final_evidence=top_evidence,
+                verdict_result=verdict_result,
+            )
             return verdict_result
 
         except Exception as e:
@@ -1902,19 +1923,56 @@ class VerdictGenerator:
         """
         # Filter ranked evidence - keep only items with valid statements
         merged: List[Dict[str, Any]] = [ev for ev in ranked_evidence if ev.get("statement") or ev.get("text")]
-        seen_statements: set[str] = {
-            self._normalize_statement_key(str(ev.get("statement") or ev.get("text") or "")) for ev in merged
-        }
+        seen_fingerprints: set[str] = set()
+        for ev in merged:
+            stmt = self._normalize_statement_key(str(ev.get("statement") or ev.get("text") or ""))
+            src = str(ev.get("source_url") or ev.get("source") or "").strip().lower()
+            if stmt:
+                seen_fingerprints.add(sha1(f"{stmt}|{src}".encode("utf-8")).hexdigest())
 
         for seg_ev in segment_evidence:
             stmt = seg_ev.get("statement") or seg_ev.get("text", "")
             stmt_key = self._normalize_statement_key(str(stmt))
-            if stmt and stmt_key and stmt_key not in seen_statements:
-                seen_statements.add(stmt_key)
+            src = str(seg_ev.get("source_url") or seg_ev.get("source") or "").strip().lower()
+            fingerprint = sha1(f"{stmt_key}|{src}".encode("utf-8")).hexdigest() if stmt_key else ""
+            if stmt and stmt_key and fingerprint and fingerprint not in seen_fingerprints:
+                seen_fingerprints.add(fingerprint)
                 merged.append(seg_ev)
 
         merged.sort(key=self._deterministic_evidence_sort_key)
         return merged
+
+    def _log_low_confidence_unverifiable_reason(
+        self,
+        claim: str,
+        ranked_evidence: List[Dict[str, Any]],
+        final_evidence: List[Dict[str, Any]],
+        verdict_result: Dict[str, Any],
+    ) -> None:
+        verdict = str(verdict_result.get("verdict", "") or "").upper()
+        confidence = float(verdict_result.get("confidence", 0.0) or 0.0)
+        if verdict != Verdict.UNVERIFIABLE.value or confidence > 0.10:
+            return
+
+        claim_breakdown = verdict_result.get("claim_breakdown", []) or []
+        unknown_count = sum(1 for item in claim_breakdown if str(item.get("status", "")).upper() == "UNKNOWN")
+        reason = "coverage_remained_unknown"
+        if not ranked_evidence:
+            reason = "retrieval_empty"
+        elif not final_evidence:
+            reason = "zero_facts_extracted"
+        elif self._policy_says_insufficient(claim, final_evidence):
+            reason = "gating_insufficient_evidence"
+        elif unknown_count > 0:
+            reason = "coverage_remained_unknown"
+
+        logger.warning(
+            "[VerdictGenerator][LowConfidence] UNVERIFIABLE<=0.10 reason=%s ranked=%d final=%d unknown_segments=%d",
+            reason,
+            len(ranked_evidence),
+            len(final_evidence),
+            unknown_count,
+        )
 
     def _get_unknown_segments(self, verdict_result: Dict[str, Any]) -> List[str]:
         """Extract segments marked as UNKNOWN from the verdict result."""

@@ -46,6 +46,10 @@ class GroqService:
         if not self._clients:
             raise RuntimeError("Missing Groq client credentials")
 
+    @property
+    def has_fallback_client(self) -> bool:
+        return any(name == "fallback" for name, _ in self._clients)
+
     @staticmethod
     def _build_headers(org_id: str | None, project_id: str | None) -> Dict[str, str] | None:
         headers: Dict[str, str] = {}
@@ -70,6 +74,7 @@ class GroqService:
         max_retries: int = 1,
         temperature: float | None = None,
         max_tokens: int | None = None,
+        force_client: str | None = None,
     ) -> Dict[str, Any]:
         """
         Calls Groq async chat completion endpoint with retry logic for rate limits.
@@ -95,9 +100,16 @@ class GroqService:
         if response_format == "json":
             kwargs["response_format"] = {"type": "json_object"}
 
+        clients_to_use = self._clients
+        if force_client:
+            requested = force_client.strip().lower()
+            clients_to_use = [(name, client) for name, client in self._clients if name == requested]
+            if not clients_to_use:
+                raise RuntimeError(f"Requested Groq client '{force_client}' is not configured")
+
         last_error: Exception | None = None
-        for client_idx, (client_name, client) in enumerate(self._clients):
-            is_last_client = client_idx == len(self._clients) - 1
+        for client_idx, (client_name, client) in enumerate(clients_to_use):
+            is_last_client = client_idx == len(clients_to_use) - 1
             for attempt in range(max_retries):
                 try:
                     response = await client.chat.completions.create(**kwargs)
@@ -107,16 +119,13 @@ class GroqService:
                     if response_format == "json":
                         if msg.content:
                             result: Dict[str, Any] = json.loads(msg.content)
-                            if client_name == "fallback":
-                                logger.warning("[GroqService] Request served by fallback Groq credentials")
+                            logger.info("[GroqService] Request served by %s Groq credentials", client_name)
                             return result
-                        if client_name == "fallback":
-                            logger.warning("[GroqService] Request served by fallback Groq credentials")
+                        logger.info("[GroqService] Request served by %s Groq credentials", client_name)
                         return {}
 
                     # Text response
-                    if client_name == "fallback":
-                        logger.warning("[GroqService] Request served by fallback Groq credentials")
+                    logger.info("[GroqService] Request served by %s Groq credentials", client_name)
                     return {"text": msg.content}
 
                 except Exception as e:
