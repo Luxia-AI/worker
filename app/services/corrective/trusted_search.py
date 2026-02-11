@@ -13,7 +13,7 @@ from app.core.config import settings
 from app.core.logger import get_logger
 from app.core.rate_limit import throttled
 from app.services.common.list_ops import dedupe_list
-from app.services.common.url_helpers import dedup_urls, is_accessible_url
+from app.services.common.url_helpers import dedup_urls
 from app.services.corrective.query_designer import ClaimEntities, CorrectiveQueryDesigner
 from app.services.corrective.query_generator import QueryPlan, build_plan, register_drift_from_url
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
@@ -1510,15 +1510,36 @@ FAILED ENTITIES:
     # ---------------------------------------------------------------------
     # Domain Whitelisting
     # ---------------------------------------------------------------------
+    @staticmethod
+    def _normalize_search_result_url(url: str) -> str:
+        """
+        Normalize search-engine redirect URLs to their target destination.
+        """
+        raw = (url or "").strip()
+        if not raw:
+            return ""
+        try:
+            parsed = urllib.parse.urlparse(raw)
+            host = (parsed.netloc or "").lower()
+            if host.startswith("www."):
+                host = host[4:]
+            if host in {"google.com", "google.co.uk", "google.lk"} and parsed.path == "/url":
+                params = urllib.parse.parse_qs(parsed.query or "")
+                target = (params.get("q") or params.get("url") or [""])[0]
+                if target:
+                    return target.strip()
+            return raw
+        except Exception:
+            return raw
+
     def is_trusted(self, url: str) -> bool:
         """
         Returns True if domain is in strict trusted domain allowlist.
         """
-        if not is_accessible_url(url):
-            return False
         try:
             allowlist = getattr(self, "strict_allowlist", None) or set(self.STRICT_TRUSTED_DOMAIN_BASE)
-            parsed = urllib.parse.urlparse(url)
+            normalized_url = self._normalize_search_result_url(url)
+            parsed = urllib.parse.urlparse(normalized_url)
             domain = (parsed.netloc or "").lower()
             if "@" in domain:
                 domain = domain.split("@")[-1]
@@ -1585,14 +1606,19 @@ FAILED ENTITIES:
             link = item.get("url") or item.get("link")
             if not link:
                 continue
-            if not self.is_trusted(link):
+            normalized_link = self._normalize_search_result_url(str(link))
+            if not self.is_trusted(normalized_link):
                 rejected_allowlist += 1
                 continue
-            reason = self._url_quality_reject_reason(link, item.get("title", ""), item.get("snippet", ""))
+            reason = self._url_quality_reject_reason(
+                normalized_link,
+                item.get("title", ""),
+                item.get("snippet", ""),
+            )
             if reason is not None:
                 rejected_quality += 1
                 continue
-            urls.append(link)
+            urls.append(normalized_link)
 
         logger.info(
             "[TrustedSearch:%s] query='%s' count_rejected_by_allowlist=%d count_rejected_by_quality=%d "

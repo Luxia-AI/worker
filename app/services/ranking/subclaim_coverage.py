@@ -30,6 +30,16 @@ _STOP_WORDS = {
     "being",
 }
 
+_NEGATION_PATTERNS = (
+    r"\bdoes\s+not\b",
+    r"\bdo\s+not\b",
+    r"\bcannot\b",
+    r"\bwithout\b",
+    r"\bnever\b",
+    r"\bnot\b",
+    r"\bno\b",
+)
+
 _ANCHOR_EXTRACTOR = AnchorExtractor()
 
 
@@ -44,6 +54,37 @@ def _safe_float(v: Any, default: float = 0.0) -> float:
         return float(v)
     except Exception:
         return default
+
+
+def _has_negation(text: str) -> bool:
+    low = (text or "").lower()
+    if not low:
+        return False
+    return any(re.search(pattern, low) for pattern in _NEGATION_PATTERNS)
+
+
+def _strip_negation(text: str) -> str:
+    cleaned = (text or "").lower()
+    cleaned = re.sub(r"\bdoes\s+not\b", " ", cleaned)
+    cleaned = re.sub(r"\bdo\s+not\b", " ", cleaned)
+    cleaned = re.sub(r"\bcannot\b", " ", cleaned)
+    cleaned = re.sub(r"\bwithout\b", " ", cleaned)
+    cleaned = re.sub(r"\bnever\b", " ", cleaned)
+    cleaned = re.sub(r"\bnot\b", " ", cleaned)
+    cleaned = re.sub(r"\bno\b", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _aligned_non_negated(subclaim: str, statement: str) -> bool:
+    sub_tokens = set(_tokens(_strip_negation(subclaim)))
+    stmt_tokens = set(_tokens(_strip_negation(statement)))
+    if not sub_tokens or not stmt_tokens:
+        return False
+    shared = sub_tokens & stmt_tokens
+    if len(shared) >= 2:
+        return True
+    overlap = len(shared) / max(1, len(sub_tokens))
+    return overlap >= 0.50
 
 
 def _as_statement(evidence: Any) -> str:
@@ -273,7 +314,20 @@ def compute_subclaim_coverage(
         contradicted = bool(best.get("contradicted", False))
         semantic = float(best.get("semantic_score", 0.0))
         anchor_hits = int(best.get("anchors_matched", 0))
-        if contradicted:
+        best_statement = _as_statement(evidence[best_idx]) if best_idx >= 0 and best_idx < len(evidence) else ""
+        claim_has_negation = _has_negation(subclaim)
+        evidence_has_negation = _has_negation(best_statement)
+        negation_mismatch = claim_has_negation != evidence_has_negation
+        high_semantic_mismatch = (
+            semantic >= 0.80
+            and negation_mismatch
+            and (_aligned_non_negated(subclaim, best_statement) or anchor_hits >= 1)
+        )
+        if high_semantic_mismatch:
+            contradicted = True
+            status = "INVALID"
+            weight = 0.0
+        elif contradicted:
             status = "UNKNOWN"
             weight = 0.0
         elif semantic >= strong_cutoff and anchor_hits >= min_anchor_hits:
