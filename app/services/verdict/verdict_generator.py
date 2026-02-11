@@ -775,6 +775,8 @@ class VerdictGenerator:
             and agreement_ratio >= 0.8
         ):
             truth_score_percent = max(float(truth_score_percent or 0.0), 85.0)
+        ceiling_percent = (0.85 + (0.10 * diversity_score)) * 100.0
+        truth_score_percent = min(float(truth_score_percent or 0.0), ceiling_percent)
         truthfulness = max(0.0, min(1.0, float(truth_score_percent or 0.0) / 100.0))
         coverage_score = max(0.0, min(1.0, coverage_score))
         agreement_ratio = max(0.0, min(1.0, agreement_ratio))
