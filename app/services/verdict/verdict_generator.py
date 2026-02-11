@@ -706,30 +706,41 @@ class VerdictGenerator:
                     seg["source_url"] = ""
                     seg["evidence_used_ids"] = []
 
-        # Calculate truthfulness from evidence (deterministic, claim-aware)
-        truthfulness_percent = self._calculate_truthfulness_from_evidence(claim, evidence)
+        # Evidence quality signal (deterministic, claim-aware) is used for confidence calibration.
+        evidence_quality_percent = self._calculate_truthfulness_from_evidence(claim, evidence)
 
         # Re-score confidence from evidence + breakdown when possible
         if evidence:
             confidence = self._calculate_confidence(evidence, claim_breakdown)
+            confidence = (0.65 * float(confidence)) + (0.35 * (float(evidence_quality_percent) / 100.0))
         self._log_subclaim_coverage(claim, evidence, claim_breakdown)
         reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
         verdict_str = reconciled["verdict"]
         policy_insufficient = self._policy_says_insufficient(claim, evidence)
-        truthfulness_cap = float(reconciled.get("truthfulness_cap", 100.0) or 100.0)
-        truthfulness_percent = min(float(truthfulness_percent or 0.0), truthfulness_cap)
+        truth_score_percent = self._calculate_truth_score_from_contract(reconciled)
+        agreement_ratio = self._calculate_evidence_agreement_ratio(claim, evidence)
+        if (
+            float(reconciled.get("weighted_truth", 0.0) or 0.0) >= 0.8
+            and int(reconciled.get("strong_covered", 0) or 0) >= 1
+            and int(reconciled.get("contradict_count", 0) or 0) == 0
+            and agreement_ratio >= 0.8
+        ):
+            truth_score_percent = max(float(truth_score_percent or 0.0), 85.0)
         confidence = self._cap_confidence_with_contract(confidence, reconciled, policy_insufficient, verdict_str)
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
         if llm_verdict == Verdict.TRUE.value and verdict_str != Verdict.TRUE.value:
             try:
-                truthfulness_percent = min(float(truthfulness_percent), 89.9)
+                truth_score_percent = min(float(truth_score_percent), 89.9)
             except Exception:
-                truthfulness_percent = 89.9
+                truth_score_percent = 89.9
 
         return {
             "verdict": verdict_str,
             "confidence": confidence,
-            "truthfulness_percent": truthfulness_percent,
+            # Backward-compatibility: keep `truthfulness_percent` but now make it a status-driven truth score.
+            "truthfulness_percent": truth_score_percent,
+            "truth_score_percent": truth_score_percent,
+            "evidence_quality_percent": float(evidence_quality_percent or 0.0),
             "rationale": rationale,
             "claim_breakdown": claim_breakdown,
             "evidence_map": evidence_map,
@@ -742,6 +753,7 @@ class VerdictGenerator:
             "unresolved_segments": reconciled["unresolved_segments"],
             "status_weighted_truth": reconciled.get("weighted_truth", 0.0),
             "truthfulness_cap": reconciled.get("truthfulness_cap", 100.0),
+            "agreement_ratio": agreement_ratio,
             "policy_sufficient": not policy_insufficient,
             "verdict_reconciled": bool(verdict_str != llm_verdict),
         }
@@ -754,6 +766,68 @@ class VerdictGenerator:
         if total <= 0:
             return 0.0
         return max(0.0, min(1.0, matched / total))
+
+    def _calculate_evidence_agreement_ratio(self, claim: str, evidence: List[Dict[str, Any]]) -> float:
+        """
+        Estimate agreement between claim segments and retrieved evidence.
+        Returns a [0..1] ratio where 1.0 means all relevant signals support.
+        """
+        if not claim or not evidence:
+            return 0.0
+
+        segments = self._split_claim_into_segments(claim) or [claim]
+        support_signals = 0
+        contradict_signals = 0
+
+        for segment in segments:
+            best_score = -1.0
+            best_polarity = "neutral"
+
+            for ev in evidence[:10]:
+                stmt = (ev.get("statement") or ev.get("text") or "").strip()
+                if not stmt or not self._segment_topic_guard_ok(segment, stmt):
+                    continue
+
+                anchor_eval = evaluate_anchor_match(segment, stmt)
+                anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
+                anchor_ok = bool(anchor_eval.get("anchor_ok", False))
+                if not anchor_ok and anchor_overlap < 0.20:
+                    continue
+
+                sem_raw = ev.get("semantic_score")
+                if sem_raw is None:
+                    sem_raw = ev.get("sem_score")
+                if sem_raw is None:
+                    sem_raw = ev.get("final_score")
+                kg_raw = ev.get("kg_score")
+                try:
+                    sem_score = float(sem_raw or 0.0)
+                except Exception:
+                    sem_score = 0.0
+                try:
+                    kg_score = float(kg_raw or 0.0)
+                except Exception:
+                    kg_score = 0.0
+                sem_score = max(0.0, min(1.0, sem_score))
+                kg_score = max(0.0, min(1.0, kg_score))
+                rel_score = max(0.0, min(1.0, (0.7 * sem_score) + (0.3 * kg_score)))
+                combined = (0.75 * rel_score) + (0.25 * anchor_overlap)
+
+                if combined > best_score:
+                    stance = str(ev.get("stance", "neutral") or "neutral")
+                    best_polarity = self._segment_polarity(segment, stmt, stance=stance)
+                    best_score = combined
+
+            if best_score >= 0.20:
+                if best_polarity == "entails":
+                    support_signals += 1
+                elif best_polarity == "contradicts":
+                    contradict_signals += 1
+
+        judged = support_signals + contradict_signals
+        if judged <= 0:
+            return 0.0
+        return max(0.0, min(1.0, support_signals / judged))
 
     @staticmethod
     def _topic_tokens(text: str) -> set[str]:
@@ -1466,6 +1540,62 @@ class VerdictGenerator:
             "contradict_count": contradict_count,
         }
 
+    def _calculate_truth_score_from_contract(self, reconciled: Dict[str, Any]) -> float:
+        """
+        Truth Score reflects "how true the claim is" from segment outcomes, not evidence strength.
+        Confidence is handled separately using evidence quality metrics.
+        """
+        statuses = [str(s or "UNKNOWN").upper() for s in (reconciled.get("matched_statuses") or [])]
+        if not statuses:
+            return 0.0
+
+        weights = {
+            "STRONGLY_VALID": 1.0,
+            "VALID": 1.0,
+            "PARTIALLY_VALID": 0.75,
+            "UNKNOWN": 0.45,
+            "PARTIALLY_INVALID": 0.25,
+            "INVALID": 0.0,
+        }
+        total = len(statuses)
+        base = sum(float(weights.get(s, 0.0)) for s in statuses) / max(1, total)
+
+        contradict_count = int(reconciled.get("contradict_count", 0) or 0)
+        unresolved = int(reconciled.get("unresolved_segments", 0) or 0)
+        strong_covered = int(reconciled.get("strong_covered", 0) or 0)
+        required_segments = int(reconciled.get("required_segments_count", total) or total)
+        has_support = bool(reconciled.get("has_support", False))
+        has_invalid = bool(reconciled.get("has_invalid", False))
+        verdict = str(reconciled.get("verdict", Verdict.UNVERIFIABLE.value) or Verdict.UNVERIFIABLE.value)
+
+        contradict_ratio = contradict_count / max(1, total)
+        unresolved_ratio = unresolved / max(1, total)
+
+        score = base
+        score -= 0.30 * contradict_ratio
+        score -= 0.10 * unresolved_ratio
+
+        # Keep unresolved claims from inflating too high.
+        if unresolved > 0 and contradict_count == 0 and has_support:
+            score = min(score, 0.89)
+
+        # Strong fully-resolved support should read as near-certain truth.
+        if (
+            verdict == Verdict.TRUE.value
+            and unresolved == 0
+            and contradict_count == 0
+            and strong_covered >= required_segments
+            and base >= 0.99
+        ):
+            score = max(score, 0.98)
+
+        # Pure contradiction should be clearly low.
+        if verdict == Verdict.FALSE.value and has_invalid and not has_support:
+            score = min(score, 0.12)
+
+        score = max(0.0, min(1.0, score))
+        return round(score * 100.0, 1)
+
     def _cap_confidence_with_contract(
         self,
         confidence: float,
@@ -1676,7 +1806,7 @@ class VerdictGenerator:
         """
         Evidence-driven truthfulness score based on:
         - segment-level best evidence support
-        - semantic relevance (final_score / sem_score)
+        - semantic/kg relevance (not rank final_score)
         - lexical overlap between segment and evidence statement
         - source credibility
         - contradiction penalty using simple negation detection
@@ -1737,6 +1867,26 @@ class VerdictGenerator:
         diversity = len(domains) / max(1, len(evidence[:8]))
         diversity = max(0.4, min(1.0, diversity))
 
+        def _semantic_strength(ev: Dict[str, Any]) -> float:
+            sem_raw = ev.get("semantic_score")
+            if sem_raw is None:
+                sem_raw = ev.get("sem_score")
+            if sem_raw is None:
+                sem_raw = ev.get("final_score")
+            kg_raw = ev.get("kg_score")
+            try:
+                sem_score = float(sem_raw or 0.0)
+            except Exception:
+                sem_score = 0.0
+            try:
+                kg_score = float(kg_raw or 0.0)
+            except Exception:
+                kg_score = 0.0
+            sem_score = max(0.0, min(1.0, sem_score))
+            kg_score = max(0.0, min(1.0, kg_score))
+            # Entailment-style relevance signal (semantic first, KG as support).
+            return max(0.0, min(1.0, (0.7 * sem_score) + (0.3 * kg_score)))
+
         def _segment_score(segment: str) -> float:
             seg_words = [w for w in re.findall(r"\b\w+\b", (segment or "").lower()) if w not in stop]
             seg_set = set(seg_words)
@@ -1744,7 +1894,8 @@ class VerdictGenerator:
                 return 0.0
             seg_has_neg = any(t in seg_set for t in neg_terms)
 
-            best = 0.0
+            support_scores: List[float] = []
+            contradiction_scores: List[float] = []
             best_src = ""
             for ev in evidence[:8]:
                 stmt = (ev.get("statement") or ev.get("text") or "").strip()
@@ -1753,14 +1904,7 @@ class VerdictGenerator:
                 if not self._segment_topic_guard_ok(segment, stmt):
                     continue
 
-                s = ev.get("final_score")
-                if s is None:
-                    s = ev.get("sem_score", ev.get("score", 0.0))
-                try:
-                    rel = float(s or 0.0)
-                except Exception:
-                    rel = 0.0
-                rel = max(0.0, min(1.0, rel))
+                rel = _semantic_strength(ev)
 
                 credibility = ev.get("credibility")
                 try:
@@ -1781,11 +1925,7 @@ class VerdictGenerator:
                 if overlap_ratio < 0.12 and rel < 0.75:
                     continue
 
-                stmt_has_neg = any(t in stmt_set for t in neg_terms)
                 stance = str(ev.get("stance", "neutral") or "neutral").lower()
-                contradiction = 1.0 if (stmt_has_neg and not seg_has_neg and overlap_ratio >= 0.25) else 0.0
-                if stance == "contradicts" and max(overlap_ratio, anchor_overlap) >= 0.20:
-                    contradiction = max(contradiction, 1.0)
                 uncertainty_penalty = 0.0
                 if claim_assertive and any(t in stmt_set for t in uncertainty_terms):
                     uncertainty_penalty = 0.22
@@ -1793,16 +1933,28 @@ class VerdictGenerator:
                 if self._is_reporting_statement(stmt):
                     reporting_penalty = 0.24
 
-                support = (0.45 * rel) + (0.25 * overlap_ratio) + (0.15 * anchor_overlap) + (0.15 * cred)
+                support = (0.70 * rel) + (0.15 * anchor_overlap) + (0.10 * overlap_ratio) + (0.05 * cred)
                 if overlap_ratio < 0.20:
-                    support *= 0.50
-                net = support - (0.60 * contradiction) - uncertainty_penalty - reporting_penalty
-                net = max(0.0, min(1.0, net))
+                    support *= 0.60
+                support = max(0.0, min(1.0, support - uncertainty_penalty - reporting_penalty))
 
-                if net > best:
-                    best = net
-                    best_src = ev.get("source_url") or ev.get("source") or ""
+                polarity = self._segment_polarity(segment, stmt, stance=stance)
+                if polarity == "contradicts":
+                    contradiction_scores.append(support)
+                    continue
+                # Top-N supportive aggregation only; neutral/irrelevant lines do not dilute.
+                if polarity == "entails" or support >= 0.40:
+                    support_scores.append(support)
+                    if support >= 0.60 and not best_src:
+                        best_src = ev.get("source_url") or ev.get("source") or ""
 
+            top_support = sorted(support_scores, reverse=True)[:3]
+            avg_support = (sum(top_support) / len(top_support)) if top_support else 0.0
+            contradiction_penalty = (max(contradiction_scores) if contradiction_scores else 0.0) * 0.55
+            neg_alignment_penalty = 0.0
+            if seg_has_neg and top_support and avg_support < 0.45:
+                neg_alignment_penalty = 0.08
+            best = max(0.0, min(1.0, avg_support - contradiction_penalty - neg_alignment_penalty))
             if best_src:
                 logger.info(
                     "[VerdictGenerator] Segment truthfulness best=%.3f src=%s segment=%s",
