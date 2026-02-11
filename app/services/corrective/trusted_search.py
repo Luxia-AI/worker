@@ -18,6 +18,7 @@ from app.services.corrective.query_designer import ClaimEntities, CorrectiveQuer
 from app.services.corrective.query_generator import QueryPlan, build_plan, register_drift_from_url
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
+from app.shared.trust_config import get_trust_config
 
 logger = get_logger(__name__)
 
@@ -207,6 +208,7 @@ class TrustedSearch:
         )
         self.serper_site_boost_domains = ordered_site_domains[:serper_site_limit]
         self.query_designer = CorrectiveQueryDesigner()
+        self.trust_config = get_trust_config()
 
         if has_google:
             logger.info("[TrustedSearch] Google CSE configured")
@@ -706,19 +708,6 @@ class TrustedSearch:
             f"site:nhs.uk {a_term} {b_variants[0]} {negations[2]} {negatives}",
         ]
 
-        # Real-world wording variants for common antibiotic-vs-virus claims.
-        if re.search(r"\bantibiotic[s]?\b", text_low) and re.search(r"\bvirus|viral|infection[s]?\b", text_low):
-            antibiotic_patterns = [
-                f"antibiotics do not treat viral infections {negatives}",
-                f"antibiotics not effective against viruses {negatives}",
-                f"antibiotics don't work for colds flu {negatives}",
-                f"antibiotics won't help viral infection {negatives}",
-                f"site:cdc.gov antibiotics viral infection {negatives}",
-                f"site:medlineplus.gov antibiotics virus {negatives}",
-                f"site:nhs.uk antibiotics viral infection {negatives}",
-            ]
-            queries = antibiotic_patterns + queries
-
         if len(b_variants) > 1 and len(queries) < max_queries:
             queries.append(f"{a_term} {negations[0]} {verb_variants[0]} {b_variants[1]} {negatives}")
         if len(negations) > 3 and len(queries) < max_queries:
@@ -726,6 +715,77 @@ class TrustedSearch:
 
         cleaned = [self._sanitize_query(q) for q in queries if q]
         return dedupe_list([q for q in cleaned if q])[: max(1, max_queries)]
+
+    async def _llm_expand_confidence_queries(
+        self,
+        claim: str,
+        entity_obj: ClaimEntities,
+        max_queries: int,
+    ) -> List[str]:
+        if not self.llm_client:
+            return []
+        anchors = ", ".join(entity_obj.anchors[:8]) if entity_obj.anchors else "none"
+        prompt = (
+            "Generate 6-10 high-precision health fact-check search queries.\n"
+            'Return JSON only: {"queries": ["..."]}\n'
+            "Rules:\n"
+            "- prioritize exact claim verification wording\n"
+            "- include trusted routing queries with site:cdc.gov, site:who.int, site:medlineplus.gov, site:nhs.uk\n"
+            "- include negation variants when relevant\n"
+            "- avoid social media domains\n\n"
+            f"Claim: {claim}\n"
+            f"Anchors: {anchors}\n"
+        )
+        try:
+            result = await self.llm_client.ainvoke(
+                prompt,
+                response_format="json",
+                priority=LLMPriority.HIGH,
+                call_tag="query_reformulation",
+            )
+            raw_queries = []
+            if isinstance(result, dict):
+                raw_queries = result.get("queries", []) or []
+            elif isinstance(result, list):
+                raw_queries = result
+            queries = [self._sanitize_query(str(q)) for q in raw_queries if str(q).strip()]
+            with_negatives: List[str] = []
+            suffix = " ".join(self._CONFIDENCE_NEGATIVE_TERMS)
+            for q in queries:
+                if not q:
+                    continue
+                if any(term in q.lower() for term in self._CONFIDENCE_NEGATIVE_TERMS):
+                    with_negatives.append(q)
+                else:
+                    with_negatives.append(self._sanitize_query(f"{q} {suffix}"))
+            return dedupe_list([q for q in with_negatives if q])[: max(1, max_queries)]
+        except Exception as e:
+            logger.warning("[TrustedSearch][ConfidenceMode] LLM query expansion failed: %s", e)
+            return []
+
+    async def _build_confidence_mode_queries_with_fallback(
+        self,
+        claim: str,
+        entity_obj: ClaimEntities,
+        max_queries: int,
+    ) -> List[str]:
+        deterministic = self._build_confidence_mode_queries(claim=claim, entity_obj=entity_obj, max_queries=max_queries)
+        use_llm = bool(get_trust_config().search_use_llm_query_expansion)
+        if not use_llm:
+            return deterministic[: max(1, max_queries)]
+
+        llm_queries = await self._llm_expand_confidence_queries(claim=claim, entity_obj=entity_obj, max_queries=10)
+        if not llm_queries:
+            return deterministic[: max(1, max_queries)]
+
+        merged = dedupe_list(llm_queries + deterministic)
+        logger.info(
+            "[TrustedSearch][ConfidenceMode] Query expansion: llm=%d deterministic=%d merged=%d",
+            len(llm_queries),
+            len(deterministic),
+            len(merged),
+        )
+        return merged[: max(1, max_queries)]
 
     def _build_research_instruction_query(self, text: str, entities: List[str] | None = None) -> str:
         entities = entities or []
@@ -1762,7 +1822,7 @@ FAILED ENTITIES:
                 entity_obj = plan.extracted_entities
             except Exception:
                 entity_obj = ClaimEntities(anchors=entities[:10], topic=entities[:6])
-            confidence_queries = self._build_confidence_mode_queries(
+            confidence_queries = await self._build_confidence_mode_queries_with_fallback(
                 claim=post_text,
                 entity_obj=entity_obj,
                 max_queries=max_queries,
@@ -1954,7 +2014,7 @@ FAILED ENTITIES:
         selected_urls: List[str] = []
         deterministic_queries: List[str]
         if self.confidence_mode:
-            deterministic_queries = self._build_confidence_mode_queries(
+            deterministic_queries = await self._build_confidence_mode_queries_with_fallback(
                 claim=plan.claim,
                 entity_obj=plan.extracted_entities,
                 max_queries=max_queries,
@@ -1984,6 +2044,14 @@ FAILED ENTITIES:
                 )
                 if urls:
                     selected_urls = dedupe_list(selected_urls + urls)
+                if self.confidence_mode and len(selected_urls) >= int(
+                    get_trust_config().search_max_urls_confidence_mode
+                ):
+                    logger.info(
+                        "[TrustedSearch][ConfidenceMode] URL cap reached (%d), stopping query loop",
+                        len(selected_urls),
+                    )
+                    break
                 if len(selected_urls) >= min_urls:
                     break
 

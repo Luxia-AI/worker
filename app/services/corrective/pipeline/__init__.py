@@ -60,6 +60,7 @@ from app.services.retrieval.metadata_enricher import TopicClassifier
 from app.services.vdb.vdb_ingest import VDBIngest
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 from app.services.verdict.verdict_generator import VerdictGenerator
+from app.shared.trust_config import get_trust_config
 
 logger = get_logger(__name__)
 
@@ -608,7 +609,15 @@ class CorrectivePipeline:
         search_api_calls = 0
         queries_executed: List[str] = []
         confidence_target_coverage = float(os.getenv("CONFIDENCE_TARGET_COVERAGE", "0.5"))
-        confidence_max_new_trusted_urls = max(1, int(os.getenv("CONFIDENCE_MAX_NEW_TRUSTED_URLS", "6")))
+        confidence_max_new_trusted_urls = max(
+            1,
+            int(
+                os.getenv(
+                    "CONFIDENCE_MAX_NEW_TRUSTED_URLS",
+                    str(get_trust_config().search_max_urls_confidence_mode),
+                )
+            ),
+        )
         new_trusted_urls_processed = 0
 
         for query_idx, query in enumerate(queries):

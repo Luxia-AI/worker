@@ -34,6 +34,7 @@ from app.services.ranking.subclaim_coverage import compute_subclaim_coverage, ev
 from app.services.ranking.trust_ranker import DummyStanceClassifier
 from app.services.retrieval.metadata_enricher import TopicClassifier
 from app.services.vdb.vdb_retrieval import VDBRetrieval
+from app.shared.anchor_extraction import AnchorExtractor
 
 logger = get_logger(__name__)
 _SEGMENT_EVIDENCE_MIN_OVERLAP = float(os.getenv("SEGMENT_EVIDENCE_MIN_OVERLAP", "0.20"))
@@ -143,6 +144,7 @@ class VerdictGenerator:
 
     def __init__(self, vdb_retriever: Optional[VDBRetrieval] = None) -> None:
         self.llm_service = HybridLLMService()
+        self.anchor_extractor = AnchorExtractor(self.llm_service)
         self.vdb_retriever = vdb_retriever or VDBRetrieval()
         self.trusted_search = TrustedSearch()
         self.fact_extractor = FactExtractor()
@@ -1112,7 +1114,17 @@ class VerdictGenerator:
     ) -> None:
         trust_policy = getattr(self, "trust_policy", None) or AdaptiveTrustPolicy()
         subclaims = trust_policy.decompose_claim(claim)
-        cov = compute_subclaim_coverage(subclaims, evidence, partial_weight=0.5)
+        anchor_extractor = getattr(self, "anchor_extractor", None)
+        if anchor_extractor is None:
+            anchor_extractor = AnchorExtractor()
+            self.anchor_extractor = anchor_extractor
+        anchor_result = anchor_extractor.extract_for_claim(claim=claim, subclaims=subclaims, entity_hints=[])
+        cov = compute_subclaim_coverage(
+            subclaims,
+            evidence,
+            partial_weight=0.5,
+            anchors_by_subclaim=anchor_result.anchors_by_subclaim,
+        )
         details = cov.get("details", [])
         if not details:
             logger.info("[VerdictGenerator][Coverage] subclaims=0 covered=0 strong=0 partial=0 unknown=0 coverage=0.00")
@@ -1131,14 +1143,16 @@ class VerdictGenerator:
                 unknown += 1
             logger.info(
                 "[VerdictGenerator][Coverage] subclaim=%d status=%s best_evidence_id=%s "
-                "relevance=%.3f overlap=%.3f anchors=%d/%d segment=%s",
+                "semantic=%.3f relevance=%.3f overlap=%.3f anchors=%d/%d terms=%s segment=%s",
                 d.get("subclaim_id"),
                 status,
                 d.get("best_evidence_id"),
+                float(d.get("semantic_score", 0.0)),
                 float(d.get("relevance_score", 0.0)),
                 float(d.get("overlap", 0.0)),
                 int(d.get("anchors_matched", 0)),
                 int(d.get("anchors_required", 0)),
+                d.get("anchors", []),
                 (d.get("subclaim") or "")[:80],
             )
 

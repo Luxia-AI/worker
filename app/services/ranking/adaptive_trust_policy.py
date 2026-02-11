@@ -19,6 +19,8 @@ from app.core.logger import get_logger
 from app.services.common.claim_segmentation import split_claim_into_segments
 from app.services.ranking.subclaim_coverage import compute_subclaim_coverage
 from app.services.ranking.trust_ranker import EvidenceItem
+from app.shared.anchor_extraction import AnchorExtractor
+from app.shared.trust_config import get_trust_config
 
 logger = get_logger(__name__)
 
@@ -31,7 +33,9 @@ class AdaptiveTrustPolicy:
     """
 
     def __init__(self):
+        cfg = get_trust_config()
         self.confidence_mode = self._is_confidence_mode()
+        self.anchor_extractor = AnchorExtractor()
         # Gating rule thresholds
         self.COVERAGE_THRESHOLD_HIGH = float(os.getenv("ADAPTIVE_COVERAGE_THRESHOLD_HIGH", "0.60"))
         self.COVERAGE_THRESHOLD_MEDIUM = float(os.getenv("ADAPTIVE_COVERAGE_THRESHOLD_MEDIUM", "0.40"))
@@ -41,8 +45,8 @@ class AdaptiveTrustPolicy:
         self.HIGH_DIVERSITY_FOR_LOW_COUNT = float(os.getenv("ADAPTIVE_HIGH_DIVERSITY_FOR_LOW_COUNT", "0.85"))
         self.HIGH_RELEVANCE_FOR_LOW_COUNT = float(os.getenv("ADAPTIVE_HIGH_RELEVANCE_FOR_LOW_COUNT", "0.75"))
         self.PARTIAL_WEIGHT = float(os.getenv("ADAPTIVE_PARTIAL_WEIGHT", "0.5"))
-        self.STRONG_THRESHOLD = float(os.getenv("ADAPTIVE_STRONG_THRESHOLD", "0.55"))
-        self.PARTIAL_THRESHOLD = float(os.getenv("ADAPTIVE_PARTIAL_THRESHOLD", "0.30"))
+        self.STRONG_THRESHOLD = float(os.getenv("ADAPTIVE_STRONG_THRESHOLD", str(cfg.coverage_min_relevance_strong)))
+        self.PARTIAL_THRESHOLD = float(os.getenv("ADAPTIVE_PARTIAL_THRESHOLD", str(cfg.coverage_min_relevance_partial)))
 
         if self.confidence_mode:
             self.MIN_EVIDENCE_COUNT = int(os.getenv("ADAPTIVE_MIN_EVIDENCE_COUNT_CONFIDENCE", "1"))
@@ -252,7 +256,12 @@ class AdaptiveTrustPolicy:
                     return [parts[0].strip(), f"{comp.strip()} {parts[1].strip()}"]
         return []
 
-    def calculate_coverage(self, subclaims: List[str], evidence_list: List[EvidenceItem]) -> float:
+    def calculate_coverage(
+        self,
+        subclaims: List[str],
+        evidence_list: List[EvidenceItem],
+        anchors_by_subclaim: Dict[str, List[str]] | None = None,
+    ) -> float:
         """
         Calculate coverage: fraction of subclaims with supporting evidence.
 
@@ -272,6 +281,7 @@ class AdaptiveTrustPolicy:
             strong_threshold=self.STRONG_THRESHOLD,
             partial_threshold=self.PARTIAL_THRESHOLD,
             partial_weight=self.PARTIAL_WEIGHT,
+            anchors_by_subclaim=anchors_by_subclaim,
         )
         coverage = float(cov.get("coverage", 0.0))
         weighted = float(cov.get("weighted_covered", 0.0))
@@ -299,14 +309,17 @@ class AdaptiveTrustPolicy:
         for d in details:
             logger.info(
                 "[AdaptiveTrustPolicy][Coverage] subclaim=%d chosen_evidence_id=%s "
-                "relevance=%.3f overlap=%.3f anchors=%d/%d anchors_per_subclaim=%d status=%s",
+                "semantic=%.3f relevance=%.3f overlap=%.3f anchors=%d/%d anchors_per_subclaim=%d "
+                "anchor_terms=%s status=%s",
                 d.get("subclaim_id"),
                 d.get("best_evidence_id"),
+                float(d.get("semantic_score", 0.0)),
                 float(d.get("relevance_score", 0.0)),
                 float(d.get("overlap", 0.0)),
                 int(d.get("anchors_matched", 0)),
                 int(d.get("anchors_required", 0)),
-                (2 if self.confidence_mode else int(d.get("anchors_per_subclaim", 0))),
+                int(d.get("anchors_per_subclaim", 0)),
+                d.get("anchors", []),
                 d.get("status"),
             )
         return coverage
@@ -544,15 +557,22 @@ class AdaptiveTrustPolicy:
         # Decompose claim into subclaims
         subclaims = self.decompose_claim(claim)
         num_subclaims = len(subclaims)
+        anchor_result = self.anchor_extractor.extract_for_claim(claim=claim, subclaims=subclaims, entity_hints=[])
+        anchors_by_subclaim = anchor_result.anchors_by_subclaim
 
         # Use top-k evidence
         top_evidence = evidence_list[:top_k] if evidence_list else []
 
         # Calculate metrics
-        coverage = self.calculate_coverage(subclaims, top_evidence)
+        coverage = self.calculate_coverage(subclaims, top_evidence, anchors_by_subclaim=anchors_by_subclaim)
         diversity = self.calculate_diversity(top_evidence)
         agreement = self.calculate_agreement(top_evidence)
-        cov = compute_subclaim_coverage(subclaims, top_evidence, partial_weight=self.PARTIAL_WEIGHT)
+        cov = compute_subclaim_coverage(
+            subclaims,
+            top_evidence,
+            partial_weight=self.PARTIAL_WEIGHT,
+            anchors_by_subclaim=anchors_by_subclaim,
+        )
         details = cov.get("details", [])
         strong_covered = sum(1 for d in details if (d.get("status") or "").upper() == "STRONGLY_VALID")
         contradicted_count = sum(1 for d in details if bool(d.get("contradicted", False)))

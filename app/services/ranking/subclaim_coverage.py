@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-import os
 import re
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Sequence
+
+from app.shared.anchor_extraction import AnchorExtractor
+from app.shared.trust_config import get_trust_config
 
 _STOP_WORDS = {
     "the",
@@ -26,84 +28,13 @@ _STOP_WORDS = {
     "be",
     "been",
     "being",
-    "could",
-    "would",
-    "should",
-    "can",
-    "may",
-    "might",
-    "according",
 }
 
-_GENERIC_WEAK_ANCHORS = {
-    "do",
-    "does",
-    "did",
-    "not",
-    "no",
-    "never",
-    "cause",
-    "causes",
-    "caused",
-    "cause",
-    "link",
-    "links",
-    "linked",
-    "associate",
-    "associates",
-    "associated",
-    "association",
-}
-
-_ANTIBIOTIC_ANCHORS = {"antibiotic", "antibiotics", "antibacterial"}
-_VIRUS_ANCHORS = {"virus", "viruses", "viral", "viral infection"}
-_NEGATION_CUES = {
-    "do not",
-    "does not",
-    "not effective",
-    "won't",
-    "will not",
-    "ineffective",
-    "do not treat",
-    "does not treat",
-}
+_ANCHOR_EXTRACTOR = AnchorExtractor()
 
 
 def _tokens(text: str) -> List[str]:
-    toks = [w for w in re.findall(r"\b[\w\-]+\b", (text or "").lower()) if w and w not in _STOP_WORDS]
-    normalized: List[str] = []
-    for t in toks:
-        n = _lemma_token(t)
-        if n:
-            normalized.append(n)
-    return normalized
-
-
-def _lemma_token(token: str) -> str:
-    t = (token or "").lower().strip()
-    if not t:
-        return ""
-    # Lightweight normalization without external NLP dependencies.
-    if len(t) > 5 and t.endswith("ies"):
-        t = t[:-3] + "y"
-    elif len(t) > 4 and t.endswith("ing"):
-        t = t[:-3]
-    elif len(t) > 4 and t.endswith("ed"):
-        t = t[:-2]
-    elif len(t) > 4 and t.endswith("es"):
-        t = t[:-2]
-    elif len(t) > 3 and t.endswith("s"):
-        t = t[:-1]
-    synonyms = {
-        "metabolic": "metabolism",
-        "detoxifies": "detox",
-        "detoxification": "detox",
-        "hydrated": "hydration",
-        "hydrate": "hydration",
-        "hepatic": "liver",
-        "citrus": "lemon",
-    }
-    return synonyms.get(t, t)
+    return [w for w in re.findall(r"\b[\w\-]+\b", (text or "").lower()) if w and w not in _STOP_WORDS]
 
 
 def _safe_float(v: Any, default: float = 0.0) -> float:
@@ -142,203 +73,108 @@ def _as_stance(evidence: Any) -> str:
     return str(getattr(evidence, "stance", "neutral") or "neutral").lower()
 
 
-def _infer_polarity(subclaim: str, statement: str) -> str:
-    """
-    Lightweight polarity alignment:
-    - contradiction when negated causal claim is paired with positive/hedged causal statement
-    - entails when both are aligned on causal polarity
-    """
-    sub = (subclaim or "").lower()
-    stmt = (statement or "").lower()
-    if not sub or not stmt:
-        return "neutral"
-
-    neg_causal_re = re.compile(
-        (
-            r"\b(?:do|does|did|can|could|may|might|must|should|would|will|is|are|was|were)?\s*"
-            r"(?:not|never|no)\s+(?:cause|causes|caused|causing|link(?:ed)?|associate(?:d)?|"
-            r"result(?:s|ed|ing)?\s+in|lead(?:s|ing)?\s+to)\b"
-        ),
-        flags=re.IGNORECASE,
-    )
-    pos_causal_re = re.compile(
-        (
-            r"\b(?:cause|causes|caused|causing|contribut(?:e|es|ed|ing)\s+to|"
-            r"link(?:ed)?\s+to|associate(?:d)?\s+with|lead(?:s|ing)?\s+to|"
-            r"result(?:s|ed|ing)?\s+in)\b"
-        ),
-        flags=re.IGNORECASE,
-    )
-    hedge_pos_re = re.compile(
-        r"\b(?:may|might|can|could|possibly|suggest(?:s|ed)?)\b.{0,25}\b(?:cause|linked?|associate)\b",
-        flags=re.IGNORECASE,
-    )
-    no_link_re = re.compile(r"\bno\s+link\b|\bnot\s+associated\b", flags=re.IGNORECASE)
-
-    sub_neg = bool(neg_causal_re.search(sub) or no_link_re.search(sub))
-    stmt_neg = bool(neg_causal_re.search(stmt) or no_link_re.search(stmt))
-    sub_pos = bool(pos_causal_re.search(sub)) and not sub_neg
-    stmt_pos = bool(pos_causal_re.search(stmt)) and not stmt_neg
-    stmt_hedged_pos = bool(hedge_pos_re.search(stmt)) and not stmt_neg
-
-    if sub_neg and (stmt_pos or stmt_hedged_pos) and not stmt_neg:
-        return "contradicts"
-    if sub_pos and stmt_neg:
-        return "contradicts"
-    if sub_neg and stmt_neg:
-        return "entails"
-    if sub_pos and stmt_pos and not stmt_hedged_pos:
-        return "entails"
-    return "neutral"
-
-
-def _contains_any(text: str, terms: Sequence[str]) -> bool:
-    low = (text or "").lower()
-    return any(t in low for t in terms)
-
-
-def _contains_anchor_terms(text: str, terms: set[str]) -> bool:
-    low = (text or "").lower()
-    for term in terms:
-        if " " in term:
-            if term in low:
-                return True
-            continue
-        if re.search(rf"\b{re.escape(term)}\b", low):
-            return True
-    return False
-
-
-def _is_antibiotic_viral_subclaim(subclaim: str) -> bool:
-    low = (subclaim or "").lower()
-    return _contains_anchor_terms(low, _ANTIBIOTIC_ANCHORS) and _contains_anchor_terms(low, _VIRUS_ANCHORS)
-
-
 def _is_kg_candidate(evidence: Any) -> bool:
     if isinstance(evidence, dict):
         candidate_type = str(evidence.get("candidate_type") or "").upper()
         source_type = str(evidence.get("source_type") or "").lower()
-        if candidate_type == "KG" or source_type == "kg":
-            return True
+        return candidate_type == "KG" or source_type == "kg"
     return str(getattr(evidence, "candidate_type", "") or "").upper() == "KG"
 
 
-def derive_anchor_groups(text: str) -> List[List[str]]:
+def _contains_anchor(statement: str, anchor: str) -> bool:
+    low = (statement or "").lower()
+    if not anchor:
+        return False
+    if " " in anchor:
+        return anchor in low
+    return bool(re.search(rf"\b{re.escape(anchor)}\b", low))
+
+
+def derive_anchor_groups(text: str, anchors: Sequence[str] | None = None) -> List[List[str]]:
     """
-    Build concept anchor groups.
-    A group is satisfied if any term in that group appears in the evidence text.
+    Build concept anchor groups from dynamic anchors.
+    A group is satisfied if any term in that group appears in evidence text.
     """
-    t = (text or "").lower()
+    cfg = get_trust_config()
+    max_groups = max(2, min(5, int(cfg.coverage_anchors_per_subclaim)))
+    anchor_terms = [a.strip().lower() for a in (anchors or []) if str(a).strip()]
+    if not anchor_terms:
+        anchor_terms = [t for t in _tokens(text) if len(t) >= 3][:max_groups]
     groups: List[List[str]] = []
-
-    if _contains_any(t, ["lemon", "citrus"]):
-        groups.append(["lemon", "citrus"])
-    if _contains_any(t, ["liver", "hepatic"]):
-        groups.append(["liver", "hepatic"])
-    if _contains_any(t, ["detox", "detoxification", "detoxifies", "cleanse", "cleansing"]):
-        groups.append(["detox", "detoxification", "detoxifies", "cleanse", "cleansing"])
-    if _contains_any(t, ["metabolism", "metabolic rate", "metabolic", "energy expenditure"]):
-        groups.append(["metabolism", "metabolic", "metabolic rate", "energy expenditure"])
-    if _contains_any(t, ["hydration", "hydrate", "hydrated"]):
-        groups.append(["hydration", "hydrate", "hydrated", "water intake"])
-
-    # Generic anchors: use independent concept tokens (not one "any-of" bucket).
-    # This prevents one token (e.g., "vaccines") from satisfying unrelated subclaims
-    # like "autism" and "flu" simultaneously.
-    if not groups:
-        generic = [w for w in _tokens(t) if len(w) > 2 and w not in _GENERIC_WEAK_ANCHORS][:4]
-        seen = set()
-        for token in generic:
-            if token in seen:
-                continue
-            seen.add(token)
-            groups.append([token])
+    for term in anchor_terms:
+        if term and [term] not in groups:
+            groups.append([term])
+        if len(groups) >= max_groups:
+            break
     return groups
 
 
-def evaluate_anchor_match(text: str, statement: str) -> Dict[str, Any]:
-    groups = derive_anchor_groups(text)
-    confidence_mode = (os.getenv("LUXIA_CONFIDENCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
-    if confidence_mode and len(groups) > 2:
-        groups = groups[:2]
+def evaluate_anchor_match(text: str, statement: str, anchors: Sequence[str] | None = None) -> Dict[str, Any]:
+    cfg = get_trust_config()
+    groups = derive_anchor_groups(text, anchors=anchors)
     stmt = (statement or "").lower()
     matched = 0
-    for g in groups:
-        if any(term in stmt for term in g):
+    for group in groups:
+        if any(_contains_anchor(stmt, term) for term in group):
             matched += 1
-    required = 0
-    if groups:
-        required = 1 if len(groups) == 1 else min(2, len(groups))
-    ok = matched >= required if required > 0 else True
+    required = min(len(groups), max(1, int(cfg.coverage_min_anchor_hits))) if groups else 0
     return {
         "anchor_groups": groups,
         "anchors_per_subclaim": len(groups),
         "required_groups": required,
         "matched_groups": matched,
         "anchor_overlap": (matched / max(1, len(groups))) if groups else 0.0,
-        "anchor_ok": ok,
+        "anchor_ok": matched >= required if required > 0 else True,
     }
 
 
-def _relevance(subclaim: str, evidence: Any) -> Dict[str, Any]:
+def _relevance(
+    subclaim: str,
+    evidence: Any,
+    anchors: Sequence[str],
+    min_anchor_hits: int,
+    semantic_weight: float,
+    kg_weight: float,
+) -> Dict[str, Any]:
     stmt = _as_statement(evidence)
     stmt_low = stmt.lower()
     sub_toks = set(_tokens(subclaim))
     stmt_toks = set(_tokens(stmt))
     lexical_overlap = len(sub_toks & stmt_toks) / max(1, len(sub_toks))
-    base_sem = _as_score(evidence)
+    semantic = max(0.0, min(1.0, _as_score(evidence)))
     stance = _as_stance(evidence)
-    polarity = _infer_polarity(subclaim, stmt)
-    anchor_eval = evaluate_anchor_match(subclaim, stmt)
-    confidence_mode = (os.getenv("LUXIA_CONFIDENCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
-    dual_anchor_required = _is_antibiotic_viral_subclaim(subclaim)
-    has_antibiotic_anchor = _contains_anchor_terms(stmt_low, _ANTIBIOTIC_ANCHORS)
-    has_virus_anchor = _contains_anchor_terms(stmt_low, _VIRUS_ANCHORS)
-    has_dual_anchor = has_antibiotic_anchor and has_virus_anchor
-    has_negation_cue = any(cue in stmt_low for cue in _NEGATION_CUES)
-    anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
+    anchor_hits = sum(1 for a in anchors if _contains_anchor(stmt_low, a))
+    anchor_overlap = anchor_hits / max(1, len(anchors)) if anchors else 0.0
+    anchor_component = min(1.0, anchor_hits / max(1, min_anchor_hits))
     overlap = max(lexical_overlap, anchor_overlap)
-    relevance = 0.6 * max(0.0, min(1.0, base_sem)) + 0.4 * max(0.0, min(1.0, overlap))
 
-    if confidence_mode and dual_anchor_required:
-        matched_groups = int(has_antibiotic_anchor) + int(has_virus_anchor)
-        anchor_eval["matched_groups"] = matched_groups
-        anchor_eval["required_groups"] = 2
-        anchor_eval["anchors_per_subclaim"] = 2
-        anchor_eval["anchor_overlap"] = matched_groups / 2.0
-        anchor_eval["anchor_ok"] = has_dual_anchor
-        anchor_overlap = float(anchor_eval["anchor_overlap"])
-        overlap = max(lexical_overlap, anchor_overlap)
-        relevance = 0.6 * max(0.0, min(1.0, base_sem)) + 0.4 * max(0.0, min(1.0, overlap))
-        if _is_kg_candidate(evidence) and not has_dual_anchor:
-            relevance = min(relevance, 0.10)
+    # Prefer semantic relevance, then anchor completeness.
+    score = (semantic_weight * semantic) + ((1.0 - semantic_weight) * anchor_component)
+    score = max(score, 0.60 * semantic + 0.40 * overlap)
 
-    if not anchor_eval["anchor_ok"]:
-        # Penalize weak anchor alignment, but avoid collapsing to zero.
-        relevance = min(relevance, 0.45 if anchor_overlap > 0.0 else 0.25)
+    # Down-weight KG evidence when anchors do not align strongly.
+    if _is_kg_candidate(evidence):
+        if anchor_hits == 0:
+            score *= max(0.0, 1.0 - kg_weight)
+        elif anchor_hits < min_anchor_hits:
+            score *= 0.85
 
-    # Polarity-aware adjustment so contradictory statements do not inflate coverage.
-    if stance == "contradicts" or polarity == "contradicts":
-        relevance *= 0.35
-    elif stance == "entails" or polarity == "entails":
-        relevance = min(1.0, relevance * 1.05)
+    contradicted = stance == "contradicts"
+    if contradicted:
+        score *= 0.30
 
     return {
-        "relevance_score": max(0.0, min(1.0, relevance)),
+        "relevance_score": max(0.0, min(1.0, score)),
+        "semantic_score": semantic,
         "overlap": overlap,
         "lexical_overlap": lexical_overlap,
         "anchor_overlap": anchor_overlap,
-        "anchors_matched": int(anchor_eval["matched_groups"]),
-        "anchors_required": int(anchor_eval["required_groups"]),
-        "anchors_per_subclaim": int(anchor_eval.get("anchors_per_subclaim", 0)),
-        "anchor_ok": bool(anchor_eval["anchor_ok"]),
+        "anchors_matched": anchor_hits,
+        "anchors_required": min_anchor_hits,
+        "anchors_per_subclaim": len(anchors),
+        "anchor_ok": anchor_hits >= min_anchor_hits,
         "stance": stance,
-        "polarity": polarity,
-        "has_antibiotic_anchor": has_antibiotic_anchor,
-        "has_virus_anchor": has_virus_anchor,
-        "has_dual_anchor": has_dual_anchor,
-        "has_negation_cue": has_negation_cue,
-        "dual_anchor_required": dual_anchor_required,
+        "contradicted": contradicted,
         "is_kg_candidate": _is_kg_candidate(evidence),
     }
 
@@ -349,6 +185,7 @@ def compute_subclaim_coverage(
     strong_threshold: float = 0.55,
     partial_threshold: float = 0.30,
     partial_weight: float = 0.5,
+    anchors_by_subclaim: Mapping[str, Sequence[str]] | None = None,
 ) -> Dict[str, Any]:
     """
     Shared weighted coverage:
@@ -356,83 +193,100 @@ def compute_subclaim_coverage(
     - PARTIALLY_VALID => weight `partial_weight`
     - UNKNOWN => weight 0.0
     """
+    cfg = get_trust_config()
+    min_anchor_hits = max(1, int(cfg.coverage_min_anchor_hits))
+    semantic_weight = max(0.0, min(1.0, float(cfg.rank_semantic_weight)))
+    kg_weight = max(0.0, min(1.0, float(cfg.rank_kg_weight)))
+    strong_cutoff = max(strong_threshold, float(cfg.coverage_min_relevance_strong))
+    partial_cutoff = max(partial_threshold, float(cfg.coverage_min_relevance_partial))
+
     subclaims = [s for s in (subclaims or []) if (s or "").strip()]
     evidence = list(evidence_list or [])
     if not subclaims:
         return {"coverage": 0.0, "weighted_covered": 0.0, "details": []}
 
+    if anchors_by_subclaim is None:
+        anchor_result = _ANCHOR_EXTRACTOR.extract_for_claim(
+            claim=" ".join(subclaims),
+            subclaims=subclaims,
+            entity_hints=[],
+        )
+        anchors_by_subclaim = anchor_result.anchors_by_subclaim
+
     details: List[Dict[str, Any]] = []
     weighted_sum = 0.0
-    confidence_mode = (os.getenv("LUXIA_CONFIDENCE_MODE", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
     for idx, subclaim in enumerate(subclaims):
-        requires_dual_anchor = confidence_mode and _is_antibiotic_viral_subclaim(subclaim)
+        anchors = [a.lower().strip() for a in (anchors_by_subclaim.get(subclaim, []) if anchors_by_subclaim else [])]
+        if not anchors:
+            anchors = [group[0] for group in derive_anchor_groups(subclaim)]
+        if not anchors:
+            tokens = [t for t in _tokens(subclaim) if len(t) >= 3]
+            anchors = tokens[: max(1, min_anchor_hits)]
+
         best_idx = -1
         best = {
             "relevance_score": 0.0,
+            "semantic_score": 0.0,
             "overlap": 0.0,
+            "lexical_overlap": 0.0,
+            "anchor_overlap": 0.0,
             "anchors_matched": 0,
-            "anchors_required": 0,
+            "anchors_required": min_anchor_hits,
+            "anchors_per_subclaim": len(anchors),
             "anchor_ok": False,
             "stance": "neutral",
-            "polarity": "neutral",
-            "has_dual_anchor": False,
-            "has_negation_cue": False,
+            "contradicted": False,
             "is_kg_candidate": False,
         }
+        best_semantic_candidate_idx = -1
+        best_semantic_candidate_score = -1.0
+
         for ev_idx, ev in enumerate(evidence):
-            ev_score = _relevance(subclaim, ev)
-            if requires_dual_anchor and not bool(ev_score.get("has_dual_anchor", False)):
-                continue
-            if (
-                requires_dual_anchor
-                and bool(ev_score.get("is_kg_candidate", False))
-                and not bool(ev_score.get("has_dual_anchor", False))
-            ):
-                continue
+            ev_score = _relevance(
+                subclaim=subclaim,
+                evidence=ev,
+                anchors=anchors,
+                min_anchor_hits=min_anchor_hits,
+                semantic_weight=semantic_weight,
+                kg_weight=kg_weight,
+            )
+            semantic = float(ev_score.get("semantic_score", 0.0))
+            if semantic >= partial_cutoff and semantic > best_semantic_candidate_score:
+                best_semantic_candidate_score = semantic
+                best_semantic_candidate_idx = ev_idx
+
             if ev_score["relevance_score"] > best["relevance_score"]:
                 best = ev_score
                 best_idx = ev_idx
 
-        overlap = float(best.get("overlap", 0.0))
+        if best_idx < 0 and best_semantic_candidate_idx >= 0:
+            best_idx = best_semantic_candidate_idx
+            best = _relevance(
+                subclaim=subclaim,
+                evidence=evidence[best_semantic_candidate_idx],
+                anchors=anchors,
+                min_anchor_hits=min_anchor_hits,
+                semantic_weight=semantic_weight,
+                kg_weight=kg_weight,
+            )
+
+        contradicted = bool(best.get("contradicted", False))
+        semantic = float(best.get("semantic_score", 0.0))
         anchor_hits = int(best.get("anchors_matched", 0))
-        contradicted = (
-            str(best.get("stance", "neutral")).lower() == "contradicts"
-            or str(best.get("polarity", "neutral")).lower() == "contradicts"
-        )
-        if contradicted and overlap >= 0.18 and anchor_hits >= 1:
+        if contradicted:
             status = "UNKNOWN"
             weight = 0.0
-        elif (
-            best["relevance_score"] >= strong_threshold
-            and overlap >= 0.30
-            and anchor_hits >= 1
-            and bool(best.get("anchor_ok", False))
-        ):
+        elif semantic >= strong_cutoff and anchor_hits >= min_anchor_hits:
             status = "STRONGLY_VALID"
             weight = 1.0
-        elif (
-            best["relevance_score"] >= partial_threshold
-            and overlap >= 0.18
-            and anchor_hits >= 1
-            and bool(best.get("anchor_ok", False))
-        ):
+        elif semantic >= partial_cutoff and anchor_hits >= 1:
             status = "PARTIALLY_VALID"
             weight = partial_weight
         else:
             status = "UNKNOWN"
             weight = 0.0
 
-        if (
-            requires_dual_anchor
-            and best_idx >= 0
-            and bool(best.get("has_dual_anchor", False))
-            and bool(best.get("has_negation_cue", False))
-            and status == "UNKNOWN"
-        ):
-            status = "PARTIALLY_VALID"
-            weight = partial_weight
         weighted_sum += weight
-
         details.append(
             {
                 "subclaim_id": idx + 1,
@@ -441,18 +295,17 @@ def compute_subclaim_coverage(
                 "weight": weight,
                 "best_evidence_id": best_idx,
                 "relevance_score": round(best["relevance_score"], 4),
+                "semantic_score": round(float(best.get("semantic_score", 0.0)), 4),
                 "overlap": round(best["overlap"], 4),
                 "lexical_overlap": round(float(best.get("lexical_overlap", 0.0)), 4),
                 "anchor_overlap": round(float(best.get("anchor_overlap", 0.0)), 4),
-                "anchors_matched": best["anchors_matched"],
-                "anchors_required": best["anchors_required"],
-                "anchors_per_subclaim": best.get("anchors_per_subclaim", 0),
+                "anchors": anchors,
+                "anchors_matched": anchor_hits,
+                "anchors_required": int(best.get("anchors_required", min_anchor_hits)),
+                "anchors_per_subclaim": int(best.get("anchors_per_subclaim", len(anchors))),
                 "stance": best.get("stance", "neutral"),
-                "polarity": best.get("polarity", "neutral"),
                 "contradicted": contradicted,
-                "has_dual_anchor": bool(best.get("has_dual_anchor", False)),
-                "has_negation_cue": bool(best.get("has_negation_cue", False)),
-                "dual_anchor_required": requires_dual_anchor,
+                "is_kg_candidate": bool(best.get("is_kg_candidate", False)),
             }
         )
 
@@ -463,6 +316,6 @@ def compute_subclaim_coverage(
         "details": details,
         "subclaims": len(subclaims),
         "partial_weight": partial_weight,
-        "strong_threshold": strong_threshold,
-        "partial_threshold": partial_threshold,
+        "strong_threshold": strong_cutoff,
+        "partial_threshold": partial_cutoff,
     }
