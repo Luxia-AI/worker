@@ -590,7 +590,18 @@ class CorrectivePipeline:
 
             # Step 1: Execute SINGLE search API call
             search_api_calls += 1
-            query_urls = await self.search_agent.execute_single_query(query)
+            if query_idx == 0:
+                query_urls = await self.search_agent.search_for_claim(
+                    post_text,
+                    min_urls=1,
+                    max_queries=1,
+                )
+            else:
+                query_urls = await self.search_agent.execute_single_query(
+                    query,
+                    claim=post_text,
+                    entities=claim_entities,
+                )
             queries_executed.append(query)
             await debug_reporter.log_step(
                 step_name="Number of URLs per search query",

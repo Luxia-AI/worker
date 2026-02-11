@@ -14,6 +14,8 @@ from app.core.logger import get_logger
 from app.core.rate_limit import throttled
 from app.services.common.list_ops import dedupe_list
 from app.services.common.url_helpers import dedup_urls, is_accessible_url
+from app.services.corrective.query_designer import ClaimEntities, CorrectiveQueryDesigner
+from app.services.corrective.query_generator import QueryPlan, build_plan, register_drift_from_url
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
 
@@ -48,31 +50,66 @@ class TrustedSearch:
     SERPER_URL = "https://google.serper.dev/search"
     STRICT_TRUSTED_DOMAIN_BASE = {
         "who.int",
+        "fda.gov",
+        "hhs.gov",
         "nih.gov",
         "nlm.nih.gov",
         "ncbi.nlm.nih.gov",
         "pubmed.ncbi.nlm.nih.gov",
         "cdc.gov",
-        "mayoclinic.org",
-        "clevelandclinic.org",
-        "health.harvard.edu",
-        "medlineplus.gov",
-        "fda.gov",
-        "hhs.gov",
+        "clinicaltrials.gov",
+        "cochranelibrary.com",
+        "plos.org",
+        "nature.com",
+        "science.org",
+        "jamanetwork.com",
+        "bmj.com",
+        "nejm.org",
+        "thelancet.com",
         "nhs.uk",
         "nice.org.uk",
+        "ema.europa.eu",
+        "ecdc.europa.eu",
+        "health.gov.au",
+        "tga.gov.au",
+        "health.gov.lk",
+        "moh.gov.sg",
+        "healthhub.sg",
+        "healthdirect.gov.au",
+        "canada.ca",
+        "ourworldindata.org",
+        "ihme.org",
+        "healthdata.org",
+        "worldbank.org",
+        "undp.org",
+        "unicef.org",
+        "unaids.org",
+        "unfpa.org",
+        "reliefweb.int",
+        "kff.org",
+        "healthaffairs.org",
+        "statnews.com",
     }
     _SERPER_SITE_BOOST_PRIORITY = [
         "pubmed.ncbi.nlm.nih.gov",
         "ncbi.nlm.nih.gov",
+        "nlm.nih.gov",
         "nih.gov",
         "cdc.gov",
         "who.int",
-        "medlineplus.gov",
-        "mayoclinic.org",
-        "clevelandclinic.org",
+        "fda.gov",
+        "hhs.gov",
         "nhs.uk",
         "nice.org.uk",
+        "clinicaltrials.gov",
+        "cochranelibrary.com",
+        "nature.com",
+        "science.org",
+        "plos.org",
+        "jamanetwork.com",
+        "bmj.com",
+        "nejm.org",
+        "thelancet.com",
     ]
 
     def __init__(
@@ -124,6 +161,7 @@ class TrustedSearch:
             + sorted(d for d in self.strict_allowlist if d not in self._SERPER_SITE_BOOST_PRIORITY)
         )
         self.serper_site_boost_domains = ordered_site_domains[:serper_site_limit]
+        self.query_designer = CorrectiveQueryDesigner()
 
         if has_google:
             logger.info("[TrustedSearch] Google CSE configured")
@@ -1015,10 +1053,12 @@ FAILED ENTITIES:
     # Single Query Search (Google CSE)
     # ---------------------------------------------------------------------
     @throttled(limit=100, period=60.0, name="google_cse")
-    async def search_query_google(self, session: aiohttp.ClientSession, query: str) -> Tuple[List[str], bool]:
+    async def search_query_google(
+        self, session: aiohttp.ClientSession, query: str
+    ) -> Tuple[List[Dict[str, str]], bool]:
         """
-        Runs a single Google CSE request and returns trusted URLs.
-        Returns (urls, quota_exceeded) tuple.
+        Runs a single Google CSE request and returns structured result items.
+        Returns (items, quota_exceeded) tuple.
         """
         import urllib.parse
 
@@ -1054,15 +1094,13 @@ FAILED ENTITIES:
 
                 items = [
                     {
-                        "link": item.get("link"),
+                        "url": item.get("link", ""),
                         "title": item.get("title", ""),
                         "snippet": item.get("snippet", ""),
                     }
                     for item in data["items"]
                 ]
-                urls, _ = self._filter_trusted_urls(items, provider="Google", query=query)
-                logger.info(f"[TrustedSearch:Google] '{query}' -> {len(urls)}/{len(data['items'])} trusted")
-                return urls, False
+                return items, False
 
         except asyncio.TimeoutError:
             logger.error(f"[TrustedSearch:Google] Timeout for '{query}'")
@@ -1074,9 +1112,9 @@ FAILED ENTITIES:
     # ---------------------------------------------------------------------
     # Single Query Search (Serper.dev fallback)
     # ---------------------------------------------------------------------
-    async def search_query_serper(self, session: aiohttp.ClientSession, query: str) -> List[str]:
+    async def search_query_serper(self, session: aiohttp.ClientSession, query: str) -> List[Dict[str, str]]:
         """
-        Runs a single Serper.dev search request and returns trusted URLs.
+        Runs a single Serper.dev search request and returns structured result items.
         Serper provides 2,500 free searches/month.
         """
         if not self.SERPER_API_KEY:
@@ -1116,15 +1154,13 @@ FAILED ENTITIES:
 
                 items = [
                     {
-                        "link": result.get("link"),
+                        "url": result.get("link", ""),
                         "title": result.get("title", ""),
                         "snippet": result.get("snippet", ""),
                     }
                     for result in organic
                 ]
-                urls, _ = self._filter_trusted_urls(items, provider="Serper", query=query)
-                logger.info(f"[TrustedSearch:Serper] '{query}' -> {len(urls)}/{len(organic)} trusted")
-                return urls
+                return items
 
         except asyncio.TimeoutError:
             logger.error(f"[TrustedSearch:Serper] Timeout for '{query}'")
@@ -1159,18 +1195,43 @@ FAILED ENTITIES:
     # ---------------------------------------------------------------------
     # Unified Search (with fallback)
     # ---------------------------------------------------------------------
-    async def search_query(self, session: aiohttp.ClientSession, query: str) -> List[str]:
+    async def search_query(
+        self,
+        session: aiohttp.ClientSession,
+        query: str,
+        claim: str | None = None,
+        claim_type: str | None = None,
+        entities: Any | None = None,
+    ) -> List[str]:
         """
-        Search with automatic fallback: Google CSE -> Serper.dev
+        Search with automatic fallback: Google CSE -> Serper.dev.
+        If claim context is provided, apply query-designer quality selection and drift learning.
         """
         query = self._sanitize_query(query)
         if not query:
             return []
 
+        if claim and (not claim_type or entities is None):
+            try:
+                plan: QueryPlan = build_plan(claim)
+                claim_type = plan.claim_type
+                entities = plan.extracted_entities
+            except Exception as e:
+                logger.warning("[TrustedSearch] build_plan failed, using allowlist-only search: %s", e)
+                claim = None
+                claim_type = None
+                entities = None
+
         # If Google quota already exceeded, go straight to Serper
         if self.google_quota_exceeded:
             if self.serper_available:
-                serper = await self.search_query_serper_with_site_boost(session, query)
+                serper = await self.search_query_serper_with_site_boost(
+                    session,
+                    query,
+                    claim=claim,
+                    claim_type=claim_type,
+                    entities=entities,
+                )
                 if serper:
                     return serper
                 return await self.search_query_pubmed(session, query)
@@ -1178,43 +1239,67 @@ FAILED ENTITIES:
 
         # Try Google first
         if self.google_available:
-            urls, quota_exceeded = await self.search_query_google(session, query)
+            google_items, quota_exceeded = await self.search_query_google(session, query)
+            google_urls = self._process_search_items(
+                provider="Google",
+                query=query,
+                items=google_items,
+                claim=claim,
+                claim_type=claim_type,
+                entities=entities,
+            )
 
             if quota_exceeded:
                 self.google_quota_exceeded = True
                 logger.warning("[TrustedSearch] Google CSE quota exceeded! " "Switching to Serper.dev fallback...")
 
                 if self.serper_available:
-                    serper = await self.search_query_serper_with_site_boost(session, query)
+                    serper = await self.search_query_serper_with_site_boost(
+                        session,
+                        query,
+                        claim=claim,
+                        claim_type=claim_type,
+                        entities=entities,
+                    )
                     if serper:
                         return serper
                     return await self.search_query_pubmed(session, query)
-                else:
-                    logger.error(
-                        "[TrustedSearch] No SERPER_API_KEY configured. "
-                        "Set SERPER_API_KEY env var for fallback search."
-                    )
-                    return []
+                logger.error(
+                    "[TrustedSearch] No SERPER_API_KEY configured. " "Set SERPER_API_KEY env var for fallback search."
+                )
+                return []
 
-            if len(urls) >= self.min_allowlist_pass:
-                return urls
+            if len(google_urls) >= self.min_allowlist_pass:
+                return google_urls
+
             logger.info(
                 "[TrustedSearch] Google trusted results below threshold (%d < %d), merging Serper fallback",
-                len(urls),
+                len(google_urls),
                 self.min_allowlist_pass,
             )
             if self.serper_available:
-                serper_urls = await self.search_query_serper_with_site_boost(session, query)
+                serper_urls = await self.search_query_serper_with_site_boost(
+                    session,
+                    query,
+                    claim=claim,
+                    claim_type=claim_type,
+                    entities=entities,
+                )
                 if serper_urls:
-                    merged = dedupe_list(urls + serper_urls)
-                    return merged
-            if urls:
-                return urls
+                    return dedupe_list(google_urls + serper_urls)
+            if google_urls:
+                return google_urls
             return await self.search_query_pubmed(session, query)
 
         # No Google, try Serper directly
         if self.serper_available:
-            serper = await self.search_query_serper_with_site_boost(session, query)
+            serper = await self.search_query_serper_with_site_boost(
+                session,
+                query,
+                claim=claim,
+                claim_type=claim_type,
+                entities=entities,
+            )
             if serper:
                 return serper
             return await self.search_query_pubmed(session, query)
@@ -1231,6 +1316,7 @@ FAILED ENTITIES:
         if not is_accessible_url(url):
             return False
         try:
+            allowlist = getattr(self, "strict_allowlist", None) or set(self.STRICT_TRUSTED_DOMAIN_BASE)
             parsed = urllib.parse.urlparse(url)
             domain = (parsed.netloc or "").lower()
             if "@" in domain:
@@ -1240,10 +1326,10 @@ FAILED ENTITIES:
             domain = domain.removeprefix("www.")
             if not domain:
                 return False
-            if domain in self.strict_allowlist:
+            if domain in allowlist:
                 return True
 
-            for trusted in self.strict_allowlist:
+            for trusted in allowlist:
                 if domain == trusted or domain.endswith("." + trusted):
                     return True
 
@@ -1295,7 +1381,7 @@ FAILED ENTITIES:
         rejected_allowlist = 0
         rejected_quality = 0
         for item in items:
-            link = item.get("link")
+            link = item.get("url") or item.get("link")
             if not link:
                 continue
             if not self.is_trusted(link):
@@ -1322,6 +1408,53 @@ FAILED ENTITIES:
             "final_trusted_count": len(urls),
         }
 
+    def _normalize_claim_entities(self, entities: Any) -> ClaimEntities:
+        if isinstance(entities, ClaimEntities):
+            return entities
+        if isinstance(entities, list):
+            anchors = [str(x).strip() for x in entities if str(x).strip()]
+            return ClaimEntities(topic=anchors[:6], anchors=anchors[:10])
+        if isinstance(entities, dict):
+            return ClaimEntities(
+                topic=list(entities.get("topic", []) or []),
+                outcome=list(entities.get("outcome", []) or []),
+                population=list(entities.get("population", []) or []),
+                comparator=list(entities.get("comparator", []) or []),
+                anchors=list(entities.get("anchors", []) or []),
+                synonyms=dict(entities.get("synonyms", {}) or {}),
+            )
+        return ClaimEntities()
+
+    def _select_and_learn(self, claim: str, claim_type: str, entities: Any, items: List[Dict[str, str]]) -> List[str]:
+        if not items:
+            return []
+        entity_obj = self._normalize_claim_entities(entities)
+
+        selected = self.query_designer.select_results(
+            claim_type=claim_type,
+            entities=entity_obj,
+            results=items,
+        )
+
+        for item in items:
+            decision = self.query_designer.quality_gate(
+                claim_type=claim_type,
+                entities=entity_obj,
+                url=str(item.get("url", "")),
+                title=str(item.get("title", "")),
+                snippet=str(item.get("snippet", "")),
+            )
+            if not decision.passed:
+                register_drift_from_url(
+                    claim_type=claim_type,
+                    url=str(item.get("url", "")),
+                    title=str(item.get("title", "")),
+                    snippet=str(item.get("snippet", "")),
+                )
+
+        selected_urls = dedupe_list([str(item.get("url", "")) for item in selected if item.get("url")])
+        return selected_urls
+
     # ---------------------------------------------------------------------
     # Site-Specific Query Generation
     # ---------------------------------------------------------------------
@@ -1332,11 +1465,24 @@ FAILED ENTITIES:
         """
         # Prioritize high-yield medical sources (capped to 3-4 sites)
         priority_sites = [
-            "medlineplus.gov",
-            "cdc.gov",
-            "nih.gov",
-            "who.int",
             "pubmed.ncbi.nlm.nih.gov",
+            "nlm.nih.gov",
+            "nih.gov",
+            "cdc.gov",
+            "who.int",
+            "fda.gov",
+            "hhs.gov",
+            "nhs.uk",
+            "nice.org.uk",
+            "clinicaltrials.gov",
+            "cochranelibrary.com",
+            "nature.com",
+            "science.org",
+            "plos.org",
+            "jamanetwork.com",
+            "bmj.com",
+            "nejm.org",
+            "thelancet.com",
         ][:max_sites]
 
         site_queries = []
@@ -1358,7 +1504,52 @@ FAILED ENTITIES:
         domains = getattr(self, "serper_site_boost_domains", []) or self._SERPER_SITE_BOOST_PRIORITY[:4]
         return [f"site:{domain} {q}" for domain in domains if domain]
 
-    async def search_query_serper_with_site_boost(self, session: aiohttp.ClientSession, query: str) -> List[str]:
+    def _process_search_items(
+        self,
+        provider: str,
+        query: str,
+        items: List[Any],
+        claim: str | None = None,
+        claim_type: str | None = None,
+        entities: Any | None = None,
+    ) -> List[str]:
+        normalized_items: List[Dict[str, str]] = []
+        for item in items:
+            if isinstance(item, str):
+                normalized_items.append({"url": item, "title": "", "snippet": ""})
+            elif isinstance(item, dict):
+                normalized_items.append(
+                    {
+                        "url": str(item.get("url") or item.get("link") or ""),
+                        "title": str(item.get("title", "") or ""),
+                        "snippet": str(item.get("snippet", "") or ""),
+                    }
+                )
+
+        urls, _ = self._filter_trusted_urls(normalized_items, provider=provider, query=query)
+        logger.info(f"[TrustedSearch:{provider}] '{query}' -> {len(urls)}/{len(normalized_items)} trusted")
+
+        if not claim or not claim_type:
+            return urls
+
+        trusted_set = set(urls)
+        trusted_items = [item for item in normalized_items if str(item.get("url", "")) in trusted_set]
+        selected_urls = self._select_and_learn(
+            claim=claim,
+            claim_type=claim_type,
+            entities=entities,
+            items=trusted_items,
+        )
+        return selected_urls or urls
+
+    async def search_query_serper_with_site_boost(
+        self,
+        session: aiohttp.ClientSession,
+        query: str,
+        claim: str | None = None,
+        claim_type: str | None = None,
+        entities: Any | None = None,
+    ) -> List[str]:
         """
         Serper fallback with trusted-domain site: boosts when generic results are weak.
         """
@@ -1366,13 +1557,29 @@ FAILED ENTITIES:
         if not simplified:
             return []
 
-        base_urls = await self.search_query_serper(session, simplified)
+        base_items = await self.search_query_serper(session, simplified)
+        base_urls = self._process_search_items(
+            provider="Serper",
+            query=simplified,
+            items=base_items,
+            claim=claim,
+            claim_type=claim_type,
+            entities=entities,
+        )
         if len(base_urls) >= self.min_allowlist_pass or "site:" in simplified.lower():
             return base_urls
 
         boosted_urls: List[str] = []
         for site_query in self._build_serper_site_boost_queries(simplified):
-            site_urls = await self.search_query_serper(session, site_query)
+            site_items = await self.search_query_serper(session, site_query)
+            site_urls = self._process_search_items(
+                provider="Serper",
+                query=site_query,
+                items=site_items,
+                claim=claim,
+                claim_type=claim_type,
+                entities=entities,
+            )
             if site_urls:
                 boosted_urls = dedupe_list(boosted_urls + site_urls)
             merged_count = len(dedupe_list(base_urls + boosted_urls))
@@ -1550,7 +1757,13 @@ FAILED ENTITIES:
     # ---------------------------------------------------------------------
     # Execute Single Query (quota-optimized)
     # ---------------------------------------------------------------------
-    async def execute_single_query(self, query: str) -> List[str]:
+    async def execute_single_query(
+        self,
+        query: str,
+        claim: str | None = None,
+        claim_type: str | None = None,
+        entities: Any | None = None,
+    ) -> List[str]:
         """
         Execute a single search query and return trusted URLs.
         This is the quota-optimized method - call only when needed.
@@ -1562,12 +1775,52 @@ FAILED ENTITIES:
 
         async with aiohttp.ClientSession() as session:
             try:
-                urls = await self.search_query(session, query)
+                urls = await self.search_query(
+                    session,
+                    query,
+                    claim=claim,
+                    claim_type=claim_type,
+                    entities=entities,
+                )
                 logger.info(f"[TrustedSearch] Single query returned {len(urls)} trusted URLs")
                 return urls
             except Exception as e:
                 logger.error(f"[TrustedSearch] Single query failed: {e}")
                 return []
+
+    async def search_for_claim(self, claim: str, min_urls: int = 3, max_queries: int = 8) -> List[str]:
+        plan: QueryPlan = build_plan(claim)
+        min_urls = max(1, int(min_urls))
+        max_queries = max(1, int(max_queries))
+        selected_urls: List[str] = []
+
+        logger.info(
+            "[TrustedSearch] search_for_claim: claim_type=%s queries=%d min_urls=%d max_queries=%d",
+            plan.claim_type,
+            len(plan.queries),
+            min_urls,
+            max_queries,
+        )
+
+        async with aiohttp.ClientSession() as session:
+            for idx, query_spec in enumerate(plan.queries[:max_queries], start=1):
+                query = self._sanitize_query(query_spec.q)
+                if not query:
+                    continue
+                logger.info("[TrustedSearch] Executing claim query %d/%d: '%s'", idx, max_queries, query)
+                urls = await self.search_query(
+                    session,
+                    query,
+                    claim=plan.claim,
+                    claim_type=plan.claim_type,
+                    entities=plan.extracted_entities,
+                )
+                if urls:
+                    selected_urls = dedupe_list(selected_urls + urls)
+                if len(selected_urls) >= min_urls:
+                    break
+
+        return dedupe_list(selected_urls)
 
     async def search(self, query: str, max_results: int = 5) -> List[Dict[str, str]]:
         """
@@ -1595,6 +1848,13 @@ FAILED ENTITIES:
         Executes reformulation → sequential Google CSE queries → URL dedupe.
         Stops early once min_urls threshold is reached.
         """
+        try:
+            subclaims = AdaptiveTrustPolicy().decompose_claim(post_text)
+        except Exception:
+            subclaims = []
+        if len([s for s in (subclaims or []) if s and s.strip()]) <= 1:
+            return await self.search_for_claim(post_text, min_urls=min_urls, max_queries=max_queries)
+
         # 1) Generate reformulated queries
         queries = await self.reformulate_queries(post_text, failed_entities)
         logger.info(f"[TrustedSearch] Reformulated queries: {queries}")
@@ -1654,6 +1914,12 @@ FAILED ENTITIES:
         """
         if failed_entities is None:
             failed_entities = []
+        try:
+            subclaims = AdaptiveTrustPolicy().decompose_claim(post_text)
+        except Exception:
+            subclaims = []
+        if len([s for s in (subclaims or []) if s and s.strip()]) <= 1:
+            return await self.search_for_claim(post_text)
         return await self.run(post_text, failed_entities)
 
     # ---------------------------------------------------------------------
