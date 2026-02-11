@@ -685,26 +685,49 @@ class VerdictGenerator:
                     stance = stance or "neutral"
             polarity = self._segment_polarity(seg_text, fact, stance=stance)
             anchor_overlap = self._segment_anchor_overlap(seg_text, fact or "")
+            try:
+                best_semantic = float(
+                    (best_ev or {}).get("semantic_score")
+                    or (best_ev or {}).get("sem_score")
+                    or (best_ev or {}).get("final_score")
+                    or (best_ev or {}).get("score")
+                    or 0.0
+                )
+            except Exception:
+                best_semantic = 0.0
+            high_semantic_negation_mismatch = bool(fact) and (seg_neg != fact_neg) and (best_semantic >= 0.80)
 
             if status in {"VALID", "PARTIALLY_VALID"} and fact and fact_neg and not seg_neg:
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
             if status in {"VALID", "PARTIALLY_VALID"} and polarity == "contradicts":
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
+            if status in {"VALID", "PARTIALLY_VALID"} and high_semantic_negation_mismatch:
+                seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
 
             # UNKNOWN minimization ladder:
             # deterministically upgrade UNKNOWN only when alignment is strong and polarity is clear.
             if status == "UNKNOWN" and best_ev is not None and fact:
-                deterministic_score = (0.70 * best_match_score) + (0.30 * anchor_overlap)
-                if deterministic_score >= 0.55 and anchor_overlap >= 0.34 and polarity in {"entails", "contradicts"}:
-                    seg["status"] = "PARTIALLY_VALID" if polarity == "entails" else "PARTIALLY_INVALID"
+                if high_semantic_negation_mismatch:
+                    seg["status"] = "INVALID"
                     seg["supporting_fact"] = fact
                     seg["source_url"] = src
                     seg["evidence_used_ids"] = [best_idx] if best_idx >= 0 else []
                 else:
-                    seg["status"] = "UNKNOWN"
-                    seg["supporting_fact"] = ""
-                    seg["source_url"] = ""
-                    seg["evidence_used_ids"] = []
+                    deterministic_score = (0.70 * best_match_score) + (0.30 * anchor_overlap)
+                    if (
+                        deterministic_score >= 0.55
+                        and anchor_overlap >= 0.34
+                        and polarity in {"entails", "contradicts"}
+                    ):
+                        seg["status"] = "PARTIALLY_VALID" if polarity == "entails" else "PARTIALLY_INVALID"
+                        seg["supporting_fact"] = fact
+                        seg["source_url"] = src
+                        seg["evidence_used_ids"] = [best_idx] if best_idx >= 0 else []
+                    else:
+                        seg["status"] = "UNKNOWN"
+                        seg["supporting_fact"] = ""
+                        seg["source_url"] = ""
+                        seg["evidence_used_ids"] = []
 
         # Evidence quality signal (deterministic, claim-aware) is used for confidence calibration.
         evidence_quality_percent = self._calculate_truthfulness_from_evidence(claim, evidence)

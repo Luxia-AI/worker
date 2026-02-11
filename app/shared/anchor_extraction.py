@@ -226,13 +226,27 @@ class AnchorExtractor:
             payload = json.loads(result)
         else:
             return {}
-        raw_items = payload.get("subclaim_anchors", []) if isinstance(payload, dict) else []
+        raw_items: Any = []
+        if isinstance(payload, dict):
+            for key in ("subclaim_anchors", "anchors", "terms", "keywords"):
+                candidate = payload.get(key)
+                if isinstance(candidate, list):
+                    raw_items = candidate
+                    break
         anchor_map: Dict[str, List[str]] = {}
         for item in raw_items:
             if not isinstance(item, dict):
                 continue
-            subclaim = str(item.get("subclaim") or "").strip()
-            raw_anchors = item.get("anchors", [])
+            subclaim = str(item.get("subclaim") or item.get("segment") or item.get("text") or "").strip()
+            raw_anchors = (
+                item.get("anchors")
+                if isinstance(item.get("anchors"), list)
+                else (
+                    item.get("terms")
+                    if isinstance(item.get("terms"), list)
+                    else item.get("keywords") if isinstance(item.get("keywords"), list) else []
+                )
+            )
             if not subclaim or not isinstance(raw_anchors, list):
                 continue
             anchor_map[subclaim] = [str(x) for x in raw_anchors if str(x).strip()]
