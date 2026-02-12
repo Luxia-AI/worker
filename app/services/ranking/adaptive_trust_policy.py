@@ -101,6 +101,40 @@ class AdaptiveTrustPolicy:
         }
         return {w for w in re.findall(r"\b[\w']+\b", (text or "").lower()) if w not in stop}
 
+    @staticmethod
+    def _object_tokens(text: str) -> set[str]:
+        low = (text or "").lower()
+        m = re.search(
+            r"\b(?:against|for|on)\s+(?P<object>.+)$",
+            low,
+        )
+        if not m:
+            return set()
+        object_text = m.group("object")
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+        }
+        return {w for w in re.findall(r"\b[\w']+\b", object_text) if w not in stop and len(w) > 2}
+
     def _lexical_partial_coverage(self, subclaim: str, evidence_list: List[EvidenceItem]) -> bool:
         tokens = self._token_set(subclaim)
         if not tokens:
@@ -110,6 +144,7 @@ class AdaptiveTrustPolicy:
         focus_tokens = [t for t in tokens if t not in neg_terms]
         if not focus_tokens:
             return False
+        target_object = self._object_tokens(subclaim)
         left = set(focus_tokens[: max(1, len(focus_tokens) // 2)])
         right = set(focus_tokens[max(1, len(focus_tokens) // 2) :]) or left
 
@@ -129,6 +164,8 @@ class AdaptiveTrustPolicy:
                 continue
             ev_tokens = self._token_set(statement)
             if not ev_tokens:
+                continue
+            if target_object and not (target_object & ev_tokens):
                 continue
             left_ok = bool(left & ev_tokens)
             right_ok = bool(right & ev_tokens)

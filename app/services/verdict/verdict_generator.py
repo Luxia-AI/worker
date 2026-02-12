@@ -1072,11 +1072,19 @@ class VerdictGenerator:
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
             if status in {"VALID", "PARTIALLY_VALID"} and high_semantic_negation_mismatch:
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
+            if status in {"VALID", "PARTIALLY_VALID"} and polarity_text:
+                object_tokens = self._segment_object_tokens(seg_text)
+                statement_tokens = self._statement_tokens(polarity_text)
+                no_object_overlap = bool(object_tokens) and len(object_tokens & statement_tokens) == 0
+                if no_object_overlap and not self._is_explicit_refutation_statement(polarity_text):
+                    seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
+            status = (seg.get("status") or "UNKNOWN").upper()
             if status in {"VALID", "PARTIALLY_VALID"} and self._is_claim_mention_statement(polarity_text):
                 seg["status"] = "UNKNOWN"
                 seg["supporting_fact"] = ""
                 seg["source_url"] = ""
                 seg["evidence_used_ids"] = []
+            status = (seg.get("status") or "UNKNOWN").upper()
             if status in {"INVALID", "PARTIALLY_INVALID"} and self._is_claim_mention_statement(polarity_text):
                 if not self._segment_is_belief_or_survey_claim(seg_text) and not self._is_explicit_refutation_statement(
                     polarity_text
@@ -1085,6 +1093,7 @@ class VerdictGenerator:
                     seg["supporting_fact"] = ""
                     seg["source_url"] = ""
                     seg["evidence_used_ids"] = []
+            status = (seg.get("status") or "UNKNOWN").upper()
 
             # UNKNOWN minimization ladder:
             # deterministically upgrade UNKNOWN only when alignment is strong and polarity is clear.
@@ -1860,6 +1869,10 @@ class VerdictGenerator:
             "person",
         }
         return {t for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", object_text) if t not in stop}
+
+    @staticmethod
+    def _statement_tokens(statement: str) -> set[str]:
+        return set(re.findall(r"\b[a-z][a-z0-9_-]+\b", (statement or "").lower()))
 
     def _evidence_score(self, ev: Dict[str, Any]) -> float:
         score = ev.get("final_score")
