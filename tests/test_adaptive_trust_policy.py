@@ -240,3 +240,27 @@ class TestAdaptiveTrustPolicy:
         assert result["agreement"] == 0.0
         assert not result["is_sufficient"]
         assert result["trust_post"] == 0.0
+
+    def test_compute_adaptive_trust_final_sufficient_is_single_source_of_truth(self, policy, monkeypatch):
+        """Late weak-relevance guard should update final result (no contradictory sufficient state)."""
+        claim = "Vaccines are effective."
+        evidence = [
+            EvidenceItem(
+                statement="Vaccines are effective in preventing severe disease.",
+                semantic_score=0.80,
+                source_url="https://who.int/a",
+                trust=0.10,  # weak trust to force late override
+                stance="entails",
+            )
+        ]
+
+        monkeypatch.setattr(policy, "apply_gating_rules", lambda *args, **kwargs: True)
+        monkeypatch.setattr(
+            policy,
+            "decompose_claim",
+            lambda *_args, **_kwargs: ["Vaccines are effective", "Vaccines are safe"],
+        )
+        result = policy.compute_adaptive_trust(claim, evidence)
+
+        assert result["is_sufficient"] is False
+        assert result["verdict_state"] == "evidence_insufficiency"

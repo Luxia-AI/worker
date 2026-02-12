@@ -83,6 +83,7 @@ class Scraper:
         self.domain_403_cooldown_seconds = 24 * 60 * 60
         self._domain_failures: Dict[str, Dict[str, float]] = {}
         self._attempted_urls: set[str] = set()
+        self._download_event_urls: set[str] = set()
 
     def _get_headers(self) -> Dict[str, str]:
         """Get browser-like headers with random User-Agent."""
@@ -173,6 +174,7 @@ class Scraper:
 
     def reset_job_attempts(self) -> None:
         self._attempted_urls.clear()
+        self._download_event_urls.clear()
 
     def _mark_attempted(self, url: str) -> bool:
         if url in self._attempted_urls:
@@ -193,6 +195,11 @@ class Scraper:
             float(seconds),
             reason,
         )
+
+    @staticmethod
+    def _is_download_event_error(error_text: str) -> bool:
+        low = (error_text or "").lower()
+        return "download is starting" in low
 
     # ---------------------------------------------------------------------
     # Primary HTTP Fetcher
@@ -312,7 +319,13 @@ class Scraper:
 
         except Exception as e:
             logger.error(f"[Scraper] Playwright fallback failed for {url}: {e}")
-            self._record_domain_failure(url, stage="playwright_exception", reason=str(e))
+            err = str(e)
+            if self._is_download_event_error(err):
+                # Download events are not access denials; do not poison domain health.
+                logger.info("[Scraper][DomainPolicy] Playwright download event observed for %s; no domain penalty", url)
+                self._download_event_urls.add(url)
+            else:
+                self._record_domain_failure(url, stage="playwright_exception", reason=err)
             return None
 
     # ---------------------------------------------------------------------
@@ -337,7 +350,12 @@ class Scraper:
         elif html is None:
             logger.info(f"[Scraper] Skipping Playwright fallback (client error): {url}")
 
-        if html is None and status_code == 403:
+        if (
+            html is None
+            and status_code == 403
+            and url not in self._download_event_urls
+            and not self._should_skip_domain(url)
+        ):
             self._block_domain_for_cooldown(url, self.domain_403_cooldown_seconds, reason="persistent_403")
 
         if not isinstance(html, str) or not html:

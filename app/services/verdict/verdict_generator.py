@@ -790,6 +790,7 @@ class VerdictGenerator:
         self._log_subclaim_coverage(claim, evidence, claim_breakdown)
         reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
         verdict_str = reconciled["verdict"]
+        claim_frame = self._classify_claim_frame(claim)
         policy_insufficient = self._policy_says_insufficient(claim, evidence)
         truth_score_percent = self._calculate_truth_score_from_contract(reconciled)
         agreement_ratio = self._calculate_evidence_agreement_ratio(claim, evidence)
@@ -827,6 +828,28 @@ class VerdictGenerator:
                 adaptive_trust_post = float(adaptive_metrics.get("trust_post", 0.0) or 0.0)
             except Exception:
                 adaptive_trust_post = 0.0
+
+        if claim_frame.get("is_strong_therapeutic_affirm", False):
+            profile = self._therapeutic_evidence_profile(claim, claim_frame, evidence)
+            if profile["high_grade_contra"] >= 1:
+                verdict_str = Verdict.FALSE.value
+            elif profile["high_grade_support"] >= 1:
+                verdict_str = Verdict.TRUE.value
+            elif (profile["weak_support"] >= 1 or coverage_score >= 0.30) and verdict_str == Verdict.UNVERIFIABLE.value:
+                verdict_str = "MISLEADING"
+            logger.info(
+                "[VerdictGenerator][PolicyOverride] type=%s strength=%s polarity=%s subject=%s object=%s "
+                "high_grade_support=%d high_grade_contra=%d weak_support=%d verdict=%s",
+                claim_frame["claim_type"],
+                claim_frame["strength"],
+                claim_frame["polarity"],
+                claim_frame["subject"] or "-",
+                claim_frame["object"] or "-",
+                profile["high_grade_support"],
+                profile["high_grade_contra"],
+                profile["weak_support"],
+                verdict_str,
+            )
 
         if (
             float(reconciled.get("weighted_truth", 0.0) or 0.0) >= 0.8
@@ -1034,6 +1057,82 @@ class VerdictGenerator:
             if any(alias in low for alias in aliases):
                 hits.add(concept)
         return hits
+
+    @staticmethod
+    def _classify_claim_frame(claim: str) -> Dict[str, Any]:
+        text = f" {str(claim or '').strip().lower()} "
+        therapeutic = bool(
+            any(tok in text for tok in [" cure ", " cures ", " treat ", " treats ", " effective against "])
+        )
+        strong = bool(any(tok in text for tok in [" cure ", " cures ", " eradicate ", " eliminate "]))
+        polarity = "NEGATIVE" if re.search(r"\b(no|not|never|without|does not|do not)\b", text) else "AFFIRM"
+
+        subject = ""
+        obj = ""
+        m = re.search(r"(?P<subject>.+?)\b(cure|cures|treat|treats|prevent|prevents)\b\s+(?P<object>.+)", text)
+        if m:
+            subject = re.sub(r"\b(drinking|taking|using|consuming)\b", "", m.group("subject")).strip(" ,.")
+            obj = m.group("object").strip(" ,.")
+        return {
+            "claim_type": "THERAPEUTIC_EFFICACY" if therapeutic else "GENERIC",
+            "strength": "STRONG" if strong else "NORMAL",
+            "polarity": polarity,
+            "subject": subject,
+            "object": obj,
+            "is_strong_therapeutic_affirm": therapeutic and strong and polarity == "AFFIRM",
+        }
+
+    def _therapeutic_evidence_profile(
+        self,
+        claim: str,
+        claim_frame: Dict[str, Any],
+        evidence: List[Dict[str, Any]],
+    ) -> Dict[str, int]:
+        subject = str(claim_frame.get("subject") or "").lower()
+        obj = str(claim_frame.get("object") or "").lower()
+        high_grade_support = 0
+        high_grade_contra = 0
+        weak_support = 0
+        high_grade_markers = (
+            "randomized",
+            "systematic review",
+            "meta-analysis",
+            "cochrane",
+            "clinical trial",
+            "guideline",
+        )
+        for ev in evidence[:12]:
+            stmt = str(ev.get("statement") or ev.get("text") or "").lower()
+            if not stmt:
+                continue
+            if subject and subject.split()[-1] not in stmt:
+                continue
+            if obj and obj.split()[-1] not in stmt:
+                continue
+            stance = str(ev.get("stance") or "neutral")
+            pol = self._segment_polarity(claim, stmt, stance=stance)
+            sem_raw = ev.get("semantic_score")
+            if sem_raw is None:
+                sem_raw = ev.get("sem_score")
+            if sem_raw is None:
+                sem_raw = ev.get("final_score")
+            sem = max(0.0, min(1.0, float(sem_raw or 0.0)))
+            if sem < 0.55:
+                continue
+            is_high_grade = any(marker in stmt for marker in high_grade_markers)
+            if pol == "contradicts":
+                if is_high_grade or sem >= 0.80:
+                    high_grade_contra += 1
+            elif pol == "entails":
+                if is_high_grade:
+                    high_grade_support += 1
+                else:
+                    weak_support += 1
+        return {
+            "high_grade_support": high_grade_support,
+            "high_grade_contra": high_grade_contra,
+            "weak_support": weak_support,
+        }
 
     def _segment_polarity(self, segment: str, statement: str, stance: str = "neutral") -> str:
         stance_l = (stance or "neutral").lower()

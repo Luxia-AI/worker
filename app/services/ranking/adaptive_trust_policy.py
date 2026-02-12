@@ -558,7 +558,10 @@ class AdaptiveTrustPolicy:
         subclaims = self.decompose_claim(claim)
         num_subclaims = len(subclaims)
         anchor_result = self.anchor_extractor.extract_for_claim(claim=claim, subclaims=subclaims, entity_hints=[])
-        anchors_by_subclaim = anchor_result.anchors_by_subclaim
+        anchors_by_subclaim = {
+            str(k): sorted([str(a) for a in (v or []) if str(a).strip()])
+            for k, v in (anchor_result.anchors_by_subclaim or {}).items()
+        }
 
         # Use top-k evidence
         top_evidence = evidence_list[:top_k] if evidence_list else []
@@ -637,6 +640,26 @@ class AdaptiveTrustPolicy:
         else:
             verdict_state = "revoked"
 
+        # Hard relevance floor: don't skip web if evidence is weak overall
+        sem_scores = [getattr(e, "semantic_score", 0.0) for e in top_evidence] if top_evidence else [0.0]
+        trust_scores = [getattr(e, "trust", 0.0) for e in top_evidence] if top_evidence else [0.0]
+        top_sem = max(sem_scores) if sem_scores else 0.0
+        top_trust = max(trust_scores) if trust_scores else 0.0
+        # Performance optimization: avoid overriding when coverage+agreement are strong.
+        strong_coverage = coverage >= 0.95
+        strong_agreement = agreement >= 0.9
+        if (
+            is_sufficient
+            and not (strong_coverage and strong_agreement)
+            and (trust_post < 0.55 or top_sem < 0.60 or top_trust < 0.55)
+        ):
+            logger.info(
+                "[AdaptiveTrustPolicy] Overriding sufficient=False due to weak relevance "
+                f"(trust_post={trust_post:.3f}, top_sem={top_sem:.3f}, top_trust={top_trust:.3f})"
+            )
+            is_sufficient = False
+            verdict_state = "evidence_insufficiency"
+
         result = {
             "trust_post": trust_post,
             "coverage": coverage,
@@ -660,34 +683,22 @@ class AdaptiveTrustPolicy:
             "strong_covered": strong_covered,
             "avg_relevance": avg_relevance,
             "contradicted_subclaims": contradicted_count,
+            "top_semantic_score": float(top_sem or 0.0),
+            "top_trust_score": float(top_trust or 0.0),
         }
 
         logger.info(
-            "Adaptive trust result: trust_post=%.3f final_coverage=%.2f sufficient=%s gate_reason=%s",
+            "Adaptive trust result: trust_post=%.3f final_coverage=%.2f sufficient=%s gate_reason=%s "
+            "strong_covered=%d contradicted=%d avg_relevance=%.3f top_sem=%.3f top_trust=%.3f",
             trust_post,
             coverage,
             is_sufficient,
             gate_reason,
+            strong_covered,
+            contradicted_count,
+            avg_relevance,
+            float(top_sem or 0.0),
+            float(top_trust or 0.0),
         )
-
-        # Hard relevance floor: don't skip web if evidence is weak overall
-        sem_scores = [getattr(e, "semantic_score", 0.0) for e in top_evidence] if top_evidence else [0.0]
-        trust_scores = [getattr(e, "trust", 0.0) for e in top_evidence] if top_evidence else [0.0]
-        top_sem = max(sem_scores) if sem_scores else 0.0
-        top_trust = max(trust_scores) if trust_scores else 0.0
-        # Performance optimization: avoid overriding when coverage+agreement are strong.
-        strong_coverage = coverage >= 0.95
-        strong_agreement = agreement >= 0.9
-        if (
-            is_sufficient
-            and not (strong_coverage and strong_agreement)
-            and (trust_post < 0.55 or top_sem < 0.60 or top_trust < 0.55)
-        ):
-            logger.info(
-                "[AdaptiveTrustPolicy] Overriding sufficient=False due to weak relevance "
-                f"(trust_post={trust_post:.3f}, top_sem={top_sem:.3f}, top_trust={top_trust:.3f})"
-            )
-            result["is_sufficient"] = False
-            result["verdict_state"] = "evidence_insufficiency"
 
         return result

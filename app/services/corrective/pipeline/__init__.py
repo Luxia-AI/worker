@@ -193,6 +193,74 @@ class CorrectivePipeline:
             top_domains = sorted(domain_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
             logger.info("[CorrectivePipeline:%s] Top evidence domains: %s", round_id, top_domains)
 
+    @staticmethod
+    def _classify_claim_frame(claim: str) -> Dict[str, Any]:
+        text = str(claim or "").strip().lower()
+        therapeutic = bool(
+            any(term in text for term in [" cure ", " cures ", " treat ", " treats ", "therapy", "effective against"])
+        )
+        strong = bool(any(term in text for term in [" cure ", " cures ", " eradicate ", " eliminate "]))
+        return {
+            "claim_type": "THERAPEUTIC_EFFICACY" if therapeutic else "GENERIC",
+            "strength": "STRONG" if strong else "NORMAL",
+            "is_strong_therapeutic": therapeutic and strong,
+        }
+
+    @staticmethod
+    def _should_stop_confidence_mode(
+        claim_frame: Dict[str, Any],
+        adaptive_trust: Dict[str, Any],
+        confidence_target_coverage: float,
+        confidence_max_new_trusted_urls: int,
+        new_trusted_urls_processed: int,
+    ) -> tuple[bool, str]:
+        if new_trusted_urls_processed >= confidence_max_new_trusted_urls:
+            return True, (
+                f"processed trusted URL cap reached "
+                f"({new_trusted_urls_processed} >= {confidence_max_new_trusted_urls})"
+            )
+
+        coverage = float(adaptive_trust.get("coverage", 0.0) or 0.0)
+        diversity = float(adaptive_trust.get("diversity", 0.0) or 0.0)
+        strong_covered = int(adaptive_trust.get("strong_covered", 0) or 0)
+        is_sufficient = bool(adaptive_trust.get("is_sufficient", False))
+        contradicted = int(adaptive_trust.get("contradicted_subclaims", 0) or 0)
+
+        if is_sufficient:
+            return True, (
+                f"adaptive_sufficient=True coverage={coverage:.2f} diversity={diversity:.2f} "
+                f"strong_covered={strong_covered}"
+            )
+
+        if claim_frame.get("is_strong_therapeutic", False):
+            # Strong therapeutic claims require stronger stopping signals than coverage-only.
+            if contradicted > 0 and strong_covered >= 1:
+                return True, (
+                    f"strong therapeutic contradiction found (contradicted={contradicted}, "
+                    f"strong_covered={strong_covered})"
+                )
+            if coverage >= confidence_target_coverage and (diversity >= 0.30 or strong_covered >= 1):
+                return True, (
+                    f"strong therapeutic coverage target met with supporting quality "
+                    f"(coverage={coverage:.2f}, diversity={diversity:.2f}, strong_covered={strong_covered})"
+                )
+            return False, (
+                f"continue: strong therapeutic claim requires quality evidence "
+                f"(coverage={coverage:.2f}, diversity={diversity:.2f}, strong_covered={strong_covered}, "
+                f"sufficient={is_sufficient})"
+            )
+
+        if coverage >= confidence_target_coverage and diversity >= 0.30:
+            return True, (
+                f"coverage target reached with diversity guard "
+                f"(coverage={coverage:.2f} >= {confidence_target_coverage:.2f}, diversity={diversity:.2f})"
+            )
+
+        return False, (
+            f"continue: coverage/diversity guard not met "
+            f"(coverage={coverage:.2f}, diversity={diversity:.2f}, sufficient={is_sufficient})"
+        )
+
     def _build_evidence_items(self, claim: str, ranked: List[Dict[str, Any]]) -> List[EvidenceItem]:
         evidence_items = [
             EvidenceItem(
@@ -618,6 +686,14 @@ class CorrectivePipeline:
                 )
             ),
         )
+        claim_frame = self._classify_claim_frame(post_text)
+        logger.info(
+            "[CorrectivePipeline:%s] Claim frame: type=%s strength=%s strong_therapeutic=%s",
+            round_id,
+            claim_frame["claim_type"],
+            claim_frame["strength"],
+            claim_frame["is_strong_therapeutic"],
+        )
         new_trusted_urls_processed = 0
 
         for query_idx, query in enumerate(queries):
@@ -844,23 +920,18 @@ class CorrectivePipeline:
                 )
                 break
 
-            if confidence_mode and float(adaptive_trust.get("coverage", 0.0) or 0.0) >= confidence_target_coverage:
-                logger.info(
-                    "[CorrectivePipeline:%s] Confidence mode stop: coverage target reached (%.2f >= %.2f)",
-                    round_id,
-                    float(adaptive_trust.get("coverage", 0.0) or 0.0),
-                    confidence_target_coverage,
+            if confidence_mode:
+                should_stop, stop_reason = self._should_stop_confidence_mode(
+                    claim_frame=claim_frame,
+                    adaptive_trust=adaptive_trust,
+                    confidence_target_coverage=confidence_target_coverage,
+                    confidence_max_new_trusted_urls=confidence_max_new_trusted_urls,
+                    new_trusted_urls_processed=new_trusted_urls_processed,
                 )
-                break
-
-            if confidence_mode and new_trusted_urls_processed >= confidence_max_new_trusted_urls:
-                logger.info(
-                    "[CorrectivePipeline:%s] Confidence mode stop: processed trusted URL cap reached (%d >= %d)",
-                    round_id,
-                    new_trusted_urls_processed,
-                    confidence_max_new_trusted_urls,
-                )
-                break
+                logger.info("[CorrectivePipeline:%s] Confidence mode decision: %s", round_id, stop_reason)
+                if should_stop:
+                    logger.info("[CorrectivePipeline:%s] Confidence mode stop: %s", round_id, stop_reason)
+                    break
 
         # Log final statistics
         logger.info(

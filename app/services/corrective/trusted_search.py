@@ -659,6 +659,19 @@ class TrustedSearch:
             f"site:nhs.uk {a_term} {b_variants[0]} {negations[2]} {negatives}",
         ]
 
+        if re.search(r"\b(cure|cures|curing|eradicate|eliminate)\b", text_low):
+            clinical_queries = [
+                f"{a_term} {b_term} randomized trial {negatives}",
+                f"{a_term} {b_term} systematic review meta-analysis {negatives}",
+                f"{a_term} {b_term} clinical trial humans {negatives}",
+                f"{a_term} {b_term} cure evidence {negatives}",
+                f"site:cancer.gov {a_term} {b_term} clinical trial {negatives}",
+                f"site:nih.gov {a_term} {b_term} evidence {negatives}",
+                f"site:cochranelibrary.com {a_term} {b_term} {negatives}",
+            ]
+            # Prioritize clinical-efficacy queries for strong therapeutic claims.
+            queries = clinical_queries + queries
+
         if len(b_variants) > 1 and len(queries) < max_queries:
             queries.append(f"{a_term} {negations[0]} {verb_variants[0]} {b_variants[1]} {negatives}")
         if len(negations) > 3 and len(queries) < max_queries:
