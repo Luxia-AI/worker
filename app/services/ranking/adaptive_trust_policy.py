@@ -567,7 +567,6 @@ class AdaptiveTrustPolicy:
         top_evidence = evidence_list[:top_k] if evidence_list else []
 
         # Calculate metrics
-        coverage = self.calculate_coverage(subclaims, top_evidence, anchors_by_subclaim=anchors_by_subclaim)
         diversity = self.calculate_diversity(top_evidence)
         agreement = self.calculate_agreement(top_evidence)
         cov = compute_subclaim_coverage(
@@ -576,7 +575,35 @@ class AdaptiveTrustPolicy:
             partial_weight=self.PARTIAL_WEIGHT,
             anchors_by_subclaim=anchors_by_subclaim,
         )
-        details = cov.get("details", [])
+        details = list(cov.get("details", []))
+
+        lexical_partial_hits = 0
+        if self.confidence_mode and subclaims and details:
+            for detail in details:
+                status = str(detail.get("status") or "UNKNOWN").upper()
+                if status != "UNKNOWN":
+                    continue
+                subclaim = str(detail.get("subclaim") or "")
+                if not subclaim:
+                    continue
+                if self._lexical_partial_coverage(subclaim, top_evidence):
+                    lexical_partial_hits += 1
+                    detail["status"] = "PARTIALLY_VALID"
+                    detail["weight"] = self.PARTIAL_WEIGHT
+                    detail["relevance_score"] = max(
+                        float(detail.get("relevance_score", 0.0) or 0.0),
+                        self.PARTIAL_WEIGHT,
+                    )
+                    detail["anchors_matched"] = max(1, int(detail.get("anchors_matched", 0) or 0))
+
+        weighted_sum = sum(float(d.get("weight", 0.0) or 0.0) for d in details)
+        coverage = weighted_sum / max(1, len(subclaims))
+        if lexical_partial_hits > 0:
+            logger.info(
+                "[AdaptiveTrustPolicy][Coverage] Confidence lexical partial upgrades=%d -> coverage=%.2f",
+                lexical_partial_hits,
+                coverage,
+            )
         strong_covered = sum(1 for d in details if (d.get("status") or "").upper() == "STRONGLY_VALID")
         contradicted_count = sum(1 for d in details if bool(d.get("contradicted", False)))
         avg_relevance = (
@@ -604,6 +631,11 @@ class AdaptiveTrustPolicy:
             gate_reason = "strict_contradiction"
 
         # Compute adaptive trust score
+        sem_scores = [getattr(e, "semantic_score", 0.0) for e in top_evidence] if top_evidence else [0.0]
+        trust_scores = [getattr(e, "trust", 0.0) for e in top_evidence] if top_evidence else [0.0]
+        top_sem = max(sem_scores) if sem_scores else 0.0
+        top_trust = max(trust_scores) if trust_scores else 0.0
+
         if not top_evidence:
             trust_post = 0.0
         else:
@@ -628,7 +660,14 @@ class AdaptiveTrustPolicy:
                 # Adaptive formula: trust_post = mean(subclaim_trust) * (0.5 + 0.5*coverage)
                 trust_post = mean_subclaim_trust * (self.BASE_WEIGHT + self.COVERAGE_WEIGHT * coverage)
             else:
-                trust_post = 0.0
+                # Keep trust aligned with coverage if lexical upgrades matched but weighted trust list is empty.
+                trust_post = max(0.0, float(top_trust or 0.0) * float(coverage or 0.0))
+
+            # Deterministic trust floor for confidence-mode pass paths:
+            # when gating passes with meaningful coverage and top trust exists,
+            # avoid reporting zero trust due sparse/missing subclaim trust weights.
+            if trust_post <= 0.0 and coverage >= 0.50 and top_trust > 0.0:
+                trust_post = float(top_trust) * float(coverage)
 
         # Determine verdict state
         if not is_sufficient:
@@ -641,15 +680,15 @@ class AdaptiveTrustPolicy:
             verdict_state = "revoked"
 
         # Hard relevance floor: don't skip web if evidence is weak overall
-        sem_scores = [getattr(e, "semantic_score", 0.0) for e in top_evidence] if top_evidence else [0.0]
-        trust_scores = [getattr(e, "trust", 0.0) for e in top_evidence] if top_evidence else [0.0]
-        top_sem = max(sem_scores) if sem_scores else 0.0
-        top_trust = max(trust_scores) if trust_scores else 0.0
         # Performance optimization: avoid overriding when coverage+agreement are strong.
         strong_coverage = coverage >= 0.95
         strong_agreement = agreement >= 0.9
+        adaptive_override_guard = (
+            gate_reason == "adaptive_override" and coverage >= 0.60 and avg_relevance >= 0.65 and top_trust >= 0.55
+        )
         if (
             is_sufficient
+            and not adaptive_override_guard
             and not (strong_coverage and strong_agreement)
             and (trust_post < 0.55 or top_sem < 0.60 or top_trust < 0.55)
         ):
@@ -662,6 +701,11 @@ class AdaptiveTrustPolicy:
             )
             is_sufficient = False
             verdict_state = "evidence_insufficiency"
+
+        # Final consistency guard: if gate passed and confidence-mode relaxed
+        # conditions are met, trust_post should not be zeroed out.
+        if trust_post <= 0.0 and coverage >= 0.50 and top_trust > 0.0:
+            trust_post = float(top_trust) * float(coverage)
 
         result = {
             "trust_post": trust_post,

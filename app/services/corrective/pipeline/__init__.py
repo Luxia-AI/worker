@@ -225,6 +225,7 @@ class CorrectivePipeline:
         strong_covered = int(adaptive_trust.get("strong_covered", 0) or 0)
         is_sufficient = bool(adaptive_trust.get("is_sufficient", False))
         contradicted = int(adaptive_trust.get("contradicted_subclaims", 0) or 0)
+        trust_post = float(adaptive_trust.get("trust_post", 0.0) or 0.0)
 
         if is_sufficient:
             return True, (
@@ -250,10 +251,11 @@ class CorrectivePipeline:
                 f"sufficient={is_sufficient})"
             )
 
-        if coverage >= confidence_target_coverage and diversity >= 0.30:
+        if coverage >= confidence_target_coverage and diversity >= 0.45 and (trust_post >= 0.55 or strong_covered >= 1):
             return True, (
                 f"coverage target reached with diversity guard "
-                f"(coverage={coverage:.2f} >= {confidence_target_coverage:.2f}, diversity={diversity:.2f})"
+                f"(coverage={coverage:.2f} >= {confidence_target_coverage:.2f}, diversity={diversity:.2f}, "
+                f"trust_post={trust_post:.3f}, strong_covered={strong_covered})"
             )
 
         return False, (

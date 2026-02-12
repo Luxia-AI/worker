@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -140,14 +141,24 @@ def _contains_anchor(text: str, anchor: str) -> bool:
 
 
 class AnchorExtractor:
+    _shared_llm: HybridLLMService | None = None
+    _cache: Dict[str, AnchorExtractionResult] = {}
+    _cache_lock = threading.Lock()
+
     def __init__(self, llm_service: HybridLLMService | None = None) -> None:
         self._llm_service = llm_service
 
     def _get_llm(self) -> HybridLLMService | None:
         if self._llm_service is not None:
             return self._llm_service
+        if os.getenv("ANCHOR_EXTRACTOR_DISABLE_LLM", "").strip().lower() in {"1", "true", "yes", "on"}:
+            return None
+        if AnchorExtractor._shared_llm is not None:
+            self._llm_service = AnchorExtractor._shared_llm
+            return self._llm_service
         try:
-            self._llm_service = HybridLLMService()
+            AnchorExtractor._shared_llm = HybridLLMService()
+            self._llm_service = AnchorExtractor._shared_llm
         except Exception as exc:
             logger.debug("[AnchorExtractor] LLM unavailable, using rule-based anchors: %s", exc)
             self._llm_service = None
@@ -217,7 +228,7 @@ class AnchorExtractor:
             prompt,
             response_format="json",
             priority=LLMPriority.HIGH,
-            call_tag="entity_extraction",
+            call_tag="anchor_extraction",
         )
         payload: Mapping[str, Any]
         if isinstance(result, dict):
@@ -287,6 +298,21 @@ class AnchorExtractor:
         subclaims: Sequence[str],
         entity_hints: Sequence[str] | None = None,
     ) -> AnchorExtractionResult:
+        key = "||".join(
+            [
+                str(claim or "").strip().lower(),
+                "|".join(str(s or "").strip().lower() for s in (subclaims or [])),
+                "|".join(sorted(str(h or "").strip().lower() for h in (entity_hints or []))),
+            ]
+        )
+        with AnchorExtractor._cache_lock:
+            cached = AnchorExtractor._cache.get(key)
+        if cached is not None:
+            return AnchorExtractionResult(
+                anchors_by_subclaim={k: list(v) for k, v in cached.anchors_by_subclaim.items()},
+                used_llm=cached.used_llm,
+            )
+
         cfg = get_trust_config()
         max_count = max(2, min(5, cfg.coverage_anchors_per_subclaim))
         hints = [str(h).strip() for h in (entity_hints or []) if str(h).strip()]
@@ -306,4 +332,10 @@ class AnchorExtractor:
                 sanitized = (sanitized + self._rule_based_anchors(normalized_subclaim, []))[:max_count]
             anchors_by_subclaim[normalized_subclaim] = sanitized[:max_count]
 
-        return AnchorExtractionResult(anchors_by_subclaim=anchors_by_subclaim, used_llm=used_llm)
+        result = AnchorExtractionResult(anchors_by_subclaim=anchors_by_subclaim, used_llm=used_llm)
+        with AnchorExtractor._cache_lock:
+            AnchorExtractor._cache[key] = result
+        return AnchorExtractionResult(
+            anchors_by_subclaim={k: list(v) for k, v in result.anchors_by_subclaim.items()},
+            used_llm=result.used_llm,
+        )

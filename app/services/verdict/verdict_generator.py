@@ -329,9 +329,15 @@ class VerdictGenerator:
 
         # Step 1) Start with VDB/KG evidence + (optional) segment retrieval
         segment_evidence: List[Dict[str, Any]] = []
+        policy_insufficient_hint = self._policy_says_insufficient(
+            claim, ranked_evidence[: min(len(ranked_evidence), 10)]
+        )
+        if adaptive_metrics is not None:
+            policy_insufficient_hint = not bool(adaptive_metrics.get("is_sufficient", False))
+
         if (not cache_sufficient) and (
             self._needs_web_boost(ranked_evidence[: min(len(ranked_evidence), 6)], claim=claim)
-            or self._policy_says_insufficient(claim, ranked_evidence[: min(len(ranked_evidence), 10)])
+            or policy_insufficient_hint
         ):
             segment_evidence = await self._retrieve_segment_evidence(
                 claim,
@@ -353,6 +359,8 @@ class VerdictGenerator:
         if not used_web_search and not cache_sufficient:
             for round_i in range(self.MAX_WEB_ROUNDS_PRE_VERDICT):
                 insufficient = self._policy_says_insufficient(claim, pre_evidence)
+                if adaptive_metrics is not None:
+                    insufficient = not bool(adaptive_metrics.get("is_sufficient", False))
                 weak = self._needs_web_boost(pre_evidence[: min(len(pre_evidence), 6)], claim=claim)
                 if not insufficient and not weak:
                     logger.info(f"[VerdictGenerator] Pre-verdict evidence sufficient (round={round_i}). Skipping web.")
@@ -811,7 +819,12 @@ class VerdictGenerator:
                     domains.add(domain)
             diversity_score = min(1.0, len(domains) / max(1, min(len(evidence), 10)))
 
-        self._log_subclaim_coverage(claim, evidence, claim_breakdown)
+        self._log_subclaim_coverage(claim, evidence, claim_breakdown, adaptive_metrics=adaptive_metrics)
+        self._apply_adaptive_coverage_fallback(
+            claim_breakdown=claim_breakdown,
+            adaptive_metrics=adaptive_metrics,
+            evidence=evidence,
+        )
         reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
         verdict_str = reconciled["verdict"]
         claim_frame = self._classify_claim_frame(claim)
@@ -1559,7 +1572,33 @@ class VerdictGenerator:
         claim: str,
         evidence: List[Dict[str, Any]],
         claim_breakdown: List[Dict[str, Any]],
+        adaptive_metrics: Dict[str, Any] | None = None,
     ) -> None:
+        # When adaptive metrics are provided by pipeline memoization,
+        # avoid expensive/redundant anchor+adaptive recomputation in verdict phase.
+        if adaptive_metrics is not None:
+            try:
+                weighted = float(adaptive_metrics.get("coverage", 0.0) or 0.0)
+                logger.info(
+                    "[VerdictGenerator][Coverage] subclaims=%d weighted_covered=%.2f strong=%d partial=%d invalid=%d "
+                    "unknown=%d coverage=%.2f",
+                    len(claim_breakdown or []),
+                    weighted,
+                    int(adaptive_metrics.get("strong_covered", 0) or 0),
+                    0,
+                    int(adaptive_metrics.get("contradicted_subclaims", 0) or 0),
+                    sum(1 for seg in (claim_breakdown or []) if str(seg.get("status", "UNKNOWN")).upper() == "UNKNOWN"),
+                    weighted,
+                )
+                logger.info(
+                    "[VerdictGenerator][Coverage][Aligned] verdict_coverage=%.2f adaptive_coverage=%.2f",
+                    0.0,
+                    weighted,
+                )
+            except Exception:
+                logger.debug("[VerdictGenerator][Coverage] memoized coverage logging skipped due to parse issue")
+            return
+
         trust_policy = getattr(self, "trust_policy", None) or AdaptiveTrustPolicy()
         subclaims = trust_policy.decompose_claim(claim)
         anchor_extractor = getattr(self, "anchor_extractor", None)
@@ -1619,6 +1658,13 @@ class VerdictGenerator:
             float(cov.get("coverage", 0.0)),
         )
         try:
+            if adaptive_metrics is not None:
+                logger.info(
+                    "[VerdictGenerator][Coverage][Aligned] verdict_coverage=%.2f adaptive_coverage=%.2f",
+                    float(cov.get("coverage", 0.0)),
+                    float(adaptive_metrics.get("coverage", 0.0) or 0.0),
+                )
+                return
 
             class _Ev:
                 __slots__ = ("statement", "source_url", "semantic_score", "stance", "trust")
@@ -1671,6 +1717,61 @@ class VerdictGenerator:
         }
         words = [w for w in re.findall(r"\b\w+\b", segment.lower()) if w not in stop]
         return len(words) >= 2 and len(segment.strip()) >= 12
+
+    def _apply_adaptive_coverage_fallback(
+        self,
+        claim_breakdown: List[Dict[str, Any]],
+        adaptive_metrics: Dict[str, Any] | None,
+        evidence: List[Dict[str, Any]],
+    ) -> None:
+        if not claim_breakdown or not adaptive_metrics:
+            return
+        adaptive_coverage = float(adaptive_metrics.get("coverage", 0.0) or 0.0)
+        if adaptive_coverage < 0.60:
+            return
+        unknown_segments = [seg for seg in claim_breakdown if str(seg.get("status", "UNKNOWN")).upper() == "UNKNOWN"]
+        if len(unknown_segments) != len(claim_breakdown):
+            return
+
+        best_ev: Dict[str, Any] | None = None
+        best_score = -1.0
+        for ev in evidence:
+            stance = str(ev.get("stance") or "neutral").lower()
+            if stance == "contradicts":
+                continue
+            sem = float(ev.get("semantic_score") or ev.get("sem_score") or ev.get("final_score") or 0.0)
+            if sem < 0.55:
+                continue
+            if sem > best_score:
+                best_score = sem
+                best_ev = ev
+        if not best_ev:
+            # If adaptive metrics are strong but sem-keyed evidence is sparse,
+            # still promote with first non-contradicting evidence to avoid UNKNOWN deadlock.
+            for ev in evidence:
+                stance = str(ev.get("stance") or "neutral").lower()
+                if stance == "contradicts":
+                    continue
+                best_ev = ev
+                best_score = float(ev.get("final_score") or ev.get("score") or 0.0)
+                break
+            if not best_ev:
+                return
+
+        fallback_fact = str(best_ev.get("statement") or best_ev.get("text") or "").strip()
+        fallback_src = str(best_ev.get("source_url") or best_ev.get("source") or "").strip()
+        if not fallback_fact:
+            return
+        for seg in claim_breakdown:
+            seg["status"] = "PARTIALLY_VALID"
+            seg["supporting_fact"] = fallback_fact
+            seg["source_url"] = fallback_src
+        logger.info(
+            "[VerdictGenerator][Coverage][Fallback] Applied adaptive fallback "
+            "(adaptive_coverage=%.2f, evidence_sem=%.3f)",
+            adaptive_coverage,
+            best_score,
+        )
 
     def _should_rebuild_claim_breakdown(self, claim: str, claim_breakdown: List[Dict[str, Any]]) -> bool:
         if not claim_breakdown:
