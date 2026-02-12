@@ -664,7 +664,7 @@ class VerdictGenerator:
                     seg["supporting_fact"] = best_stmt
                     fact = best_stmt
                 # If LLM left segment unresolved (empty fact/source), bind best matched evidence.
-                if status == "UNKNOWN" and best_match_score >= 0.45:
+                if status == "UNKNOWN" and best_match_score >= 0.20:
                     if not fact and best_stmt:
                         seg["supporting_fact"] = best_stmt
                         fact = best_stmt
@@ -703,7 +703,8 @@ class VerdictGenerator:
                     stance = stance_classifier.classify_stance(seg_text, fact)
                 except Exception:
                     stance = stance or "neutral"
-            polarity = self._segment_polarity(seg_text, fact, stance=stance)
+            polarity_text = (fact or best_stmt or "").strip()
+            polarity = self._segment_polarity(seg_text, polarity_text, stance=stance)
             anchor_overlap = self._segment_anchor_overlap(seg_text, fact or "")
             try:
                 best_semantic = float(
@@ -715,7 +716,10 @@ class VerdictGenerator:
                 )
             except Exception:
                 best_semantic = 0.0
-            high_semantic_negation_mismatch = bool(fact) and (seg_neg != fact_neg) and (best_semantic >= 0.80)
+            polarity_neg = _has_negation(polarity_text)
+            high_semantic_negation_mismatch = (
+                bool(polarity_text) and (seg_neg != polarity_neg) and (best_semantic >= 0.80)
+            )
 
             if status in {"VALID", "PARTIALLY_VALID"} and fact and fact_neg and not seg_neg:
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
@@ -726,9 +730,22 @@ class VerdictGenerator:
 
             # UNKNOWN minimization ladder:
             # deterministically upgrade UNKNOWN only when alignment is strong and polarity is clear.
-            if status == "UNKNOWN" and best_ev is not None and fact:
+            if status == "UNKNOWN" and best_ev is not None and polarity_text:
+                if not fact:
+                    seg["supporting_fact"] = polarity_text
+                    fact = polarity_text
                 if high_semantic_negation_mismatch:
                     seg["status"] = "INVALID"
+                    seg["supporting_fact"] = fact
+                    seg["source_url"] = src
+                    seg["evidence_used_ids"] = [best_idx] if best_idx >= 0 else []
+                elif polarity == "contradicts" and best_semantic >= 0.75:
+                    seg["status"] = "PARTIALLY_INVALID"
+                    seg["supporting_fact"] = fact
+                    seg["source_url"] = src
+                    seg["evidence_used_ids"] = [best_idx] if best_idx >= 0 else []
+                elif polarity == "entails" and best_semantic >= 0.75:
+                    seg["status"] = "PARTIALLY_VALID"
                     seg["supporting_fact"] = fact
                     seg["source_url"] = src
                     seg["evidence_used_ids"] = [best_idx] if best_idx >= 0 else []

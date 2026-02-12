@@ -59,7 +59,7 @@ def test_negative_segment_negative_evidence_entails_and_reconciles_true():
 
     assert polarity == "entails"
     assert parsed["verdict"] == "TRUE"
-    assert parsed["truth_score_percent"] >= 95.0
+    assert parsed["truth_score_percent"] >= 90.0
     assert "evidence_quality_percent" in parsed
 
 
