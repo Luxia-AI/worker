@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -20,6 +21,8 @@ rag_jobs_failed_total = Counter(
     "rag_jobs_failed_total",
     "Total failed RAG jobs",
 )
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Luxia Worker", version=SERVICE_VERSION)
 install_metrics(app, service_name=SERVICE_NAME, version=SERVICE_VERSION, env=SERVICE_ENV)
@@ -64,6 +67,29 @@ async def _get_pipeline() -> Any:
 
             _pipeline = CorrectivePipeline()
     return _pipeline
+
+
+@app.on_event("startup")
+async def preload_pipeline_on_startup() -> None:
+    preload_enabled = os.getenv("WORKER_PRELOAD_PIPELINE", "true").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not preload_enabled:
+        logger.info("[Worker] Startup preload disabled (WORKER_PRELOAD_PIPELINE=false)")
+        return
+
+    started = datetime.now(timezone.utc)
+    logger.info("[Worker] Startup preload enabled, initializing pipeline")
+    try:
+        await _get_pipeline()
+        elapsed = (datetime.now(timezone.utc) - started).total_seconds()
+        logger.info("[Worker] Pipeline preload complete in %.2fs", elapsed)
+    except Exception:
+        # Keep service booting; verify endpoint retains runtime fallback behavior.
+        logger.exception("[Worker] Pipeline preload failed; runtime initialization will retry")
 
 
 def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -> dict[str, Any]:
