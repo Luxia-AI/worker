@@ -207,6 +207,43 @@ class CorrectivePipeline:
         }
 
     @staticmethod
+    def _is_comparative_claim(claim: str) -> bool:
+        text = f" {str(claim or '').strip().lower()} "
+        return bool(
+            re.search(
+                r"\b(more|less|fewer|greater|higher|lower|sooner|faster|slower|longer|shorter)\b.{0,80}\bthan\b"
+                r"|\bvs\b|\bversus\b|\bcompared to\b",
+                text,
+            )
+        )
+
+    @staticmethod
+    def _count_comparative_evidence_hits(claim: str, ranked: List[Dict[str, Any]]) -> int:
+        claim_terms = {w for w in re.findall(r"\b[a-z][a-z0-9_-]{2,}\b", (claim or "").lower())}
+        stop = {"more", "less", "than", "with", "from", "lack", "human", "humans", "can", "die"}
+        claim_terms = {w for w in claim_terms if w not in stop}
+        hits = 0
+        for item in ranked[:10]:
+            stmt = str(item.get("statement") or item.get("text") or "")
+            if not stmt:
+                continue
+            low = stmt.lower()
+            has_comparison = bool(
+                re.search(
+                    r"\b(than|compared to|versus|vs|sooner|faster|slower|longer|shorter|higher|lower)\b",
+                    low,
+                )
+            )
+            has_quant = bool(
+                re.search(r"\b\d+(?:\.\d+)?\b|\b(days?|hours?|weeks?|months?|years?|mortality|survival)\b", low)
+            )
+            stmt_terms = set(re.findall(r"\b[a-z][a-z0-9_-]{2,}\b", low))
+            overlap = len(claim_terms & stmt_terms)
+            if has_comparison and (has_quant or overlap >= 2):
+                hits += 1
+        return hits
+
+    @staticmethod
     def _should_stop_confidence_mode(
         claim_frame: Dict[str, Any],
         adaptive_trust: Dict[str, Any],
@@ -723,6 +760,9 @@ class CorrectivePipeline:
             claim_frame["strength"],
             claim_frame["is_strong_therapeutic"],
         )
+        is_comparative_claim = self._is_comparative_claim(post_text)
+        comparative_monopoly_rounds = 0
+        best_comparative_hits = 0
         new_trusted_urls_processed = 0
         for query_idx, query in enumerate(queries):
             # OPTIMIZATION: Hard limit on search queries to prevent runaway searches
@@ -943,6 +983,32 @@ class CorrectivePipeline:
                 f"total_facts={len(all_facts)}, "
                 f"search_calls={search_api_calls}"
             )
+
+            if is_comparative_claim:
+                diversity_now = float(adaptive_trust.get("diversity", 0.0) or 0.0)
+                comparative_hits = self._count_comparative_evidence_hits(post_text, top_ranked)
+                if diversity_now <= 0.10 and comparative_hits <= best_comparative_hits:
+                    comparative_monopoly_rounds += 1
+                else:
+                    comparative_monopoly_rounds = 0
+                    best_comparative_hits = max(best_comparative_hits, comparative_hits)
+                logger.info(
+                    "[CorrectivePipeline:%s] Comparative quality: hits=%d best_hits=%d "
+                    "diversity=%.2f monopoly_rounds=%d",
+                    round_id,
+                    comparative_hits,
+                    best_comparative_hits,
+                    diversity_now,
+                    comparative_monopoly_rounds,
+                )
+                if comparative_monopoly_rounds >= 2:
+                    logger.info(
+                        "[CorrectivePipeline:%s] Comparative early-stop: domain monopoly persisted "
+                        "(diversity<=0.10) with no new comparator evidence for %d rounds.",
+                        round_id,
+                        comparative_monopoly_rounds,
+                    )
+                    break
 
             # Step 6: Check if adaptive trust sufficient - STOP to save quota!
             if is_sufficient:

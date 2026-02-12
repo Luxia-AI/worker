@@ -346,6 +346,23 @@ class VerdictGenerator:
             return None
         return (lb, ub)
 
+    def _is_direct_comparative_statement(self, stmt: str, lhs_tokens: set[str], rhs_tokens: set[str]) -> bool:
+        low = (stmt or "").lower()
+        has_comparison = bool(
+            re.search(
+                r"\b(than|versus|vs|compared to|sooner|faster|slower|longer|shorter|higher|lower)\b",
+                low,
+            )
+        )
+        has_quant = bool(
+            re.search(r"\b\d+(?:\.\d+)?\b|\b(days?|hours?|weeks?|months?|years?|mortality|survival)\b", low)
+        )
+        stmt_tokens = self._meaningful_tokens(stmt)
+        lhs_overlap = len(lhs_tokens & stmt_tokens)
+        rhs_overlap = len(rhs_tokens & stmt_tokens)
+        has_both_sides = lhs_overlap > 0 and rhs_overlap > 0
+        return has_comparison and has_quant and has_both_sides
+
     def _resolve_numeric_comparison_override(
         self,
         claim: str,
@@ -376,6 +393,7 @@ class VerdictGenerator:
         lhs_constraints: List[Tuple[float, float]] = []
         rhs_constraints: List[Tuple[float, float]] = []
         observed_numeric_evidence = 0
+        direct_comparative_evidence = 0
 
         for ev in evidence[:12]:
             stmt = str(ev.get("statement") or ev.get("text") or "").strip()
@@ -385,6 +403,8 @@ class VerdictGenerator:
             if not constraints:
                 continue
             observed_numeric_evidence += 1
+            if self._is_direct_comparative_statement(stmt, lhs_tokens, rhs_tokens):
+                direct_comparative_evidence += 1
             stmt_tokens = self._meaningful_tokens(stmt)
             lhs_overlap = len(lhs_tokens & stmt_tokens)
             rhs_overlap = len(rhs_tokens & stmt_tokens)
@@ -403,20 +423,28 @@ class VerdictGenerator:
             if rhs_overlap > lhs_overlap:
                 rhs_constraints.extend(constraints)
 
+        if direct_comparative_evidence <= 0:
+            return {
+                "verdict": Verdict.UNVERIFIABLE.value,
+                "status": "UNKNOWN",
+                "reason": (
+                    "Comparative evidence quality gate: no direct two-sided quantitative "
+                    "comparison evidence was found."
+                ),
+                "truthfulness_percent": 45.0,
+            }
+
         lhs_interval = self._merge_constraints(lhs_constraints)
         rhs_interval = self._merge_constraints(rhs_constraints)
         if lhs_interval is None or rhs_interval is None:
-            if observed_numeric_evidence == 0:
-                return None
             reason = (
-                "Numeric comparison evidence is incomplete: at least one side of the comparison "
-                "has no usable quantitative support."
+                "Numeric comparison evidence is incomplete: explicit two-sided " "quantitative support is required."
             )
             return {
                 "verdict": Verdict.UNVERIFIABLE.value,
                 "status": "UNKNOWN",
                 "reason": reason,
-                "truthfulness_percent": 35.0,
+                "truthfulness_percent": 45.0 if observed_numeric_evidence > 0 else 40.0,
             }
 
         lhs_lb, lhs_ub = lhs_interval
@@ -469,7 +497,7 @@ class VerdictGenerator:
             "verdict": Verdict.UNVERIFIABLE.value,
             "status": "UNKNOWN",
             "reason": "Numeric comparison could not be resolved confidently from bounded evidence ranges.",
-            "truthfulness_percent": 35.0,
+            "truthfulness_percent": 45.0,
         }
 
     def _needs_web_boost(self, evidence: List[Dict[str, Any]], claim: str = "") -> bool:
@@ -1215,7 +1243,13 @@ class VerdictGenerator:
         confidence = min(float(confidence), 0.95)
         if coverage_score >= 0.8:
             confidence = max(confidence, truthfulness * 0.75)
-        confidence = self._cap_confidence_with_contract(confidence, reconciled, policy_insufficient, verdict_str)
+        confidence = self._cap_confidence_with_contract(
+            confidence,
+            reconciled,
+            policy_insufficient,
+            verdict_str,
+            is_comparative_claim=self._is_numeric_comparison_claim(claim),
+        )
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
         if llm_verdict == Verdict.TRUE.value and verdict_str != Verdict.TRUE.value:
             try:
@@ -2272,6 +2306,7 @@ class VerdictGenerator:
         contract: Dict[str, Any],
         policy_insufficient: bool,
         verdict: str,
+        is_comparative_claim: bool = False,
     ) -> float:
         cap = 0.98
         unresolved = int(contract.get("unresolved_segments", 0) or 0)
@@ -2282,7 +2317,7 @@ class VerdictGenerator:
         if policy_insufficient:
             cap = min(cap, 0.62 if unresolved == 0 else 0.55)
         if verdict == Verdict.UNVERIFIABLE.value:
-            cap = min(cap, 0.35)
+            cap = min(cap, 0.45 if is_comparative_claim else 0.35)
         if unresolved > 0 and weighted_truth <= 0.35:
             cap = min(cap, 0.48)
         return max(0.05, min(float(confidence or 0.0), cap))

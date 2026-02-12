@@ -707,9 +707,21 @@ class TrustedSearch:
     def _is_numeric_comparison_claim(text: str) -> bool:
         low = (text or "").lower()
         has_comparison = bool(
-            re.search(r"\b(more|less|fewer|greater|higher|lower)\b.+\bthan\b|\bvs\.?\b|\bversus\b", low)
+            re.search(
+                r"\b(more|less|fewer|greater|higher|lower|sooner|faster|slower|longer|shorter)\b.+\bthan\b"
+                r"|\bvs\.?\b|\bversus\b|\bcompared to\b",
+                low,
+            )
         )
-        has_quantity = bool(re.search(r"\b(count|number|estimate|estimated|population)\b", low))
+        has_quantity = bool(
+            re.search(
+                (
+                    r"\b(count|number|estimate|estimated|population|days?|hours?|weeks?|months?|years?|"
+                    r"mortality|survival)\b"
+                ),
+                low,
+            )
+        )
         return has_comparison and has_quantity
 
     @staticmethod
@@ -1448,7 +1460,13 @@ FAILED ENTITIES:
 
         # Try Google first
         if self.google_available:
-            google_query = self._strip_site_operators(query)
+            preserve_site_scope = False
+            if "site:" in (query or "").lower():
+                comparative = self._is_numeric_comparison_claim(query) or self._is_numeric_comparison_claim(claim or "")
+                # For comparative claims, keep targeted site constraints to avoid broad-query drift.
+                if comparative:
+                    preserve_site_scope = True
+            google_query = query if preserve_site_scope else self._strip_site_operators(query)
             if google_query != query:
                 logger.info(
                     "[TrustedSearch] Google general-first rewrite: '%s' -> '%s'",
