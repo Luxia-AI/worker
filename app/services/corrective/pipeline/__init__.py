@@ -492,8 +492,8 @@ class CorrectivePipeline:
         adaptive_cache[current_snapshot_id] = adaptive_trust
         if is_sufficient:
             logger.info(
-                f"[CorrectivePipeline:{round_id}] Adaptive trust sufficient. "
-                "Attempting cache verdict precheck before web search."
+                f"[CorrectivePipeline:{round_id}] Adaptive trust threshold met. "
+                "Running cache verdict precheck before deciding web search."
             )
 
             verdict_result = await self.verdict_generator.generate_verdict(
@@ -571,8 +571,15 @@ class CorrectivePipeline:
                 }
             logger.info(
                 f"[CorrectivePipeline:{round_id}] Cache precheck unresolved required segments; "
-                "continuing to web search."
+                "marking adaptive_sufficient=False and continuing to web search."
             )
+            adaptive_trust = {
+                **adaptive_trust,
+                "is_sufficient": False,
+                "gate_reason": "cache_precheck_unresolved",
+            }
+            adaptive_payload = self._trust_payload_adaptive(adaptive_trust)
+            adaptive_cache[current_snapshot_id] = adaptive_trust
 
         # ====================================================================
         # PHASE 4: Quota-Optimized Incremental Search (ONE QUERY AT A TIME)
@@ -1010,9 +1017,11 @@ class CorrectivePipeline:
             adaptive_cache[final_snapshot_id] = final_adaptive_trust
         else:
             logger.info(
-                "[CorrectivePipeline:%s] Using memoized adaptive trust snapshot=%s",
+                "[CorrectivePipeline:%s] Using memoized adaptive trust snapshot=%s trust_post=%.3f sufficient=%s",
                 round_id,
                 final_snapshot_id[:12],
+                float(final_adaptive_trust.get("trust_post", 0.0) or 0.0),
+                bool(final_adaptive_trust.get("is_sufficient", False)),
             )
         final_trust_post = self.trust_ranker.compute_post_trust(final_top_ranked_evidence, internal_top_k)
         final_trust_score = final_trust_post["trust_post"]

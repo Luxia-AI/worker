@@ -202,7 +202,14 @@ class VerdictGenerator:
         score = 0.25 + 0.45 * max(0.0, min(1.0, conf)) + 0.35 * max(0.0, min(1.0, overlap_ratio))
         return max(0.0, min(1.0, score))
 
-    def _policy_says_insufficient(self, claim: str, evidence: List[Dict[str, Any]]) -> bool:
+    def _policy_says_insufficient(
+        self,
+        claim: str,
+        evidence: List[Dict[str, Any]],
+        adaptive_metrics: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        if adaptive_metrics is not None:
+            return not bool(adaptive_metrics.get("is_sufficient", False))
         if not evidence:
             return True
         trust_policy = getattr(self, "trust_policy", None) or AdaptiveTrustPolicy()
@@ -333,7 +340,9 @@ class VerdictGenerator:
             policy_insufficient_hint = not bool(adaptive_metrics.get("is_sufficient", False))
         else:
             policy_insufficient_hint = self._policy_says_insufficient(
-                claim, ranked_evidence[: min(len(ranked_evidence), 10)]
+                claim,
+                ranked_evidence[: min(len(ranked_evidence), 10)],
+                adaptive_metrics=None,
             )
 
         if (not cache_sufficient) and (
@@ -362,7 +371,7 @@ class VerdictGenerator:
                 if adaptive_metrics is not None:
                     insufficient = not bool(adaptive_metrics.get("is_sufficient", False))
                 else:
-                    insufficient = self._policy_says_insufficient(claim, pre_evidence)
+                    insufficient = self._policy_says_insufficient(claim, pre_evidence, adaptive_metrics=None)
                 weak = self._needs_web_boost(pre_evidence[: min(len(pre_evidence), 6)], claim=claim)
                 if not insufficient and not weak:
                     logger.info(f"[VerdictGenerator] Pre-verdict evidence sufficient (round={round_i}). Skipping web.")
@@ -821,16 +830,16 @@ class VerdictGenerator:
                     domains.add(domain)
             diversity_score = min(1.0, len(domains) / max(1, min(len(evidence), 10)))
 
-        self._log_subclaim_coverage(claim, evidence, claim_breakdown, adaptive_metrics=adaptive_metrics)
         self._apply_adaptive_coverage_fallback(
             claim_breakdown=claim_breakdown,
             adaptive_metrics=adaptive_metrics,
             evidence=evidence,
         )
+        self._log_subclaim_coverage(claim, evidence, claim_breakdown, adaptive_metrics=adaptive_metrics)
         reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
         verdict_str = reconciled["verdict"]
         claim_frame = self._classify_claim_frame(claim)
-        policy_insufficient = self._policy_says_insufficient(claim, evidence)
+        policy_insufficient = self._policy_says_insufficient(claim, evidence, adaptive_metrics=adaptive_metrics)
         truth_score_percent = self._calculate_truth_score_from_contract(reconciled)
         agreement_ratio = self._calculate_evidence_agreement_ratio(claim, evidence)
         coverage_score = float(reconciled.get("weighted_truth", 0.0) or 0.0)
@@ -2641,7 +2650,7 @@ class VerdictGenerator:
             reason = "retrieval_empty"
         elif not final_evidence:
             reason = "zero_facts_extracted"
-        elif self._policy_says_insufficient(claim, final_evidence):
+        elif self._policy_says_insufficient(claim, final_evidence, adaptive_metrics=None):
             reason = "gating_insufficient_evidence"
         elif unknown_count > 0:
             reason = "coverage_remained_unknown"
