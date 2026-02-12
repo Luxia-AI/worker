@@ -4,6 +4,7 @@ import asyncio
 import re
 from typing import Any, Dict, List
 
+from app.config.trusted_domains import is_trusted_domain
 from app.core.logger import get_logger
 from app.services.kg.neo4j_client import Neo4jClient
 
@@ -216,17 +217,9 @@ class KGRetrieval:
 
         source_url_lower = source_url.lower()
 
-        # Very high-authority medical domains
-        if any(domain in source_url_lower for domain in ("who.int", "nih.gov", "cdc.gov")):
+        # Canonical trusted domains.
+        if is_trusted_domain(source_url):
             return 0.95
-
-        # Government/educational domains
-        if any(domain in source_url_lower for domain in (".gov", ".edu")):
-            return 0.75
-
-        # Trusted medical news/publishers
-        if any(domain in source_url_lower for domain in ("health.harvard.edu", "medlineplus.gov", "nhs.uk")):
-            return 0.85
 
         # General news/media (lower credibility)
         if any(domain in source_url_lower for domain in ("news", "press", "blog", "medium.com")):

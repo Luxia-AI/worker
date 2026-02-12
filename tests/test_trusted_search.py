@@ -11,14 +11,13 @@ class _FakeLLM:
 @pytest.fixture
 def trusted_search(monkeypatch):
     monkeypatch.setenv("SERPER_API_KEY", "test-key")
-    monkeypatch.setenv("TRUSTED_SEARCH_EXTRA_ALLOWLIST", "example.org")
     monkeypatch.setattr(trusted_search_module, "HybridLLMService", _FakeLLM)
     return trusted_search_module.TrustedSearch()
 
 
 def test_is_trusted_allowlist_and_override(trusted_search):
     assert trusted_search.is_trusted("https://pubmed.ncbi.nlm.nih.gov/123456/")
-    assert trusted_search.is_trusted("https://example.org/health")
+    assert not trusted_search.is_trusted("https://example.org/health")
     assert not trusted_search.is_trusted("https://not-trusted.invalid/path")
 
 

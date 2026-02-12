@@ -21,23 +21,14 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Protocol
 from urllib.parse import parse_qs, urlencode, urlparse
 
+from app.config.trusted_domains import TRUSTED_ROOT_DOMAINS, is_trusted_domain
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
 
 
 # Default source credibility scores (configurable)
-DEFAULT_SOURCE_SCORES = {
-    "who.int": 0.95,
-    "cdc.gov": 0.93,
-    "nih.gov": 0.90,
-    "pubmed.ncbi.nlm.nih.gov": 0.92,
-    "nature.com": 0.90,
-    "sciencedirect.com": 0.88,
-    "bbc.com": 0.75,
-    "reuters.com": 0.80,
-    # Add more as needed
-}
+DEFAULT_SOURCE_SCORES = {domain: 0.75 for domain in TRUSTED_ROOT_DOMAINS}
 
 # Constants for iterative trust loop
 TRUST_THRESHOLD = 0.75
@@ -299,6 +290,9 @@ class TrustRankingModule:
                 suffix = ".".join(parts[i:])
                 if suffix in self.source_scores:
                     return self.source_scores[suffix]
+
+            if is_trusted_domain(source_url):
+                return 0.75
 
             return 0.5
         except Exception:

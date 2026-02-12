@@ -7,7 +7,8 @@ from typing import Any, Dict, List, Tuple
 
 import aiohttp
 
-from app.constants.config import GOOGLE_CSE_SEARCH_URL, GOOGLE_CSE_TIMEOUT, TRUSTED_DOMAINS
+from app.config.trusted_domains import TRUSTED_ROOT_DOMAINS, is_trusted_domain
+from app.constants.config import GOOGLE_CSE_SEARCH_URL, GOOGLE_CSE_TIMEOUT, PIPELINE_MAX_URLS_PER_QUERY
 from app.constants.llm_prompts import QUERY_REFORMULATION_PROMPT, REINFORCEMENT_QUERY_PROMPT
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -49,72 +50,6 @@ class TrustedSearch:
 
     SEARCH_URL = GOOGLE_CSE_SEARCH_URL
     SERPER_URL = "https://google.serper.dev/search"
-    STRICT_TRUSTED_DOMAIN_BASE = {
-        "who.int",
-        "fda.gov",
-        "hhs.gov",
-        "nih.gov",
-        "nlm.nih.gov",
-        "ncbi.nlm.nih.gov",
-        "pubmed.ncbi.nlm.nih.gov",
-        "cdc.gov",
-        "clinicaltrials.gov",
-        "medlineplus.gov",
-        "cochranelibrary.com",
-        "plos.org",
-        "nature.com",
-        "science.org",
-        "jamanetwork.com",
-        "bmj.com",
-        "nejm.org",
-        "thelancet.com",
-        "sciencedirect.com",
-        "nhs.uk",
-        "nice.org.uk",
-        "ema.europa.eu",
-        "ecdc.europa.eu",
-        "health.gov.au",
-        "tga.gov.au",
-        "health.gov.lk",
-        "moh.gov.sg",
-        "healthhub.sg",
-        "healthdirect.gov.au",
-        "canada.ca",
-        "ourworldindata.org",
-        "ihme.org",
-        "healthdata.org",
-        "worldbank.org",
-        "undp.org",
-        "unicef.org",
-        "unaids.org",
-        "unfpa.org",
-        "reliefweb.int",
-        "kff.org",
-        "healthaffairs.org",
-        "statnews.com",
-    }
-    _SERPER_SITE_BOOST_PRIORITY = [
-        "pubmed.ncbi.nlm.nih.gov",
-        "ncbi.nlm.nih.gov",
-        "nlm.nih.gov",
-        "nih.gov",
-        "cdc.gov",
-        "who.int",
-        "fda.gov",
-        "hhs.gov",
-        "medlineplus.gov",
-        "nhs.uk",
-        "nice.org.uk",
-        "clinicaltrials.gov",
-        "cochranelibrary.com",
-        "nature.com",
-        "science.org",
-        "plos.org",
-        "jamanetwork.com",
-        "bmj.com",
-        "nejm.org",
-        "thelancet.com",
-    ]
     _CONFIDENCE_NEGATIVE_TERMS = [
         "-facebook",
         "-quora",
@@ -141,6 +76,36 @@ class TrustedSearch:
         "help",
         "effective against",
     ]
+
+    @staticmethod
+    def _prioritize_trusted_domains(domains: set[str]) -> List[str]:
+        """Stable ordering for site-boost queries derived from canonical trusted roots."""
+        priority_tokens = (
+            "pubmed",
+            "pmc",
+            "ncbi",
+            "nih",
+            "cdc",
+            "who",
+            "fda",
+            "clinicaltrials",
+            "cochrane",
+            "nejm",
+            "thelancet",
+            "bmj",
+            "jamanetwork",
+            "nature",
+            "science",
+            "nhs",
+            "nice",
+        )
+        return sorted(
+            domains,
+            key=lambda domain: (
+                next((idx for idx, token in enumerate(priority_tokens) if token in domain), len(priority_tokens)),
+                domain,
+            ),
+        )
 
     def __init__(
         self,
@@ -176,37 +141,18 @@ class TrustedSearch:
         else:
             self.confidence_mode = confidence_raw.strip().lower() in {"1", "true", "yes", "on"}
         self.min_allowlist_pass = max(1, int(os.getenv("TRUSTED_SEARCH_MIN_ALLOWLIST_PASS", "3")))
-        extra_allowlist = {
-            d.strip().lower().removeprefix("www.")
-            for d in (os.getenv("TRUSTED_SEARCH_EXTRA_ALLOWLIST", "") or "").split(",")
-            if d.strip()
-        }
-        include_trusted_domains = (os.getenv("TRUSTED_SEARCH_INCLUDE_TRUSTED_DOMAINS", "false") or "").strip().lower()
-        trusted_base = (
-            {d.lower().removeprefix("www.") for d in TRUSTED_DOMAINS}
-            if include_trusted_domains
-            in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-            else set()
-        )
-        self.strict_allowlist = set(self.STRICT_TRUSTED_DOMAIN_BASE) | trusted_base | extra_allowlist
+        self.strict_allowlist = set(TRUSTED_ROOT_DOMAINS)
         allowlist_fingerprint = hashlib.sha256("|".join(sorted(self.strict_allowlist)).encode("utf-8")).hexdigest()[:12]
-        serper_site_env = [
-            d.strip().lower().removeprefix("www.")
-            for d in (os.getenv("TRUSTED_SEARCH_SERPER_SITE_DOMAINS", "") or "").split(",")
-            if d.strip()
-        ]
         serper_site_limit = max(1, int(os.getenv("TRUSTED_SEARCH_SERPER_SITE_MAX_DOMAINS", "4")))
-        ordered_site_domains = dedupe_list(
-            serper_site_env
-            + self._SERPER_SITE_BOOST_PRIORITY
-            + sorted(d for d in self.strict_allowlist if d not in self._SERPER_SITE_BOOST_PRIORITY)
-        )
+        ordered_site_domains = self._prioritize_trusted_domains(self.strict_allowlist)
         self.serper_site_boost_domains = ordered_site_domains[:serper_site_limit]
+        scrape_cap_raw = os.getenv("PIPELINE_MAX_URLS_PER_QUERY", str(PIPELINE_MAX_URLS_PER_QUERY))
+        try:
+            scrape_cap = max(1, int(scrape_cap_raw))
+        except (TypeError, ValueError):
+            scrape_cap = max(1, int(PIPELINE_MAX_URLS_PER_QUERY))
+        # Fetch a slightly broader candidate set, then keep existing per-query scrape cap.
+        self.fetch_num_per_query = min(10, max(5, scrape_cap * 2))
         self.query_designer = CorrectiveQueryDesigner()
         self.trust_config = get_trust_config()
 
@@ -222,6 +168,11 @@ class TrustedSearch:
         logger.info(
             "[TrustedSearch] Serper site-boost domains: %s",
             self.serper_site_boost_domains,
+        )
+        logger.info(
+            "[TrustedSearch] Query fetch size: num=%d (scrape_cap=%d)",
+            self.fetch_num_per_query,
+            scrape_cap,
         )
         logger.info("[TrustedSearch] Confidence mode: %s", self.confidence_mode)
 
@@ -1270,6 +1221,7 @@ FAILED ENTITIES:
             cse=self.GOOGLE_CSE_ID,
             query=encoded_query,
         )
+        url = f"{url}&num={self.fetch_num_per_query}"
 
         try:
             async with session.get(url, timeout=GOOGLE_CSE_TIMEOUT) as resp:
@@ -1328,7 +1280,7 @@ FAILED ENTITIES:
 
         payload = {
             "q": query,
-            "num": 10,  # Get 10 results
+            "num": self.fetch_num_per_query,
         }
 
         try:
@@ -1534,28 +1486,11 @@ FAILED ENTITIES:
 
     def is_trusted(self, url: str) -> bool:
         """
-        Returns True if domain is in strict trusted domain allowlist.
+        Returns True when URL/domain resolves to canonical trusted domains.
         """
         try:
-            allowlist = getattr(self, "strict_allowlist", None) or set(self.STRICT_TRUSTED_DOMAIN_BASE)
             normalized_url = self._normalize_search_result_url(url)
-            parsed = urllib.parse.urlparse(normalized_url)
-            domain = (parsed.netloc or "").lower()
-            if "@" in domain:
-                domain = domain.split("@")[-1]
-            if ":" in domain:
-                domain = domain.split(":")[0]
-            domain = domain.removeprefix("www.")
-            if not domain:
-                return False
-            if domain in allowlist:
-                return True
-
-            for trusted in allowlist:
-                if domain == trusted or domain.endswith("." + trusted):
-                    return True
-
-            return False
+            return is_trusted_domain(normalized_url)
         except Exception:
             return False
 
@@ -1691,26 +1626,10 @@ FAILED ENTITIES:
         Kept small for speed and quota efficiency.
         """
         # Prioritize high-yield medical sources (capped to 3-4 sites)
-        priority_sites = [
-            "pubmed.ncbi.nlm.nih.gov",
-            "nlm.nih.gov",
-            "nih.gov",
-            "cdc.gov",
-            "who.int",
-            "fda.gov",
-            "hhs.gov",
-            "nhs.uk",
-            "nice.org.uk",
-            "clinicaltrials.gov",
-            "cochranelibrary.com",
-            "nature.com",
-            "science.org",
-            "plos.org",
-            "jamanetwork.com",
-            "bmj.com",
-            "nejm.org",
-            "thelancet.com",
-        ][:max_sites]
+        boosted_domains = getattr(self, "serper_site_boost_domains", [])
+        if not boosted_domains:
+            boosted_domains = self._prioritize_trusted_domains(set(TRUSTED_ROOT_DOMAINS))
+        priority_sites = boosted_domains[:max_sites]
 
         site_queries = []
         for site in priority_sites:
@@ -1728,7 +1647,9 @@ FAILED ENTITIES:
             return []
         if "site:" in q.lower():
             return [q]
-        domains = getattr(self, "serper_site_boost_domains", []) or self._SERPER_SITE_BOOST_PRIORITY[:4]
+        domains = getattr(self, "serper_site_boost_domains", [])
+        if not domains:
+            domains = self._prioritize_trusted_domains(set(TRUSTED_ROOT_DOMAINS))[:4]
         return [f"site:{domain} {q}" for domain in domains if domain]
 
     def _process_search_items(

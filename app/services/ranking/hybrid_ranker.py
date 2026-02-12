@@ -5,19 +5,15 @@ import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.config.trusted_domains import is_trusted_domain
 from app.constants.config import (
     CREDIBILITY_AUTHORITY,
     CREDIBILITY_DEFAULT,
-    CREDIBILITY_EDU_GOV,
-    CREDIBILITY_NEWS,
     RANKING_MIN_CLAIM_OVERLAP,
     RANKING_MIN_CREDIBILITY_THRESHOLD,
     RANKING_MIN_SCORE_FLOOR,
     RANKING_WEIGHTS,
     RECENCY_HALF_LIFE_DAYS,
-    TRUSTED_DOMAINS_AUTHORITY,
-    TRUSTED_DOMAINS_EDU_GOV,
-    TRUSTED_DOMAINS_NEWS,
 )
 from app.core.logger import get_logger
 from app.services.common.list_ops import dedupe_list
@@ -207,16 +203,10 @@ def _credibility_score_from_meta(meta: Dict[str, Any]) -> float:
             # If credibility is not convertible to float, fall through to domain heuristics
             logger.debug(f"[hybrid_rank] Invalid credibility value: {c}, using domain heuristics")
 
-    # domain heuristics
-    domain = (meta.get("source_url") or meta.get("source") or "").lower()
-    if domain:
-        # very small whitelist (customize per deployment)
-        if any(d in domain for d in TRUSTED_DOMAINS_AUTHORITY):
-            return CREDIBILITY_AUTHORITY
-        if any(d in domain for d in TRUSTED_DOMAINS_EDU_GOV):
-            return CREDIBILITY_EDU_GOV
-        if any(d in domain for d in TRUSTED_DOMAINS_NEWS):
-            return CREDIBILITY_NEWS
+    # Canonical trusted-domain heuristic.
+    source_url = (meta.get("source_url") or meta.get("source") or "").strip()
+    if source_url and is_trusted_domain(source_url):
+        return CREDIBILITY_AUTHORITY
 
     # no source or unknown source
     return CREDIBILITY_DEFAULT

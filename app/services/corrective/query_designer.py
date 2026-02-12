@@ -22,6 +22,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 from urllib.parse import urlparse
 
+from app.config.trusted_domains import TRUSTED_ROOT_DOMAINS, is_trusted_domain
 from app.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -272,73 +273,16 @@ class CorrectiveQueryDesigner:
     }
 
     # ----------------------------
-    # Trusted-domain routing MUST match your Google PSE allowlist.
-    # Keep these as hostnames you are sure PSE includes.
+    # Trusted-domain routing derived from canonical trusted roots.
     # ----------------------------
-    _TRUSTED_ROUTE_BY_TYPE: Dict[str, Tuple[str, ...]] = {
-        "EFFICACY": (
-            "pubmed.ncbi.nlm.nih.gov",
-            "www.cochranelibrary.com",
-            "www.cdc.gov",
-            "www.nih.gov",
-            "www.who.int",
-            "www.clinicaltrials.gov",
-            "jamanetwork.com",
-            "www.bmj.com",
-            "www.nejm.org",
-            "www.thelancet.com",
-            "www.nature.com",
-            "journals.plos.org",
-        ),
-        "SAFETY": (
-            "www.cdc.gov",
-            "www.fda.gov",
-            "www.nih.gov",
-            "www.who.int",
-            "www.clinicaltrials.gov",
-            "pubmed.ncbi.nlm.nih.gov",
-            "www.ecdc.europa.eu",
-            "www.ema.europa.eu",
-            "www.nhs.uk",
-        ),
-        "STATISTICAL": (
-            "www.cdc.gov",
-            "www.who.int",
-            "pubmed.ncbi.nlm.nih.gov",
-            "ourworldindata.org",
-            "ihme.org",
-            "healthdata.org",
-            "worldbank.org",
-        ),
-        "MECHANISM": (
-            "pubmed.ncbi.nlm.nih.gov",
-            "www.nih.gov",
-            "www.nlm.nih.gov",
-            "www.nature.com",
-            "www.science.org",
-            "journals.plos.org",
-        ),
-        "MYTH": (
-            "www.cdc.gov",
-            "www.who.int",
-            "www.nih.gov",
-            "www.nhs.uk",
-            "www.nice.org.uk",
-        ),
-        "UNIQUENESS": (
-            "pubmed.ncbi.nlm.nih.gov",
-            "www.nih.gov",
-            "www.nlm.nih.gov",
-            "www.nature.com",
-            "journals.plos.org",
-        ),
-        "GENERAL": (
-            "pubmed.ncbi.nlm.nih.gov",
-            "www.cdc.gov",
-            "www.nih.gov",
-            "www.who.int",
-            "www.nhs.uk",
-        ),
+    _TRUSTED_ROUTE_HINTS_BY_TYPE: Dict[str, Tuple[str, ...]] = {
+        "EFFICACY": ("pubmed", "cochrane", "clinicaltrials", "cdc", "nih", "who", "jamanetwork", "bmj", "nejm"),
+        "SAFETY": ("fda", "cdc", "nih", "who", "ema", "ecdc", "nhs", "clinicaltrials"),
+        "STATISTICAL": ("ourworldindata", "ihme", "healthdata", "worldbank", "cdc", "who"),
+        "MECHANISM": ("pubmed", "pmc", "nih", "nlm", "nature", "science", "plos"),
+        "MYTH": ("cdc", "who", "nih", "nhs", "nice"),
+        "UNIQUENESS": ("pubmed", "pmc", "nih", "nlm", "nature", "plos"),
+        "GENERAL": ("pubmed", "cdc", "nih", "who", "nhs"),
     }
 
     # Low-signal patterns: used for scoring and drift
@@ -505,6 +449,18 @@ class CorrectiveQueryDesigner:
             {t: self._drift_counts[claim_key].get(t) for t in sorted(tokens)},
         )
 
+    def _trusted_routes_for_claim_type(self, claim_type: str) -> List[str]:
+        claim_key = (claim_type or "GENERAL").upper()
+        hints = self._TRUSTED_ROUTE_HINTS_BY_TYPE.get(
+            claim_key,
+            self._TRUSTED_ROUTE_HINTS_BY_TYPE["GENERAL"],
+        )
+        routes: List[str] = []
+        for domain in sorted(TRUSTED_ROOT_DOMAINS):
+            if any(hint in domain for hint in hints):
+                routes.append(domain)
+        return routes or sorted(TRUSTED_ROOT_DOMAINS)
+
     # ----------------------------
     # Quality gate + adaptive selection
     # ----------------------------
@@ -525,8 +481,7 @@ class CorrectiveQueryDesigner:
             score += 1.0
             reasons.append("claim_type_keyword")
 
-        trusted_domains = self._TRUSTED_ROUTE_BY_TYPE.get(claim_type, ())
-        if any(d in (url or "").lower() for d in trusted_domains):
+        if is_trusted_domain(url or ""):
             score += 0.75
             reasons.append("trusted_domain")
 
@@ -705,7 +660,7 @@ class CorrectiveQueryDesigner:
 
         type_hint = self._claim_type_query_hint(claim_type)
         secondary_hint = self._claim_type_secondary_hint(claim_type)
-        domain_routes = self._TRUSTED_ROUTE_BY_TYPE.get(claim_type, self._TRUSTED_ROUTE_BY_TYPE["GENERAL"])
+        domain_routes = self._trusted_routes_for_claim_type(claim_type)
 
         candidates: List[QuerySpec] = []
 
