@@ -2453,6 +2453,8 @@ class VerdictGenerator:
         unresolved = int(contract.get("unresolved_segments", 0) or 0)
         resolved_ratio = float(contract.get("resolved_ratio", 0.0) or 0.0)
         weighted_truth = float(contract.get("weighted_truth", 0.0) or 0.0)
+        has_support = bool(contract.get("has_support", False))
+        has_invalid = bool(contract.get("has_invalid", False))
         if unresolved > 0:
             cap = min(cap, 0.40 + (0.35 * resolved_ratio))
         if policy_insufficient:
@@ -2461,7 +2463,17 @@ class VerdictGenerator:
             cap = min(cap, 0.45 if is_comparative_claim else 0.35)
         if unresolved > 0 and weighted_truth <= 0.35:
             cap = min(cap, 0.48)
-        return max(0.05, min(float(confidence or 0.0), cap))
+        bounded = max(0.05, min(float(confidence or 0.0), cap))
+        # Fully resolved contradiction-only outcomes should not look underconfident.
+        if (
+            verdict == Verdict.FALSE.value
+            and unresolved == 0
+            and has_invalid
+            and not has_support
+            and not is_comparative_claim
+        ):
+            bounded = max(bounded, 0.50)
+        return bounded
 
     def _reconcile_verdict_with_breakdown(self, claim: str, claim_breakdown: List[Dict[str, Any]]) -> Dict[str, Any]:
         contract = self._status_contract(claim, claim_breakdown)
@@ -2474,14 +2486,27 @@ class VerdictGenerator:
         contradict_count = int(contract.get("contradict_count", 0) or 0)
         has_support = bool(contract["has_support"])
         has_invalid = bool(contract["has_invalid"])
+        support_like = {"VALID", "PARTIALLY_VALID", "STRONGLY_VALID"}
+        invalid_like = {"INVALID", "PARTIALLY_INVALID"}
         all_valid = bool(statuses) and all(s == "VALID" for s in statuses)
         all_invalid = bool(statuses) and all(s == "INVALID" for s in statuses)
+        all_invalid_like = bool(statuses) and all((s in invalid_like) for s in statuses)
+        all_support_like = bool(statuses) and all((s in support_like) for s in statuses)
 
         if unresolved_segments > 0:
-            verdict = Verdict.PARTIALLY_TRUE.value if (has_support or has_invalid) else Verdict.UNVERIFIABLE.value
-        elif all_valid:
+            if has_support and has_invalid:
+                verdict = Verdict.PARTIALLY_TRUE.value
+            elif has_support:
+                verdict = Verdict.PARTIALLY_TRUE.value
+            else:
+                verdict = Verdict.UNVERIFIABLE.value
+        elif all_valid or (all_support_like and not has_invalid):
             verdict = Verdict.TRUE.value
-        elif all_invalid:
+        elif all_invalid or (all_invalid_like and not has_support):
+            verdict = Verdict.FALSE.value
+        elif has_support and has_invalid:
+            verdict = Verdict.PARTIALLY_TRUE.value
+        elif has_invalid and not has_support:
             verdict = Verdict.FALSE.value
         else:
             verdict = Verdict.PARTIALLY_TRUE.value

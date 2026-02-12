@@ -41,6 +41,7 @@ class GroqJobState:
     degraded_mode: bool = False
     skipped_calls: list[str] = field(default_factory=list)
     fact_extraction_override_used: bool = False
+    warned_events: set[str] = field(default_factory=set)
 
 
 _groq_job_state: contextvars.ContextVar[GroqJobState] = contextvars.ContextVar(
@@ -181,20 +182,31 @@ class HybridLLMService:
     def _mark_degraded_skip(self, call_tag: str) -> Dict[str, Any]:
         state = _groq_job_state.get()
         state.degraded_mode = True
+        should_warn = False
         if call_tag and call_tag not in state.skipped_calls:
             state.skipped_calls.append(call_tag)
+            should_warn = True
         _groq_job_state.set(state)
-        logger.warning(
-            "[HybridLLMService] Degraded mode active: skipped non-critical call '%s' for job=%s",
-            call_tag or "unknown",
-            state.job_id,
-        )
+        if should_warn:
+            logger.warning(
+                "[HybridLLMService] Degraded mode active: skipped non-critical call '%s' for job=%s",
+                call_tag or "unknown",
+                state.job_id,
+            )
         return {
             "_llm_error": "skipped_due_to_quota",
             "_degraded_skip": True,
             "degraded_mode": True,
             "call_tag": call_tag,
         }
+
+    @staticmethod
+    def _warn_once(state: GroqJobState, key: str, message: str, *args: Any) -> None:
+        if key in state.warned_events:
+            return
+        state.warned_events.add(key)
+        _groq_job_state.set(state)
+        logger.warning(message, *args)
 
     @staticmethod
     def _is_critical_call(call_tag: str) -> bool:
@@ -240,7 +252,12 @@ class HybridLLMService:
             if confidence_mode and is_fact_extraction_call:
                 # unreachable due guard, but keep for defensive safety.
                 pass
-            logger.warning(
+            self._warn_once(
+                state,
+                (
+                    f"preserve_critical:{priority.value}:{call_tag or 'unknown'}:"
+                    f"{reserved_for_verdict}:{reserved_for_fact}"
+                ),
                 "[HybridLLMService] Preserving critical reserved slots for job=%s "
                 "(used=%d/%d, remaining=%d, reserve_pool=%d, verdict_reserved=%d, "
                 "fact_reserved=%d, priority=%s, tag=%s)",
@@ -288,7 +305,9 @@ class HybridLLMService:
                 state.fact_extraction_override_used = True
                 _groq_job_state.set(state)
                 return True, state.calls_used, state.max_calls, "confidence_override_reserved_for_verdict"
-            logger.warning(
+            self._warn_once(
+                state,
+                f"preserve_verdict:{call_tag or 'unknown'}:{reserved_for_verdict}",
                 "[HybridLLMService] Preserving reserved verdict slot(s) for job=%s "
                 "(used=%d/%d, remaining=%d, verdict_reserved=%d, tag=%s)",
                 state.job_id,
@@ -354,9 +373,12 @@ class HybridLLMService:
         )
 
         if not can_use_groq:
-            logger.warning(
+            state = _groq_job_state.get()
+            self._warn_once(
+                state,
+                f"budget_unavailable:{budget_reason}:{priority.value}:{call_tag or 'unknown'}",
                 "[HybridLLMService] Groq budget unavailable for job=%s (%d/%d, reason=%s), priority=%s, tag=%s",
-                _groq_job_state.get().job_id,
+                state.job_id,
                 call_num,
                 max_calls,
                 budget_reason,
