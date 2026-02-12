@@ -653,11 +653,24 @@ class TrustedSearch:
             f"{a_term} {negations[0]} {verb_variants[0]} {b_variants[0]} {negatives}",
             f"{a_term} {b_variants[0]} {negations[1]} {negatives}",
             f'"{a_term}" "{b_variants[0]}" guideline OR advice OR recommend {negatives}',
-            f"site:cdc.gov {a_term} {b_variants[0]} {negations[2]} {negatives}",
-            f"site:who.int {a_term} {b_variants[0]} {negations[2]} {negatives}",
-            f"site:medlineplus.gov {a_term} {b_variants[0]} {negations[2]} {negatives}",
-            f"site:nhs.uk {a_term} {b_variants[0]} {negations[2]} {negatives}",
+            f"{a_term} {b_variants[0]} evidence review {negatives}",
+            f"{a_term} {b_variants[0]} systematic review meta-analysis {negatives}",
+            f"{a_term} {b_variants[0]} public health evidence {negatives}",
+            f"{a_term} {b_variants[0]} clinical study {negatives}",
         ]
+
+        # Numeric-comparison claims need broader scientific phrasing before site-scoped fallback.
+        if self._is_numeric_comparison_claim(claim_clean):
+            queries = [
+                f'"{claim_clean}" {negatives}',
+                f'"oral microbiome" estimated oral bacteria count "human mouth" {negatives}',
+                f'"bacteria in human mouth" estimated count comparison "world population" {negatives}',
+                f'"estimated oral bacteria" "people in the world" comparison {negatives}',
+                f'"oral bacteria" "human population" comparative estimate {negatives}',
+                f'"oral microbiome" "global population" quantitative comparison {negatives}',
+                f'"pubmed" oral microbiome bacteria count estimate {negatives}',
+                f'"ncbi" oral bacteria population estimate {negatives}',
+            ]
 
         if re.search(r"\b(cure|cures|curing|eradicate|eliminate)\b", text_low):
             clinical_queries = [
@@ -690,6 +703,21 @@ class TrustedSearch:
         cleaned = [self._sanitize_query(q) for q in queries if q]
         return dedupe_list([q for q in cleaned if q])[: max(1, max_queries)]
 
+    @staticmethod
+    def _is_numeric_comparison_claim(text: str) -> bool:
+        low = (text or "").lower()
+        has_comparison = bool(
+            re.search(r"\b(more|less|fewer|greater|higher|lower)\b.+\bthan\b|\bvs\.?\b|\bversus\b", low)
+        )
+        has_quantity = bool(re.search(r"\b(count|number|estimate|estimated|population)\b", low))
+        return has_comparison and has_quantity
+
+    @staticmethod
+    def _strip_site_operators(query: str) -> str:
+        cleaned = re.sub(r"\bsite:[^\s]+", " ", query or "", flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
     async def _llm_expand_confidence_queries(
         self,
         claim: str,
@@ -704,7 +732,8 @@ class TrustedSearch:
             'Return JSON only: {"queries": ["..."]}\n'
             "Rules:\n"
             "- prioritize exact claim verification wording\n"
-            "- include trusted routing queries with site:cdc.gov, site:who.int, site:medlineplus.gov, site:nhs.uk\n"
+            "- prefer broad semantic queries first (do not force site: operators)\n"
+            "- include numeric comparison phrasing when claim compares magnitudes/counts\n"
             "- include negation variants when relevant\n"
             "- avoid social media domains\n\n"
             f"Claim: {claim}\n"
@@ -1419,10 +1448,17 @@ FAILED ENTITIES:
 
         # Try Google first
         if self.google_available:
-            google_items, quota_exceeded = await self.search_query_google(session, query)
+            google_query = self._strip_site_operators(query)
+            if google_query != query:
+                logger.info(
+                    "[TrustedSearch] Google general-first rewrite: '%s' -> '%s'",
+                    query,
+                    google_query,
+                )
+            google_items, quota_exceeded = await self.search_query_google(session, google_query or query)
             google_urls = self._process_search_items(
                 provider="Google",
-                query=query,
+                query=google_query or query,
                 items=google_items,
                 claim=claim,
                 claim_type=claim_type,

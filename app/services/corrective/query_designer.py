@@ -31,6 +31,7 @@ CLAIM_TYPES = {
     "EFFICACY",
     "SAFETY",
     "STATISTICAL",
+    "NUMERIC_COMPARISON",
     "MECHANISM",
     "MYTH",
     "UNIQUENESS",
@@ -189,6 +190,21 @@ class CorrectiveQueryDesigner:
             "proportion",
             "statistics",
         ),
+        "NUMERIC_COMPARISON": (
+            "more than",
+            "less than",
+            "fewer than",
+            "greater than",
+            "higher than",
+            "lower than",
+            "compared to",
+            "versus",
+            "vs",
+            "number of",
+            "count",
+            "population",
+            "estimate",
+        ),
         "MECHANISM": (
             "mechanism",
             "pathway",
@@ -266,6 +282,7 @@ class CorrectiveQueryDesigner:
         "EFFICACY": {"testimonial", "opinion"},
         "SAFETY": {"promo", "advertisement"},
         "STATISTICAL": {"lottery"},
+        "NUMERIC_COMPARISON": {"lottery", "gambling"},
         "MECHANISM": {"astrology", "spiritual"},
         "MYTH": {"satire"},
         "UNIQUENESS": {"username", "logo", "tattoo", "wallpaper"},
@@ -279,6 +296,7 @@ class CorrectiveQueryDesigner:
         "EFFICACY": ("pubmed", "cochrane", "clinicaltrials", "cdc", "nih", "who", "jamanetwork", "bmj", "nejm"),
         "SAFETY": ("fda", "cdc", "nih", "who", "ema", "ecdc", "nhs", "clinicaltrials"),
         "STATISTICAL": ("ourworldindata", "ihme", "healthdata", "worldbank", "cdc", "who"),
+        "NUMERIC_COMPARISON": ("pubmed", "pmc", "ncbi", "plos", "nature", "science", "ourworldindata", "worldbank"),
         "MECHANISM": ("pubmed", "pmc", "nih", "nlm", "nature", "science", "plos"),
         "MYTH": ("cdc", "who", "nih", "nhs", "nice"),
         "UNIQUENESS": ("pubmed", "pmc", "nih", "nlm", "nature", "plos"),
@@ -332,6 +350,13 @@ class CorrectiveQueryDesigner:
         # Strong signals
         if re.search(r"\b\d+(?:\.\d+)?\s*%?\b", text):
             score["STATISTICAL"] += 1.5
+        if re.search(
+            r"\b(more|less|fewer|greater|higher|lower)\b.+\bthan\b|\bvs\.?\b|\bversus\b|\bcompared to\b",
+            text,
+        ):
+            score["NUMERIC_COMPARISON"] += 1.8
+        if re.search(r"\b(population|count|number of|estimate|estimated)\b", text):
+            score["NUMERIC_COMPARISON"] += 1.2
         if re.search(r"\bno two\b|\bunique\b|\bindividuality\b|\bbiometric\b", text):
             score["UNIQUENESS"] += 1.5
         if re.search(r"\bnot true\b|\bfalse\b|\bhoax\b|\bmyth\b|\bdebunk\b", text):
@@ -349,7 +374,16 @@ class CorrectiveQueryDesigner:
                 return "STATISTICAL"
             return "GENERAL"
 
-        ordered_priority = ["MYTH", "UNIQUENESS", "SAFETY", "EFFICACY", "STATISTICAL", "MECHANISM", "GENERAL"]
+        ordered_priority = [
+            "MYTH",
+            "UNIQUENESS",
+            "NUMERIC_COMPARISON",
+            "SAFETY",
+            "EFFICACY",
+            "STATISTICAL",
+            "MECHANISM",
+            "GENERAL",
+        ]
         best = max(ordered_priority, key=lambda ct: (score.get(ct, 0.0), -ordered_priority.index(ct)))
         return best if best in CLAIM_TYPES else "GENERAL"
 
@@ -455,11 +489,16 @@ class CorrectiveQueryDesigner:
             claim_key,
             self._TRUSTED_ROUTE_HINTS_BY_TYPE["GENERAL"],
         )
-        routes: List[str] = []
+        routes: List[Tuple[int, str]] = []
         for domain in sorted(TRUSTED_ROOT_DOMAINS):
-            if any(hint in domain for hint in hints):
-                routes.append(domain)
-        return routes or sorted(TRUSTED_ROOT_DOMAINS)
+            try:
+                idx = next(i for i, hint in enumerate(hints) if hint in domain)
+            except StopIteration:
+                continue
+            routes.append((idx, domain))
+        routes.sort(key=lambda x: (x[0], x[1]))
+        ordered = [d for _, d in routes]
+        return ordered or sorted(TRUSTED_ROOT_DOMAINS)
 
     # ----------------------------
     # Quality gate + adaptive selection
@@ -725,6 +764,28 @@ class CorrectiveQueryDesigner:
                     weight=0.82,
                 )
             )
+        elif claim_type == "NUMERIC_COMPARISON":
+            candidates.append(
+                QuerySpec(
+                    q=self._apply_negatives(
+                        f"{primary} {secondary} estimated count comparison world population",
+                        negatives,
+                    ),
+                    goal="numeric comparison backup",
+                    weight=0.84,
+                )
+            )
+            candidates.append(
+                QuerySpec(
+                    q=self._apply_negatives(
+                        f'"{primary}" "{secondary}" oral microbiome estimated oral bacteria '
+                        f"human population comparison",
+                        negatives,
+                    ),
+                    goal="numeric comparison oral microbiome backup",
+                    weight=0.83,
+                )
+            )
         elif claim_type == "MYTH":
             candidates.append(
                 QuerySpec(
@@ -771,6 +832,7 @@ class CorrectiveQueryDesigner:
             "EFFICACY": "randomized trial evidence review",
             "SAFETY": "adverse effects safety evidence",
             "STATISTICAL": "statistics prevalence incidence",
+            "NUMERIC_COMPARISON": "estimated count comparison population statistics",
             "MECHANISM": "mechanism pathway biological",
             "MYTH": "evidence fact check",
             "UNIQUENESS": "uniqueness individuality identification",
@@ -783,6 +845,7 @@ class CorrectiveQueryDesigner:
             "EFFICACY": "systematic review meta-analysis",
             "SAFETY": "risk profile cohort",
             "STATISTICAL": "population rate registry",
+            "NUMERIC_COMPARISON": "human population estimate comparative magnitude",
             "MECHANISM": "causal pathway physiology",
             "MYTH": "debunk",
             "UNIQUENESS": "forensic biometrics",
