@@ -1077,6 +1077,14 @@ class VerdictGenerator:
                 seg["supporting_fact"] = ""
                 seg["source_url"] = ""
                 seg["evidence_used_ids"] = []
+            if status in {"INVALID", "PARTIALLY_INVALID"} and self._is_claim_mention_statement(polarity_text):
+                if not self._segment_is_belief_or_survey_claim(seg_text) and not self._is_explicit_refutation_statement(
+                    polarity_text
+                ):
+                    seg["status"] = "UNKNOWN"
+                    seg["supporting_fact"] = ""
+                    seg["source_url"] = ""
+                    seg["evidence_used_ids"] = []
 
             # UNKNOWN minimization ladder:
             # deterministically upgrade UNKNOWN only when alignment is strong and polarity is clear.
@@ -1534,6 +1542,35 @@ class VerdictGenerator:
         return any(re.search(p, low) for p in mention_patterns)
 
     @staticmethod
+    def _segment_is_belief_or_survey_claim(segment: str) -> bool:
+        if not segment:
+            return False
+        low = segment.lower()
+        return bool(
+            re.search(
+                r"\b(believe|belief|believed|think|thought|perceive|perceived|concern|hesitancy|acceptance|survey)\b",
+                low,
+            )
+        )
+
+    @staticmethod
+    def _is_explicit_refutation_statement(text: str) -> bool:
+        if not text:
+            return False
+        low = text.lower()
+        patterns = (
+            r"\bdo(?:es)?\s+not\b",
+            r"\bno evidence\b",
+            r"\bfalse\b",
+            r"\bnot true\b",
+            r"\bdebunk(?:ed|s|ing)?\b",
+            r"\bmyth\b",
+            r"\bunfounded\b",
+            r"\bincorrect\b",
+        )
+        return any(re.search(p, low) for p in patterns)
+
+    @staticmethod
     def _concept_aliases() -> Dict[str, List[str]]:
         return {
             "vaccine": ["vaccine", "vaccines", "vaccination"],
@@ -1930,10 +1967,10 @@ class VerdictGenerator:
 
         evidence_by_id: Dict[int, Dict[str, Any]] = {idx: ev for idx, ev in enumerate(evidence)}
         allowed_rel = {"SUPPORTS", "CONTRADICTS", "PARTIAL", "PARTIALLY_SUPPORTS", "PARTIALLY_CONTRADICTS"}
-        support_like = {"SUPPORTS", "PARTIAL", "PARTIALLY_SUPPORTS"}
 
         for seg in claim_breakdown:
             segment = (seg.get("claim_segment") or "").strip()
+            segment_belief_mode = self._segment_is_belief_or_survey_claim(segment)
             best_item: Dict[str, Any] | None = None
             best_score = -1.0
             for em in evidence_map:
@@ -1943,7 +1980,7 @@ class VerdictGenerator:
                 statement = (em.get("statement") or "").strip()
                 if not statement:
                     continue
-                if rel in support_like and self._is_claim_mention_statement(statement):
+                if self._is_claim_mention_statement(statement) and not segment_belief_mode:
                     continue
                 if not self._segment_topic_guard_ok(segment, statement):
                     continue
@@ -1966,8 +2003,7 @@ class VerdictGenerator:
                     statement = (ev.get("statement") or ev.get("text") or "").strip()
                     if not statement:
                         continue
-                    stance = str(ev.get("stance") or "neutral").lower()
-                    if stance != "contradicts" and self._is_claim_mention_statement(statement):
+                    if self._is_claim_mention_statement(statement) and not segment_belief_mode:
                         continue
                     if seg_q and seg_q not in segment.lower():
                         continue
@@ -2633,12 +2669,16 @@ class VerdictGenerator:
                 reporting_penalty = 0.0
                 if self._is_reporting_statement(stmt):
                     reporting_penalty = 0.24
+                mention_penalty = 0.0
+                if self._is_claim_mention_statement(stmt) and not self._segment_is_belief_or_survey_claim(seg):
+                    mention_penalty = 0.40
                 score = (
                     (0.50 * max(0.0, min(1.0, rel_f)))
                     + (0.25 * max(0.0, min(1.0, overlap)))
                     + (0.25 * max(0.0, min(1.0, anchor_overlap)))
                     - uncertainty_penalty
                     - reporting_penalty
+                    - mention_penalty
                 )
                 if not anchor_ok:
                     score *= 0.35

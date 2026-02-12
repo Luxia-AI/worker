@@ -1460,12 +1460,7 @@ FAILED ENTITIES:
 
         # Try Google first
         if self.google_available:
-            preserve_site_scope = False
-            if "site:" in (query or "").lower():
-                comparative = self._is_numeric_comparison_claim(query) or self._is_numeric_comparison_claim(claim or "")
-                # For comparative claims, keep targeted site constraints to avoid broad-query drift.
-                if comparative:
-                    preserve_site_scope = True
+            preserve_site_scope = "site:" in (query or "").lower()
             google_query = query if preserve_site_scope else self._strip_site_operators(query)
             if google_query != query:
                 logger.info(
