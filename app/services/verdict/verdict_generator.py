@@ -1072,10 +1072,21 @@ class VerdictGenerator:
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
             if status in {"VALID", "PARTIALLY_VALID"} and high_semantic_negation_mismatch:
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
+            if status in {"VALID", "PARTIALLY_VALID"} and self._is_claim_mention_statement(polarity_text):
+                seg["status"] = "UNKNOWN"
+                seg["supporting_fact"] = ""
+                seg["source_url"] = ""
+                seg["evidence_used_ids"] = []
 
             # UNKNOWN minimization ladder:
             # deterministically upgrade UNKNOWN only when alignment is strong and polarity is clear.
             if status == "UNKNOWN" and best_ev is not None and polarity_text:
+                if self._is_claim_mention_statement(polarity_text):
+                    seg["status"] = "UNKNOWN"
+                    seg["supporting_fact"] = ""
+                    seg["source_url"] = ""
+                    seg["evidence_used_ids"] = []
+                    continue
                 if not fact:
                     seg["supporting_fact"] = polarity_text
                     fact = polarity_text
@@ -1495,6 +1506,34 @@ class VerdictGenerator:
         return any(re.search(p, low) for p in reporting_patterns)
 
     @staticmethod
+    def _is_claim_mention_statement(text: str) -> bool:
+        """
+        Detect wording that reports a belief/concern/myth rather than asserting
+        the proposition as factual support.
+        """
+        if not text:
+            return False
+        low = text.lower()
+        mention_patterns = (
+            r"\bmyth\b",
+            r"\bmisinformation\b",
+            r"\bdisinformation\b",
+            r"\bconspiracy\b",
+            r"\bfalse claim\b",
+            r"\bunfounded\b",
+            r"\bhoax\b",
+            r"\brumou?r\b",
+            r"\bparticipants?\s+(?:expressed|reported|mentioned|stated)\s+concern",
+            r"\bconcerns?\s+about\b",
+            r"\bworried\s+about\b",
+            r"\bbeliev(?:e|ed|es|ing)\s+that\b",
+            r"\bperceiv(?:e|ed|es|ing)\s+that\b",
+            r"\bhesitan(?:cy|t)\b",
+            r"\bacceptance\b",
+        )
+        return any(re.search(p, low) for p in mention_patterns)
+
+    @staticmethod
     def _concept_aliases() -> Dict[str, List[str]]:
         return {
             "vaccine": ["vaccine", "vaccines", "vaccination"],
@@ -1771,6 +1810,8 @@ class VerdictGenerator:
         statement = str(ev.get("statement") or ev.get("text") or "")
         if self._is_reporting_statement(statement):
             score_f *= 0.40
+        if self._is_claim_mention_statement(statement):
+            score_f *= 0.25
         return score_f
 
     def _select_balanced_top_evidence(
@@ -1863,6 +1904,9 @@ class VerdictGenerator:
             if self._is_reporting_statement(statement):
                 relevance = "NEUTRAL"
                 relevance_score *= 0.35
+            if self._is_claim_mention_statement(statement):
+                relevance = "NEUTRAL"
+                relevance_score *= 0.25
             normalized.append(
                 {
                     "evidence_id": ev_idx if ev_idx >= 0 else len(normalized),
@@ -1886,6 +1930,7 @@ class VerdictGenerator:
 
         evidence_by_id: Dict[int, Dict[str, Any]] = {idx: ev for idx, ev in enumerate(evidence)}
         allowed_rel = {"SUPPORTS", "CONTRADICTS", "PARTIAL", "PARTIALLY_SUPPORTS", "PARTIALLY_CONTRADICTS"}
+        support_like = {"SUPPORTS", "PARTIAL", "PARTIALLY_SUPPORTS"}
 
         for seg in claim_breakdown:
             segment = (seg.get("claim_segment") or "").strip()
@@ -1897,6 +1942,8 @@ class VerdictGenerator:
                     continue
                 statement = (em.get("statement") or "").strip()
                 if not statement:
+                    continue
+                if rel in support_like and self._is_claim_mention_statement(statement):
                     continue
                 if not self._segment_topic_guard_ok(segment, statement):
                     continue
@@ -1918,6 +1965,9 @@ class VerdictGenerator:
                     seg_q = (ev.get("_segment_query") or "").strip().lower()
                     statement = (ev.get("statement") or ev.get("text") or "").strip()
                     if not statement:
+                        continue
+                    stance = str(ev.get("stance") or "neutral").lower()
+                    if stance != "contradicts" and self._is_claim_mention_statement(statement):
                         continue
                     if seg_q and seg_q not in segment.lower():
                         continue
@@ -2148,6 +2198,9 @@ class VerdictGenerator:
             stance = str(ev.get("stance") or "neutral").lower()
             if stance == "contradicts":
                 continue
+            statement = str(ev.get("statement") or ev.get("text") or "")
+            if self._is_claim_mention_statement(statement):
+                continue
             sem = float(ev.get("semantic_score") or ev.get("sem_score") or ev.get("final_score") or 0.0)
             if sem < 0.55:
                 continue
@@ -2160,6 +2213,9 @@ class VerdictGenerator:
             for ev in evidence:
                 stance = str(ev.get("stance") or "neutral").lower()
                 if stance == "contradicts":
+                    continue
+                statement = str(ev.get("statement") or ev.get("text") or "")
+                if self._is_claim_mention_statement(statement):
                     continue
                 best_ev = ev
                 best_score = float(ev.get("final_score") or ev.get("score") or 0.0)
