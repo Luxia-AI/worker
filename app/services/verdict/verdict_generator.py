@@ -346,6 +346,38 @@ class VerdictGenerator:
             return None
         return (lb, ub)
 
+    def _find_direct_non_kg_support(self, claim: str, evidence: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        claim_tokens = self._meaningful_tokens(claim)
+        if not claim_tokens:
+            return None
+        best: Optional[Dict[str, Any]] = None
+        best_score = -1.0
+        for ev in evidence[:12]:
+            stmt = str(ev.get("statement") or ev.get("text") or "").strip()
+            if not stmt:
+                continue
+            stance = str(ev.get("stance") or "neutral").lower()
+            if stance == "contradicts":
+                continue
+            candidate_type = str(ev.get("candidate_type") or "").upper()
+            source_type = str(ev.get("source_type") or "").lower()
+            if candidate_type == "KG" or source_type == "kg":
+                continue
+            sem = float(
+                ev.get("semantic_score") or ev.get("sem_score") or ev.get("final_score") or ev.get("score") or 0.0
+            )
+            if sem < 0.90:
+                continue
+            stmt_tokens = self._meaningful_tokens(stmt)
+            overlap = len(claim_tokens & stmt_tokens)
+            if overlap < 3:
+                continue
+            score = (0.70 * sem) + (0.30 * (overlap / max(1, len(claim_tokens))))
+            if score > best_score:
+                best_score = score
+                best = ev
+        return best
+
     def _is_direct_comparative_statement(self, stmt: str, lhs_tokens: set[str], rhs_tokens: set[str]) -> bool:
         low = (stmt or "").lower()
         has_comparison = bool(
@@ -1177,6 +1209,39 @@ class VerdictGenerator:
                 adaptive_trust_post = float(adaptive_metrics.get("trust_post", 0.0) or 0.0)
             except Exception:
                 adaptive_trust_post = 0.0
+
+        # Single-subclaim promotion:
+        # If adaptive trust is already maxed and direct non-KG support exists,
+        # upgrade PARTIALLY_TRUE/PARTIALLY_VALID to TRUE/VALID.
+        if (
+            claim_frame.get("claim_type") != "THERAPEUTIC_EFFICACY"
+            and len(claim_breakdown or []) == 1
+            and verdict_str == Verdict.PARTIALLY_TRUE.value
+            and str((claim_breakdown[0] or {}).get("status", "")).upper() == "PARTIALLY_VALID"
+            and float(coverage_score) >= 0.95
+            and float(agreement_ratio) >= 0.90
+            and float(adaptive_trust_post) >= 0.45
+            and int((adaptive_metrics or {}).get("strong_covered", 0) or 0) >= 1
+            and int((adaptive_metrics or {}).get("contradicted_subclaims", 0) or 0) == 0
+        ):
+            direct_support = self._find_direct_non_kg_support(claim, evidence)
+            if direct_support is not None:
+                claim_breakdown[0]["status"] = "VALID"
+                claim_breakdown[0]["supporting_fact"] = str(
+                    direct_support.get("statement") or direct_support.get("text") or ""
+                )
+                claim_breakdown[0]["source_url"] = str(
+                    direct_support.get("source_url") or direct_support.get("source") or ""
+                )
+                reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
+                verdict_str = reconciled["verdict"]
+                logger.info(
+                    "[VerdictGenerator][SingleSubclaimPromote] Promoted PARTIALLY_VALID -> VALID "
+                    "under strong adaptive support (coverage=%.2f agreement=%.2f trust_post=%.3f).",
+                    coverage_score,
+                    agreement_ratio,
+                    adaptive_trust_post,
+                )
 
         if claim_frame.get("is_strong_therapeutic_affirm", False):
             profile = self._therapeutic_evidence_profile(claim, claim_frame, evidence)
