@@ -238,13 +238,13 @@ class CorrectivePipeline:
                     f"strong therapeutic contradiction found (contradicted={contradicted}, "
                     f"strong_covered={strong_covered})"
                 )
-            if coverage >= confidence_target_coverage and (diversity >= 0.30 or strong_covered >= 1):
+            if coverage >= confidence_target_coverage and strong_covered >= 1:
                 return True, (
-                    f"strong therapeutic coverage target met with supporting quality "
-                    f"(coverage={coverage:.2f}, diversity={diversity:.2f}, strong_covered={strong_covered})"
+                    f"strong therapeutic coverage target met with strong evidence "
+                    f"(coverage={coverage:.2f}, strong_covered={strong_covered})"
                 )
             return False, (
-                f"continue: strong therapeutic claim requires quality evidence "
+                f"continue: strong therapeutic claim requires strong efficacy evidence "
                 f"(coverage={coverage:.2f}, diversity={diversity:.2f}, strong_covered={strong_covered}, "
                 f"sufficient={is_sufficient})"
             )

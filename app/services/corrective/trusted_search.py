@@ -744,6 +744,7 @@ class TrustedSearch:
         max_queries: int,
     ) -> List[str]:
         deterministic = self._build_confidence_mode_queries(claim=claim, entity_obj=entity_obj, max_queries=max_queries)
+        is_strong_therapeutic = bool(re.search(r"\b(cure|cures|curing|eradicate|eliminate)\b", (claim or "").lower()))
         use_llm = bool(get_trust_config().search_use_llm_query_expansion)
         if not use_llm:
             return deterministic[: max(1, max_queries)]
@@ -752,7 +753,10 @@ class TrustedSearch:
         if not llm_queries:
             return deterministic[: max(1, max_queries)]
 
-        merged = dedupe_list(llm_queries + deterministic)
+        if is_strong_therapeutic:
+            merged = dedupe_list(deterministic + llm_queries)
+        else:
+            merged = dedupe_list(llm_queries + deterministic)
         logger.info(
             "[TrustedSearch][ConfidenceMode] Query expansion: llm=%d deterministic=%d merged=%d",
             len(llm_queries),

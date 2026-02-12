@@ -835,7 +835,9 @@ class VerdictGenerator:
                 verdict_str = Verdict.FALSE.value
             elif profile["high_grade_support"] >= 1:
                 verdict_str = Verdict.TRUE.value
-            elif (profile["weak_support"] >= 1 or coverage_score >= 0.30) and verdict_str in {
+            elif (
+                profile["weak_support"] >= 1 or profile["scope_mismatch"] >= 1 or coverage_score >= 0.30
+            ) and verdict_str in {
                 Verdict.UNVERIFIABLE.value,
                 Verdict.PARTIALLY_TRUE.value,
             }:
@@ -843,7 +845,7 @@ class VerdictGenerator:
                 verdict_str = misleading.value if misleading else "MISLEADING"
             logger.info(
                 "[VerdictGenerator][PolicyOverride] type=%s strength=%s polarity=%s subject=%s object=%s "
-                "high_grade_support=%d high_grade_contra=%d weak_support=%d verdict=%s",
+                "high_grade_support=%d high_grade_contra=%d weak_support=%d scope_mismatch=%d verdict=%s",
                 claim_frame["claim_type"],
                 claim_frame["strength"],
                 claim_frame["polarity"],
@@ -852,6 +854,7 @@ class VerdictGenerator:
                 profile["high_grade_support"],
                 profile["high_grade_contra"],
                 profile["weak_support"],
+                profile["scope_mismatch"],
                 verdict_str,
             )
 
@@ -1097,6 +1100,7 @@ class VerdictGenerator:
         high_grade_support = 0
         high_grade_contra = 0
         weak_support = 0
+        scope_mismatch = 0
         high_grade_markers = (
             "randomized",
             "systematic review",
@@ -1132,10 +1136,13 @@ class VerdictGenerator:
                     high_grade_support += 1
                 else:
                     weak_support += 1
+            else:
+                scope_mismatch += 1
         return {
             "high_grade_support": high_grade_support,
             "high_grade_contra": high_grade_contra,
             "weak_support": weak_support,
+            "scope_mismatch": scope_mismatch,
         }
 
     def _segment_polarity(self, segment: str, statement: str, stance: str = "neutral") -> str:
