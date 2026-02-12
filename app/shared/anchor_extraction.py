@@ -101,7 +101,7 @@ Anchors must be biomedical entities or short noun phrases useful for retrieval.
 Do not include stopwords or generic verbs.
 
 Return JSON only:
-{"subclaim_anchors":[{"subclaim":"...","anchors":["...", "..."]}]}
+{{"subclaim_anchors":[{{"subclaim":"...","anchors":["...", "..."]}}]}}
 
 Claim:
 {claim}
@@ -250,6 +250,13 @@ class AnchorExtractor:
             if not subclaim or not isinstance(raw_anchors, list):
                 continue
             anchor_map[subclaim] = [str(x) for x in raw_anchors if str(x).strip()]
+        if not anchor_map and isinstance(payload, dict):
+            # Tolerate map-shaped payloads like {"<subclaim>": ["a1", "a2"]}.
+            for key, value in payload.items():
+                if isinstance(key, str) and isinstance(value, list):
+                    cleaned = [str(x) for x in value if str(x).strip()]
+                    if cleaned:
+                        anchor_map[key.strip()] = cleaned
         return anchor_map
 
     def _extract_with_llm_sync(self, claim: str, subclaims: Sequence[str]) -> Dict[str, List[str]]:

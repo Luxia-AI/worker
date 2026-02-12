@@ -2,7 +2,25 @@ from app.services.verdict.verdict_generator import VerdictGenerator
 
 
 def _vg() -> VerdictGenerator:
-    return VerdictGenerator.__new__(VerdictGenerator)
+    vg = VerdictGenerator.__new__(VerdictGenerator)
+
+    class _TrustPolicyStub:
+        def decompose_claim(self, claim):
+            return [claim]
+
+        def compute_adaptive_trust(self, claim, evidence, top_k=10):
+            return {
+                "coverage": 0.0,
+                "agreement": 1.0,
+                "diversity": 0.5,
+                "trust_post": 0.0,
+                "is_sufficient": True,
+                "num_subclaims": 1,
+            }
+
+    vg.trust_policy = _TrustPolicyStub()
+    vg._log_subclaim_coverage = lambda *args, **kwargs: None
+    return vg
 
 
 def test_negative_segment_negative_evidence_entails_and_reconciles_true():
@@ -78,3 +96,38 @@ def test_ineffective_and_do_not_work_are_symmetric_entailment():
         stance="neutral",
     )
     assert polarity == "entails"
+
+
+def test_unknown_segment_without_fact_is_aligned_and_marked_invalid_for_negation_mismatch():
+    vg = _vg()
+    claim = "Handwashing does not reduce the spread of infectious diseases."
+    evidence = [
+        {
+            "statement": "Good handwashing prevents the spread of germs.",
+            "source_url": "https://www.esneft.nhs.uk/service/infection-control/",
+            "semantic_score": 1.0,
+            "final_score": 0.85,
+            "credibility": 0.95,
+            "stance": "supports",
+        }
+    ]
+    llm_result = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.35,
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": "Handwashing does not reduce the spread of infectious diseases",
+                "status": "UNKNOWN",
+                "supporting_fact": "",
+                "source_url": "",
+            }
+        ],
+        "evidence_map": [],
+        "key_findings": [],
+    }
+
+    parsed = vg._parse_verdict_result(llm_result, claim, evidence)
+
+    assert parsed["verdict"] == "FALSE"
+    assert parsed["claim_breakdown"][0]["status"] == "INVALID"

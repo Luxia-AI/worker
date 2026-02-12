@@ -652,6 +652,8 @@ class VerdictGenerator:
             src = seg.get("source_url") or ""
             fact = (seg.get("supporting_fact") or "").strip()
             best_idx, best_ev, best_match_score = _best_evidence_match(seg_text, fact, src)
+            best_src = ""
+            best_stmt = ""
             if best_ev is not None:
                 best_src = (best_ev.get("source_url") or best_ev.get("source") or "").strip()
                 best_stmt = (best_ev.get("statement") or best_ev.get("text") or "").strip()
@@ -661,16 +663,34 @@ class VerdictGenerator:
                 if src and not fact and best_stmt:
                     seg["supporting_fact"] = best_stmt
                     fact = best_stmt
+                # If LLM left segment unresolved (empty fact/source), bind best matched evidence.
+                if status == "UNKNOWN" and best_match_score >= 0.45:
+                    if not fact and best_stmt:
+                        seg["supporting_fact"] = best_stmt
+                        fact = best_stmt
+                    if not src and best_src:
+                        seg["source_url"] = best_src
+                        src = best_src
                 if status != "UNKNOWN":
                     seg["evidence_used_ids"] = [best_idx] if best_idx >= 0 else []
             else:
                 seg["evidence_used_ids"] = []
             if (src and src not in ev_urls) or (fact and not _overlap_ok(fact, ev_text)):
-                seg["status"] = "UNKNOWN"
-                seg["supporting_fact"] = ""
-                seg["source_url"] = ""
-                seg["evidence_used_ids"] = []
-                continue
+                if best_ev is None:
+                    seg["status"] = "UNKNOWN"
+                    seg["supporting_fact"] = ""
+                    seg["source_url"] = ""
+                    seg["evidence_used_ids"] = []
+                    continue
+                # Recover from hallucinated source/fact by re-binding to the best in-pipeline evidence.
+                if best_stmt:
+                    seg["supporting_fact"] = best_stmt
+                    fact = best_stmt
+                if best_src:
+                    seg["source_url"] = best_src
+                    src = best_src
+                if best_idx >= 0:
+                    seg["evidence_used_ids"] = [best_idx]
 
             # Polarity guardrails (hard): contradiction cannot be labeled VALID/PARTIALLY_VALID.
             seg_neg = _has_negation(seg_text)
@@ -1394,6 +1414,7 @@ class VerdictGenerator:
 
         strong = 0
         partial = 0
+        invalid = 0
         unknown = 0
         for d in details:
             status = (d.get("status") or "UNKNOWN").upper()
@@ -1401,6 +1422,8 @@ class VerdictGenerator:
                 strong += 1
             elif status == "PARTIALLY_VALID":
                 partial += 1
+            elif status in {"INVALID", "PARTIALLY_INVALID"}:
+                invalid += 1
             else:
                 unknown += 1
             logger.info(
@@ -1419,12 +1442,13 @@ class VerdictGenerator:
             )
 
         logger.info(
-            "[VerdictGenerator][Coverage] subclaims=%d weighted_covered=%.2f strong=%d partial=%d "
+            "[VerdictGenerator][Coverage] subclaims=%d weighted_covered=%.2f strong=%d partial=%d invalid=%d "
             "unknown=%d coverage=%.2f",
             int(cov.get("subclaims", len(details))),
             float(cov.get("weighted_covered", 0.0)),
             strong,
             partial,
+            invalid,
             unknown,
             float(cov.get("coverage", 0.0)),
         )
