@@ -329,11 +329,12 @@ class VerdictGenerator:
 
         # Step 1) Start with VDB/KG evidence + (optional) segment retrieval
         segment_evidence: List[Dict[str, Any]] = []
-        policy_insufficient_hint = self._policy_says_insufficient(
-            claim, ranked_evidence[: min(len(ranked_evidence), 10)]
-        )
         if adaptive_metrics is not None:
             policy_insufficient_hint = not bool(adaptive_metrics.get("is_sufficient", False))
+        else:
+            policy_insufficient_hint = self._policy_says_insufficient(
+                claim, ranked_evidence[: min(len(ranked_evidence), 10)]
+            )
 
         if (not cache_sufficient) and (
             self._needs_web_boost(ranked_evidence[: min(len(ranked_evidence), 6)], claim=claim)
@@ -358,9 +359,10 @@ class VerdictGenerator:
         pre_evidence = enriched_evidence[: min(len(enriched_evidence), max(top_k, 12), 20)]
         if not used_web_search and not cache_sufficient:
             for round_i in range(self.MAX_WEB_ROUNDS_PRE_VERDICT):
-                insufficient = self._policy_says_insufficient(claim, pre_evidence)
                 if adaptive_metrics is not None:
                     insufficient = not bool(adaptive_metrics.get("is_sufficient", False))
+                else:
+                    insufficient = self._policy_says_insufficient(claim, pre_evidence)
                 weak = self._needs_web_boost(pre_evidence[: min(len(pre_evidence), 6)], claim=claim)
                 if not insufficient and not weak:
                     logger.info(f"[VerdictGenerator] Pre-verdict evidence sufficient (round={round_i}). Skipping web.")
@@ -1579,20 +1581,31 @@ class VerdictGenerator:
         if adaptive_metrics is not None:
             try:
                 weighted = float(adaptive_metrics.get("coverage", 0.0) or 0.0)
+                status_weight = {
+                    "VALID": 1.0,
+                    "STRONGLY_VALID": 1.0,
+                    "PARTIALLY_VALID": 0.7,
+                    "PARTIALLY_INVALID": 0.7,
+                    "INVALID": 1.0,
+                }
+                verdict_weighted = sum(
+                    status_weight.get(str(seg.get("status", "UNKNOWN")).upper(), 0.0) for seg in (claim_breakdown or [])
+                )
+                verdict_cov = verdict_weighted / max(1, len(claim_breakdown or []))
                 logger.info(
                     "[VerdictGenerator][Coverage] subclaims=%d weighted_covered=%.2f strong=%d partial=%d invalid=%d "
                     "unknown=%d coverage=%.2f",
                     len(claim_breakdown or []),
-                    weighted,
+                    verdict_weighted,
                     int(adaptive_metrics.get("strong_covered", 0) or 0),
                     0,
                     int(adaptive_metrics.get("contradicted_subclaims", 0) or 0),
                     sum(1 for seg in (claim_breakdown or []) if str(seg.get("status", "UNKNOWN")).upper() == "UNKNOWN"),
-                    weighted,
+                    verdict_cov,
                 )
                 logger.info(
                     "[VerdictGenerator][Coverage][Aligned] verdict_coverage=%.2f adaptive_coverage=%.2f",
-                    0.0,
+                    verdict_cov,
                     weighted,
                 )
             except Exception:

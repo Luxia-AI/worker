@@ -481,16 +481,19 @@ class CorrectivePipeline:
         initial_fixed_payload = self._trust_payload_fixed(initial_fixed_trust_score, self.CONF_THRESHOLD)
         is_sufficient = adaptive_trust["is_sufficient"]
         adaptive_payload = self._trust_payload_adaptive(adaptive_trust)
+        adaptive_cache: Dict[str, Dict[str, Any]] = {}
 
         logger.info(
             f"[CorrectivePipeline:{round_id}] Adaptive trust: sufficient={is_sufficient}, "
             f"coverage={adaptive_trust['coverage']:.2f}, diversity={adaptive_trust['diversity']:.2f}"
         )
 
+        current_snapshot_id = self._evidence_snapshot_id_from_ranked(post_text, top_ranked)
+        adaptive_cache[current_snapshot_id] = adaptive_trust
         if is_sufficient:
             logger.info(
                 f"[CorrectivePipeline:{round_id}] Adaptive trust sufficient. "
-                "Skipping web search - using cached evidence!"
+                "Attempting cache verdict precheck before web search."
             )
 
             verdict_result = await self.verdict_generator.generate_verdict(
@@ -499,6 +502,8 @@ class CorrectivePipeline:
                 top_k=internal_top_k,
                 used_web_search=False,
                 cache_sufficient=True,
+                adaptive_metrics=adaptive_trust,
+                evidence_snapshot_id=current_snapshot_id,
             )
 
             logger.info(
@@ -565,7 +570,7 @@ class CorrectivePipeline:
                     **adaptive_payload,
                 }
             logger.info(
-                f"[CorrectivePipeline:{round_id}] Cache evidence insufficient for required segment resolution; "
+                f"[CorrectivePipeline:{round_id}] Cache precheck unresolved required segments; "
                 "continuing to web search."
             )
 
@@ -712,9 +717,6 @@ class CorrectivePipeline:
             claim_frame["is_strong_therapeutic"],
         )
         new_trusted_urls_processed = 0
-        adaptive_cache: Dict[str, Dict[str, Any]] = {}
-        current_snapshot_id: Optional[str] = None
-
         for query_idx, query in enumerate(queries):
             # OPTIMIZATION: Hard limit on search queries to prevent runaway searches
             if search_api_calls >= self.MAX_SEARCH_QUERIES:

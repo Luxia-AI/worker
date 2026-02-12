@@ -36,6 +36,7 @@ class AdaptiveTrustPolicy:
         cfg = get_trust_config()
         self.confidence_mode = self._is_confidence_mode()
         self.anchor_extractor = AnchorExtractor()
+        self._anchor_cache: Dict[str, Dict[str, List[str]]] = {}
         # Gating rule thresholds
         self.COVERAGE_THRESHOLD_HIGH = float(os.getenv("ADAPTIVE_COVERAGE_THRESHOLD_HIGH", "0.60"))
         self.COVERAGE_THRESHOLD_MEDIUM = float(os.getenv("ADAPTIVE_COVERAGE_THRESHOLD_MEDIUM", "0.40"))
@@ -557,11 +558,17 @@ class AdaptiveTrustPolicy:
         # Decompose claim into subclaims
         subclaims = self.decompose_claim(claim)
         num_subclaims = len(subclaims)
-        anchor_result = self.anchor_extractor.extract_for_claim(claim=claim, subclaims=subclaims, entity_hints=[])
-        anchors_by_subclaim = {
-            str(k): sorted([str(a) for a in (v or []) if str(a).strip()])
-            for k, v in (anchor_result.anchors_by_subclaim or {}).items()
-        }
+        claim_key = f"{claim.strip().lower()}|{'||'.join(sorted([s.strip().lower() for s in subclaims]))}"
+        cached_anchors = self._anchor_cache.get(claim_key)
+        if cached_anchors is not None:
+            anchors_by_subclaim = cached_anchors
+        else:
+            anchor_result = self.anchor_extractor.extract_for_claim(claim=claim, subclaims=subclaims, entity_hints=[])
+            anchors_by_subclaim = {
+                str(k): sorted([str(a) for a in (v or []) if str(a).strip()])
+                for k, v in (anchor_result.anchors_by_subclaim or {}).items()
+            }
+            self._anchor_cache[claim_key] = anchors_by_subclaim
 
         # Use top-k evidence
         top_evidence = evidence_list[:top_k] if evidence_list else []
@@ -686,6 +693,7 @@ class AdaptiveTrustPolicy:
         adaptive_override_guard = (
             gate_reason == "adaptive_override" and coverage >= 0.60 and avg_relevance >= 0.65 and top_trust >= 0.55
         )
+        weak_relevance_guard_applied = False
         if (
             is_sufficient
             and not adaptive_override_guard
@@ -701,11 +709,15 @@ class AdaptiveTrustPolicy:
             )
             is_sufficient = False
             verdict_state = "evidence_insufficiency"
+            weak_relevance_guard_applied = True
 
         # Final consistency guard: if gate passed and confidence-mode relaxed
         # conditions are met, trust_post should not be zeroed out.
         if trust_post <= 0.0 and coverage >= 0.50 and top_trust > 0.0:
             trust_post = float(top_trust) * float(coverage)
+
+        if weak_relevance_guard_applied:
+            gate_reason = "weak_relevance_guard"
 
         result = {
             "trust_post": trust_post,
