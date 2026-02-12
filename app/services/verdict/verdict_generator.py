@@ -1109,10 +1109,8 @@ class VerdictGenerator:
     @staticmethod
     def _classify_claim_frame(claim: str) -> Dict[str, Any]:
         text = f" {str(claim or '').strip().lower()} "
-        therapeutic = bool(
-            any(tok in text for tok in [" cure ", " cures ", " treat ", " treats ", " effective against "])
-        )
-        strong = bool(any(tok in text for tok in [" cure ", " cures ", " eradicate ", " eliminate "]))
+        therapeutic = bool(re.search(r"\b(cure|cures|treat|treats|therapy|effective against)\b", text))
+        strong = bool(re.search(r"\b(cure|cures|eradicate|eliminate)\b", text))
         polarity = "NEGATIVE" if re.search(r"\b(no|not|never|without|does not|do not)\b", text) else "AFFIRM"
 
         subject = ""
