@@ -1834,6 +1834,33 @@ class VerdictGenerator:
             return False
         return True
 
+    @staticmethod
+    def _segment_object_tokens(segment: str) -> set[str]:
+        text = (segment or "").lower()
+        match = re.search(
+            r"\b(?:contain|contains|contained|work|works|effective|effectiveness)\b(?:\s+against)?\s+(?P<object>.+)$",
+            text,
+        )
+        if not match:
+            return set()
+        object_text = match.group("object")
+        stop = {
+            "to",
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "of",
+            "in",
+            "on",
+            "for",
+            "with",
+            "people",
+            "person",
+        }
+        return {t for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", object_text) if t not in stop}
+
     def _evidence_score(self, ev: Dict[str, Any]) -> float:
         score = ev.get("final_score")
         if score is None:
@@ -1990,6 +2017,12 @@ class VerdictGenerator:
                 anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
                 if anchor_overlap < _SEGMENT_EVIDENCE_MIN_OVERLAP:
                     continue
+                object_tokens = self._segment_object_tokens(segment)
+                if object_tokens and not segment_belief_mode:
+                    statement_tokens = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", statement.lower()))
+                    no_object_overlap = len(object_tokens & statement_tokens) == 0
+                    if no_object_overlap and not self._is_explicit_refutation_statement(statement):
+                        continue
                 rel_score = float(em.get("relevance_score", 0.0) or 0.0)
                 score = (0.8 * rel_score) + (0.2 * anchor_overlap)
                 if score > best_score:
@@ -2015,6 +2048,12 @@ class VerdictGenerator:
                     anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
                     if anchor_overlap < _SEGMENT_EVIDENCE_MIN_OVERLAP:
                         continue
+                    object_tokens = self._segment_object_tokens(segment)
+                    if object_tokens and not segment_belief_mode:
+                        statement_tokens = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", statement.lower()))
+                        no_object_overlap = len(object_tokens & statement_tokens) == 0
+                        if no_object_overlap and not self._is_explicit_refutation_statement(statement):
+                            continue
                     score = (0.7 * float(ev.get("final_score", ev.get("score", 0.0)) or 0.0)) + (0.3 * anchor_overlap)
                     if score > best_score:
                         best_score = score

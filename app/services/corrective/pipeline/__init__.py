@@ -744,12 +744,12 @@ class CorrectivePipeline:
         if len(already_processed_urls) > max_vdb_url_skip:
             logger.warning(
                 "[CorrectivePipeline:%s] Processed URL set exceeded cap (%d > %d); "
-                "disabling VDB URL-skip filter for this run to avoid stale/shared namespace leakage",
+                "truncating URL-skip filter to cap to reduce stale/shared namespace leakage",
                 round_id,
                 len(already_processed_urls),
                 max_vdb_url_skip,
             )
-            already_processed_urls = set()
+            already_processed_urls = set(sorted(already_processed_urls)[:max_vdb_url_skip])
         logger.info(
             f"[CorrectivePipeline:{round_id}] Found {len(already_processed_urls)} " "already-processed URLs in VDB"
         )

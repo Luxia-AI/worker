@@ -113,8 +113,20 @@ class AdaptiveTrustPolicy:
         left = set(focus_tokens[: max(1, len(focus_tokens) // 2)])
         right = set(focus_tokens[max(1, len(focus_tokens) // 2) :]) or left
 
+        mention_patterns = (
+            r"\bbeliev(?:e|ed|es|ing)\b",
+            r"\bparticipants?\b",
+            r"\bsurvey\b",
+            r"\bhesitan(?:cy|t)\b",
+            r"\bodds?\s+ratio\b",
+            r"\bmisinformation\b",
+            r"\bconspiracy\b",
+            r"\bmyth\b",
+        )
         for ev in evidence_list:
             statement = str(getattr(ev, "statement", "") or "")
+            if any(re.search(p, statement, flags=re.IGNORECASE) for p in mention_patterns):
+                continue
             ev_tokens = self._token_set(statement)
             if not ev_tokens:
                 continue
