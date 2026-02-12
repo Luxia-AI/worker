@@ -835,8 +835,12 @@ class VerdictGenerator:
                 verdict_str = Verdict.FALSE.value
             elif profile["high_grade_support"] >= 1:
                 verdict_str = Verdict.TRUE.value
-            elif (profile["weak_support"] >= 1 or coverage_score >= 0.30) and verdict_str == Verdict.UNVERIFIABLE.value:
-                verdict_str = "MISLEADING"
+            elif (profile["weak_support"] >= 1 or coverage_score >= 0.30) and verdict_str in {
+                Verdict.UNVERIFIABLE.value,
+                Verdict.PARTIALLY_TRUE.value,
+            }:
+                misleading = getattr(Verdict, "MISLEADING", None)
+                verdict_str = misleading.value if misleading else "MISLEADING"
             logger.info(
                 "[VerdictGenerator][PolicyOverride] type=%s strength=%s polarity=%s subject=%s object=%s "
                 "high_grade_support=%d high_grade_contra=%d weak_support=%d verdict=%s",

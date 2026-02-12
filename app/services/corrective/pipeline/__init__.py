@@ -25,6 +25,7 @@ This approach MAXIMIZES quota efficiency by:
 """
 
 import os
+import re
 import urllib.parse
 import uuid
 from typing import Any, Awaitable, Callable, Dict, List, Optional
@@ -195,11 +196,9 @@ class CorrectivePipeline:
 
     @staticmethod
     def _classify_claim_frame(claim: str) -> Dict[str, Any]:
-        text = str(claim or "").strip().lower()
-        therapeutic = bool(
-            any(term in text for term in [" cure ", " cures ", " treat ", " treats ", "therapy", "effective against"])
-        )
-        strong = bool(any(term in text for term in [" cure ", " cures ", " eradicate ", " eliminate "]))
+        text = f" {str(claim or '').strip().lower()} "
+        therapeutic = bool(re.search(r"\b(cure|cures|treat|treats|therapy|effective against)\b", text))
+        strong = bool(re.search(r"\b(cure|cures|eradicate|eliminate)\b", text))
         return {
             "claim_type": "THERAPEUTIC_EFFICACY" if therapeutic else "GENERIC",
             "strength": "STRONG" if strong else "NORMAL",

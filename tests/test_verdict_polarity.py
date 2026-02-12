@@ -136,7 +136,6 @@ def test_unknown_segment_without_fact_is_aligned_and_marked_invalid_for_negation
 def test_strong_therapeutic_profile_triggers_misleading_for_weak_only_support():
     vg = _vg()
     claim = "Drinking green tea cures cancer."
-    claim_frame = vg._classify_claim_frame(claim)
     evidence = [
         {
             "statement": "Green tea cures cancer in anecdotal reports.",
@@ -147,16 +146,21 @@ def test_strong_therapeutic_profile_triggers_misleading_for_weak_only_support():
             "stance": "entails",
         }
     ]
-    profile = vg._therapeutic_evidence_profile(claim, claim_frame, evidence)
-    assert profile["high_grade_support"] == 0
-    assert profile["high_grade_contra"] == 0
-    assert profile["weak_support"] >= 1
+    llm_result = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.35,
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": "Drinking green tea cures cancer",
+                "status": "UNKNOWN",
+                "supporting_fact": "",
+                "source_url": "",
+            }
+        ],
+        "evidence_map": [],
+        "key_findings": [],
+    }
 
-    verdict = "UNVERIFIABLE"
-    if profile["high_grade_contra"] >= 1:
-        verdict = "FALSE"
-    elif profile["high_grade_support"] >= 1:
-        verdict = "TRUE"
-    elif profile["weak_support"] >= 1:
-        verdict = "MISLEADING"
-    assert verdict == "MISLEADING"
+    parsed = vg._parse_verdict_result(llm_result, claim, evidence)
+    assert parsed["verdict"] == "MISLEADING"

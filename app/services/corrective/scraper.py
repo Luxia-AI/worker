@@ -350,12 +350,7 @@ class Scraper:
         elif html is None:
             logger.info(f"[Scraper] Skipping Playwright fallback (client error): {url}")
 
-        if (
-            html is None
-            and status_code == 403
-            and url not in self._download_event_urls
-            and not self._should_skip_domain(url)
-        ):
+        if html is None and status_code == 403 and url not in self._download_event_urls:
             self._block_domain_for_cooldown(url, self.domain_403_cooldown_seconds, reason="persistent_403")
 
         if not isinstance(html, str) or not html:

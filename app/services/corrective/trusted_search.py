@@ -670,7 +670,17 @@ class TrustedSearch:
                 f"site:cochranelibrary.com {a_term} {b_term} {negatives}",
             ]
             # Prioritize clinical-efficacy queries for strong therapeutic claims.
-            queries = clinical_queries + queries
+            merged = clinical_queries + queries
+            seen: set[str] = set()
+            ordered: List[str] = []
+            for q in merged:
+                if q in seen:
+                    continue
+                seen.add(q)
+                ordered.append(q)
+                if len(ordered) >= max_queries:
+                    break
+            queries = ordered
 
         if len(b_variants) > 1 and len(queries) < max_queries:
             queries.append(f"{a_term} {negations[0]} {verb_variants[0]} {b_variants[1]} {negatives}")
