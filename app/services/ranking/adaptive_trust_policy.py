@@ -653,9 +653,12 @@ class AdaptiveTrustPolicy:
             and not (strong_coverage and strong_agreement)
             and (trust_post < 0.55 or top_sem < 0.60 or top_trust < 0.55)
         ):
-            logger.info(
-                "[AdaptiveTrustPolicy] Overriding sufficient=False due to weak relevance "
-                f"(trust_post={trust_post:.3f}, top_sem={top_sem:.3f}, top_trust={top_trust:.3f})"
+            logger.debug(
+                "[AdaptiveTrustPolicy] Applying weak relevance guard "
+                "(trust_post=%.3f, top_sem=%.3f, top_trust=%.3f)",
+                trust_post,
+                float(top_sem or 0.0),
+                float(top_trust or 0.0),
             )
             is_sufficient = False
             verdict_state = "evidence_insufficiency"

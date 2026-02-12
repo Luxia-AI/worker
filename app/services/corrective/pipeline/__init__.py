@@ -55,6 +55,7 @@ from app.services.kg.neo4j_client import Neo4jClient
 from app.services.llms.hybrid_service import get_groq_job_metadata, reset_groq_counter
 from app.services.logging.log_handler import LogManagerHandler
 from app.services.pipeline_debug_report import PipelineDebugReporter
+from app.services.ranking.evidence_snapshot import make_evidence_snapshot_id
 from app.services.ranking.trust_ranker import EvidenceItem, TrustRankingModule
 from app.services.retrieval.lexical_index import LexicalIndex
 from app.services.retrieval.metadata_enricher import TopicClassifier
@@ -294,6 +295,21 @@ class CorrectivePipeline:
             components["stance_mapped"] = stance_mapped
             ev.score_components = components
         return evidence_items
+
+    @staticmethod
+    def _evidence_snapshot_id_from_ranked(claim: str, ranked: List[Dict[str, Any]]) -> str:
+        class _SnapshotEv:
+            __slots__ = ("id", "domain", "source_url", "text")
+
+            def __init__(self, idx: int, item: Dict[str, Any]) -> None:
+                self.id = idx
+                src = str(item.get("source_url") or item.get("source") or "")
+                self.source_url = src
+                self.domain = urllib.parse.urlparse(src).netloc.lower().removeprefix("www.")
+                self.text = str(item.get("statement") or item.get("text") or "")
+
+        items = [_SnapshotEv(i, item) for i, item in enumerate(ranked or [])]
+        return make_evidence_snapshot_id(items, salt=claim).snapshot_id
 
     async def run(
         self,
@@ -694,6 +710,8 @@ class CorrectivePipeline:
             claim_frame["is_strong_therapeutic"],
         )
         new_trusted_urls_processed = 0
+        adaptive_cache: Dict[str, Dict[str, Any]] = {}
+        current_snapshot_id: Optional[str] = None
 
         for query_idx, query in enumerate(queries):
             # OPTIMIZATION: Hard limit on search queries to prevent runaway searches
@@ -896,9 +914,14 @@ class CorrectivePipeline:
             # Compute trust scores
             top_ranked_evidence = self._build_evidence_items(post_text, top_ranked)
 
-            adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(
-                post_text, top_ranked_evidence, internal_top_k
-            )
+            current_snapshot_id = self._evidence_snapshot_id_from_ranked(post_text, top_ranked)
+            if current_snapshot_id in adaptive_cache:
+                adaptive_trust = adaptive_cache[current_snapshot_id]
+            else:
+                adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(
+                    post_text, top_ranked_evidence, internal_top_k
+                )
+                adaptive_cache[current_snapshot_id] = adaptive_trust
             is_sufficient = adaptive_trust["is_sufficient"]
 
             logger.info(
@@ -974,9 +997,19 @@ class CorrectivePipeline:
         # Compute final trust scores
         final_top_ranked_evidence = self._build_evidence_items(post_text, top_ranked)
 
-        final_adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(
-            post_text, final_top_ranked_evidence, internal_top_k
-        )
+        final_snapshot_id = self._evidence_snapshot_id_from_ranked(post_text, top_ranked)
+        final_adaptive_trust = adaptive_cache.get(final_snapshot_id)
+        if final_adaptive_trust is None:
+            final_adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(
+                post_text, final_top_ranked_evidence, internal_top_k
+            )
+            adaptive_cache[final_snapshot_id] = final_adaptive_trust
+        else:
+            logger.info(
+                "[CorrectivePipeline:%s] Using memoized adaptive trust snapshot=%s",
+                round_id,
+                final_snapshot_id[:12],
+            )
         final_trust_post = self.trust_ranker.compute_post_trust(final_top_ranked_evidence, internal_top_k)
         final_trust_score = final_trust_post["trust_post"]
         adaptive_payload = self._trust_payload_adaptive(final_adaptive_trust)
@@ -987,6 +1020,8 @@ class CorrectivePipeline:
             ranked_evidence=top_ranked,
             top_k=internal_top_k,
             used_web_search=search_api_calls > 0,
+            adaptive_metrics=final_adaptive_trust,
+            evidence_snapshot_id=final_snapshot_id,
         )
 
         logger.info(

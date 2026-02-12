@@ -30,10 +30,13 @@ from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
+from app.services.ranking.contradiction_scorer import ContradictionScorer
 from app.services.ranking.subclaim_coverage import compute_subclaim_coverage, evaluate_anchor_match
 from app.services.ranking.trust_ranker import DummyStanceClassifier
 from app.services.retrieval.metadata_enricher import TopicClassifier
 from app.services.vdb.vdb_retrieval import VDBRetrieval
+from app.services.verdict.policy_override import OverrideSignals, therapeutic_strong_override
+from app.services.verdict.rationale_filter import is_efficacy_relevant
 from app.shared.anchor_extraction import AnchorExtractor
 
 logger = get_logger(__name__)
@@ -152,6 +155,7 @@ class VerdictGenerator:
         self.scraper = Scraper()
         self.trust_policy = AdaptiveTrustPolicy()
         self.stance_classifier = DummyStanceClassifier()
+        self.contradiction_scorer = ContradictionScorer(semantic_min=0.35)
         self.topic_classifier = TopicClassifier()
         self.MAX_WEB_ROUNDS_PRE_VERDICT = 2
         self.WEB_SEGMENTS_LIMIT = 3
@@ -283,6 +287,8 @@ class VerdictGenerator:
         top_k: int = 5,
         used_web_search: bool = False,
         cache_sufficient: bool = False,
+        adaptive_metrics: Optional[Dict[str, Any]] = None,
+        evidence_snapshot_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Generate a verdict for the claim based on ranked evidence.
@@ -385,7 +391,13 @@ class VerdictGenerator:
             )
 
             # Validate and parse result
-            verdict_result = self._parse_verdict_result(result, claim, top_evidence)
+            verdict_result = self._parse_verdict_result(
+                result,
+                claim,
+                top_evidence,
+                adaptive_metrics=adaptive_metrics,
+                evidence_snapshot_id=evidence_snapshot_id,
+            )
 
             logger.info(
                 f"[VerdictGenerator] Generated verdict: {verdict_result['verdict']} "
@@ -449,7 +461,13 @@ class VerdictGenerator:
                             temperature=LLM_TEMPERATURE_VERDICT,
                             call_tag="verdict_generation",
                         )
-                        verdict_result = self._parse_verdict_result(enriched_result, claim, top_evidence)
+                        verdict_result = self._parse_verdict_result(
+                            enriched_result,
+                            claim,
+                            top_evidence,
+                            adaptive_metrics=adaptive_metrics,
+                            evidence_snapshot_id=evidence_snapshot_id,
+                        )
                         logger.info(
                             "[VerdictGenerator] Re-generated verdict after targeted recovery: %s (confidence: %.2f)",
                             verdict_result["verdict"],
@@ -498,6 +516,8 @@ class VerdictGenerator:
         llm_result: Dict[str, Any],
         claim: str,
         evidence: List[Dict[str, Any]],
+        adaptive_metrics: Optional[Dict[str, Any]] = None,
+        evidence_snapshot_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Parse and validate LLM result, with fallback handling."""
         # Handle LLM error indicators
@@ -645,6 +665,8 @@ class VerdictGenerator:
             return any(t in tokens for t in neg_terms)
 
         stance_classifier = getattr(self, "stance_classifier", None) or DummyStanceClassifier()
+        claim_frame_for_alignment = self._classify_claim_frame(claim)
+        therapeutic_efficacy_claim = claim_frame_for_alignment.get("claim_type") == "THERAPEUTIC_EFFICACY"
 
         for seg in claim_breakdown:
             status = (seg.get("status") or "UNKNOWN").upper()
@@ -704,6 +726,8 @@ class VerdictGenerator:
                 except Exception:
                     stance = stance or "neutral"
             polarity_text = (fact or best_stmt or "").strip()
+            if therapeutic_efficacy_claim and polarity_text and not is_efficacy_relevant(polarity_text):
+                polarity_text = ""
             polarity = self._segment_polarity(seg_text, polarity_text, stance=stance)
             anchor_overlap = self._segment_anchor_overlap(seg_text, fact or "")
             try:
@@ -796,7 +820,17 @@ class VerdictGenerator:
         agreement_ratio = self._calculate_evidence_agreement_ratio(claim, evidence)
         coverage_score = float(reconciled.get("weighted_truth", 0.0) or 0.0)
         adaptive_trust_post = 0.0
-        if evidence:
+        if adaptive_metrics is not None:
+            coverage_score = float(adaptive_metrics.get("coverage", coverage_score) or coverage_score)
+            agreement_ratio = float(adaptive_metrics.get("agreement", agreement_ratio) or agreement_ratio)
+            diversity_score = float(adaptive_metrics.get("diversity", diversity_score) or diversity_score)
+            adaptive_trust_post = float(adaptive_metrics.get("trust_post", 0.0) or 0.0)
+            logger.info(
+                "[VerdictGenerator] Using memoized adaptive trust snapshot=%s trust_post=%.3f",
+                (evidence_snapshot_id or "none")[:12],
+                adaptive_trust_post,
+            )
+        elif evidence:
             try:
 
                 class _Ev:
@@ -831,21 +865,27 @@ class VerdictGenerator:
 
         if claim_frame.get("is_strong_therapeutic_affirm", False):
             profile = self._therapeutic_evidence_profile(claim, claim_frame, evidence)
-            if profile["high_grade_contra"] >= 1:
-                verdict_str = Verdict.FALSE.value
-            elif profile["high_grade_support"] >= 1:
-                verdict_str = Verdict.TRUE.value
-            elif (
-                profile["weak_support"] >= 1 or profile["scope_mismatch"] >= 1 or coverage_score >= 0.30
-            ) and verdict_str in {
-                Verdict.UNVERIFIABLE.value,
-                Verdict.PARTIALLY_TRUE.value,
-            }:
+            override_verdict, override_reason = therapeutic_strong_override(
+                OverrideSignals(
+                    high_grade_support=profile["high_grade_support"],
+                    high_grade_contra=profile["high_grade_contra"],
+                    relevant_noncurative=profile["weak_support"] + profile["scope_mismatch"],
+                    relevant_any=(
+                        profile["high_grade_support"]
+                        + profile["high_grade_contra"]
+                        + profile["weak_support"]
+                        + profile["scope_mismatch"]
+                    ),
+                )
+            )
+            if override_verdict == "MISLEADING":
                 misleading = getattr(Verdict, "MISLEADING", None)
                 verdict_str = misleading.value if misleading else "MISLEADING"
+            elif override_verdict in {Verdict.TRUE.value, Verdict.FALSE.value, Verdict.UNVERIFIABLE.value}:
+                verdict_str = override_verdict
             logger.info(
                 "[VerdictGenerator][PolicyOverride] type=%s strength=%s polarity=%s subject=%s object=%s "
-                "high_grade_support=%d high_grade_contra=%d weak_support=%d scope_mismatch=%d verdict=%s",
+                "high_grade_support=%d high_grade_contra=%d weak_support=%d scope_mismatch=%d verdict=%s reason=%s",
                 claim_frame["claim_type"],
                 claim_frame["strength"],
                 claim_frame["polarity"],
@@ -856,6 +896,7 @@ class VerdictGenerator:
                 profile["weak_support"],
                 profile["scope_mismatch"],
                 verdict_str,
+                override_reason,
             )
 
         if (

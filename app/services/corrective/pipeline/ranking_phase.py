@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 
 from app.core.logger import get_logger
 from app.services.logging.log_manager import LogManager
+from app.services.ranking.contradiction_scorer import ContradictionScorer
 from app.services.ranking.hybrid_ranker import hybrid_rank
 from app.services.ranking.trust_ranker import DummyStanceClassifier, TrustRanker
 from app.services.retrieval.evidence_gate import filter_candidates_for_count_claim
@@ -68,18 +69,18 @@ async def rank_candidates(
         query_text=query_text,
     )
     stance_classifier = DummyStanceClassifier()
-    contradicting_count = 0
+    scorer = ContradictionScorer(semantic_min=0.35)
     for item in ranked:
         statement = str(item.get("statement") or item.get("text") or "")
         stance = stance_classifier.classify_stance(query_text, statement) if statement else "neutral"
         item["stance"] = stance
         if stance == "contradicts":
-            contradicting_count += 1
             raw_score = float(item.get("final_score", 0.0) or 0.0)
             penalized = max(0.0, raw_score * 0.60)
             item["raw_final_score"] = raw_score
             item["final_score"] = penalized
             item["contradiction_penalty"] = round(raw_score - penalized, 4)
+    contradicting_count = scorer.score(ranked).contra_count
 
     ranked.sort(
         key=lambda r: (
