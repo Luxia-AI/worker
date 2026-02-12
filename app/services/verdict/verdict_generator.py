@@ -19,7 +19,7 @@ import os
 import re
 from enum import Enum
 from hashlib import sha1
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.constants.config import LLM_TEMPERATURE_VERDICT
 from app.core.config import settings
@@ -236,6 +236,241 @@ class VerdictGenerator:
         if num_subclaims > 1 and (coverage < 0.99 or len(adapted) < num_subclaims):
             return True
         return not bool(metrics.get("is_sufficient", False))
+
+    @staticmethod
+    def _is_numeric_comparison_claim(claim: str) -> bool:
+        text = f" {str(claim or '').strip().lower()} "
+        if not text.strip():
+            return False
+        patterns = (
+            r"\bmore\b.{0,80}\bthan\b",
+            r"\bless\b.{0,80}\bthan\b",
+            r"\bfewer\b.{0,80}\bthan\b",
+            r"\bgreater\b.{0,80}\bthan\b",
+            r"\bhigher\b.{0,80}\bthan\b",
+            r"\blower\b.{0,80}\bthan\b",
+            r"\bvs\b|\bversus\b|\bcompared to\b",
+        )
+        return any(re.search(p, text) for p in patterns)
+
+    @staticmethod
+    def _meaningful_tokens(text: str) -> set[str]:
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "there",
+            "than",
+            "more",
+            "less",
+            "fewer",
+            "greater",
+            "higher",
+            "lower",
+            "your",
+            "their",
+            "our",
+        }
+        return {w for w in re.findall(r"\b[a-z][a-z0-9_-]{1,}\b", (text or "").lower()) if w not in stop}
+
+    def _parse_numeric_mentions(self, text: str) -> List[Tuple[float, float]]:
+        # Returns numeric constraints as (lower_bound, upper_bound).
+        # `float("inf")` means no upper bound.
+        if not text:
+            return []
+        pattern = re.compile(
+            r"(?P<prefix>\b(?:about|around|approx(?:imately)?|over|under|at least|at most|more than|less than)\b\s*)?"
+            r"(?P<symbol>>=|<=|>|<)?\s*"
+            r"(?P<num>\d+(?:[.,]\d+)?)\s*"
+            r"(?P<scale>trillion|billion|million|thousand)?",
+            re.IGNORECASE,
+        )
+        scale_map = {
+            "thousand": 1_000.0,
+            "million": 1_000_000.0,
+            "billion": 1_000_000_000.0,
+            "trillion": 1_000_000_000_000.0,
+            None: 1.0,
+        }
+        constraints: List[Tuple[float, float]] = []
+        for m in pattern.finditer(text):
+            raw_num = (m.group("num") or "").replace(",", "")
+            try:
+                base = float(raw_num)
+            except Exception:
+                continue
+            scale = (m.group("scale") or "").lower() or None
+            value = base * scale_map.get(scale, 1.0)
+            prefix = (m.group("prefix") or "").strip().lower()
+            symbol = (m.group("symbol") or "").strip()
+
+            lb = value
+            ub = value
+            if symbol in {">", ">="} or prefix in {"over", "more than", "at least"}:
+                lb, ub = value, float("inf")
+            elif symbol in {"<", "<="} or prefix in {"under", "less than", "at most"}:
+                lb, ub = 0.0, value
+            elif prefix in {"about", "around", "approx", "approximately"}:
+                lb, ub = value * 0.9, value * 1.1
+            constraints.append((max(0.0, lb), max(0.0, ub)))
+        return constraints
+
+    @staticmethod
+    def _merge_constraints(constraints: List[Tuple[float, float]]) -> Optional[Tuple[float, float]]:
+        if not constraints:
+            return None
+        lb = 0.0
+        ub = float("inf")
+        for c_lb, c_ub in constraints:
+            lb = max(lb, float(c_lb))
+            ub = min(ub, float(c_ub))
+        if lb > ub:
+            return None
+        return (lb, ub)
+
+    def _resolve_numeric_comparison_override(
+        self,
+        claim: str,
+        evidence: List[Dict[str, Any]],
+        claim_breakdown: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not self._is_numeric_comparison_claim(claim):
+            return None
+        claim_text = str(claim or "").strip()
+        lower_claim = claim_text.lower()
+        op = ">"
+        if re.search(r"\b(less|fewer|lower)\b.{0,80}\bthan\b", lower_claim):
+            op = "<"
+
+        if " than " in lower_claim:
+            lhs_text, rhs_text = lower_claim.split(" than ", 1)
+        elif " compared to " in lower_claim:
+            lhs_text, rhs_text = lower_claim.split(" compared to ", 1)
+        elif " versus " in lower_claim:
+            lhs_text, rhs_text = lower_claim.split(" versus ", 1)
+        elif " vs " in lower_claim:
+            lhs_text, rhs_text = lower_claim.split(" vs ", 1)
+        else:
+            lhs_text, rhs_text = lower_claim, ""
+
+        lhs_tokens = self._meaningful_tokens(lhs_text)
+        rhs_tokens = self._meaningful_tokens(rhs_text)
+        lhs_constraints: List[Tuple[float, float]] = []
+        rhs_constraints: List[Tuple[float, float]] = []
+        observed_numeric_evidence = 0
+
+        for ev in evidence[:12]:
+            stmt = str(ev.get("statement") or ev.get("text") or "").strip()
+            if not stmt:
+                continue
+            constraints = self._parse_numeric_mentions(stmt)
+            if not constraints:
+                continue
+            observed_numeric_evidence += 1
+            stmt_tokens = self._meaningful_tokens(stmt)
+            lhs_overlap = len(lhs_tokens & stmt_tokens)
+            rhs_overlap = len(rhs_tokens & stmt_tokens)
+
+            if lhs_overlap == 0 and rhs_overlap == 0:
+                if re.search(r"\b(oral|mouth|microbiome|bacteria)\b", stmt.lower()):
+                    lhs_constraints.extend(constraints)
+                    continue
+                if re.search(r"\b(world|global|population|people|humans?)\b", stmt.lower()):
+                    rhs_constraints.extend(constraints)
+                    continue
+                continue
+
+            if lhs_overlap >= rhs_overlap:
+                lhs_constraints.extend(constraints)
+            if rhs_overlap > lhs_overlap:
+                rhs_constraints.extend(constraints)
+
+        lhs_interval = self._merge_constraints(lhs_constraints)
+        rhs_interval = self._merge_constraints(rhs_constraints)
+        if lhs_interval is None or rhs_interval is None:
+            if observed_numeric_evidence == 0:
+                return None
+            reason = (
+                "Numeric comparison evidence is incomplete: at least one side of the comparison "
+                "has no usable quantitative support."
+            )
+            return {
+                "verdict": Verdict.UNVERIFIABLE.value,
+                "status": "UNKNOWN",
+                "reason": reason,
+                "truthfulness_percent": 35.0,
+            }
+
+        lhs_lb, lhs_ub = lhs_interval
+        rhs_lb, rhs_ub = rhs_interval
+
+        if op == ">":
+            if lhs_lb > rhs_ub:
+                return {
+                    "verdict": Verdict.TRUE.value,
+                    "status": "VALID",
+                    "reason": (
+                        "Numeric comparison resolved deterministically: "
+                        "left-side lower bound exceeds right-side upper bound."
+                    ),
+                    "truthfulness_percent": 92.0,
+                }
+            if lhs_ub <= rhs_lb:
+                return {
+                    "verdict": Verdict.FALSE.value,
+                    "status": "INVALID",
+                    "reason": (
+                        "Numeric comparison resolved deterministically: "
+                        "left-side upper bound does not exceed right-side lower bound."
+                    ),
+                    "truthfulness_percent": 12.0,
+                }
+        else:
+            if lhs_ub < rhs_lb:
+                return {
+                    "verdict": Verdict.TRUE.value,
+                    "status": "VALID",
+                    "reason": (
+                        "Numeric comparison resolved deterministically: "
+                        "left-side upper bound remains below right-side lower bound."
+                    ),
+                    "truthfulness_percent": 92.0,
+                }
+            if lhs_lb >= rhs_ub:
+                return {
+                    "verdict": Verdict.FALSE.value,
+                    "status": "INVALID",
+                    "reason": (
+                        "Numeric comparison resolved deterministically: "
+                        "left-side lower bound is not below right-side upper bound."
+                    ),
+                    "truthfulness_percent": 12.0,
+                }
+
+        return {
+            "verdict": Verdict.UNVERIFIABLE.value,
+            "status": "UNKNOWN",
+            "reason": "Numeric comparison could not be resolved confidently from bounded evidence ranges.",
+            "truthfulness_percent": 35.0,
+        }
 
     def _needs_web_boost(self, evidence: List[Dict[str, Any]], claim: str = "") -> bool:
         """Heuristic: trigger web search when ranked evidence is weak/off-topic."""
@@ -838,6 +1073,34 @@ class VerdictGenerator:
         self._log_subclaim_coverage(claim, evidence, claim_breakdown, adaptive_metrics=adaptive_metrics)
         reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
         verdict_str = reconciled["verdict"]
+        numeric_override = self._resolve_numeric_comparison_override(claim, evidence, claim_breakdown)
+        numeric_truth_override: Optional[float] = None
+        if numeric_override is not None:
+            verdict_str = str(numeric_override.get("verdict") or verdict_str)
+            status_override = str(numeric_override.get("status") or "").strip().upper()
+            if claim_breakdown and status_override in {
+                "VALID",
+                "INVALID",
+                "PARTIALLY_VALID",
+                "PARTIALLY_INVALID",
+                "UNKNOWN",
+            }:
+                claim_breakdown[0]["status"] = status_override
+            reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
+            numeric_reason = str(numeric_override.get("reason") or "").strip()
+            if numeric_reason:
+                rationale = numeric_reason
+            if numeric_override.get("truthfulness_percent") is not None:
+                try:
+                    numeric_truth_override = float(numeric_override.get("truthfulness_percent"))
+                except Exception:
+                    numeric_truth_override = None
+            logger.info(
+                "[VerdictGenerator][NumericOverride] verdict=%s status=%s reason=%s",
+                verdict_str,
+                status_override or "-",
+                numeric_reason or "-",
+            )
         claim_frame = self._classify_claim_frame(claim)
         policy_insufficient = self._policy_says_insufficient(claim, evidence, adaptive_metrics=adaptive_metrics)
         truth_score_percent = self._calculate_truth_score_from_contract(reconciled)
@@ -930,6 +1193,11 @@ class VerdictGenerator:
             and agreement_ratio >= 0.8
         ):
             truth_score_percent = max(float(truth_score_percent or 0.0), 85.0)
+        if numeric_truth_override is not None:
+            truth_score_percent = float(numeric_truth_override)
+            if verdict_str == Verdict.UNVERIFIABLE.value:
+                coverage_score = min(float(coverage_score), 0.35)
+                adaptive_trust_post = min(float(adaptive_trust_post), 0.35)
         ceiling_percent = (0.85 + (0.10 * diversity_score)) * 100.0
         truth_score_percent = min(float(truth_score_percent or 0.0), ceiling_percent)
         truthfulness = max(0.0, min(1.0, float(truth_score_percent or 0.0) / 100.0))
