@@ -263,11 +263,31 @@ class CorrectivePipeline:
         is_sufficient = bool(adaptive_trust.get("is_sufficient", False))
         contradicted = int(adaptive_trust.get("contradicted_subclaims", 0) or 0)
         trust_post = float(adaptive_trust.get("trust_post", 0.0) or 0.0)
+        agreement = float(adaptive_trust.get("agreement", 0.0) or 0.0)
+        num_subclaims = int(adaptive_trust.get("num_subclaims", 0) or 0)
 
         if is_sufficient:
             return True, (
                 f"adaptive_sufficient=True coverage={coverage:.2f} diversity={diversity:.2f} "
                 f"strong_covered={strong_covered}"
+            )
+
+        # Contradiction-focused early stop for non-therapeutic claims:
+        # if contradiction signal is stable and broad enough, additional search rounds
+        # usually add latency without improving decision quality.
+        if (
+            not claim_frame.get("is_strong_therapeutic", False)
+            and contradicted >= max(1, num_subclaims)
+            and agreement >= 0.90
+            and diversity >= 0.60
+            and new_trusted_urls_processed >= 6
+            and trust_post <= 0.20
+        ):
+            return True, (
+                "stable contradiction stop "
+                f"(contradicted={contradicted}, agreement={agreement:.2f}, "
+                f"diversity={diversity:.2f}, trust_post={trust_post:.3f}, "
+                f"processed={new_trusted_urls_processed})"
             )
 
         if claim_frame.get("is_strong_therapeutic", False):
