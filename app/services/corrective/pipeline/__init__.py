@@ -1009,6 +1009,24 @@ class CorrectivePipeline:
                         comparative_monopoly_rounds,
                     )
                     break
+                strong_covered_now = int(adaptive_trust.get("strong_covered", 0) or 0)
+                trust_post_now = float(adaptive_trust.get("trust_post", 0.0) or 0.0)
+                if (
+                    search_api_calls >= 4
+                    and strong_covered_now == 0
+                    and comparative_hits <= 2
+                    and trust_post_now < 0.40
+                ):
+                    logger.info(
+                        "[CorrectivePipeline:%s] Comparative early-stop: saturated low-signal search "
+                        "(calls=%d hits=%d strong_covered=%d trust_post=%.3f).",
+                        round_id,
+                        search_api_calls,
+                        comparative_hits,
+                        strong_covered_now,
+                        trust_post_now,
+                    )
+                    break
 
             # Step 6: Check if adaptive trust sufficient - STOP to save quota!
             if is_sufficient:

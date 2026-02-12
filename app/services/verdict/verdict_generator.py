@@ -464,6 +464,7 @@ class VerdictGenerator:
                     "comparison evidence was found."
                 ),
                 "truthfulness_percent": 45.0,
+                "deterministic_gate": True,
             }
 
         lhs_interval = self._merge_constraints(lhs_constraints)
@@ -477,6 +478,7 @@ class VerdictGenerator:
                 "status": "UNKNOWN",
                 "reason": reason,
                 "truthfulness_percent": 45.0 if observed_numeric_evidence > 0 else 40.0,
+                "deterministic_gate": True,
             }
 
         lhs_lb, lhs_ub = lhs_interval
@@ -492,6 +494,7 @@ class VerdictGenerator:
                         "left-side lower bound exceeds right-side upper bound."
                     ),
                     "truthfulness_percent": 92.0,
+                    "deterministic_gate": True,
                 }
             if lhs_ub <= rhs_lb:
                 return {
@@ -502,6 +505,7 @@ class VerdictGenerator:
                         "left-side upper bound does not exceed right-side lower bound."
                     ),
                     "truthfulness_percent": 12.0,
+                    "deterministic_gate": True,
                 }
         else:
             if lhs_ub < rhs_lb:
@@ -513,6 +517,7 @@ class VerdictGenerator:
                         "left-side upper bound remains below right-side lower bound."
                     ),
                     "truthfulness_percent": 92.0,
+                    "deterministic_gate": True,
                 }
             if lhs_lb >= rhs_ub:
                 return {
@@ -523,6 +528,7 @@ class VerdictGenerator:
                         "left-side lower bound is not below right-side upper bound."
                     ),
                     "truthfulness_percent": 12.0,
+                    "deterministic_gate": True,
                 }
 
         return {
@@ -530,6 +536,7 @@ class VerdictGenerator:
             "status": "UNKNOWN",
             "reason": "Numeric comparison could not be resolved confidently from bounded evidence ranges.",
             "truthfulness_percent": 45.0,
+            "deterministic_gate": True,
         }
 
     def _needs_web_boost(self, evidence: List[Dict[str, Any]], claim: str = "") -> bool:
@@ -721,7 +728,7 @@ class VerdictGenerator:
             # If UNKNOWN segments remain, run bounded targeted recovery rounds.
             # Efficient strategy: try segment-targeted VDB retrieval first, then
             # do a minimal web pass only if required.
-            if not cache_sufficient:
+            if not cache_sufficient and not bool(verdict_result.get("skip_targeted_recovery", False)):
                 unknown_round_budget = self.MAX_UNKNOWN_ROUNDS_POST_VERDICT if not used_web_search else 1
                 for _ in range(max(1, unknown_round_budget)):
                     unknown_segments = self._get_unknown_segments(verdict_result)
@@ -1135,6 +1142,8 @@ class VerdictGenerator:
         verdict_str = reconciled["verdict"]
         numeric_override = self._resolve_numeric_comparison_override(claim, evidence, claim_breakdown)
         numeric_truth_override: Optional[float] = None
+        skip_targeted_recovery = False
+        numeric_conf_floor: Optional[float] = None
         if numeric_override is not None:
             verdict_str = str(numeric_override.get("verdict") or verdict_str)
             status_override = str(numeric_override.get("status") or "").strip().upper()
@@ -1146,6 +1155,10 @@ class VerdictGenerator:
                 "UNKNOWN",
             }:
                 claim_breakdown[0]["status"] = status_override
+                if status_override == "UNKNOWN":
+                    claim_breakdown[0]["supporting_fact"] = ""
+                    claim_breakdown[0]["source_url"] = ""
+                    claim_breakdown[0]["evidence_used_ids"] = []
             reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
             numeric_reason = str(numeric_override.get("reason") or "").strip()
             if numeric_reason:
@@ -1155,6 +1168,10 @@ class VerdictGenerator:
                     numeric_truth_override = float(numeric_override.get("truthfulness_percent"))
                 except Exception:
                     numeric_truth_override = None
+            if bool(numeric_override.get("deterministic_gate", False)):
+                skip_targeted_recovery = True
+                if verdict_str == Verdict.UNVERIFIABLE.value:
+                    numeric_conf_floor = 0.42
             logger.info(
                 "[VerdictGenerator][NumericOverride] verdict=%s status=%s reason=%s",
                 verdict_str,
@@ -1315,6 +1332,8 @@ class VerdictGenerator:
             verdict_str,
             is_comparative_claim=self._is_numeric_comparison_claim(claim),
         )
+        if numeric_conf_floor is not None:
+            confidence = max(float(confidence), float(numeric_conf_floor))
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
         if llm_verdict == Verdict.TRUE.value and verdict_str != Verdict.TRUE.value:
             try:
@@ -1344,6 +1363,7 @@ class VerdictGenerator:
             "agreement_ratio": agreement_ratio,
             "policy_sufficient": not policy_insufficient,
             "verdict_reconciled": bool(verdict_str != llm_verdict),
+            "skip_targeted_recovery": bool(skip_targeted_recovery),
         }
 
     def _segment_anchor_overlap(self, segment: str, statement: str) -> float:
