@@ -29,7 +29,7 @@ class LLMPriority(Enum):
     """Priority levels for LLM calls."""
 
     HIGH = "high"  # Use Groq (critical tasks: query reformulation, initial fact extraction)
-    LOW = "low"  # Use Local LLM (entity extraction, relation extraction, etc.)
+    LOW = "low"  # Non-critical calls that may be degraded when budget is constrained
 
 
 @dataclass
@@ -40,7 +40,6 @@ class GroqJobState:
     burst_enabled: bool = False
     degraded_mode: bool = False
     skipped_calls: list[str] = field(default_factory=list)
-    fallback_to_local: bool = False
     fact_extraction_override_used: bool = False
 
 
@@ -151,7 +150,6 @@ def get_groq_job_metadata() -> Dict[str, Any]:
         "reserved_critical_calls_total": reserved_verdict_calls + reserved_fact_calls,
         "degraded_mode": state.degraded_mode,
         "skipped_calls": skipped,
-        "fallback_to_local": state.fallback_to_local,
         "confidence_mode": _env_confidence_mode(),
         "fact_extraction_override_used": state.fact_extraction_override_used,
     }
@@ -164,7 +162,6 @@ class HybridLLMService:
     """
 
     groq_service: Optional[GroqService]
-    local_service: Optional[Any]
     _groq_semaphore: asyncio.Semaphore = asyncio.Semaphore(max(1, int(os.getenv("GROQ_MAX_IN_FLIGHT", "4"))))
 
     def __init__(self) -> None:
@@ -178,22 +175,8 @@ class HybridLLMService:
             self.groq_service = None
             self.groq_available = False
 
-        # Optional local fallback service (if implemented/configured in deployment)
-        self.local_service = None
-        self.local_available = False
-        local_enabled = (os.getenv("LOCAL_LLM_ENABLED", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
-        if local_enabled:
-            try:
-                from app.services.llms.local_service import LocalLLMService  # type: ignore
-
-                self.local_service = LocalLLMService()
-                self.local_available = True
-                logger.info("[HybridLLMService] Local LLM fallback available")
-            except Exception as e:
-                logger.warning("[HybridLLMService] Local fallback requested but unavailable: %s", e)
-
-        if not self.groq_available and not self.local_available:
-            raise RuntimeError("No LLM service available (Groq and local fallback unavailable)")
+        if not self.groq_available:
+            raise RuntimeError("No LLM service available (Groq unavailable)")
 
     def _mark_degraded_skip(self, call_tag: str) -> Dict[str, Any]:
         state = _groq_job_state.get()
@@ -339,19 +322,6 @@ class HybridLLMService:
             return max(192, base)
         return max(64, base)
 
-    async def _invoke_local(
-        self,
-        prompt: str,
-        response_format: str,
-        temperature: float | None,
-    ) -> Dict[str, Any]:
-        if not self.local_available or not self.local_service:
-            raise RuntimeError("Local LLM fallback unavailable")
-        state = _groq_job_state.get()
-        state.fallback_to_local = True
-        _groq_job_state.set(state)
-        return await self.local_service.ainvoke(prompt, response_format=response_format, temperature=temperature)
-
     async def ainvoke(
         self,
         prompt: str,
@@ -373,8 +343,7 @@ class HybridLLMService:
         Strategy:
         - Groq with per-job hard cap and reserved verdict-generation slot
         - Per-call output token caps by call type (TPM protection)
-        - Local fallback when available
-        - If local unavailable and call is non-critical, return degraded skip marker
+        - If quota unavailable and call is non-critical, return degraded skip marker
         """
         confidence_mode = _env_confidence_mode()
         critical_call = self._is_critical_call(call_tag)
@@ -412,9 +381,6 @@ class HybridLLMService:
                             max_tokens=max_tokens,
                             force_client="fallback",
                         )
-            if self.local_available and self.local_service:
-                logger.info("[HybridLLMService] Falling back to local LLM (budget unavailable)")
-                return await self._invoke_local(prompt, response_format, temperature)
             if priority == LLMPriority.LOW:
                 return self._mark_degraded_skip(call_tag or "non_critical")
             if budget_reason == "reserved_for_verdict":
@@ -497,10 +463,6 @@ class HybridLLMService:
                             )
                     except Exception as fallback_error:
                         logger.warning("[HybridLLMService] Fallback credential retry failed: %s", fallback_error)
-
-        if self.local_available and self.local_service:
-            logger.info("[HybridLLMService] Falling back to local LLM after Groq failure")
-            return await self._invoke_local(prompt, response_format, temperature)
 
         if priority == LLMPriority.LOW:
             return self._mark_degraded_skip(call_tag or "non_critical")

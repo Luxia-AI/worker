@@ -21,7 +21,6 @@ async def test_groq_never_exceeds_per_job_limit(monkeypatch):
     monkeypatch.setenv("GROQ_MAX_CALLS_PER_JOB", "2")
     monkeypatch.setenv("GROQ_RESERVED_VERDICT_CALLS", "0")
     monkeypatch.setenv("GROQ_RESERVED_FACT_EXTRACTION_CALLS", "0")
-    monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
 
     fake = _FakeGroqService()
     monkeypatch.setattr(hybrid_module, "GroqService", lambda: fake)
@@ -47,7 +46,6 @@ async def test_groq_never_exceeds_per_job_limit(monkeypatch):
 @pytest.mark.asyncio
 async def test_groq_limit_is_per_job(monkeypatch):
     monkeypatch.setenv("ALLOW_GROQ_BURST", "false")
-    monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
 
     fake = _FakeGroqService()
     monkeypatch.setattr(hybrid_module, "GroqService", lambda: fake)
@@ -70,7 +68,6 @@ async def test_reserve_one_verdict_call_budget(monkeypatch):
     monkeypatch.setenv("ALLOW_GROQ_BURST", "false")
     monkeypatch.setenv("GROQ_MAX_CALLS_PER_JOB", "2")
     monkeypatch.setenv("GROQ_RESERVED_VERDICT_CALLS", "1")
-    monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
 
     fake = _FakeGroqService()
     monkeypatch.setattr(hybrid_module, "GroqService", lambda: fake)
@@ -91,7 +88,6 @@ async def test_call_tag_specific_max_tokens_are_forwarded(monkeypatch):
     monkeypatch.setenv("ALLOW_GROQ_BURST", "false")
     monkeypatch.setenv("GROQ_MAX_CALLS_PER_JOB", "3")
     monkeypatch.setenv("GROQ_RESERVED_VERDICT_CALLS", "1")
-    monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
 
     fake = _FakeGroqService()
     monkeypatch.setattr(hybrid_module, "GroqService", lambda: fake)
@@ -122,7 +118,6 @@ async def test_fact_extraction_can_use_reserved_critical_pool(monkeypatch):
     monkeypatch.setenv("GROQ_MAX_CALLS_PER_JOB", "4")
     monkeypatch.setenv("GROQ_RESERVED_VERDICT_CALLS", "1")
     monkeypatch.setenv("GROQ_RESERVED_FACT_EXTRACTION_CALLS", "1")
-    monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
 
     fake = _FakeGroqService()
     monkeypatch.setattr(hybrid_module, "GroqService", lambda: fake)
@@ -157,7 +152,6 @@ async def test_high_priority_entity_extraction_can_consume_non_verdict_reserved_
     monkeypatch.setenv("GROQ_MAX_CALLS_PER_JOB", "4")
     monkeypatch.setenv("GROQ_RESERVED_VERDICT_CALLS", "1")
     monkeypatch.setenv("GROQ_RESERVED_FACT_EXTRACTION_CALLS", "1")
-    monkeypatch.setenv("LOCAL_LLM_ENABLED", "false")
 
     fake = _FakeGroqService()
     monkeypatch.setattr(hybrid_module, "GroqService", lambda: fake)
