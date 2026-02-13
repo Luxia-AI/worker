@@ -84,6 +84,7 @@ class Scraper:
         self._domain_failures: Dict[str, Dict[str, float]] = {}
         self._attempted_urls: set[str] = set()
         self._download_event_urls: set[str] = set()
+        self._pdf_403_skip_domains = {"stacks.cdc.gov"}
 
     def _get_headers(self) -> Dict[str, str]:
         """Get browser-like headers with random User-Agent."""
@@ -122,6 +123,15 @@ class Scraper:
         if key and key in self.domain_playwright_timeouts:
             return int(self.domain_playwright_timeouts[key])
         return int(default_timeout)
+
+    def _should_skip_playwright_for_pdf_403(self, url: str, status_code: int | None) -> bool:
+        if status_code != 403:
+            return False
+        low = (url or "").lower()
+        if ".pdf" not in low:
+            return False
+        domain = self._extract_domain(url) or ""
+        return domain in self._pdf_403_skip_domains
 
     def _should_skip_domain(self, url: str) -> bool:
         domain = self._extract_domain(url)
@@ -344,9 +354,13 @@ class Scraper:
         html, should_fallback, status_code = await self.fetch_html(session, url)
 
         if html is None and should_fallback:
-            logger.info(f"[Scraper] Falling back to Playwright: {url}")
-            timeout_override = self.who_playwright_timeout if is_who else max(self.playwright_timeout, 12000)
-            html = await self.playwright_fallback(url, timeout_override=timeout_override)
+            if self._should_skip_playwright_for_pdf_403(url, status_code):
+                logger.info("[Scraper] Skipping Playwright fallback for known PDF 403 domain: %s", url)
+                should_fallback = False
+            if should_fallback:
+                logger.info(f"[Scraper] Falling back to Playwright: {url}")
+                timeout_override = self.who_playwright_timeout if is_who else max(self.playwright_timeout, 12000)
+                html = await self.playwright_fallback(url, timeout_override=timeout_override)
         elif html is None:
             logger.info(f"[Scraper] Skipping Playwright fallback (client error): {url}")
 

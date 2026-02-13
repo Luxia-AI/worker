@@ -30,6 +30,41 @@ _STOP_WORDS = {
     "being",
 }
 
+_VERB_HINTS = {
+    "work",
+    "works",
+    "working",
+    "treat",
+    "treats",
+    "treating",
+    "prevent",
+    "prevents",
+    "preventing",
+    "reduce",
+    "reduces",
+    "reducing",
+    "contain",
+    "contains",
+    "containing",
+    "cause",
+    "causes",
+    "causing",
+    "against",
+}
+
+_REFUTATION_CUES = (
+    "does not",
+    "do not",
+    "not effective",
+    "ineffective",
+    "cannot",
+    "can't",
+    "no evidence",
+    "doesn't",
+    "aren't",
+    "isn't",
+)
+
 _NEGATION_PATTERNS = (
     r"\bdoes\s+not\b",
     r"\bdo\s+not\b",
@@ -129,6 +164,17 @@ def _contains_anchor(statement: str, anchor: str) -> bool:
     if " " in anchor:
         return anchor in low
     return bool(re.search(rf"\b{re.escape(anchor)}\b", low))
+
+
+def _object_tokens(text: str) -> set[str]:
+    return {tok for tok in _tokens(text) if len(tok) >= 4 and tok not in _VERB_HINTS}
+
+
+def _has_explicit_refutation_signal(text: str) -> bool:
+    low = (text or "").lower()
+    if not low:
+        return False
+    return any(cue in low for cue in _REFUTATION_CUES)
 
 
 def derive_anchor_groups(text: str, anchors: Sequence[str] | None = None) -> List[List[str]]:
@@ -315,14 +361,21 @@ def compute_subclaim_coverage(
         semantic = float(best.get("semantic_score", 0.0))
         anchor_hits = int(best.get("anchors_matched", 0))
         best_statement = _as_statement(evidence[best_idx]) if best_idx >= 0 and best_idx < len(evidence) else ""
+        sub_obj = _object_tokens(subclaim)
+        stmt_obj = _object_tokens(best_statement)
+        object_overlap = bool(sub_obj and stmt_obj and (sub_obj & stmt_obj))
+        explicit_refutation = _has_explicit_refutation_signal(best_statement)
         claim_has_negation = _has_negation(subclaim)
         evidence_has_negation = _has_negation(best_statement)
         negation_mismatch = claim_has_negation != evidence_has_negation
         high_semantic_mismatch = (
             semantic >= 0.80
             and negation_mismatch
+            and (object_overlap or explicit_refutation)
             and (_aligned_non_negated(subclaim, best_statement) or anchor_hits >= 1)
         )
+        if contradicted and not (object_overlap or explicit_refutation):
+            contradicted = False
         if high_semantic_mismatch:
             contradicted = True
             status = "INVALID"
