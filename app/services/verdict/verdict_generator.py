@@ -1424,7 +1424,10 @@ class VerdictGenerator:
         map_support_signal, map_contradict_signal, map_admissible_count, map_offtopic_count = (
             self._evidence_map_signal_strengths(claim, evidence_map)
         )
-        weak_signal_no_stance = map_support_signal < 0.65 and map_contradict_signal < 0.65
+        decisive_support = map_support_signal >= 0.58 and map_contradict_signal <= 0.40
+        decisive_contradict = map_contradict_signal >= 0.58 and map_support_signal <= 0.40
+        conflicting_signals = map_support_signal >= 0.45 and map_contradict_signal >= 0.45
+        weak_signal_no_stance = (not decisive_support and not decisive_contradict) or conflicting_signals
         if weak_signal_no_stance:
             policy_insufficient = True
         canonical_stance = breakdown_stance
@@ -1531,6 +1534,26 @@ class VerdictGenerator:
         if weak_signal_no_stance:
             truth_score_percent = max(35.0, min(55.0, float(truth_score_percent or 0.0)))
             confidence = min(float(confidence), 0.55)
+            for seg in claim_breakdown or []:
+                if str(seg.get("status", "UNKNOWN")).upper() in {
+                    "VALID",
+                    "INVALID",
+                    "PARTIALLY_VALID",
+                    "PARTIALLY_INVALID",
+                }:
+                    seg["status"] = "UNKNOWN"
+                    seg["supporting_fact"] = ""
+                    seg["source_url"] = ""
+                    seg["evidence_used_ids"] = []
+                    seg["alignment_debug"] = {
+                        "reason": "insufficient_admissible_evidence",
+                        "support_signal": round(map_support_signal, 3),
+                        "contradict_signal": round(map_contradict_signal, 3),
+                    }
+            rationale = (
+                "Available evidence is mixed or insufficiently decisive for this claim, "
+                "so the result is UNVERIFIABLE."
+            )
         if verdict_str == Verdict.UNVERIFIABLE.value and numeric_truth_override is None:
             truth_score_percent = max(35.0, min(65.0, float(truth_score_percent or 0.0)))
         if self._has_absolute_quantifier(claim) and verdict_str == Verdict.TRUE.value:
@@ -1619,6 +1642,9 @@ class VerdictGenerator:
                 "map_admissible_signal_count": int(map_admissible_count),
                 "map_offtopic_count": int(map_offtopic_count),
                 "weak_signal_no_stance": bool(weak_signal_no_stance),
+                "decisive_support_signal": bool(decisive_support),
+                "decisive_contradict_signal": bool(decisive_contradict),
+                "conflicting_signal_band": bool(conflicting_signals),
                 "llm_verdict_raw": llm_verdict,
                 "llm_verdict_changed": bool(llm_verdict != verdict_str),
             },
@@ -2298,6 +2324,13 @@ class VerdictGenerator:
             if self._is_claim_mention_statement(statement):
                 relevance = "NEUTRAL"
                 relevance_score *= 0.25
+            dna_rel = self._dna_integration_relevance(claim, statement)
+            if dna_rel == "SUPPORTS":
+                relevance = "SUPPORTS"
+                relevance_score = max(relevance_score, 0.70)
+            elif dna_rel == "CONTRADICTS":
+                relevance = "CONTRADICTS"
+                relevance_score = max(relevance_score, 0.70)
             numeric_rel = self._numeric_relation_relevance(claim, statement)
             if numeric_rel == "CONTRADICTS":
                 relevance = "CONTRADICTS"
@@ -3095,6 +3128,31 @@ class VerdictGenerator:
                 contradict_max = max(contradict_max, score)
 
         return support_max, contradict_max, admissible_count, offtopic_count
+
+    @staticmethod
+    def _dna_integration_relevance(claim: str, statement: str) -> str:
+        seg = (claim or "").lower()
+        stmt = (statement or "").lower()
+        if not (("integrate" in seg or "integration" in seg) and "dna" in seg):
+            return "NEUTRAL"
+
+        supports = bool(
+            re.search(
+                r"\b(may|can|could|does|do|is|are)?\s*integrat(?:e|es|ed|ion)\b.{0,30}\b(dna|genom(?:e|ic))\b",
+                stmt,
+            )
+        ) or bool(re.search(r"\b(reverse transcription|genomic integration|integrate into the human genome)\b", stmt))
+        contradicts = bool(
+            re.search(
+                r"\b(do(?:es)?\s+not|cannot|can't|not)\b.{0,30}\b(integrat(?:e|ion)|alter|change)\b.{0,30}\bdna\b",
+                stmt,
+            )
+        ) or bool(re.search(r"\bdoes not integrate with (our|human) dna\b", stmt))
+        if supports and not contradicts:
+            return "SUPPORTS"
+        if contradicts and not supports:
+            return "CONTRADICTS"
+        return "NEUTRAL"
 
     @staticmethod
     def _has_absolute_quantifier(text: str) -> bool:
