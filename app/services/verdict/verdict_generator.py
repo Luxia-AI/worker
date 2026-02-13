@@ -1429,6 +1429,8 @@ class VerdictGenerator:
         if canonical_stance == "neutral":
             canonical_stance = top_stance
 
+        strong_vote_contradiction = vote_decision == Verdict.FALSE.value and vote_contradict >= 0.65
+        strong_vote_support = vote_decision == Verdict.TRUE.value and vote_support >= 0.65
         if vote_decision in {Verdict.TRUE.value, Verdict.FALSE.value}:
             verdict_str = vote_decision
 
@@ -1505,8 +1507,17 @@ class VerdictGenerator:
                 and admissible_ratio >= 0.50
             )
             binary_gate_ok = bool(binary_gate_ok or strong_contradiction_exception)
+            if strong_vote_contradiction:
+                binary_gate_ok = True
             if not binary_gate_ok:
                 verdict_str = Verdict.UNVERIFIABLE.value
+        if strong_vote_contradiction:
+            verdict_str = Verdict.FALSE.value
+            truth_score_percent = min(float(truth_score_percent or 0.0), 10.0)
+            confidence = max(float(confidence), 0.70)
+        elif strong_vote_support and self._has_absolute_quantifier(claim):
+            verdict_str = Verdict.PARTIALLY_TRUE.value
+            truth_score_percent = min(float(truth_score_percent or 0.0), 55.0)
         if numeric_conf_floor is not None:
             confidence = max(float(confidence), float(numeric_conf_floor))
         if verdict_str == Verdict.UNVERIFIABLE.value and numeric_truth_override is None:
@@ -2057,6 +2068,47 @@ class VerdictGenerator:
         stmt_tokens = self._topic_tokens(statement)
         if len(seg_tokens) >= 3 and len(seg_tokens & stmt_tokens) == 0 and not (seg_concepts & stmt_concepts):
             return False
+        if not self._predicate_guard_ok(segment, statement):
+            return False
+        return True
+
+    @staticmethod
+    def _predicate_guard_ok(segment: str, statement: str) -> bool:
+        seg = (segment or "").lower()
+        stmt = (statement or "").lower()
+        if not seg or not stmt:
+            return False
+
+        # DNA integration claims need integration/genomic predicate evidence (or explicit negation).
+        if ("integrate" in seg or "integration" in seg) and "dna" in seg:
+            has_predicate = bool(
+                re.search(
+                    r"\b(integrat(?:e|es|ed|ion)|genom(?:e|ic)|incorporat(?:e|ed|ion)|reverse transcription)\b",
+                    stmt,
+                )
+            )
+            has_explicit_neg = bool(
+                re.search(
+                    r"\b(do(?:es)?\s+not|cannot|can't|not)\b.{0,30}\b(integrat(?:e|ion)|alter|change)\b.{0,30}\bdna\b",
+                    stmt,
+                )
+            )
+            return has_predicate or has_explicit_neg
+
+        # Smoking -> lung cancer risk claims require both entities and risk predicate.
+        if "smoking" in seg and "lung" in seg and "cancer" in seg:
+            has_entities = ("smoking" in stmt) and ("lung" in stmt) and ("cancer" in stmt)
+            has_predicate = bool(re.search(r"\b(risk|increase|increases|cause|causes|associated)\b", stmt))
+            return has_entities and has_predicate
+
+        # Vitamin C -> common cold claims require both entities and prevention/treatment predicate.
+        if "vitamin" in seg and "cold" in seg:
+            has_entities = ("vitamin c" in stmt or ("vitamin" in stmt and "c" in stmt)) and ("cold" in stmt)
+            has_predicate = bool(
+                re.search(r"\b(prevent|prevents|prevention|reduce|reduces|treat|treatment|duration)\b", stmt)
+            )
+            return has_entities and has_predicate
+
         return True
 
     @staticmethod
@@ -2335,6 +2387,15 @@ class VerdictGenerator:
                 ev = evidence_by_id.get(ev_id, {})
                 statement = (best_item.get("statement") or ev.get("statement") or ev.get("text") or "").strip()
                 source_url = (best_item.get("source_url") or ev.get("source_url") or ev.get("source") or "").strip()
+                rel = str(best_item.get("relevance") or "NEUTRAL").upper()
+                if rel == "CONTRADICTS":
+                    seg["status"] = "INVALID"
+                elif rel in {"SUPPORTS", "VALID"}:
+                    seg["status"] = "VALID"
+                elif rel in {"PARTIALLY_SUPPORTS", "PARTIAL"}:
+                    seg["status"] = "PARTIALLY_VALID"
+                elif rel in {"PARTIALLY_CONTRADICTS"}:
+                    seg["status"] = "PARTIALLY_INVALID"
                 if statement:
                     seg["supporting_fact"] = statement
                 if statement and source_url:
@@ -2972,7 +3033,7 @@ class VerdictGenerator:
         low = (text or "").lower()
         return bool(
             re.search(
-                r"\b(always|never|all|none|every|entirely|completely|must|only)\b",
+                r"\b(always|never|all|none|every|entirely|completely|must|only|prevents|prevents|cures|cure)\b",
                 low,
             )
         )
