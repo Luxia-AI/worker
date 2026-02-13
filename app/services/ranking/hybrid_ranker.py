@@ -38,6 +38,53 @@ UNCERTAINTY_PHRASES = (
 )
 
 
+def _object_tokens_for_query(text: str) -> set[str]:
+    if not text:
+        return set()
+    m = re.search(r"\b(?:against|for|on)\s+(.+)$", text.lower())
+    if not m:
+        return set()
+    stop = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "to",
+        "for",
+        "of",
+        "in",
+        "on",
+        "with",
+        "by",
+        "at",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+    }
+    return {w for w in re.findall(r"\b[\w']+\b", m.group(1)) if w not in stop and len(w) > 2}
+
+
+def _statement_tokens(text: str) -> set[str]:
+    return {w for w in re.findall(r"\b[\w']+\b", (text or "").lower()) if len(w) > 2}
+
+
+def _has_object_refutation_signal(statement: str) -> bool:
+    low = (statement or "").lower()
+    patterns = (
+        r"\bonly\s+(?:for|against)\b",
+        r"\bdo(?:es)?\s+not\s+work\s+(?:for|against|on)\b",
+        r"\bnot\s+effective\s+(?:for|against)\b",
+        r"\bineffective\s+(?:for|against)\b",
+        r"\bviral\b",
+    )
+    return any(re.search(p, low) for p in patterns)
+
+
 def _safe_float(v: Optional[float], default: float = 0.0) -> float:
     try:
         return float(v) if v is not None else default
@@ -326,6 +373,7 @@ def hybrid_rank(
     # Compute final score for each candidate
     results: List[Dict[str, Any]] = []
     now = now or datetime.now(timezone.utc)
+    query_object_tokens = _object_tokens_for_query(query_text)
 
     for key, item in candidates_map.items():
         sem_s = sem_norm_map.get(key, 0.0)
@@ -378,6 +426,10 @@ def hybrid_rank(
         is_backfill = bool(item.get("is_backfill", False))
         if is_backfill and not (ent_s >= 0.25 or kg_s >= 0.55 or kg_raw >= 0.55):
             final_score *= 0.85
+        stmt_tokens = _statement_tokens(item["statement"])
+        object_overlap = len(query_object_tokens & stmt_tokens) if query_object_tokens else 0
+        if query_object_tokens and object_overlap == 0 and not _has_object_refutation_signal(item["statement"]):
+            final_score *= 0.55
         final_score -= uncertainty_penalty
 
         # small heuristic: if both sem and kg are zero but credibility high, ensure min floor
@@ -414,6 +466,9 @@ def hybrid_rank(
             and not ((kg_s >= 0.55 or kg_raw >= 0.45) and ent_s >= 0.20 and claim_overlap >= 0.08)
         ):
             continue
+        if query_object_tokens and object_overlap == 0 and claim_overlap < 0.40 and sem_s < 0.90 and kg_raw < 0.90:
+            if not _has_object_refutation_signal(item["statement"]):
+                continue
         if sem_s < 0.20 and claim_overlap < 0.08 and ent_s < 0.20 and kg_raw < 0.40:
             continue
         results.append(out)

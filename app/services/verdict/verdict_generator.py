@@ -1035,6 +1035,22 @@ class VerdictGenerator:
                 if best_idx >= 0:
                     seg["evidence_used_ids"] = [best_idx]
 
+            # Replace mention/survey phrasing with stronger aligned evidence for non-belief claims.
+            if (
+                best_ev is not None
+                and not self._segment_is_belief_or_survey_claim(seg_text)
+                and fact
+                and self._is_claim_mention_statement(fact)
+            ):
+                if best_stmt and not self._is_claim_mention_statement(best_stmt):
+                    seg["supporting_fact"] = best_stmt
+                    fact = best_stmt
+                if best_src:
+                    seg["source_url"] = best_src
+                    src = best_src
+                if best_idx >= 0:
+                    seg["evidence_used_ids"] = [best_idx]
+
             # Polarity guardrails (hard): contradiction cannot be labeled VALID/PARTIALLY_VALID.
             seg_neg = _has_negation(seg_text)
             fact_neg = _has_negation(fact)
