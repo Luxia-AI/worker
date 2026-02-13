@@ -41,7 +41,12 @@ from app.shared.anchor_extraction import AnchorExtractor
 
 logger = get_logger(__name__)
 _SEGMENT_EVIDENCE_MIN_OVERLAP = float(os.getenv("SEGMENT_EVIDENCE_MIN_OVERLAP", "0.20"))
-_POLARITY_DEBUG = os.getenv("VERDICT_DEBUG_POLARITY", "0").strip().lower() in {"1", "true", "yes", "on"}
+_POLARITY_DEBUG = os.getenv("VERDICT_DEBUG_POLARITY", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 class Verdict(Enum):
@@ -164,7 +169,12 @@ class VerdictGenerator:
         if env_flag is None:
             self.confidence_mode = bool(getattr(settings, "LUXIA_CONFIDENCE_MODE", False))
         else:
-            self.confidence_mode = env_flag.strip().lower() in {"1", "true", "yes", "on"}
+            self.confidence_mode = env_flag.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
 
     def _quick_web_score(self, segment: str, fact_stmt: str, conf: float) -> float:
         stop = {
@@ -387,7 +397,10 @@ class VerdictGenerator:
             )
         )
         has_quant = bool(
-            re.search(r"\b\d+(?:\.\d+)?\b|\b(days?|hours?|weeks?|months?|years?|mortality|survival)\b", low)
+            re.search(
+                r"\b\d+(?:\.\d+)?\b|\b(days?|hours?|weeks?|months?|years?|mortality|survival)\b",
+                low,
+            )
         )
         stmt_tokens = self._meaningful_tokens(stmt)
         lhs_overlap = len(lhs_tokens & stmt_tokens)
@@ -1109,13 +1122,19 @@ class VerdictGenerator:
                 if no_object_overlap and not self._is_explicit_refutation_statement(polarity_text):
                     seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
             status = (seg.get("status") or "UNKNOWN").upper()
-            if status in {"VALID", "PARTIALLY_VALID"} and self._is_claim_mention_statement(polarity_text):
+            if status in {
+                "VALID",
+                "PARTIALLY_VALID",
+            } and self._is_claim_mention_statement(polarity_text):
                 seg["status"] = "UNKNOWN"
                 seg["supporting_fact"] = ""
                 seg["source_url"] = ""
                 seg["evidence_used_ids"] = []
             status = (seg.get("status") or "UNKNOWN").upper()
-            if status in {"INVALID", "PARTIALLY_INVALID"} and self._is_claim_mention_statement(polarity_text):
+            if status in {
+                "INVALID",
+                "PARTIALLY_INVALID",
+            } and self._is_claim_mention_statement(polarity_text):
                 if not self._segment_is_belief_or_survey_claim(seg_text) and not self._is_explicit_refutation_statement(
                     polarity_text
                 ):
@@ -1282,7 +1301,13 @@ class VerdictGenerator:
             try:
 
                 class _Ev:
-                    __slots__ = ("statement", "source_url", "semantic_score", "stance", "trust")
+                    __slots__ = (
+                        "statement",
+                        "source_url",
+                        "semantic_score",
+                        "stance",
+                        "trust",
+                    )
 
                     def __init__(self, d: Dict[str, Any]):
                         self.statement = d.get("statement") or d.get("text") or ""
@@ -1362,7 +1387,11 @@ class VerdictGenerator:
             if override_verdict == "MISLEADING":
                 misleading = getattr(Verdict, "MISLEADING", None)
                 verdict_str = misleading.value if misleading else "MISLEADING"
-            elif override_verdict in {Verdict.TRUE.value, Verdict.FALSE.value, Verdict.UNVERIFIABLE.value}:
+            elif override_verdict in {
+                Verdict.TRUE.value,
+                Verdict.FALSE.value,
+                Verdict.UNVERIFIABLE.value,
+            }:
                 verdict_str = override_verdict
             logger.info(
                 "[VerdictGenerator][PolicyOverride] type=%s strength=%s polarity=%s subject=%s object=%s "
@@ -1421,9 +1450,12 @@ class VerdictGenerator:
         rationale_stance = self._rationale_polarity_hint(rationale)
         top_stance, top_stance_score = self._top_admissible_stance_signal(claim, evidence_map)
         vote_decision, vote_support, vote_contradict = self._stance_vote_decision(claim, evidence_map)
-        map_support_signal, map_contradict_signal, map_admissible_count, map_offtopic_count = (
-            self._evidence_map_signal_strengths(claim, evidence_map)
-        )
+        (
+            map_support_signal,
+            map_contradict_signal,
+            map_admissible_count,
+            map_offtopic_count,
+        ) = self._evidence_map_signal_strengths(claim, evidence_map)
         decisive_support = map_support_signal >= 0.58 and map_contradict_signal <= 0.40
         decisive_contradict = map_contradict_signal >= 0.58 and map_support_signal <= 0.40
         conflicting_signals = map_support_signal >= 0.45 and map_contradict_signal >= 0.45
@@ -1517,7 +1549,17 @@ class VerdictGenerator:
                 and agreement_ratio >= 0.80
                 and admissible_ratio >= 0.50
             )
-            binary_gate_ok = bool(binary_gate_ok or strong_contradiction_exception)
+            strong_support_exception = (
+                verdict_str == Verdict.TRUE.value
+                and canonical_stance == "entails"
+                and coverage_score >= 0.90
+                and agreement_ratio >= 0.90
+                and admissible_ratio >= 0.60
+                and top_stance == "entails"
+                and top_stance_score >= 0.68
+                and map_contradict_signal < 0.35
+            )
+            binary_gate_ok = bool(binary_gate_ok or strong_contradiction_exception or strong_support_exception)
             if strong_vote_contradiction:
                 binary_gate_ok = True
             if not binary_gate_ok:
@@ -1864,6 +1906,9 @@ class VerdictGenerator:
             "hyperactivity": ["hyperactivity", "adhd", "attention deficit"],
             "egg": ["egg", "eggs"],
             "heart": ["heart", "cardiovascular", "cvd", "cholesterol"],
+            "hypertension": ["hypertension", "high blood pressure", "blood pressure"],
+            "headache": ["headache", "headaches"],
+            "symptom": ["symptom", "symptoms", "asymptomatic", "silent"],
         }
 
     def _concept_hits(self, text: str) -> set[str]:
@@ -1883,7 +1928,10 @@ class VerdictGenerator:
 
         subject = ""
         obj = ""
-        m = re.search(r"(?P<subject>.+?)\b(cure|cures|treat|treats|prevent|prevents)\b\s+(?P<object>.+)", text)
+        m = re.search(
+            r"(?P<subject>.+?)\b(cure|cures|treat|treats|prevent|prevents)\b\s+(?P<object>.+)",
+            text,
+        )
         if m:
             subject = re.sub(r"\b(drinking|taking|using|consuming)\b", "", m.group("subject")).strip(" ,.")
             obj = m.group("object").strip(" ,.")
@@ -2008,11 +2056,91 @@ class VerdictGenerator:
                     hits.add(group)
             return hits
 
+        def _is_antibiotic_viral_inefficacy_claim(text: str) -> bool:
+            low = (text or "").lower()
+            has_antibiotic = bool(re.search(r"\bantibiotic(?:s|al)?\b", low))
+            has_viral_target = bool(re.search(r"\b(viral?|virus(?:es)?|common cold|flu|influenza)\b", low))
+            has_negative_efficacy = bool(
+                re.search(
+                    r"\b(do(?:es)?\s+not|cannot|can't|ineffective|no effect|not effective)\b.{0,30}\b"
+                    r"(work|treat|help|cure|prevent)\b",
+                    low,
+                )
+            )
+            return has_antibiotic and has_viral_target and has_negative_efficacy
+
+        def _misuse_implies_inefficacy(text: str) -> bool:
+            low = (text or "").lower()
+            has_antibiotic = bool(re.search(r"\bantibiotic(?:s|al)?\b", low))
+            has_viral_target = bool(re.search(r"\b(viral?|virus(?:es)?|common cold|flu|influenza)\b", low))
+            misuse_pattern = bool(
+                re.search(
+                    r"\b(misus(?:e|ed)|inappropriate|unnecessary|overprescrib(?:e|ed|ing)|" r"not recommended)\b",
+                    low,
+                )
+            )
+            return has_antibiotic and has_viral_target and misuse_pattern
+
+        def _is_hypertension_symptom_claim(text: str) -> bool:
+            low = (text or "").lower()
+            has_condition = bool(re.search(r"\b(hypertension|high blood pressure|blood pressure)\b", low))
+            has_symptom_focus = bool(
+                re.search(
+                    r"\b(symptom|symptoms|headache|headaches|noticeable|silent|asymptomatic)\b",
+                    low,
+                )
+            )
+            return has_condition and has_symptom_focus
+
+        def _hypertension_symptom_polarity(text: str) -> str:
+            low = (text or "").lower()
+            has_condition = bool(re.search(r"\b(hypertension|high blood pressure|blood pressure)\b", low))
+            if not has_condition:
+                return "neutral"
+            no_symptoms = bool(
+                re.search(
+                    r"\b(no symptoms?|asymptomatic|silent (condition|killer)|"
+                    r"often has no symptoms?|usually has no symptoms?)\b",
+                    low,
+                )
+            )
+            has_symptoms = bool(
+                re.search(
+                    r"\b(has symptoms?|noticeable symptoms?|symptoms? like headaches?|"
+                    r"headaches? (are|is) (common|typical|reliable))\b",
+                    low,
+                )
+            )
+            if no_symptoms and not has_symptoms:
+                return "contradicts"
+            if has_symptoms and not no_symptoms:
+                return "entails"
+            return "neutral"
+
         seg_neg = _has_semantic_negation(seg)
         stmt_neg = _has_semantic_negation(stmt)
         seg_groups = _predicate_groups(seg)
         stmt_groups = _predicate_groups(stmt)
         same_predicate = bool(seg_groups & stmt_groups)
+
+        # Special-case biomedical efficacy framing:
+        # "misused/inappropriate for viral infections" supports claims that antibiotics
+        # do not work against viruses, even when statement phrasing includes "treating".
+        if _is_antibiotic_viral_inefficacy_claim(seg) and _misuse_implies_inefficacy(stmt):
+            return "entails"
+
+        # Hypertension symptom framing:
+        # "silent/asymptomatic/no symptoms" should contradict claims that BP usually
+        # has noticeable symptoms (e.g., headaches).
+        if _is_hypertension_symptom_claim(seg):
+            seg_h = _hypertension_symptom_polarity(seg)
+            stmt_h = _hypertension_symptom_polarity(stmt)
+            if seg_h == "entails" and stmt_h == "contradicts":
+                return "contradicts"
+            if seg_h == "contradicts" and stmt_h == "entails":
+                return "contradicts"
+            if seg_h != "neutral" and seg_h == stmt_h:
+                return "entails"
 
         # Negation symmetry guard (runs before stance fallback):
         # negative + negative over same predicate => support, not contradiction.
@@ -2099,14 +2227,20 @@ class VerdictGenerator:
     def _segment_topic_guard_ok(self, segment: str, statement: str) -> bool:
         seg_concepts = self._concept_hits(segment)
         stmt_concepts = self._concept_hits(statement)
-        if {"vaccine", "flu"}.issubset(seg_concepts) and not {"vaccine", "flu"}.issubset(stmt_concepts):
+        if {"vaccine", "flu"}.issubset(seg_concepts) and not {
+            "vaccine",
+            "flu",
+        }.issubset(stmt_concepts):
             return False
         if "antibiotic" in seg_concepts and ({"cold", "flu", "virus"} & seg_concepts):
             if "antibiotic" not in stmt_concepts:
                 return False
             if not ({"cold", "flu", "virus"} & stmt_concepts):
                 return False
-        if {"sugar", "hyperactivity"}.issubset(seg_concepts) and not {"sugar", "hyperactivity"}.issubset(stmt_concepts):
+        if {"sugar", "hyperactivity"}.issubset(seg_concepts) and not {
+            "sugar",
+            "hyperactivity",
+        }.issubset(stmt_concepts):
             return False
 
         seg_tokens = self._topic_tokens(segment)
@@ -2146,26 +2280,134 @@ class VerdictGenerator:
             has_predicate = bool(re.search(r"\b(risk|increase|increases|cause|causes|associated)\b", stmt))
             return has_entities and has_predicate
 
+        # Smoking vascular-risk claims should keep disease target alignment strict.
+        if "smoking" in seg and bool(re.search(r"\b(risk|increase|increases|cause|causes|associated)\b", seg)):
+            requires_stroke = "stroke" in seg
+            requires_heart = bool(
+                re.search(
+                    r"\b(heart disease|cardiovascular disease|coronary heart disease|heart attack)\b",
+                    seg,
+                )
+            )
+            if requires_stroke or requires_heart:
+                has_smoking = "smoking" in stmt
+                has_predicate = bool(re.search(r"\b(risk|increase|increases|cause|causes|associated)\b", stmt))
+                has_stroke = bool(re.search(r"\bstroke\b", stmt))
+                has_heart = bool(
+                    re.search(
+                        r"\b(heart disease|cardiovascular disease|coronary heart disease|heart attack)\b",
+                        stmt,
+                    )
+                )
+                if requires_stroke and not has_stroke:
+                    return False
+                if requires_heart and not has_heart:
+                    return False
+                return has_smoking and has_predicate
+
         # Vitamin C -> common cold claims require both entities and prevention/treatment predicate.
         if "vitamin" in seg and "cold" in seg:
             has_entities = ("vitamin c" in stmt or ("vitamin" in stmt and "c" in stmt)) and ("cold" in stmt)
             has_predicate = bool(
-                re.search(r"\b(prevent|prevents|prevention|reduce|reduces|treat|treatment|duration)\b", stmt)
+                re.search(
+                    r"\b(prevent|prevents|prevention|reduce|reduces|treat|treatment|duration)\b",
+                    stmt,
+                )
             )
             return has_entities and has_predicate
+
+        # Diabetes management claims require management/medication predicates, not etiology-only facts.
+        if "diabetes" in seg and bool(
+            re.search(
+                r"\b(manage|managed|management|lifestyle|medication|medications|reduce|stop)\b",
+                seg,
+            )
+        ):
+            has_diabetes = bool(re.search(r"\b(type\s*2\s+diabetes|type ii diabetes|diabetes)\b", stmt))
+            if not has_diabetes:
+                return False
+
+            medication_change_claim = bool(
+                re.search(
+                    r"\b(reduce|stop|discontinue|withdraw)\b.{0,30}\b(medication|medications|drug|drugs)\b",
+                    seg,
+                )
+            )
+            if medication_change_claim:
+                has_medication_change = bool(
+                    re.search(
+                        r"\b(reduce|reduced|stop|stopped|discontinue|discontinued|withdraw|withdrawn)\b.{0,40}\b"
+                        r"(medication|medications|drug|drugs|insulin)\b",
+                        stmt,
+                    )
+                )
+                has_supervision_or_context = bool(
+                    re.search(
+                        r"\b(medical supervision|doctor|clinician|supervised|healthcare provider)\b",
+                        stmt,
+                    )
+                ) or bool(re.search(r"\b(lifestyle|diet|exercise|weight loss|remission)\b", stmt))
+                return has_medication_change and has_supervision_or_context
+
+            lifestyle_manage_claim = bool(re.search(r"\b(manage|managed|management|lifestyle)\b", seg))
+            if lifestyle_manage_claim:
+                has_lifestyle_signal = bool(
+                    re.search(
+                        r"\b(lifestyle|diet|exercise|weight loss|physical activity|remission|managed?)\b",
+                        stmt,
+                    )
+                )
+                return has_lifestyle_signal
+
+        # Hypertension symptom claims require symptom-language evidence.
+        if re.search(r"\b(hypertension|high blood pressure|blood pressure)\b", seg) and re.search(
+            r"\b(symptom|symptoms|headache|headaches|noticeable|silent|asymptomatic)\b",
+            seg,
+        ):
+            has_condition = bool(re.search(r"\b(hypertension|high blood pressure|blood pressure)\b", stmt))
+            has_symptom_signal = bool(
+                re.search(
+                    r"\b(symptom|symptoms|headache|headaches|asymptomatic|silent|no symptoms?)\b",
+                    stmt,
+                )
+            )
+            return has_condition and has_symptom_signal
 
         return True
 
     @staticmethod
     def _segment_object_tokens(segment: str) -> set[str]:
         text = (segment or "").lower()
-        match = re.search(
+        patterns = (
             r"\b(?:contain|contains|contained|work|works|effective|effectiveness)\b(?:\s+against)?\s+(?P<object>.+)$",
-            text,
+            (
+                r"\b(?:increase|increases|increased|raise|raises|raised)\b(?:\s+the)?\s*"
+                r"(?:risk|chance|likelihood)?(?:\s+of)?\s+(?P<object>.+)$"
+            ),
+            (
+                r"\b(?:reduce|reduces|reduced|lower|lowers|lowered)\b(?:\s+the)?\s*"
+                r"(?:risk|chance|likelihood)?(?:\s+of)?\s+(?P<object>.+)$"
+            ),
+            r"\b(?:prevent|prevents|prevented|preventing|cause|causes|caused|causing)\s+(?P<object>.+)$",
+            r"\b(?:managed?|management)\s+(?:with|by|through)\s+(?P<object>.+)$",
+            (
+                r"\b(?:reduce|reduces|reduced|stop|stops|stopped|discontinue|discontinues|discontinued)\s+"
+                r"(?P<object>.+?)(?:\s+under\b|$)"
+            ),
         )
-        if not match:
+        object_text = ""
+        for pattern in patterns:
+            match = re.search(pattern, text)
+            if match:
+                object_text = str(match.group("object") or "").strip()
+                break
+        if not object_text:
             return set()
-        object_text = match.group("object")
+        object_text = re.sub(
+            r"^(?:the\s+)?(?:risk|chance|likelihood)\s+of\s+",
+            "",
+            object_text,
+        )
         stop = {
             "to",
             "the",
@@ -2180,6 +2422,12 @@ class VerdictGenerator:
             "with",
             "people",
             "person",
+            "risk",
+            "chance",
+            "likelihood",
+            "medical",
+            "supervision",
+            "under",
         }
         return {t for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", object_text) if t not in stop}
 
@@ -2341,6 +2589,14 @@ class VerdictGenerator:
             elif numeric_rel == "SUPPORTS":
                 relevance = "SUPPORTS"
                 relevance_score = max(relevance_score, 0.70)
+            if relevance != "OFFTOPIC" and anchor_score >= 0.25:
+                polarity_rel = self._segment_polarity(claim, statement, stance="neutral")
+                if polarity_rel == "entails":
+                    relevance = "SUPPORTS"
+                    relevance_score = max(relevance_score, 0.62)
+                elif polarity_rel == "contradicts":
+                    relevance = "CONTRADICTS"
+                    relevance_score = max(relevance_score, 0.62)
             normalized.append(
                 {
                     "evidence_id": ev_idx if ev_idx >= 0 else len(normalized),
@@ -2363,7 +2619,13 @@ class VerdictGenerator:
             return claim_breakdown
 
         evidence_by_id: Dict[int, Dict[str, Any]] = {idx: ev for idx, ev in enumerate(evidence)}
-        allowed_rel = {"SUPPORTS", "CONTRADICTS", "PARTIAL", "PARTIALLY_SUPPORTS", "PARTIALLY_CONTRADICTS"}
+        allowed_rel = {
+            "SUPPORTS",
+            "CONTRADICTS",
+            "PARTIAL",
+            "PARTIALLY_SUPPORTS",
+            "PARTIALLY_CONTRADICTS",
+        }
 
         for seg in claim_breakdown:
             segment = (seg.get("claim_segment") or "").strip()
@@ -2580,7 +2842,13 @@ class VerdictGenerator:
                 return
 
             class _Ev:
-                __slots__ = ("statement", "source_url", "semantic_score", "stance", "trust")
+                __slots__ = (
+                    "statement",
+                    "source_url",
+                    "semantic_score",
+                    "stance",
+                    "trust",
+                )
 
                 def __init__(self, d: Dict[str, Any]):
                     self.statement = d.get("statement") or d.get("text") or ""
@@ -2592,7 +2860,9 @@ class VerdictGenerator:
                     self.trust = float(d.get("trust") or d.get("final_score") or d.get("score") or 0.0)
 
             adaptive = trust_policy.compute_adaptive_trust(
-                claim, [_Ev(d) for d in evidence if (d.get("statement") or d.get("text"))], top_k=min(12, len(evidence))
+                claim,
+                [_Ev(d) for d in evidence if (d.get("statement") or d.get("text"))],
+                top_k=min(12, len(evidence)),
             )
             logger.info(
                 "[VerdictGenerator][Coverage][Aligned] verdict_coverage=%.2f adaptive_coverage=%.2f",
@@ -3105,7 +3375,12 @@ class VerdictGenerator:
         admissible_count = 0
         offtopic_count = 0
         support_labels = {"SUPPORTS", "PARTIALLY_SUPPORTS", "VALID", "PARTIALLY_VALID"}
-        contradict_labels = {"CONTRADICTS", "PARTIALLY_CONTRADICTS", "INVALID", "PARTIALLY_INVALID"}
+        contradict_labels = {
+            "CONTRADICTS",
+            "PARTIALLY_CONTRADICTS",
+            "INVALID",
+            "PARTIALLY_INVALID",
+        }
 
         for ev in evidence_map or []:
             stmt = str(ev.get("statement") or "").strip()
@@ -3144,7 +3419,12 @@ class VerdictGenerator:
                 r"\b(may|can|could|does|do|is|are)?\s*integrat(?:e|es|ed|ion)\b.{0,30}\b(dna|genom(?:e|ic))\b",
                 stmt,
             )
-        ) or bool(re.search(r"\b(reverse transcription|genomic integration|integrate into the human genome)\b", stmt))
+        ) or bool(
+            re.search(
+                r"\b(reverse transcription|genomic integration|integrate into the human genome)\b",
+                stmt,
+            )
+        )
         contradicts = bool(
             re.search(
                 r"\b(do(?:es)?\s+not|cannot|can't|not)\b.{0,30}\b(integrat(?:e|ion)|alter|change)\b.{0,30}\bdna\b",
@@ -3261,9 +3541,21 @@ class VerdictGenerator:
         """
         segments = self._split_claim_into_segments(claim)
         out: List[Dict[str, Any]] = []
-        uncertainty_terms = {"less", "uncertain", "unclear", "inconclusive", "mixed", "limited", "insufficient"}
+        uncertainty_terms = {
+            "less",
+            "uncertain",
+            "unclear",
+            "inconclusive",
+            "mixed",
+            "limited",
+            "insufficient",
+        }
         assertive_claim = bool(
-            re.search(r"\b(helps?|prevents?|reduces?|increases?|causes?|proves?|protects?)\b", claim, re.IGNORECASE)
+            re.search(
+                r"\b(helps?|prevents?|reduces?|increases?|causes?|proves?|protects?)\b",
+                claim,
+                re.IGNORECASE,
+            )
         )
         for seg in segments:
             seg_words = set(re.findall(r"\b\w+\b", seg.lower()))
@@ -3406,10 +3698,30 @@ class VerdictGenerator:
             "should",
             "can",
         }
-        neg_terms = {"no", "not", "never", "none", "without", "lack", "lacks", "lacking"}
-        uncertainty_terms = {"uncertain", "unclear", "inconclusive", "mixed", "limited", "insufficient"}
+        neg_terms = {
+            "no",
+            "not",
+            "never",
+            "none",
+            "without",
+            "lack",
+            "lacks",
+            "lacking",
+        }
+        uncertainty_terms = {
+            "uncertain",
+            "unclear",
+            "inconclusive",
+            "mixed",
+            "limited",
+            "insufficient",
+        }
         claim_assertive = bool(
-            re.search(r"\b(helps?|prevents?|reduces?|increases?|causes?|proves?|protects?)\b", claim, re.IGNORECASE)
+            re.search(
+                r"\b(helps?|prevents?|reduces?|increases?|causes?|proves?|protects?)\b",
+                claim,
+                re.IGNORECASE,
+            )
         )
 
         # Diversity adjustment based on unique domains in top evidence
@@ -3514,7 +3826,10 @@ class VerdictGenerator:
             neg_alignment_penalty = 0.0
             if seg_has_neg and top_support and avg_support < 0.45:
                 neg_alignment_penalty = 0.08
-            best = max(0.0, min(1.0, avg_support - contradiction_penalty - neg_alignment_penalty))
+            best = max(
+                0.0,
+                min(1.0, avg_support - contradiction_penalty - neg_alignment_penalty),
+            )
             if best_src:
                 logger.info(
                     "[VerdictGenerator] Segment truthfulness best=%.3f src=%s segment=%s",
@@ -3753,7 +4068,11 @@ class VerdictGenerator:
         except Exception:
             score_f = 0.0
         source = str(ev.get("source_url") or ev.get("source") or "").strip().lower()
-        stmt = re.sub(r"\s+", " ", str(ev.get("statement") or ev.get("text") or "").strip().lower())
+        stmt = re.sub(
+            r"\s+",
+            " ",
+            str(ev.get("statement") or ev.get("text") or "").strip().lower(),
+        )
         return (-score_f, source, stmt)
 
     def _merge_evidence(
@@ -3834,6 +4153,28 @@ class VerdictGenerator:
 
         return unknown_segments
 
+    @staticmethod
+    def _segment_recovery_query_hints(segment: str) -> List[str]:
+        """Deterministic query hints for hard claim patterns."""
+        seg = (segment or "").strip()
+        low = seg.lower()
+        hints: List[str] = []
+        if re.search(r"\b(hypertension|high blood pressure|blood pressure)\b", low) and re.search(
+            r"\b(symptom|symptoms|headache|headaches|noticeable)\b",
+            low,
+        ):
+            hints.append("high blood pressure symptoms silent condition no symptoms headaches not reliable indicator")
+            hints.append("hypertension usually no symptoms headaches not a reliable sign")
+        if "smoking" in low and ("stroke" in low or "heart disease" in low or "cardiovascular" in low):
+            hints.append("smoking increases risk of stroke and heart disease evidence")
+            hints.append("cdc smoking causes stroke and heart disease")
+        if "diabetes" in low and (
+            "lifestyle" in low or "managed" in low or "medication" in low or "supervision" in low
+        ):
+            hints.append("type 2 diabetes can be managed with lifestyle changes diet exercise")
+            hints.append("type 2 diabetes reduce or stop medication under medical supervision remission")
+        return hints
+
     async def _fetch_web_evidence_for_unknown_segments(
         self,
         unknown_segments: List[str],
@@ -3855,6 +4196,9 @@ class VerdictGenerator:
                     subclaims=[segment],
                     entities=[],
                 )
+                hinted = [q for q in self._segment_recovery_query_hints(segment) if q]
+                if hinted:
+                    queries = list(dict.fromkeys(hinted + (queries or [])))
                 if not queries:
                     logger.warning(f"[VerdictGenerator] No search queries generated for segment: {segment[:30]}...")
                     continue
