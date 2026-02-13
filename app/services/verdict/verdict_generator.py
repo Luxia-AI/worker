@@ -937,10 +937,20 @@ class VerdictGenerator:
                 stmt = (ev.get("statement") or ev.get("text") or "").strip()
                 if not stmt:
                     continue
+                if not self._segment_topic_guard_ok(segment, stmt):
+                    continue
                 if not self._segment_is_belief_or_survey_claim(segment) and not self._evidence_is_admissible_for_claim(
                     segment, stmt
                 ):
                     continue
+                seg_subject_tokens = self._segment_subject_tokens(segment)
+                seg_object_tokens = self._segment_object_tokens(segment)
+                stmt_tokens_full = self._statement_tokens(stmt)
+                if seg_subject_tokens and len(seg_subject_tokens & stmt_tokens_full) == 0:
+                    continue
+                if seg_object_tokens and len(seg_object_tokens & stmt_tokens_full) == 0:
+                    if not self._is_explicit_refutation_statement(stmt):
+                        continue
                 stmt_tokens = {
                     w for w in re.findall(r"\b\w+\b", stmt.lower()) if w and w not in stop_words and len(w) > 2
                 }
@@ -1158,6 +1168,20 @@ class VerdictGenerator:
                         seg["supporting_fact"] = ""
                         seg["source_url"] = ""
                         seg["evidence_used_ids"] = []
+
+            # Hard consistency: INVALID/PARTIALLY_INVALID requires contradiction signal.
+            final_status = (seg.get("status") or "UNKNOWN").upper()
+            if final_status in {"INVALID", "PARTIALLY_INVALID"}:
+                contradiction_signal = (
+                    polarity == "contradicts"
+                    or high_semantic_negation_mismatch
+                    or self._is_explicit_refutation_statement(polarity_text or "")
+                )
+                if not contradiction_signal:
+                    seg["status"] = "UNKNOWN"
+                    seg["supporting_fact"] = ""
+                    seg["source_url"] = ""
+                    seg["evidence_used_ids"] = []
 
         # Evidence quality signal (deterministic, claim-aware) is used for confidence calibration.
         evidence_quality_percent = self._calculate_truthfulness_from_evidence(claim, evidence)
@@ -1395,11 +1419,14 @@ class VerdictGenerator:
         breakdown_stance = self._canonical_stance_from_breakdown(claim_breakdown)
         map_stance = self._canonical_stance_from_evidence_map(evidence_map)
         rationale_stance = self._rationale_polarity_hint(rationale)
+        top_stance, top_stance_score = self._top_admissible_stance_signal(claim, evidence_map)
         canonical_stance = breakdown_stance
         if canonical_stance == "neutral":
             canonical_stance = map_stance
         if canonical_stance == "neutral":
             canonical_stance = rationale_stance
+        if canonical_stance == "neutral":
+            canonical_stance = top_stance
 
         # Hard polarity guardrails to keep verdict and rationale/segment stance consistent.
         if canonical_stance == "contradicts" and verdict_str == Verdict.TRUE.value:
@@ -1410,6 +1437,22 @@ class VerdictGenerator:
                 map_stance,
                 rationale_stance,
             )
+        # Deterministic stance-to-verdict override on strong admissible contradiction.
+        if (
+            top_stance == "contradicts"
+            and top_stance_score >= 0.62
+            and coverage_score >= 0.60
+            and admissible_ratio >= 0.50
+        ):
+            verdict_str = Verdict.FALSE.value
+        elif (
+            top_stance == "entails"
+            and top_stance_score >= 0.70
+            and coverage_score >= 0.70
+            and admissible_ratio >= 0.60
+            and not self._has_absolute_quantifier(claim)
+        ):
+            verdict_str = Verdict.TRUE.value
         elif canonical_stance == "entails" and verdict_str == Verdict.FALSE.value:
             verdict_str = Verdict.TRUE.value
             logger.warning(
@@ -1434,10 +1477,22 @@ class VerdictGenerator:
                 and (diversity_score >= 0.40 or adaptive_trust_post >= 0.45)
                 and (coverage_score >= 0.70 or agreement_ratio >= 0.80)
             )
+            # Allow strong contradiction outcomes for simple factual numeric claims
+            # even when diversity is low (single high-quality source can be decisive).
+            strong_contradiction_exception = (
+                verdict_str == Verdict.FALSE.value
+                and canonical_stance == "contradicts"
+                and coverage_score >= 0.70
+                and agreement_ratio >= 0.80
+                and admissible_ratio >= 0.50
+            )
+            binary_gate_ok = bool(binary_gate_ok or strong_contradiction_exception)
             if not binary_gate_ok:
                 verdict_str = Verdict.UNVERIFIABLE.value
         if numeric_conf_floor is not None:
             confidence = max(float(confidence), float(numeric_conf_floor))
+        if verdict_str == Verdict.UNVERIFIABLE.value and numeric_truth_override is None:
+            truth_score_percent = max(35.0, min(65.0, float(truth_score_percent or 0.0)))
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
         if llm_verdict == Verdict.TRUE.value and verdict_str != Verdict.TRUE.value:
             try:
@@ -1958,6 +2013,33 @@ class VerdictGenerator:
             "person",
         }
         return {t for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", object_text) if t not in stop}
+
+    @staticmethod
+    def _segment_subject_tokens(segment: str) -> set[str]:
+        text = (segment or "").lower()
+        match = re.search(
+            r"^(?P<subject>.+?)\b(?:increase|increases|increased|cause|causes|caused|"
+            r"reduce|reduces|reduced|prevent|prevents|prevented|contain|contains|work|works|has|have)\b",
+            text,
+        )
+        if not match:
+            return set()
+        subject_text = match.group("subject")
+        stop = {
+            "to",
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "of",
+            "in",
+            "on",
+            "for",
+            "with",
+            "risk",
+        }
+        return {t for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", subject_text) if t not in stop}
 
     @staticmethod
     def _statement_tokens(statement: str) -> set[str]:
@@ -2749,6 +2831,41 @@ class VerdictGenerator:
         if supports >= (contradicts * 1.15) and (supports - contradicts) >= 0.15:
             return "entails"
         return "neutral"
+
+    def _top_admissible_stance_signal(self, claim: str, evidence_map: List[Dict[str, Any]]) -> tuple[str, float]:
+        best_stance = "neutral"
+        best_score = 0.0
+        for ev in evidence_map or []:
+            stmt = str(ev.get("statement") or "").strip()
+            if not stmt:
+                continue
+            if not self._evidence_is_admissible_for_claim(claim, stmt):
+                continue
+            rel = str(ev.get("relevance") or "").upper()
+            if rel in {"PARTIALLY_VALID", "VALID"}:
+                rel = "SUPPORTS"
+            elif rel in {"PARTIALLY_INVALID", "INVALID"}:
+                rel = "CONTRADICTS"
+            if rel not in {"SUPPORTS", "CONTRADICTS"}:
+                continue
+            try:
+                score = float(ev.get("relevance_score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            if score > best_score:
+                best_score = score
+                best_stance = "entails" if rel == "SUPPORTS" else "contradicts"
+        return best_stance, max(0.0, min(1.0, best_score))
+
+    @staticmethod
+    def _has_absolute_quantifier(text: str) -> bool:
+        low = (text or "").lower()
+        return bool(
+            re.search(
+                r"\b(always|never|all|none|every|entirely|completely|must|only)\b",
+                low,
+            )
+        )
 
     @staticmethod
     def _rationale_polarity_hint(rationale: str) -> str:

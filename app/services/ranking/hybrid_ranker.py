@@ -151,6 +151,50 @@ def _claim_focus_tokens(text: str) -> set[str]:
     return tokens
 
 
+def _relation_focus_tokens(text: str) -> tuple[set[str], set[str]]:
+    """
+    Extract coarse subject/object token sets for directional claims, e.g.:
+    "smoking increases risk of lung cancer" -> subject={smoking}, object={lung,cancer}
+    """
+    if not text:
+        return set(), set()
+    low = text.lower().strip()
+    stop = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "to",
+        "for",
+        "of",
+        "in",
+        "on",
+        "with",
+        "by",
+        "at",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "risk",
+    }
+    m = re.search(
+        r"^(?P<subj>.+?)\b(?:increase|increases|increased|cause|causes|caused|"
+        r"reduce|reduces|reduced|prevent|prevents|prevented|has|have)\b(?P<obj>.+)$",
+        low,
+    )
+    if not m:
+        return set(), set()
+    subj = {w for w in re.findall(r"\b[\w']+\b", m.group("subj")) if len(w) > 2 and w not in stop}
+    obj = {w for w in re.findall(r"\b[\w']+\b", m.group("obj")) if len(w) > 2 and w not in stop}
+    return subj, obj
+
+
 def _safe_float(v: Optional[float], default: float = 0.0) -> float:
     try:
         return float(v) if v is not None else default
@@ -441,6 +485,7 @@ def hybrid_rank(
     now = now or datetime.now(timezone.utc)
     query_object_tokens = _object_tokens_for_query(query_text)
     claim_focus_tokens = _claim_focus_tokens(query_text)
+    subject_focus_tokens, object_focus_tokens = _relation_focus_tokens(query_text)
     belief_claim = _claim_is_belief_or_survey(query_text)
 
     for key, item in candidates_map.items():
@@ -497,10 +542,16 @@ def hybrid_rank(
         stmt_tokens = _statement_tokens(item["statement"])
         object_overlap = len(query_object_tokens & stmt_tokens) if query_object_tokens else 0
         focus_overlap = len(claim_focus_tokens & stmt_tokens) if claim_focus_tokens else 0
+        subject_overlap = len(subject_focus_tokens & stmt_tokens) if subject_focus_tokens else 0
+        object_relation_overlap = len(object_focus_tokens & stmt_tokens) if object_focus_tokens else 0
         if query_object_tokens and object_overlap == 0 and not _has_object_refutation_signal(item["statement"]):
             final_score *= 0.55
         if claim_focus_tokens and focus_overlap <= 1 and sem_s < 0.85 and kg_raw < 0.85:
             final_score *= 0.75
+        if subject_focus_tokens and subject_overlap == 0 and sem_s < 0.90 and kg_raw < 0.90:
+            final_score *= 0.60
+        if object_focus_tokens and object_relation_overlap == 0 and sem_s < 0.90 and kg_raw < 0.90:
+            final_score *= 0.70
         if not belief_claim and _is_claim_mention_statement(item["statement"]):
             final_score *= 0.65
         final_score -= uncertainty_penalty
@@ -543,6 +594,10 @@ def hybrid_rank(
             if not _has_object_refutation_signal(item["statement"]):
                 continue
         if claim_focus_tokens and focus_overlap <= 1 and claim_overlap < 0.35 and sem_s < 0.90 and kg_raw < 0.90:
+            continue
+        if subject_focus_tokens and subject_overlap == 0 and sem_s < 0.95 and kg_raw < 0.95:
+            continue
+        if object_focus_tokens and object_relation_overlap == 0 and sem_s < 0.95 and kg_raw < 0.95:
             continue
         if not belief_claim and _is_claim_mention_statement(item["statement"]) and claim_overlap < 0.60:
             continue
