@@ -65,6 +65,21 @@ _REFUTATION_CUES = (
     "isn't",
 )
 
+_BAD_ANCHOR_TERMS = {
+    "do",
+    "does",
+    "did",
+    "not",
+    "no",
+    "never",
+    "against",
+    "for",
+    "on",
+    "work",
+    "works",
+    "working",
+}
+
 _NEGATION_PATTERNS = (
     r"\bdoes\s+not\b",
     r"\bdo\s+not\b",
@@ -186,7 +201,18 @@ def derive_anchor_groups(text: str, anchors: Sequence[str] | None = None) -> Lis
     max_groups = max(2, min(5, int(cfg.coverage_anchors_per_subclaim)))
     anchor_terms = [a.strip().lower() for a in (anchors or []) if str(a).strip()]
     if not anchor_terms:
-        anchor_terms = [t for t in _tokens(text) if len(t) >= 3][:max_groups]
+        anchor_terms = [t for t in _tokens(_strip_negation(text)) if len(t) >= 3]
+    rel_match = re.search(r"\b(?:against|for|on)\s+(.+)$", (text or "").lower())
+    if rel_match:
+        relation_obj_terms = [
+            t
+            for t in re.findall(r"\b[\w\-]+\b", rel_match.group(1))
+            if len(t) >= 3 and t not in _STOP_WORDS and t not in _BAD_ANCHOR_TERMS
+        ]
+        anchor_terms.extend(relation_obj_terms)
+    anchor_terms = [
+        t for t in anchor_terms if t and len(t) >= 3 and t not in _BAD_ANCHOR_TERMS and t not in _STOP_WORDS
+    ]
     groups: List[List[str]] = []
     for term in anchor_terms:
         if term and [term] not in groups:
@@ -234,10 +260,17 @@ def _relevance(
     anchor_overlap = anchor_hits / max(1, len(anchors)) if anchors else 0.0
     anchor_component = min(1.0, anchor_hits / max(1, min_anchor_hits))
     overlap = max(lexical_overlap, anchor_overlap)
+    sub_obj = _object_tokens(subclaim)
+    stmt_obj = _object_tokens(stmt)
+    object_overlap = bool(sub_obj and stmt_obj and (sub_obj & stmt_obj))
 
     # Prefer semantic relevance, then anchor completeness.
     score = (semantic_weight * semantic) + ((1.0 - semantic_weight) * anchor_component)
     score = max(score, 0.60 * semantic + 0.40 * overlap)
+    if object_overlap and semantic >= 0.65:
+        score = min(1.0, score + 0.08)
+    elif sub_obj and not object_overlap and semantic >= 0.75 and not _has_explicit_refutation_signal(stmt):
+        score *= 0.85
 
     # Down-weight KG evidence when anchors do not align strongly.
     if _is_kg_candidate(evidence):
@@ -260,6 +293,7 @@ def _relevance(
         "anchors_required": min_anchor_hits,
         "anchors_per_subclaim": len(anchors),
         "anchor_ok": anchor_hits >= min_anchor_hits,
+        "object_overlap": object_overlap,
         "stance": stance,
         "contradicted": contradicted,
         "is_kg_candidate": _is_kg_candidate(evidence),
@@ -360,10 +394,11 @@ def compute_subclaim_coverage(
         contradicted = bool(best.get("contradicted", False))
         semantic = float(best.get("semantic_score", 0.0))
         anchor_hits = int(best.get("anchors_matched", 0))
+        object_overlap = bool(best.get("object_overlap", False))
         best_statement = _as_statement(evidence[best_idx]) if best_idx >= 0 and best_idx < len(evidence) else ""
         sub_obj = _object_tokens(subclaim)
         stmt_obj = _object_tokens(best_statement)
-        object_overlap = bool(sub_obj and stmt_obj and (sub_obj & stmt_obj))
+        object_scope_overlap = bool(sub_obj and stmt_obj and (sub_obj & stmt_obj))
         explicit_refutation = _has_explicit_refutation_signal(best_statement)
         claim_has_negation = _has_negation(subclaim)
         evidence_has_negation = _has_negation(best_statement)
@@ -371,10 +406,10 @@ def compute_subclaim_coverage(
         high_semantic_mismatch = (
             semantic >= 0.80
             and negation_mismatch
-            and (object_overlap or explicit_refutation)
+            and (object_scope_overlap or explicit_refutation)
             and (_aligned_non_negated(subclaim, best_statement) or anchor_hits >= 1)
         )
-        if contradicted and not (object_overlap or explicit_refutation):
+        if contradicted and not (object_scope_overlap or explicit_refutation):
             contradicted = False
         if high_semantic_mismatch:
             contradicted = True
@@ -383,10 +418,10 @@ def compute_subclaim_coverage(
         elif contradicted:
             status = "UNKNOWN"
             weight = 0.0
-        elif semantic >= strong_cutoff and anchor_hits >= min_anchor_hits:
+        elif semantic >= strong_cutoff and (anchor_hits >= min_anchor_hits or (object_overlap and semantic >= 0.80)):
             status = "STRONGLY_VALID"
             weight = 1.0
-        elif semantic >= partial_cutoff and anchor_hits >= 1:
+        elif semantic >= partial_cutoff and (anchor_hits >= 1 or object_overlap):
             status = "PARTIALLY_VALID"
             weight = partial_weight
         else:

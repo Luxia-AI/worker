@@ -937,6 +937,10 @@ class VerdictGenerator:
                 stmt = (ev.get("statement") or ev.get("text") or "").strip()
                 if not stmt:
                     continue
+                if not self._segment_is_belief_or_survey_claim(segment) and not self._evidence_is_admissible_for_claim(
+                    segment, stmt
+                ):
+                    continue
                 stmt_tokens = {
                     w for w in re.findall(r"\b\w+\b", stmt.lower()) if w and w not in stop_words and len(w) > 2
                 }
@@ -1388,12 +1392,32 @@ class VerdictGenerator:
             verdict_str,
             is_comparative_claim=self._is_numeric_comparison_claim(claim),
         )
-        canonical_stance = self._canonical_stance_from_breakdown(claim_breakdown)
+        breakdown_stance = self._canonical_stance_from_breakdown(claim_breakdown)
+        map_stance = self._canonical_stance_from_evidence_map(evidence_map)
+        rationale_stance = self._rationale_polarity_hint(rationale)
+        canonical_stance = breakdown_stance
+        if canonical_stance == "neutral":
+            canonical_stance = map_stance
+        if canonical_stance == "neutral":
+            canonical_stance = rationale_stance
+
         # Hard polarity guardrails to keep verdict and rationale/segment stance consistent.
         if canonical_stance == "contradicts" and verdict_str == Verdict.TRUE.value:
             verdict_str = Verdict.FALSE.value
+            logger.warning(
+                "[VerdictGenerator][Consistency] Flipped TRUE->FALSE " "(breakdown=%s map=%s rationale=%s)",
+                breakdown_stance,
+                map_stance,
+                rationale_stance,
+            )
         elif canonical_stance == "entails" and verdict_str == Verdict.FALSE.value:
             verdict_str = Verdict.TRUE.value
+            logger.warning(
+                "[VerdictGenerator][Consistency] Flipped FALSE->TRUE " "(breakdown=%s map=%s rationale=%s)",
+                breakdown_stance,
+                map_stance,
+                rationale_stance,
+            )
         # Trust-gate fallback: if trust is insufficient and stance is unresolved, avoid confident binary verdicts.
         if (
             policy_insufficient
@@ -1401,6 +1425,17 @@ class VerdictGenerator:
             and verdict_str in {Verdict.TRUE.value, Verdict.FALSE.value}
         ):
             verdict_str = Verdict.UNVERIFIABLE.value
+        # Conservative binary gate:
+        # Avoid hard TRUE/FALSE unless stance is explicit and evidence quality/diversity are sufficient.
+        if verdict_str in {Verdict.TRUE.value, Verdict.FALSE.value}:
+            binary_gate_ok = (
+                canonical_stance in {"entails", "contradicts"}
+                and admissible_ratio >= 0.50
+                and (diversity_score >= 0.40 or adaptive_trust_post >= 0.45)
+                and (coverage_score >= 0.70 or agreement_ratio >= 0.80)
+            )
+            if not binary_gate_ok:
+                verdict_str = Verdict.UNVERIFIABLE.value
         if numeric_conf_floor is not None:
             confidence = max(float(confidence), float(numeric_conf_floor))
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
@@ -2691,6 +2726,50 @@ class VerdictGenerator:
         if contra > 0 and support == 0 and unknown == 0:
             return "contradicts"
         if support > 0 and contra == 0 and unknown == 0:
+            return "entails"
+        return "neutral"
+
+    @staticmethod
+    def _canonical_stance_from_evidence_map(evidence_map: List[Dict[str, Any]]) -> str:
+        supports = 0.0
+        contradicts = 0.0
+        for ev in evidence_map or []:
+            rel = str(ev.get("relevance") or "").upper()
+            try:
+                score = float(ev.get("relevance_score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            weight = max(0.2, min(1.0, score))
+            if rel == "SUPPORTS":
+                supports += weight
+            elif rel == "CONTRADICTS":
+                contradicts += weight
+        if contradicts >= (supports * 1.15) and (contradicts - supports) >= 0.15:
+            return "contradicts"
+        if supports >= (contradicts * 1.15) and (supports - contradicts) >= 0.15:
+            return "entails"
+        return "neutral"
+
+    @staticmethod
+    def _rationale_polarity_hint(rationale: str) -> str:
+        text = (rationale or "").lower()
+        if not text:
+            return "neutral"
+        contradict_patterns = (
+            r"\bcontradict(?:ed|s|ion)?\b",
+            r"\bclaim\s+is\s+false\b",
+            r"\bnot\s+supported\b",
+            r"\bdebunk(?:ed|ing)?\b",
+        )
+        entail_patterns = (
+            r"\bsupported\s+by\s+evidence\b",
+            r"\bevidence\s+confirms\b",
+            r"\bclaim\s+is\s+true\b",
+            r"\bstrongly\s+supports\b",
+        )
+        if any(re.search(p, text) for p in contradict_patterns):
+            return "contradicts"
+        if any(re.search(p, text) for p in entail_patterns):
             return "entails"
         return "neutral"
 
