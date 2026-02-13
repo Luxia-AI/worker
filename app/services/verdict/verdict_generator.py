@@ -1420,6 +1420,7 @@ class VerdictGenerator:
         map_stance = self._canonical_stance_from_evidence_map(evidence_map)
         rationale_stance = self._rationale_polarity_hint(rationale)
         top_stance, top_stance_score = self._top_admissible_stance_signal(claim, evidence_map)
+        vote_decision, vote_support, vote_contradict = self._stance_vote_decision(claim, evidence_map)
         canonical_stance = breakdown_stance
         if canonical_stance == "neutral":
             canonical_stance = map_stance
@@ -1427,6 +1428,9 @@ class VerdictGenerator:
             canonical_stance = rationale_stance
         if canonical_stance == "neutral":
             canonical_stance = top_stance
+
+        if vote_decision in {Verdict.TRUE.value, Verdict.FALSE.value}:
+            verdict_str = vote_decision
 
         # Hard polarity guardrails to keep verdict and rationale/segment stance consistent.
         if canonical_stance == "contradicts" and verdict_str == Verdict.TRUE.value:
@@ -1461,6 +1465,8 @@ class VerdictGenerator:
                 map_stance,
                 rationale_stance,
             )
+        if rationale_stance == "contradicts" and verdict_str == Verdict.TRUE.value:
+            verdict_str = Verdict.FALSE.value if vote_contradict >= 0.60 else Verdict.UNVERIFIABLE.value
         # Trust-gate fallback: if trust is insufficient and stance is unresolved, avoid confident binary verdicts.
         if (
             policy_insufficient
@@ -1471,11 +1477,23 @@ class VerdictGenerator:
         # Conservative binary gate:
         # Avoid hard TRUE/FALSE unless stance is explicit and evidence quality/diversity are sufficient.
         if verdict_str in {Verdict.TRUE.value, Verdict.FALSE.value}:
+            unique_domains_count = 0
+            try:
+                unique_domains_count = len(
+                    {
+                        str((ev.get("source_url") or ev.get("source") or "").split("/")[2]).lower().removeprefix("www.")
+                        for ev in (evidence or [])
+                        if str(ev.get("source_url") or ev.get("source") or "").startswith("http")
+                    }
+                )
+            except Exception:
+                unique_domains_count = 0
             binary_gate_ok = (
                 canonical_stance in {"entails", "contradicts"}
                 and admissible_ratio >= 0.50
                 and (diversity_score >= 0.40 or adaptive_trust_post >= 0.45)
                 and (coverage_score >= 0.70 or agreement_ratio >= 0.80)
+                and unique_domains_count >= 2
             )
             # Allow strong contradiction outcomes for simple factual numeric claims
             # even when diversity is low (single high-quality source can be decisive).
@@ -1493,12 +1511,45 @@ class VerdictGenerator:
             confidence = max(float(confidence), float(numeric_conf_floor))
         if verdict_str == Verdict.UNVERIFIABLE.value and numeric_truth_override is None:
             truth_score_percent = max(35.0, min(65.0, float(truth_score_percent or 0.0)))
+        if self._has_absolute_quantifier(claim) and verdict_str == Verdict.TRUE.value:
+            verdict_str = Verdict.PARTIALLY_TRUE.value
+            truth_score_percent = min(float(truth_score_percent or 0.0), 55.0)
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
         if llm_verdict == Verdict.TRUE.value and verdict_str != Verdict.TRUE.value:
             try:
                 truth_score_percent = min(float(truth_score_percent), 89.9)
             except Exception:
                 truth_score_percent = 89.9
+
+        rel_counts: Dict[str, int] = {}
+        for evm in evidence_map or []:
+            rel = str(evm.get("relevance") or "NEUTRAL").upper()
+            rel_counts[rel] = rel_counts.get(rel, 0) + 1
+
+        status_counts: Dict[str, int] = {}
+        for seg in claim_breakdown or []:
+            st = str(seg.get("status") or "UNKNOWN").upper()
+            status_counts[st] = status_counts.get(st, 0) + 1
+
+        admissible_count = 0
+        for ev in evidence or []:
+            stmt = str(ev.get("statement") or ev.get("text") or "")
+            if self._evidence_is_admissible_for_claim(claim, stmt):
+                admissible_count += 1
+
+        unique_domains = set()
+        for ev in evidence or []:
+            src = str(ev.get("source_url") or ev.get("source") or "").strip()
+            if not src:
+                continue
+            try:
+                d = src.split("/")[2].lower()
+                if d.startswith("www."):
+                    d = d[4:]
+                if d:
+                    unique_domains.add(d)
+            except Exception:
+                continue
 
         return {
             "verdict": verdict_str,
@@ -1523,6 +1574,27 @@ class VerdictGenerator:
             "policy_sufficient": not policy_insufficient,
             "verdict_reconciled": bool(verdict_str != llm_verdict),
             "skip_targeted_recovery": bool(skip_targeted_recovery),
+            "analysis_counts": {
+                "evidence_total_input": len(evidence),
+                "evidence_map_count": len(evidence_map or []),
+                "claim_breakdown_count": len(claim_breakdown or []),
+                "admissible_evidence_count": admissible_count,
+                "admissible_evidence_ratio": round(admissible_ratio, 4),
+                "unique_source_domains": len(unique_domains),
+                "relevance_distribution": rel_counts,
+                "segment_status_distribution": status_counts,
+                "canonical_stance_breakdown": breakdown_stance,
+                "canonical_stance_evidence_map": map_stance,
+                "canonical_stance_rationale": rationale_stance,
+                "canonical_stance_final": canonical_stance,
+                "top_admissible_stance": top_stance,
+                "top_admissible_stance_score": round(top_stance_score, 4),
+                "vote_support_max": round(vote_support, 4),
+                "vote_contradict_max": round(vote_contradict, 4),
+                "vote_decision": vote_decision,
+                "llm_verdict_raw": llm_verdict,
+                "llm_verdict_changed": bool(llm_verdict != verdict_str),
+            },
         }
 
     def _segment_anchor_overlap(self, segment: str, statement: str) -> float:
@@ -2146,6 +2218,9 @@ class VerdictGenerator:
             relevance_score = float(item.get("relevance_score", ev.get("final_score", ev.get("score", 0.0))) or 0.0)
             anchor_score = float(ev.get("anchor_match_score", self._segment_anchor_overlap(claim, statement)) or 0.0)
             relevance = str(item.get("relevance", "NEUTRAL") or "NEUTRAL").upper()
+            if not self._segment_topic_guard_ok(claim, statement):
+                relevance = "OFFTOPIC"
+                relevance_score *= 0.10
             if anchor_score < 0.2:
                 relevance = "NEUTRAL"
                 relevance_score *= 0.6
@@ -2155,6 +2230,13 @@ class VerdictGenerator:
             if self._is_claim_mention_statement(statement):
                 relevance = "NEUTRAL"
                 relevance_score *= 0.25
+            numeric_rel = self._numeric_relation_relevance(claim, statement)
+            if numeric_rel == "CONTRADICTS":
+                relevance = "CONTRADICTS"
+                relevance_score = max(relevance_score, 0.75)
+            elif numeric_rel == "SUPPORTS":
+                relevance = "SUPPORTS"
+                relevance_score = max(relevance_score, 0.70)
             normalized.append(
                 {
                     "evidence_id": ev_idx if ev_idx >= 0 else len(normalized),
@@ -2857,6 +2939,34 @@ class VerdictGenerator:
                 best_stance = "entails" if rel == "SUPPORTS" else "contradicts"
         return best_stance, max(0.0, min(1.0, best_score))
 
+    def _stance_vote_decision(self, claim: str, evidence_map: List[Dict[str, Any]]) -> tuple[str | None, float, float]:
+        support = 0.0
+        contradict = 0.0
+        for ev in evidence_map or []:
+            stmt = str(ev.get("statement") or "")
+            if not stmt or not self._evidence_is_admissible_for_claim(claim, stmt):
+                continue
+            rel = str(ev.get("relevance") or "").upper()
+            if rel in {"PARTIALLY_VALID", "VALID"}:
+                rel = "SUPPORTS"
+            elif rel in {"PARTIALLY_INVALID", "INVALID"}:
+                rel = "CONTRADICTS"
+            try:
+                score = float(ev.get("relevance_score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            if rel == "SUPPORTS":
+                support = max(support, score)
+            elif rel == "CONTRADICTS":
+                contradict = max(contradict, score)
+
+        decision: str | None = None
+        if contradict >= 0.65 and contradict > support:
+            decision = Verdict.FALSE.value
+        elif support >= 0.65 and support > contradict:
+            decision = Verdict.TRUE.value
+        return decision, support, contradict
+
     @staticmethod
     def _has_absolute_quantifier(text: str) -> bool:
         low = (text or "").lower()
@@ -2866,6 +2976,34 @@ class VerdictGenerator:
                 low,
             )
         )
+
+    @staticmethod
+    def _extract_simple_numbers(text: str) -> List[float]:
+        nums: List[float] = []
+        for m in re.finditer(r"\b\d+(?:\.\d+)?\b", (text or "")):
+            try:
+                nums.append(float(m.group(0)))
+            except Exception:
+                continue
+        return nums
+
+    def _numeric_relation_relevance(self, claim: str, statement: str) -> str:
+        """
+        For simple exact-value claims (non-comparative), detect numeric entailment/contradiction.
+        """
+        if self._is_numeric_comparison_claim(claim):
+            return "NEUTRAL"
+        if not self._segment_topic_guard_ok(claim, statement):
+            return "NEUTRAL"
+        claim_nums = self._extract_simple_numbers(claim)
+        stmt_nums = self._extract_simple_numbers(statement)
+        if len(claim_nums) != 1 or len(stmt_nums) != 1:
+            return "NEUTRAL"
+        c = claim_nums[0]
+        s = stmt_nums[0]
+        if abs(c - s) < 1e-9:
+            return "SUPPORTS"
+        return "CONTRADICTS"
 
     @staticmethod
     def _rationale_polarity_hint(rationale: str) -> str:
