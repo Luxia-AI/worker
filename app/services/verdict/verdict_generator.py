@@ -1224,6 +1224,18 @@ class VerdictGenerator:
             )
         claim_frame = self._classify_claim_frame(claim)
         policy_insufficient = self._policy_says_insufficient(claim, evidence, adaptive_metrics=adaptive_metrics)
+        admissible_evidence = [
+            ev
+            for ev in evidence
+            if self._evidence_is_admissible_for_claim(
+                claim,
+                ev.get("statement") or ev.get("text") or "",
+            )
+        ]
+        admissible_ratio = (len(admissible_evidence) / max(1, len(evidence))) if evidence else 0.0
+        if evidence and admissible_ratio < 0.35:
+            # Strongly penalize confidence when most evidence is belief/reporting style.
+            policy_insufficient = True
         truth_score_percent = self._calculate_truth_score_from_contract(reconciled)
         agreement_ratio = self._calculate_evidence_agreement_ratio(claim, evidence)
         coverage_score = float(reconciled.get("weighted_truth", 0.0) or 0.0)
@@ -1376,6 +1388,19 @@ class VerdictGenerator:
             verdict_str,
             is_comparative_claim=self._is_numeric_comparison_claim(claim),
         )
+        canonical_stance = self._canonical_stance_from_breakdown(claim_breakdown)
+        # Hard polarity guardrails to keep verdict and rationale/segment stance consistent.
+        if canonical_stance == "contradicts" and verdict_str == Verdict.TRUE.value:
+            verdict_str = Verdict.FALSE.value
+        elif canonical_stance == "entails" and verdict_str == Verdict.FALSE.value:
+            verdict_str = Verdict.TRUE.value
+        # Trust-gate fallback: if trust is insufficient and stance is unresolved, avoid confident binary verdicts.
+        if (
+            policy_insufficient
+            and canonical_stance == "neutral"
+            and verdict_str in {Verdict.TRUE.value, Verdict.FALSE.value}
+        ):
+            verdict_str = Verdict.UNVERIFIABLE.value
         if numeric_conf_floor is not None:
             confidence = max(float(confidence), float(numeric_conf_floor))
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
@@ -1577,6 +1602,19 @@ class VerdictGenerator:
                 low,
             )
         )
+
+    def _evidence_is_admissible_for_claim(self, claim: str, statement: str) -> bool:
+        """
+        Admissibility filter: belief/survey prevalence evidence is not admissible
+        for factual composition/efficacy claims unless the claim itself is about belief.
+        """
+        if not statement:
+            return False
+        if self._segment_is_belief_or_survey_claim(claim):
+            return True
+        if self._is_claim_mention_statement(statement):
+            return False
+        return True
 
     @staticmethod
     def _is_explicit_refutation_statement(text: str) -> bool:
@@ -2641,6 +2679,20 @@ class VerdictGenerator:
             "has_support": has_support,
             "has_invalid": has_invalid,
         }
+
+    @staticmethod
+    def _canonical_stance_from_breakdown(claim_breakdown: List[Dict[str, Any]]) -> str:
+        statuses = [str((seg or {}).get("status", "UNKNOWN") or "UNKNOWN").upper() for seg in (claim_breakdown or [])]
+        if not statuses:
+            return "neutral"
+        support = sum(1 for s in statuses if s in {"VALID", "PARTIALLY_VALID", "STRONGLY_VALID"})
+        contra = sum(1 for s in statuses if s in {"INVALID", "PARTIALLY_INVALID"})
+        unknown = sum(1 for s in statuses if s == "UNKNOWN")
+        if contra > 0 and support == 0 and unknown == 0:
+            return "contradicts"
+        if support > 0 and contra == 0 and unknown == 0:
+            return "entails"
+        return "neutral"
 
     def _rewrite_rationale_from_breakdown(
         self,

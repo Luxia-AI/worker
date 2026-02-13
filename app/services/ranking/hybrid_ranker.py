@@ -38,6 +38,40 @@ UNCERTAINTY_PHRASES = (
 )
 
 
+def _is_claim_mention_statement(text: str) -> bool:
+    if not text:
+        return False
+    low = text.lower()
+    patterns = (
+        r"\bmyth\b",
+        r"\bmisinformation\b",
+        r"\bdisinformation\b",
+        r"\bconspiracy\b",
+        r"\bfalse claim\b",
+        r"\bunfounded\b",
+        r"\bhoax\b",
+        r"\brumou?r\b",
+        r"\bbeliev(?:e|ed|es|ing)\s+that\b",
+        r"\bperceiv(?:e|ed|es|ing)\s+that\b",
+        r"\bhesitan(?:cy|t)\b",
+        r"\bacceptance\b",
+        r"\bsurvey\b",
+    )
+    return any(re.search(p, low) for p in patterns)
+
+
+def _claim_is_belief_or_survey(claim_text: str) -> bool:
+    if not claim_text:
+        return False
+    low = claim_text.lower()
+    return bool(
+        re.search(
+            r"\b(believe|belief|believed|think|thought|perceive|perceived|concern|hesitancy|acceptance|survey)\b",
+            low,
+        )
+    )
+
+
 def _object_tokens_for_query(text: str) -> set[str]:
     if not text:
         return set()
@@ -407,6 +441,7 @@ def hybrid_rank(
     now = now or datetime.now(timezone.utc)
     query_object_tokens = _object_tokens_for_query(query_text)
     claim_focus_tokens = _claim_focus_tokens(query_text)
+    belief_claim = _claim_is_belief_or_survey(query_text)
 
     for key, item in candidates_map.items():
         sem_s = sem_norm_map.get(key, 0.0)
@@ -466,6 +501,8 @@ def hybrid_rank(
             final_score *= 0.55
         if claim_focus_tokens and focus_overlap <= 1 and sem_s < 0.85 and kg_raw < 0.85:
             final_score *= 0.75
+        if not belief_claim and _is_claim_mention_statement(item["statement"]):
+            final_score *= 0.65
         final_score -= uncertainty_penalty
 
         # small heuristic: if both sem and kg are zero but credibility high, ensure min floor
@@ -506,6 +543,8 @@ def hybrid_rank(
             if not _has_object_refutation_signal(item["statement"]):
                 continue
         if claim_focus_tokens and focus_overlap <= 1 and claim_overlap < 0.35 and sem_s < 0.90 and kg_raw < 0.90:
+            continue
+        if not belief_claim and _is_claim_mention_statement(item["statement"]) and claim_overlap < 0.60:
             continue
         if sem_s < 0.20 and claim_overlap < 0.08 and ent_s < 0.20 and kg_raw < 0.40:
             continue
