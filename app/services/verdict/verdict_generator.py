@@ -1421,6 +1421,12 @@ class VerdictGenerator:
         rationale_stance = self._rationale_polarity_hint(rationale)
         top_stance, top_stance_score = self._top_admissible_stance_signal(claim, evidence_map)
         vote_decision, vote_support, vote_contradict = self._stance_vote_decision(claim, evidence_map)
+        map_support_signal, map_contradict_signal, map_admissible_count, map_offtopic_count = (
+            self._evidence_map_signal_strengths(claim, evidence_map)
+        )
+        weak_signal_no_stance = map_support_signal < 0.65 and map_contradict_signal < 0.65
+        if weak_signal_no_stance:
+            policy_insufficient = True
         canonical_stance = breakdown_stance
         if canonical_stance == "neutral":
             canonical_stance = map_stance
@@ -1469,6 +1475,8 @@ class VerdictGenerator:
             )
         if rationale_stance == "contradicts" and verdict_str == Verdict.TRUE.value:
             verdict_str = Verdict.FALSE.value if vote_contradict >= 0.60 else Verdict.UNVERIFIABLE.value
+        if weak_signal_no_stance:
+            verdict_str = Verdict.UNVERIFIABLE.value
         # Trust-gate fallback: if trust is insufficient and stance is unresolved, avoid confident binary verdicts.
         if (
             policy_insufficient
@@ -1520,6 +1528,9 @@ class VerdictGenerator:
             truth_score_percent = min(float(truth_score_percent or 0.0), 55.0)
         if numeric_conf_floor is not None:
             confidence = max(float(confidence), float(numeric_conf_floor))
+        if weak_signal_no_stance:
+            truth_score_percent = max(35.0, min(55.0, float(truth_score_percent or 0.0)))
+            confidence = min(float(confidence), 0.55)
         if verdict_str == Verdict.UNVERIFIABLE.value and numeric_truth_override is None:
             truth_score_percent = max(35.0, min(65.0, float(truth_score_percent or 0.0)))
         if self._has_absolute_quantifier(claim) and verdict_str == Verdict.TRUE.value:
@@ -1603,6 +1614,11 @@ class VerdictGenerator:
                 "vote_support_max": round(vote_support, 4),
                 "vote_contradict_max": round(vote_contradict, 4),
                 "vote_decision": vote_decision,
+                "map_support_signal_max": round(map_support_signal, 4),
+                "map_contradict_signal_max": round(map_contradict_signal, 4),
+                "map_admissible_signal_count": int(map_admissible_count),
+                "map_offtopic_count": int(map_offtopic_count),
+                "weak_signal_no_stance": bool(weak_signal_no_stance),
                 "llm_verdict_raw": llm_verdict,
                 "llm_verdict_changed": bool(llm_verdict != verdict_str),
             },
@@ -2593,6 +2609,12 @@ class VerdictGenerator:
         unknown_segments = [seg for seg in claim_breakdown if str(seg.get("status", "UNKNOWN")).upper() == "UNKNOWN"]
         if len(unknown_segments) != len(claim_breakdown):
             return
+        # Do not promote UNKNOWN when alignment explicitly says no relevant evidence.
+        if all(
+            str(((seg.get("alignment_debug") or {}).get("reason") or "")).lower() == "no_relevant_evidence"
+            for seg in unknown_segments
+        ):
+            return
 
         best_ev: Dict[str, Any] | None = None
         best_score = -1.0
@@ -2602,6 +2624,10 @@ class VerdictGenerator:
                 continue
             statement = str(ev.get("statement") or ev.get("text") or "")
             if self._is_claim_mention_statement(statement):
+                continue
+            if not all(
+                self._segment_topic_guard_ok(str(seg.get("claim_segment") or ""), statement) for seg in unknown_segments
+            ):
                 continue
             sem = float(ev.get("semantic_score") or ev.get("sem_score") or ev.get("final_score") or 0.0)
             if sem < 0.55:
@@ -2618,6 +2644,11 @@ class VerdictGenerator:
                     continue
                 statement = str(ev.get("statement") or ev.get("text") or "")
                 if self._is_claim_mention_statement(statement):
+                    continue
+                if not all(
+                    self._segment_topic_guard_ok(str(seg.get("claim_segment") or ""), statement)
+                    for seg in unknown_segments
+                ):
                     continue
                 best_ev = ev
                 best_score = float(ev.get("final_score") or ev.get("score") or 0.0)
@@ -3027,6 +3058,43 @@ class VerdictGenerator:
         elif support >= 0.65 and support > contradict:
             decision = Verdict.TRUE.value
         return decision, support, contradict
+
+    def _evidence_map_signal_strengths(
+        self,
+        claim: str,
+        evidence_map: List[Dict[str, Any]],
+    ) -> tuple[float, float, int, int]:
+        support_max = 0.0
+        contradict_max = 0.0
+        admissible_count = 0
+        offtopic_count = 0
+        support_labels = {"SUPPORTS", "PARTIALLY_SUPPORTS", "VALID", "PARTIALLY_VALID"}
+        contradict_labels = {"CONTRADICTS", "PARTIALLY_CONTRADICTS", "INVALID", "PARTIALLY_INVALID"}
+
+        for ev in evidence_map or []:
+            stmt = str(ev.get("statement") or "").strip()
+            if not stmt:
+                continue
+            rel = str(ev.get("relevance") or "").upper()
+            if rel == "OFFTOPIC":
+                offtopic_count += 1
+                continue
+            if not self._segment_topic_guard_ok(claim, stmt):
+                continue
+            if not self._evidence_is_admissible_for_claim(claim, stmt):
+                continue
+            admissible_count += 1
+            try:
+                score = float(ev.get("relevance_score", 0.0) or 0.0)
+            except Exception:
+                score = 0.0
+            score = max(0.0, min(1.0, score))
+            if rel in support_labels:
+                support_max = max(support_max, score)
+            elif rel in contradict_labels:
+                contradict_max = max(contradict_max, score)
+
+        return support_max, contradict_max, admissible_count, offtopic_count
 
     @staticmethod
     def _has_absolute_quantifier(text: str) -> bool:

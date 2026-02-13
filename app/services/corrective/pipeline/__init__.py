@@ -154,6 +154,9 @@ class CorrectivePipeline:
     def _cache_fast_path_allowed(adaptive_trust: Dict[str, Any], verdict_result: Dict[str, Any]) -> bool:
         if not bool(adaptive_trust.get("is_sufficient", False)):
             return False
+        verdict = str(verdict_result.get("verdict") or "").upper()
+        if verdict == "UNVERIFIABLE":
+            return False
 
         # Deterministic gate from adaptive trust metrics (not LLM phrasing).
         coverage = float(adaptive_trust.get("coverage", 0.0) or 0.0)
@@ -165,10 +168,41 @@ class CorrectivePipeline:
             if coverage < 0.99:
                 return False
 
+        analysis_counts = verdict_result.get("analysis_counts", {}) or {}
+        if analysis_counts:
+            try:
+                admissible_ratio = float(analysis_counts.get("admissible_evidence_ratio", 0.0) or 0.0)
+            except Exception:
+                admissible_ratio = 0.0
+            if admissible_ratio < 0.35:
+                return False
+            rel_dist = analysis_counts.get("relevance_distribution", {}) or {}
+            supports = (
+                int(rel_dist.get("SUPPORTS", 0) or 0)
+                + int(rel_dist.get("PARTIALLY_SUPPORTS", 0) or 0)
+                + int(rel_dist.get("VALID", 0) or 0)
+                + int(rel_dist.get("PARTIALLY_VALID", 0) or 0)
+            )
+            contradicts = (
+                int(rel_dist.get("CONTRADICTS", 0) or 0)
+                + int(rel_dist.get("PARTIALLY_CONTRADICTS", 0) or 0)
+                + int(rel_dist.get("INVALID", 0) or 0)
+                + int(rel_dist.get("PARTIALLY_INVALID", 0) or 0)
+            )
+            if (supports + contradicts) == 0:
+                return False
+
+        claim_breakdown = verdict_result.get("claim_breakdown", []) or []
+        if claim_breakdown:
+            unresolved_reasons = {
+                str(((seg.get("alignment_debug") or {}).get("reason") or "")).lower() for seg in claim_breakdown
+            }
+            if "no_relevant_evidence" in unresolved_reasons or "insufficient_admissible_evidence" in unresolved_reasons:
+                return False
+
         if "required_segments_resolved" in verdict_result:
             return bool(verdict_result.get("required_segments_resolved", False))
 
-        claim_breakdown = verdict_result.get("claim_breakdown", []) or []
         if not claim_breakdown:
             return False
         return all((seg.get("status") or "UNKNOWN").upper() != "UNKNOWN" for seg in claim_breakdown)
