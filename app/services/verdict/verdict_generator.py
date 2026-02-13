@@ -1526,32 +1526,29 @@ class VerdictGenerator:
             verdict_str = Verdict.FALSE.value
             truth_score_percent = min(float(truth_score_percent or 0.0), 10.0)
             confidence = max(float(confidence), 0.70)
-        elif strong_vote_support and self._has_absolute_quantifier(claim):
+        final_lock_unverifiable = bool(weak_signal_no_stance or policy_insufficient)
+        if strong_vote_support and self._has_absolute_quantifier(claim) and not final_lock_unverifiable:
             verdict_str = Verdict.PARTIALLY_TRUE.value
             truth_score_percent = min(float(truth_score_percent or 0.0), 55.0)
         if numeric_conf_floor is not None:
             confidence = max(float(confidence), float(numeric_conf_floor))
-        if weak_signal_no_stance:
+        if final_lock_unverifiable:
+            verdict_str = Verdict.UNVERIFIABLE.value
             truth_score_percent = max(35.0, min(55.0, float(truth_score_percent or 0.0)))
             confidence = min(float(confidence), 0.55)
             for seg in claim_breakdown or []:
-                if str(seg.get("status", "UNKNOWN")).upper() in {
-                    "VALID",
-                    "INVALID",
-                    "PARTIALLY_VALID",
-                    "PARTIALLY_INVALID",
-                }:
-                    seg["status"] = "UNKNOWN"
-                    seg["supporting_fact"] = ""
-                    seg["source_url"] = ""
-                    seg["evidence_used_ids"] = []
-                    seg["alignment_debug"] = {
-                        "reason": "insufficient_admissible_evidence",
-                        "support_signal": round(map_support_signal, 3),
-                        "contradict_signal": round(map_contradict_signal, 3),
-                    }
+                seg["status"] = "UNKNOWN"
+                seg["supporting_fact"] = ""
+                seg["source_url"] = ""
+                seg["evidence_used_ids"] = []
+                seg["alignment_debug"] = {
+                    "reason": "insufficient_admissible_evidence",
+                    "support_signal": round(map_support_signal, 3),
+                    "contradict_signal": round(map_contradict_signal, 3),
+                }
+            reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
             rationale = (
-                "Available evidence is mixed or insufficiently decisive for this claim, "
+                "Available admissible evidence is mixed or insufficiently decisive for this claim, "
                 "so the result is UNVERIFIABLE."
             )
         if verdict_str == Verdict.UNVERIFIABLE.value and numeric_truth_override is None:
@@ -1560,6 +1557,12 @@ class VerdictGenerator:
             verdict_str = Verdict.PARTIALLY_TRUE.value
             truth_score_percent = min(float(truth_score_percent or 0.0), 55.0)
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
+        if final_lock_unverifiable:
+            verdict_str = Verdict.UNVERIFIABLE.value
+            rationale = (
+                "Available admissible evidence is mixed or insufficiently decisive for this claim, "
+                "so the result is UNVERIFIABLE."
+            )
         if llm_verdict == Verdict.TRUE.value and verdict_str != Verdict.TRUE.value:
             try:
                 truth_score_percent = min(float(truth_score_percent), 89.9)
@@ -3229,6 +3232,11 @@ class VerdictGenerator:
         verdict = str(reconciled.get("verdict", Verdict.UNVERIFIABLE.value))
         unresolved = int(reconciled.get("unresolved_segments", unknown_count) or 0)
 
+        if verdict == Verdict.UNVERIFIABLE.value:
+            return (
+                "Available admissible evidence is mixed or insufficiently decisive for this claim, "
+                "so the result is UNVERIFIABLE."
+            )
         if unresolved > 0 or unknown_count > 0:
             return (
                 f"Evidence supports {valid_count}/{total} segment(s), "
@@ -3909,3 +3917,30 @@ class VerdictGenerator:
             f"for {len(unknown_segments)} UNKNOWN segments"
         )
         return all_web_evidence
+
+
+def _self_test_unverifiable_lock_and_rationale() -> None:
+    """Lightweight sanity checks for UNVERIFIABLE lock behavior."""
+    # Case 1: mixed signals on absolute claim should force lock.
+    support_signal = 0.46
+    contradict_signal = 0.47
+    decisive_support = support_signal >= 0.58 and contradict_signal <= 0.40
+    decisive_contradict = contradict_signal >= 0.58 and support_signal <= 0.40
+    conflicting_signals = support_signal >= 0.45 and contradict_signal >= 0.45
+    weak_signal_no_stance = (not decisive_support and not decisive_contradict) or conflicting_signals
+    policy_insufficient = True
+    final_lock_unverifiable = bool(weak_signal_no_stance or policy_insufficient)
+    assert final_lock_unverifiable, "Mixed signals must lock verdict to UNVERIFIABLE."
+
+    # Case 2: UNVERIFIABLE rationale must not imply TRUE.
+    vg = VerdictGenerator.__new__(VerdictGenerator)
+    reconciled = {"verdict": Verdict.UNVERIFIABLE.value, "unresolved_segments": 1}
+    breakdown = [{"status": "UNKNOWN"}]
+    rationale = vg._rewrite_rationale_from_breakdown("placeholder", breakdown, reconciled)
+    assert "UNVERIFIABLE" in rationale, "Rationale must explicitly state UNVERIFIABLE."
+    assert "Verdict is TRUE" not in rationale, "Rationale must not imply TRUE when UNVERIFIABLE."
+
+
+if __name__ == "__main__":
+    _self_test_unverifiable_lock_and_rationale()
+    print("verdict_generator sanity checks passed")
