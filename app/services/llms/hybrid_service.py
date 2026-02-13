@@ -71,7 +71,19 @@ def _env_confidence_mode() -> bool:
 
 
 def _env_allow_groq_burst() -> bool:
-    return (os.getenv("ALLOW_GROQ_BURST", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+    return (os.getenv("ALLOW_GROQ_BURST", "false") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _env_max_unspecified_low_calls() -> int:
+    try:
+        return max(1, int(os.getenv("GROQ_MAX_UNSPECIFIED_LOW_PER_JOB", "6")))
+    except Exception:
+        return 6
 
 
 def _env_max_calls() -> int:
@@ -217,6 +229,22 @@ class HybridLLMService:
     ) -> tuple[bool, int, int, str]:
         state = _groq_job_state.get()
         confidence_mode = _env_confidence_mode()
+        normalized_tag = (call_tag or "").strip().lower()
+
+        # Guardrail: avoid long tails of low-priority unnamed calls.
+        if priority == LLMPriority.LOW and normalized_tag in {"", "unspecified"}:
+            max_unspecified = _env_max_unspecified_low_calls()
+            if state.calls_used >= max_unspecified:
+                self._warn_once(
+                    state,
+                    f"unspecified_low_cap:{max_unspecified}",
+                    "[HybridLLMService] Capping low-priority unspecified Groq calls for job=%s " "(used=%d, cap=%d)",
+                    state.job_id,
+                    state.calls_used,
+                    max_unspecified,
+                )
+                return False, state.calls_used, state.max_calls, "unspecified_low_cap"
+
         if state.calls_used >= state.max_calls:
             if confidence_mode and allow_quota_override and self._is_critical_call(call_tag):
                 logger.warning(
@@ -229,12 +257,17 @@ class HybridLLMService:
                 )
                 state.calls_used += 1
                 _groq_job_state.set(state)
-                return True, state.calls_used, state.max_calls, "confidence_override_hard_cap"
+                return (
+                    True,
+                    state.calls_used,
+                    state.max_calls,
+                    "confidence_override_hard_cap",
+                )
             return False, state.calls_used, state.max_calls, "hard_cap"
 
         reserved_for_verdict, reserved_for_fact = _reserved_call_budget(state.max_calls)
         reserve_pool = reserved_for_verdict + reserved_for_fact
-        tag = (call_tag or "").strip().lower()
+        tag = normalized_tag
         is_verdict_call = tag == "verdict_generation"
         is_fact_extraction_call = tag == "fact_extraction"
         remaining = state.max_calls - state.calls_used
@@ -288,7 +321,12 @@ class HybridLLMService:
                 state.calls_used += 1
                 state.fact_extraction_override_used = True
                 _groq_job_state.set(state)
-                return True, state.calls_used, state.max_calls, f"confidence_override_{reason}"
+                return (
+                    True,
+                    state.calls_used,
+                    state.max_calls,
+                    f"confidence_override_{reason}",
+                )
             return False, state.calls_used, state.max_calls, reason
 
         # Fact extraction can use its own reserved pool, but must preserve verdict slot(s).
@@ -304,7 +342,12 @@ class HybridLLMService:
                 state.calls_used += 1
                 state.fact_extraction_override_used = True
                 _groq_job_state.set(state)
-                return True, state.calls_used, state.max_calls, "confidence_override_reserved_for_verdict"
+                return (
+                    True,
+                    state.calls_used,
+                    state.max_calls,
+                    "confidence_override_reserved_for_verdict",
+                )
             self._warn_once(
                 state,
                 f"preserve_verdict:{call_tag or 'unknown'}:{reserved_for_verdict}",
@@ -454,12 +497,25 @@ class HybridLLMService:
                                 force_client="fallback",
                             )
                     except Exception as fallback_error:
-                        logger.warning("[HybridLLMService] Fallback credential retry failed: %s", fallback_error)
+                        logger.warning(
+                            "[HybridLLMService] Fallback credential retry failed: %s",
+                            fallback_error,
+                        )
             except Exception as e:
                 logger.warning(f"[HybridLLMService] Groq failed: {e}")
                 msg = str(e).lower()
                 should_retry_fallback = any(
-                    token in msg for token in ("quota", "hard_cap", "budget unavailable", "reserved_for", "rate")
+                    token in msg
+                    for token in (
+                        "quota",
+                        "hard_cap",
+                        "budget unavailable",
+                        "reserved_for",
+                        "rate",
+                        "timeout",
+                        "timed out",
+                        "readtimeout",
+                    )
                 )
                 if (
                     confidence_mode
@@ -484,7 +540,10 @@ class HybridLLMService:
                                 force_client="fallback",
                             )
                     except Exception as fallback_error:
-                        logger.warning("[HybridLLMService] Fallback credential retry failed: %s", fallback_error)
+                        logger.warning(
+                            "[HybridLLMService] Fallback credential retry failed: %s",
+                            fallback_error,
+                        )
 
         if priority == LLMPriority.LOW:
             return self._mark_degraded_skip(call_tag or "non_critical")

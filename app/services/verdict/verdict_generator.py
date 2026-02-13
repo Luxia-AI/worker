@@ -1519,20 +1519,22 @@ class VerdictGenerator:
             and verdict_str in {Verdict.TRUE.value, Verdict.FALSE.value}
         ):
             verdict_str = Verdict.UNVERIFIABLE.value
+
+        unique_domains_count = 0
+        try:
+            unique_domains_count = len(
+                {
+                    str((ev.get("source_url") or ev.get("source") or "").split("/")[2]).lower().removeprefix("www.")
+                    for ev in (evidence or [])
+                    if str(ev.get("source_url") or ev.get("source") or "").startswith("http")
+                }
+            )
+        except Exception:
+            unique_domains_count = 0
+
         # Conservative binary gate:
         # Avoid hard TRUE/FALSE unless stance is explicit and evidence quality/diversity are sufficient.
         if verdict_str in {Verdict.TRUE.value, Verdict.FALSE.value}:
-            unique_domains_count = 0
-            try:
-                unique_domains_count = len(
-                    {
-                        str((ev.get("source_url") or ev.get("source") or "").split("/")[2]).lower().removeprefix("www.")
-                        for ev in (evidence or [])
-                        if str(ev.get("source_url") or ev.get("source") or "").startswith("http")
-                    }
-                )
-            except Exception:
-                unique_domains_count = 0
             binary_gate_ok = (
                 canonical_stance in {"entails", "contradicts"}
                 and admissible_ratio >= 0.50
@@ -1558,12 +1560,19 @@ class VerdictGenerator:
                 and top_stance == "entails"
                 and top_stance_score >= 0.68
                 and map_contradict_signal < 0.35
+                and unique_domains_count >= 2
+                and diversity_score >= 0.20
             )
             binary_gate_ok = bool(binary_gate_ok or strong_contradiction_exception or strong_support_exception)
             if strong_vote_contradiction:
                 binary_gate_ok = True
             if not binary_gate_ok:
                 verdict_str = Verdict.UNVERIFIABLE.value
+        # Single-source support should not produce overconfident hard TRUE.
+        if verdict_str == Verdict.TRUE.value and unique_domains_count < 2:
+            verdict_str = Verdict.PARTIALLY_TRUE.value
+            truth_score_percent = min(float(truth_score_percent or 0.0), 75.0)
+            confidence = min(float(confidence), 0.75)
         if strong_vote_contradiction:
             verdict_str = Verdict.FALSE.value
             truth_score_percent = min(float(truth_score_percent or 0.0), 10.0)
@@ -3511,6 +3520,24 @@ class VerdictGenerator:
         total = max(1, len(statuses))
         verdict = str(reconciled.get("verdict", Verdict.UNVERIFIABLE.value))
         unresolved = int(reconciled.get("unresolved_segments", unknown_count) or 0)
+        original = (original_rationale or "").strip()
+
+        def _normalize_for_verdict(text: str, verdict_value: str) -> str:
+            t = (text or "").strip()
+            if not t:
+                return t
+            if verdict_value == Verdict.TRUE.value:
+                # Keep label+rationale consistent; a TRUE verdict must not claim "partially true".
+                t = re.sub(r"\bpartially\s+true\b", "true", t, flags=re.IGNORECASE)
+            elif verdict_value == Verdict.PARTIALLY_TRUE.value:
+                # Prefer explicit partial framing for partial verdicts.
+                if not re.search(r"\bpartially\s+true\b", t, flags=re.IGNORECASE):
+                    t = f"{t} Overall, the claim is partially true."
+            elif verdict_value == Verdict.FALSE.value:
+                # Remove contradictory support wording.
+                if re.search(r"\bpartially\s+true\b", t, flags=re.IGNORECASE):
+                    t = "Evidence contradicts the claim."
+            return t
 
         if verdict == Verdict.UNVERIFIABLE.value:
             return (
@@ -3531,8 +3558,14 @@ class VerdictGenerator:
         if invalid_count == total:
             return "Evidence contradicts all required claim segments."
         if valid_count == total and verdict == Verdict.TRUE.value:
-            return original_rationale or "Evidence supports all required claim segments."
-        return original_rationale or "Verdict is based on segment-level evidence evaluation."
+            return _normalize_for_verdict(
+                original or "Evidence supports all required claim segments.",
+                verdict,
+            )
+        return _normalize_for_verdict(
+            original or "Verdict is based on segment-level evidence evaluation.",
+            verdict,
+        )
 
     def _build_deterministic_claim_breakdown(self, claim: str, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """

@@ -147,6 +147,25 @@ def test_diabetes_medication_reduction_segment_accepts_supervised_statement():
     )
 
 
+def test_rationale_rewrite_removes_partially_true_for_true_verdict():
+    vg = _vg()
+    reconciled = {"verdict": "TRUE", "unresolved_segments": 0}
+    breakdown = [
+        {
+            "claim_segment": "Vaccines do not cause autism",
+            "status": "VALID",
+            "supporting_fact": "Vaccines do not cause autism.",
+            "source_url": "https://example.org",
+        }
+    ]
+    out = vg._rewrite_rationale_from_breakdown(
+        "The claim is partially true based on evidence.",
+        breakdown,
+        reconciled,
+    )
+    assert "partially true" not in out.lower()
+
+
 def test_unknown_segment_without_fact_is_aligned_and_marked_invalid_for_negation_mismatch():
     vg = _vg()
     claim = "Handwashing does not reduce the spread of infectious diseases."

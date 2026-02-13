@@ -28,20 +28,42 @@ class GroqService:
             raise RuntimeError("Missing GROQ_API_KEY")
         self.model = LLM_MODEL_NAME
         self._clients: list[tuple[str, AsyncGroq]] = []
+        try:
+            self.request_timeout_seconds = max(5.0, float(os.getenv("GROQ_REQUEST_TIMEOUT_SECONDS", "30")))
+        except Exception:
+            self.request_timeout_seconds = 30.0
 
         primary_headers = self._build_headers(
             os.getenv("GROQ_ORG_ID") or settings.GROQ_ORG_ID,
             os.getenv("GROQ_PROJECT_ID") or settings.GROQ_PROJECT_ID,
         )
         if primary_api_key:
-            self._clients.append(("primary", AsyncGroq(api_key=primary_api_key, default_headers=primary_headers)))
+            self._clients.append(
+                (
+                    "primary",
+                    AsyncGroq(
+                        api_key=primary_api_key,
+                        default_headers=primary_headers,
+                        timeout=self.request_timeout_seconds,
+                    ),
+                )
+            )
 
         fallback_headers = self._build_headers(
             os.getenv("GROQ_ORG_ID_FALLBACK") or settings.GROQ_ORG_ID_FALLBACK,
             os.getenv("GROQ_PROJECT_ID_FALLBACK") or settings.GROQ_PROJECT_ID_FALLBACK,
         )
         if fallback_api_key and fallback_api_key != primary_api_key:
-            self._clients.append(("fallback", AsyncGroq(api_key=fallback_api_key, default_headers=fallback_headers)))
+            self._clients.append(
+                (
+                    "fallback",
+                    AsyncGroq(
+                        api_key=fallback_api_key,
+                        default_headers=fallback_headers,
+                        timeout=self.request_timeout_seconds,
+                    ),
+                )
+            )
 
         if not self._clients:
             raise RuntimeError("Missing Groq client credentials")
@@ -119,13 +141,22 @@ class GroqService:
                     if response_format == "json":
                         if msg.content:
                             result: Dict[str, Any] = json.loads(msg.content)
-                            logger.info("[GroqService] Request served by %s Groq credentials", client_name)
+                            logger.info(
+                                "[GroqService] Request served by %s Groq credentials",
+                                client_name,
+                            )
                             return result
-                        logger.info("[GroqService] Request served by %s Groq credentials", client_name)
+                        logger.info(
+                            "[GroqService] Request served by %s Groq credentials",
+                            client_name,
+                        )
                         return {}
 
                     # Text response
-                    logger.info("[GroqService] Request served by %s Groq credentials", client_name)
+                    logger.info(
+                        "[GroqService] Request served by %s Groq credentials",
+                        client_name,
+                    )
                     return {"text": msg.content}
 
                 except Exception as e:
