@@ -1,13 +1,15 @@
 import json
+import os
 import re
 import uuid
 from typing import Any, Dict, List, Optional
 
-from app.core.logger import get_logger
+from app.core.logger import get_logger, log_value_payload
 from app.services.common.dedup import dedup_triples_by_structure
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 
 logger = get_logger(__name__)
+RELATION_MIN_CONF = float(os.getenv("RELATION_MIN_CONFIDENCE", "0.2"))
 
 # Batch relation extraction prompt - extract triples from multiple facts at once
 BATCH_TRIPLE_PROMPT = """You are a relation extraction agent specialized in biomedical/health facts.
@@ -163,10 +165,52 @@ class RelationExtractor:
                         return parsed
                     if "triples" in parsed:
                         return {"results": [{"index": 0, "triples": parsed["triples"]}]}
-            except json.JSONDecodeError:
-                pass
+            except json.JSONDecodeError as e:
+                preview = result[:800].replace("\n", "\\n")
+                logger.warning(
+                    "[RelationExtractor] JSON parse error: msg=%s line=%s col=%s pos=%s preview=%s",
+                    e.msg,
+                    e.lineno,
+                    e.colno,
+                    e.pos,
+                    preview,
+                )
+                repaired = self._repair_json_string(result)
+                if repaired:
+                    try:
+                        parsed = json.loads(repaired)
+                        if isinstance(parsed, dict):
+                            if "results" in parsed:
+                                logger.warning("[RelationExtractor] JSON repaired successfully")
+                                return parsed
+                            if "triples" in parsed:
+                                logger.warning("[RelationExtractor] JSON repaired successfully (triples root)")
+                                return {"results": [{"index": 0, "triples": parsed["triples"]}]}
+                    except json.JSONDecodeError as repair_err:
+                        logger.warning(
+                            "[RelationExtractor] JSON repair parse failed: msg=%s line=%s col=%s pos=%s",
+                            repair_err.msg,
+                            repair_err.lineno,
+                            repair_err.colno,
+                            repair_err.pos,
+                        )
 
         return None
+
+    @staticmethod
+    def _repair_json_string(raw_text: str) -> str:
+        """Best-effort JSON repair for markdown fences + trailing commas + extra wrappers."""
+        text = (raw_text or "").strip()
+        if not text:
+            return ""
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s*```$", "", text)
+        start_obj = text.find("{")
+        end_obj = text.rfind("}")
+        if start_obj != -1 and end_obj != -1 and end_obj > start_obj:
+            text = text[start_obj : end_obj + 1]
+        text = re.sub(r",\s*([}\]])", r"\1", text)
+        return text
 
     async def _parse_llm_response(
         self, result: Any, original_prompt: str, required_format: str, max_retries: int = 1
@@ -214,7 +258,7 @@ class RelationExtractor:
         if not facts:
             return []
 
-        logger.info(f"[RelationExtractor] Batch extracting relations for {len(facts)} facts (1 LLM call)")
+        logger.debug("[RelationExtractor] extracting relations for facts=%d", len(facts))
 
         # Build batch prompt with all facts
         facts_text = "\n".join(f"[{i}] {fact.get('statement', '')}" for i, fact in enumerate(facts))
@@ -234,6 +278,12 @@ class RelationExtractor:
                 priority=LLMPriority.LOW,
                 call_tag="relation_extraction",
             )
+            if isinstance(result, str):
+                preview = result[:900].replace("\n", "\\n")
+                logger.debug("[RelationExtractor] LLM raw output preview=%s", preview)
+            elif isinstance(result, dict):
+                preview = json.dumps(result, ensure_ascii=True, default=str)[:900].replace("\n", "\\n")
+                logger.debug("[RelationExtractor] LLM raw output preview=%s", preview)
 
             # Parse with retry logic
             parsed = await self._parse_llm_response(result, prompt, required_format)
@@ -244,12 +294,27 @@ class RelationExtractor:
 
             all_triples: List[Dict[str, Any]] = []
             results_list = parsed.get("results", [])
+            raw_triples_count = 0
+            parsed_triples_count = 0
+            rejected_by_reason: Dict[str, int] = {
+                "invalid_index": 0,
+                "non_dict_triple": 0,
+                "missing_subject": 0,
+                "missing_predicate": 0,
+                "missing_object": 0,
+                "same_entity": 0,
+                "low_conf": 0,
+                "negation_guard_drop": 0,
+                "malformed_triple": 0,
+            }
 
             for item in results_list:
                 idx = item.get("index", -1)
                 raw_triples = item.get("triples", [])
+                raw_triples_count += len(raw_triples or [])
 
                 if idx < 0 or idx >= len(facts):
+                    rejected_by_reason["invalid_index"] += len(raw_triples or [])
                     continue
 
                 fact = facts[idx]
@@ -258,17 +323,33 @@ class RelationExtractor:
                 for rt in raw_triples:
                     try:
                         if not isinstance(rt, dict):
+                            rejected_by_reason["non_dict_triple"] += 1
                             continue
+                        parsed_triples_count += 1
                         subj = (rt.get("subject") or "").strip()
                         rel = (rt.get("relation") or "").strip()
                         obj = (rt.get("object") or "").strip()
                         conf = float(rt.get("confidence", 0.0))
 
-                        if not subj or not rel or not obj:
+                        if not subj:
+                            rejected_by_reason["missing_subject"] += 1
+                            continue
+                        if not rel:
+                            rejected_by_reason["missing_predicate"] += 1
+                            continue
+                        if not obj:
+                            rejected_by_reason["missing_object"] += 1
+                            continue
+                        if subj.strip().lower() == obj.strip().lower():
+                            rejected_by_reason["same_entity"] += 1
+                            continue
+                        if conf < RELATION_MIN_CONF:
+                            rejected_by_reason["low_conf"] += 1
                             continue
 
                         normalized_relation = self._apply_negation_guard(fact.get("statement", ""), rel)
                         if not normalized_relation:
+                            rejected_by_reason["negation_guard_drop"] += 1
                             continue
 
                         triple = {
@@ -284,10 +365,20 @@ class RelationExtractor:
                         all_triples.append(triple)
                     except Exception as e:
                         logger.warning(f"[RelationExtractor] Skipping malformed triple: {e}")
+                        rejected_by_reason["malformed_triple"] += 1
                         continue
 
             deduped = dedup_triples_by_structure(all_triples)
-            logger.info(f"[RelationExtractor] Extracted {len(deduped)} unique triples (batched)")
+            log_value_payload(
+                logger,
+                "relation_extraction",
+                {
+                    "raw_triples": raw_triples_count,
+                    "parsed_triples": parsed_triples_count,
+                    "valid_triples": len(deduped),
+                    "rejected_by_reason": rejected_by_reason,
+                },
+            )
             return deduped
 
         except (json.JSONDecodeError, TypeError) as e:

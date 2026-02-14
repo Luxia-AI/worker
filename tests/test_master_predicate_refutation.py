@@ -99,3 +99,24 @@ def test_master_injection_claim_mrna_false_not_unverifiable():
         for ev in (out.get("evidence_map") or [])
     )
     assert out["verdict"] != "UNVERIFIABLE"
+
+
+def test_calcium_build_claim_maps_to_support_not_neutral():
+    vg = _vg()
+    claim = "Calcium builds strong bones."
+    evidence = [
+        {
+            "statement": "Calcium is needed to build and maintain strong bones.",
+            "source_url": "https://ods.od.nih.gov/factsheets/Calcium-HealthProfessional/",
+            "final_score": 0.83,
+            "credibility": 0.95,
+        }
+    ]
+    normalized = vg._normalize_evidence_map(
+        claim,
+        [{"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.7}],
+        evidence,
+    )
+    assert normalized
+    assert normalized[0]["relevance"] == "SUPPORTS"
+    assert float(normalized[0].get("predicate_match_score", 0.0) or 0.0) >= 0.7

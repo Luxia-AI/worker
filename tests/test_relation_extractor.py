@@ -49,3 +49,14 @@ def test_negation_guard_maps_contributes_to_into_negative_causal_relation():
     statement = "Large studies show vaccines do not cause autism."
     relation = ex._apply_negation_guard(statement, "contributes to")
     assert relation == "does_not_cause"
+
+
+def test_repair_json_string_handles_fenced_trailing_comma():
+    ex = _make_extractor()
+    raw = """```json
+{"results":[{"index":0,"triples":[{"subject":"a","relation":"causes","object":"b","confidence":0.9},]}],}
+```"""
+    repaired = ex._repair_json_string(raw)
+    parsed = ex._try_parse_result(repaired)
+    assert isinstance(parsed, dict)
+    assert "results" in parsed

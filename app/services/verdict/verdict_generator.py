@@ -1729,7 +1729,7 @@ class VerdictGenerator:
             verdict_str = Verdict.FALSE.value
             truth_score_percent = min(float(truth_score_percent or 0.0), 10.0)
             confidence = max(float(confidence), 0.70)
-        final_lock_unverifiable = bool(weak_signal_no_stance or policy_insufficient)
+        final_lock_unverifiable = bool(weak_signal_no_stance or (policy_insufficient and canonical_stance == "neutral"))
         if strong_vote_support and self._has_absolute_quantifier(claim) and not final_lock_unverifiable:
             verdict_str = Verdict.PARTIALLY_TRUE.value
             truth_score_percent = min(float(truth_score_percent or 0.0), 55.0)
@@ -2365,6 +2365,10 @@ class VerdictGenerator:
                     r"\b(?:prevent|prevents|prevented|prevention|reduce|reduces|reduced|reduction|"
                     r"protect|protects|protected)\b"
                 ),
+                "build_support": (
+                    r"\b(?:build|builds|built|maintain|maintains|maintained|support|supports|supported|"
+                    r"strengthen|strengthens|strengthened|need|needs|needed|required|requires|essential|necessary)\b"
+                ),
             }
             hits: set[str] = set()
             for group, pattern in groups.items():
@@ -2469,6 +2473,9 @@ class VerdictGenerator:
                     same_predicate,
                     stance_l,
                 )
+            return "entails"
+        # Positive symmetry guard: same predicate family + no negation + anchor overlap implies support.
+        if same_predicate and not seg_neg and not stmt_neg and self._segment_anchor_overlap(segment, statement) >= 0.2:
             return "entails"
         # Same predicate with polarity mismatch => contradiction.
         if same_predicate and (seg_neg ^ stmt_neg):
@@ -2790,6 +2797,36 @@ class VerdictGenerator:
                 return t[: -len(suf)]
         return t
 
+    @staticmethod
+    def _predicate_bucket_tokens(text: str) -> set[str]:
+        low = str(text or "").lower()
+        buckets: set[str] = set()
+        groups = {
+            "causal": (
+                r"\b(cause|causes|caused|causing|lead|leads|leading|result|results|resulting|"
+                r"associate|associated|link|linked)\b"
+            ),
+            "preventive": r"\b(prevent|prevents|prevention|reduce|reduces|reduced|protect|protects)\b",
+            "therapeutic": r"\b(treat|treats|treatment|cure|cures|help|helps|effective|efficacious)\b",
+            "genomic_change": (
+                r"\b(alter|alters|altered|change|changes|changed|integrate|integration|"
+                r"incorporat|modify|modifies)\b"
+            ),
+            "build_support": (
+                r"\b(build|builds|built|maintain|maintains|maintained|support|supports|supported|"
+                r"strengthen|strengthens|strengthened|needed|need|needs|required|requires|essential|necessary)\b"
+            ),
+        }
+        for name, pattern in groups.items():
+            if re.search(pattern, low):
+                buckets.add(name)
+        return buckets
+
+    def _predicate_semantic_equivalent(self, claim_predicate: str, evidence_predicate: str) -> bool:
+        c_b = self._predicate_bucket_tokens(claim_predicate)
+        e_b = self._predicate_bucket_tokens(evidence_predicate)
+        return bool(c_b and e_b and (c_b & e_b))
+
     def _extract_canonical_predicate_triplet(self, text: str) -> Dict[str, str]:
         low = (text or "").strip().lower()
         tokens = re.findall(r"\b[a-z][a-z0-9_-]*\b", low)
@@ -2819,13 +2856,56 @@ class VerdictGenerator:
             "not",
         }
         stop = {"the", "a", "an", "and", "or", "of", "in", "on", "for", "with", "that", "this", "your", "our"}
+        adjective_stop = {
+            "strong",
+            "weak",
+            "healthy",
+            "good",
+            "bad",
+            "normal",
+            "abnormal",
+            "possible",
+            "likely",
+            "unlikely",
+        }
+        verb_hints = {
+            "build",
+            "maintain",
+            "support",
+            "help",
+            "need",
+            "require",
+            "prevent",
+            "reduce",
+            "treat",
+            "cure",
+            "cause",
+            "increase",
+            "decrease",
+            "alter",
+            "change",
+            "integrate",
+            "modify",
+            "lead",
+            "result",
+            "associate",
+            "link",
+            "work",
+            "contain",
+            "manage",
+        }
         pred_idx = -1
         best_score = -1
         for i in range(1, len(tokens) - 1):
             tok = tokens[i]
             if tok in stop:
                 continue
+            if tok in adjective_stop:
+                continue
             score = 0
+            lemma = self._lemma_token(tok)
+            if lemma in verb_hints:
+                score += 4
             if tok in aux:
                 score += 2
             if tok.endswith(("ing", "ed", "es", "e")):
@@ -2894,7 +2974,27 @@ class VerdictGenerator:
         claim_obj = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", claim_t.get("object_span", "")))
         ev_obj = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", ev_t.get("object_span", "")))
         obj_overlap = (len(claim_obj & ev_obj) / max(1, len(claim_obj))) if claim_obj else 0.0
+        cp_full = " ".join(
+            x
+            for x in [
+                str(claim_t.get("canonical_predicate") or ""),
+                str(claim_t.get("predicate_span") or ""),
+            ]
+            if x
+        )
+        ep_full = " ".join(
+            x
+            for x in [
+                str(ev_t.get("canonical_predicate") or ""),
+                str(ev_t.get("predicate_span") or ""),
+            ]
+            if x
+        )
         if overlap > 0.0:
+            return 0.7
+        if self._predicate_semantic_equivalent(cp_full, ep_full) and (
+            obj_overlap >= 0.5 or anchor_overlap >= ANCHOR_THRESHOLD
+        ):
             return 0.7
 
         if anchor_overlap >= 0.2 and sub_overlap >= 0.5 and obj_overlap >= 0.5:
