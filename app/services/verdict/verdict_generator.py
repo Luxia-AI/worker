@@ -21,6 +21,8 @@ from enum import Enum
 from hashlib import sha1
 from typing import Any, Dict, List, Optional, Tuple
 
+from prometheus_client import Counter
+
 from app.constants.config import LLM_TEMPERATURE_VERDICT
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -29,6 +31,9 @@ from app.services.corrective.fact_extractor import FactExtractor
 from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
+from app.services.logic.claim_strictness import compute_claim_strictness
+from app.services.logic.evidence_strength import compute_evidence_strength
+from app.services.logic.overrides import apply_claim_logic_overrides
 from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
 from app.services.ranking.contradiction_scorer import ContradictionScorer
 from app.services.ranking.subclaim_coverage import compute_subclaim_coverage, evaluate_anchor_match
@@ -47,6 +52,24 @@ _POLARITY_DEBUG = os.getenv("VERDICT_DEBUG_POLARITY", "0").strip().lower() in {
     "yes",
     "on",
 }
+
+logic_overrides_total = Counter(
+    "logic_overrides_total",
+    "Total strictness logic overrides fired",
+    ["type"],
+)
+confidence_capped_total = Counter(
+    "confidence_capped_total",
+    "Total times confidence was capped by strictness/diversity logic",
+)
+contradiction_override_total = Counter(
+    "contradiction_override_total",
+    "Total contradiction dominance overrides",
+)
+hedge_mismatch_total = Counter(
+    "hedge_mismatch_total",
+    "Total hedge mismatch overrides",
+)
 
 
 class Verdict(Enum):
@@ -1445,6 +1468,34 @@ class VerdictGenerator:
             verdict_str,
             is_comparative_claim=self._is_numeric_comparison_claim(claim),
         )
+        strictness_profile = compute_claim_strictness(claim)
+
+        rel_by_statement: Dict[str, str] = {}
+        for evm in evidence_map or []:
+            stmt = str(evm.get("statement") or "").strip().lower()
+            if not stmt:
+                continue
+            rel_by_statement[stmt] = str(evm.get("relevance") or "").upper()
+
+        evidence_strengths = []
+        for ev in evidence[: min(len(evidence), 10)]:
+            stmt = str(ev.get("statement") or ev.get("text") or "").strip()
+            if not stmt:
+                continue
+            evidence_strengths.append(
+                compute_evidence_strength(
+                    claim_text=claim,
+                    text_snippet=stmt,
+                    source_meta=ev,
+                    stance_hint=rel_by_statement.get(stmt.lower()),
+                )
+            )
+
+        kg_hint_ratio = 0.0
+        if evidence:
+            kg_hint_ratio = sum(1 for ev in evidence if float(ev.get("kg_score", 0.0) or 0.0) > 0.0) / max(
+                1, len(evidence)
+            )
         breakdown_stance = self._canonical_stance_from_breakdown(claim_breakdown)
         map_stance = self._canonical_stance_from_evidence_map(evidence_map)
         rationale_stance = self._rationale_polarity_hint(rationale)
@@ -1607,8 +1658,48 @@ class VerdictGenerator:
         if self._has_absolute_quantifier(claim) and verdict_str == Verdict.TRUE.value:
             verdict_str = Verdict.PARTIALLY_TRUE.value
             truth_score_percent = min(float(truth_score_percent or 0.0), 55.0)
+
+        logic_result = apply_claim_logic_overrides(
+            claim=claim,
+            strictness=strictness_profile,
+            evidence_strengths=evidence_strengths,
+            claim_breakdown=claim_breakdown,
+            verdict=verdict_str,
+            truthfulness_percent=float(truth_score_percent or 0.0),
+            confidence=float(confidence or 0.0),
+            diversity=float(diversity_score or 0.0),
+            agreement=float(agreement_ratio or 0.0),
+            evidence_count=len(evidence),
+            kg_hint_ratio=float(kg_hint_ratio or 0.0),
+        )
+        if logic_result.override_fired != "NONE":
+            logic_overrides_total.labels(type=logic_result.override_fired).inc()
+            if logic_result.override_fired == "CONTRADICTION_DOMINANCE":
+                contradiction_override_total.inc()
+            if logic_result.override_fired == "HEDGE_MISMATCH":
+                hedge_mismatch_total.inc()
+            logger.warning(
+                "[VerdictGenerator][LogicOverride] type=%s reason=%s claim='%s' strictness=%s key_numbers=%s",
+                logic_result.override_fired,
+                logic_result.override_reason,
+                claim[:220],
+                strictness_profile.to_dict(),
+                logic_result.key_numbers,
+            )
+        if logic_result.confidence_cap is not None and float(confidence or 0.0) > float(logic_result.confidence_cap):
+            confidence_capped_total.inc()
+            confidence = float(logic_result.confidence_cap)
+        if logic_result.confidence_floor is not None:
+            confidence = max(float(confidence or 0.0), float(logic_result.confidence_floor))
+        if logic_result.truthfulness_cap_percent is not None:
+            truth_score_percent = min(float(truth_score_percent or 0.0), float(logic_result.truthfulness_cap_percent))
+        verdict_str = str(logic_result.verdict or verdict_str)
+        if verdict_str == Verdict.FALSE.value:
+            confidence = max(float(confidence or 0.0), float(os.getenv("FALSE_VERDICT_MIN_CONFIDENCE", "0.55")))
+        confidence = max(0.05, min(0.98, float(confidence or 0.0)))
+
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
-        if final_lock_unverifiable:
+        if final_lock_unverifiable and logic_result.override_fired not in {"CONTRADICTION_DOMINANCE"}:
             verdict_str = Verdict.UNVERIFIABLE.value
             rationale = (
                 "Available admissible evidence is mixed or insufficiently decisive for this claim, "
@@ -1673,6 +1764,10 @@ class VerdictGenerator:
             "policy_sufficient": not policy_insufficient,
             "verdict_reconciled": bool(verdict_str != llm_verdict),
             "skip_targeted_recovery": bool(skip_targeted_recovery),
+            "strictness_profile": strictness_profile.to_dict(),
+            "override_fired": logic_result.override_fired,
+            "override_reason": logic_result.override_reason,
+            "override_key_numbers": logic_result.key_numbers,
             "analysis_counts": {
                 "evidence_total_input": len(evidence),
                 "evidence_map_count": len(evidence_map or []),

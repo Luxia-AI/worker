@@ -334,4 +334,30 @@ This sequence usually identifies whether the problem is retrieval quality, ranki
 - `docs/interfaces-and-contracts.md`
 - `docs/testing-and-validation.md`
 
+## 12) Strictness Layer Config (Env)
+
+New claim strictness / override tuning variables:
+
+- `STRICTNESS_HIGH_THRESHOLD` (default `0.70`)
+- `STRICTNESS_VERY_HIGH_THRESHOLD` (default `0.82`)
+- `STRICTNESS_MEDIUM_THRESHOLD` (default `0.52`)
+- `REFUTE_COVERAGE_FORCE_FALSE` (default `0.50`)
+- `REFUTE_DIVERSITY_FORCE_FALSE` (default `0.35`)
+- `HEDGE_PENALTY_BLOCK_TRUE` (default `0.45`)
+- `DIVERSITY_CONFIDENCE_CAP_LOW` (default `0.70`)
+- `DIVERSITY_CONFIDENCE_CAP_MID` (default `0.80`)
+- `NEGATION_ANCHOR_BOOST_WEIGHT` (default `0.07`)
+- `MULTIHOP_KG_HINT_MAX_BOOST` (default `0.15`)
+
+Supporting confidence-cap controls:
+
+- `STRICTNESS_MIN_EVIDENCE_COUNT` (default `3`)
+- `STRICTNESS_DIVERSITY_LOW_THRESHOLD` (default `0.10`)
+- `STRICTNESS_DIVERSITY_MID_THRESHOLD` (default `0.20`)
+- `STRICTNESS_AGREEMENT_MIN` (default `0.70`)
+- `STRICTNESS_LOW_EVIDENCE_CONFIDENCE_CAP` (default `0.75`)
+- `STRICTNESS_LOW_AGREEMENT_CONFIDENCE_CAP` (default `0.75`)
+- `STRICTNESS_HIGH_CLAIM_LOW_DIVERSITY_CAP` (default `0.72`)
+- `FALSE_VERDICT_MIN_CONFIDENCE` (default `0.55`)
+
 Last verified against code: February 13, 2026

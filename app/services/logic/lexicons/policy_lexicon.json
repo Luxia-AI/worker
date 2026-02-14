@@ -1,0 +1,133 @@
+{
+  "claim": {
+    "universal_quantifiers": [
+      "all",
+      "every",
+      "entirely",
+      "completely",
+      "always",
+      "never",
+      "none",
+      "without exception"
+    ],
+    "broad_quantifiers": [
+      "typically",
+      "generally",
+      "usually",
+      "most",
+      "majority"
+    ],
+    "tentative_markers": [
+      "may",
+      "might",
+      "can",
+      "could",
+      "possible",
+      "possibly",
+      "potentially",
+      "associated with",
+      "linked to"
+    ],
+    "definitive_markers": [
+      "proves",
+      "proven",
+      "definitely",
+      "certainly",
+      "guaranteed"
+    ],
+    "causal_connectors": [
+      "causes",
+      "results in",
+      "leads to",
+      "drives",
+      "induces",
+      "prevents",
+      "cures",
+      "eliminates",
+      "reverses"
+    ],
+    "comparative_markers": [
+      "higher than",
+      "lower than",
+      "more than",
+      "less than",
+      "compared to",
+      "versus",
+      "vs"
+    ],
+    "conditional_markers": [
+      "if",
+      "when",
+      "under",
+      "depending on",
+      "provided that",
+      "in some cases",
+      "for some people"
+    ],
+    "symptom_inference_markers": [
+      "noticeable symptoms",
+      "you can tell",
+      "you will feel",
+      "usually has symptoms",
+      "easy to recognize"
+    ]
+  },
+  "evidence": {
+    "hedge_markers": [
+      "may",
+      "might",
+      "could",
+      "suggests",
+      "suggested",
+      "possibly",
+      "appears to",
+      "potentially",
+      "is associated with",
+      "correlates with"
+    ],
+    "uncertainty_markers": [
+      "uncertain",
+      "inconclusive",
+      "mixed evidence",
+      "insufficient evidence",
+      "more research is needed",
+      "not well established"
+    ],
+    "rarity_markers": [
+      "rare",
+      "rarely",
+      "in rare cases",
+      "isolated case",
+      "case report"
+    ],
+    "conditionality_markers": [
+      "under certain conditions",
+      "depending on",
+      "if",
+      "when",
+      "can occur in"
+    ],
+    "study_context_low_generalizability": [
+      "in vitro",
+      "in mice",
+      "animal model",
+      "cell line",
+      "preclinical"
+    ],
+    "refuting_symptom_negation_markers": [
+      "asymptomatic",
+      "silent",
+      "no symptoms",
+      "without symptoms",
+      "often no symptoms"
+    ],
+    "supporting_assertive_markers": [
+      "demonstrated",
+      "confirmed",
+      "meta-analysis",
+      "systematic review",
+      "randomized trial"
+    ]
+  }
+}
+

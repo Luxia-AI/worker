@@ -1,0 +1,40 @@
+{
+  "hedged_support_vs_diverse_refute": {
+    "claim": "A treatment completely prevents severe disease in all adults.",
+    "evidence": [
+      {
+        "statement": "The treatment may prevent severe disease in some populations and rare cases.",
+        "source_url": "https://example1.org/study",
+        "final_score": 0.72,
+        "sem_score": 0.86,
+        "kg_score": 0.0,
+        "credibility": 0.82
+      },
+      {
+        "statement": "A large trial found the treatment did not prevent severe disease.",
+        "source_url": "https://example2.org/trial",
+        "final_score": 0.79,
+        "sem_score": 0.88,
+        "kg_score": 0.0,
+        "credibility": 0.95
+      },
+      {
+        "statement": "Meta-analysis reports no prevention effect for severe disease outcomes.",
+        "source_url": "https://example3.org/meta",
+        "final_score": 0.81,
+        "sem_score": 0.9,
+        "kg_score": 0.0,
+        "credibility": 0.96
+      },
+      {
+        "statement": "Independent cohort replication found no reduction in severe outcomes.",
+        "source_url": "https://example4.org/cohort",
+        "final_score": 0.77,
+        "sem_score": 0.84,
+        "kg_score": 0.0,
+        "credibility": 0.93
+      }
+    ]
+  }
+}
+

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -17,6 +18,7 @@ from app.constants.config import (
 )
 from app.core.logger import get_logger
 from app.services.common.list_ops import dedupe_list
+from app.services.logic.evidence_strength import compute_negation_anchor_overlap
 from app.services.ranking.subclaim_coverage import evaluate_anchor_match
 
 logger = get_logger(__name__)
@@ -502,6 +504,7 @@ def hybrid_rank(
         claim_overlap = _claim_overlap_score(query_text, item["statement"])
         anchor_eval = evaluate_anchor_match(query_text, item["statement"])
         anchor_match_score = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
+        negation_anchor_overlap = float(compute_negation_anchor_overlap(query_text, item["statement"]) or 0.0)
         if not anchor_eval["anchor_ok"]:
             claim_overlap = min(claim_overlap, 0.20)
         stmt_lq = item["statement"].lower()
@@ -522,6 +525,9 @@ def hybrid_rank(
             + (w_recency * recency_s)
             + (w_cred * cred_s)
         )
+        neg_anchor_weight = float(os.getenv("NEGATION_ANCHOR_BOOST_WEIGHT", "0.07"))
+        if negation_anchor_overlap > 0.0:
+            final_score += neg_anchor_weight * max(0.0, min(1.0, negation_anchor_overlap))
         # Keep raw KG confidence relevant even when normalization compresses scores.
         if kg_raw > 0.0 and claim_overlap >= 0.08:
             final_score += 0.05 * min(1.0, kg_raw)
@@ -574,6 +580,7 @@ def hybrid_rank(
             "anchors_matched": int(anchor_eval.get("matched_groups", 0)),
             "anchors_required": int(anchor_eval.get("required_groups", 0)),
             "anchor_match_score": anchor_match_score,
+            "negation_anchor_overlap": negation_anchor_overlap,
             "anchor_ok": bool(anchor_eval.get("anchor_ok", True)),
             "candidate_type": candidate_type,
             "is_backfill": is_backfill,
