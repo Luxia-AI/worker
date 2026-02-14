@@ -28,6 +28,34 @@ Return ONLY valid JSON with this exact structure (no extra text, no markdown):
 Content:
 {content}"""
 
+FACT_EXTRACTION_PREDICATE_FORCING_PROMPT = """Extract only statements that explicitly address whether:
+subject: {subject}
+predicate: {predicate}
+object: {object}
+
+Strict extraction rules:
+1) Keep only statements that explicitly negate or confirm the predicate mechanism for this subject/object.
+2) A statement qualifies as refuting only when it contains explicit negation,
+   biological impossibility, or mechanism preventing the predicate.
+   Refutation cues include patterns such as:
+   - does not
+   - cannot
+   - no evidence
+   - does not enter
+   - does not integrate
+   - cannot alter
+   - cannot modify
+   - does not affect
+3) Generic background information must be excluded.
+4) If the predicate phrase (or a clear semantic equivalent) is not present, skip it.
+5) Return atomic single-claim statements only.
+
+Return ONLY valid JSON:
+{{"facts": [{{"statement": "...", "confidence": 0.85}}, {{"statement": "...", "confidence": 0.90}}]}}
+
+Content:
+{content}"""
+
 # ============================================================================
 # RELATION EXTRACTION PROMPTS
 # ============================================================================

@@ -3,7 +3,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
-from app.constants.llm_prompts import FACT_EXTRACTION_PROMPT
+from app.constants.llm_prompts import FACT_EXTRACTION_PREDICATE_FORCING_PROMPT, FACT_EXTRACTION_PROMPT
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.common.dedup import generate_fact_id
@@ -146,6 +146,17 @@ class FactExtractor:
                 normalized.append(new_fact)
         return normalized
 
+    @staticmethod
+    def _build_fact_prompt(content: str, predicate_target: Optional[Dict[str, str]] = None) -> str:
+        if predicate_target:
+            return FACT_EXTRACTION_PREDICATE_FORCING_PROMPT.format(
+                subject=str(predicate_target.get("subject", "") or ""),
+                predicate=str(predicate_target.get("predicate", "") or ""),
+                object=str(predicate_target.get("object", "") or ""),
+                content=content,
+            )
+        return FACT_EXTRACTION_PROMPT.format(content=content)
+
     async def _parse_llm_response(
         self, result: Any, original_prompt: str, required_format: str, max_retries: int = 1
     ) -> Optional[Dict[str, Any]]:
@@ -178,7 +189,11 @@ class FactExtractor:
         logger.warning("[FactExtractor] All retries exhausted, returning None")
         return None
 
-    async def extract(self, scraped_pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def extract(
+        self,
+        scraped_pages: List[Dict[str, Any]],
+        predicate_target: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Extract facts from scraped web pages using BATCHED LLM call.
         ONE LLM call for ALL pages (instead of N calls).
@@ -264,7 +279,7 @@ class FactExtractor:
 
             if parsed is None:
                 logger.warning("[FactExtractor] Could not parse LLM response after retries, using fallback")
-                return await self._extract_per_page_fallback(valid_pages)
+                return await self._extract_per_page_fallback(valid_pages, predicate_target=predicate_target)
 
             facts: List[Dict[str, Any]] = []
             results_list = parsed.get("results", [])
@@ -302,9 +317,13 @@ class FactExtractor:
 
         except Exception as e:
             logger.warning(f"[FactExtractor] Batch extraction failed: {e}, falling back to per-page")
-            return await self._extract_per_page_fallback(valid_pages)
+            return await self._extract_per_page_fallback(valid_pages, predicate_target=predicate_target)
 
-    async def _extract_per_page_fallback(self, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    async def _extract_per_page_fallback(
+        self,
+        pages: List[Dict[str, Any]],
+        predicate_target: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
         """Fallback: extract facts one page at a time if batch fails."""
         facts: List[Dict[str, Any]] = []
         confidence_mode = self._confidence_mode()
@@ -313,7 +332,7 @@ class FactExtractor:
         for page in pages:
             content = page.get("content", "")
             content_chunk = truncate_content(content, max_length=2000)
-            prompt = FACT_EXTRACTION_PROMPT.format(content=content_chunk)
+            prompt = self._build_fact_prompt(content_chunk, predicate_target=predicate_target)
 
             try:
                 result = await self.llm_service.ainvoke(
