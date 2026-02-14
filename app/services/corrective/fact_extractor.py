@@ -15,6 +15,9 @@ logger = get_logger(__name__)
 # Batch fact extraction prompt - extract facts from multiple pages at once
 BATCH_FACT_PROMPT = """Extract key factual statements from each content section below.
 For each section, return ONLY atomic, single-claim facts (no conjunctions).
+Keep only truth-grounded statements explicitly asserted in the section.
+Exclude speculative/hedged language (may, might, could, possible, suggests, appears),
+opinion text, claim-about-claim text, and generic background filler.
 
 IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
 Return ONLY valid JSON with this exact structure:
@@ -145,6 +148,49 @@ class FactExtractor:
                 new_fact["fact_id"] = generate_fact_id(new_fact["statement"], new_fact.get("source_url", ""))
                 normalized.append(new_fact)
         return normalized
+
+    @staticmethod
+    def _is_truth_grounded_statement(statement: str) -> bool:
+        text = (statement or "").strip()
+        if len(text) < 10:
+            return False
+        lower = text.lower()
+        if "?" in lower:
+            return False
+        hedge_patterns = (
+            r"\bmay\b",
+            r"\bmight\b",
+            r"\bcould\b",
+            r"\bpossible\b",
+            r"\bpossibly\b",
+            r"\bpotentially\b",
+            r"\blikely\b",
+            r"\bunlikely\b",
+            r"\bsuggest(?:s|ed|ing)?\b",
+            r"\bappear(?:s|ed|ing)?\b",
+            r"\bindicate(?:s|d)?\b",
+            r"\bhypothes(?:is|ized|es)\b",
+        )
+        if any(re.search(p, lower) for p in hedge_patterns):
+            return False
+        non_factual_patterns = (
+            r"\b(some people|many people)\s+(say|claim|believe)\b",
+            r"\bit is believed\b",
+            r"\brumou?r\b",
+            r"\bconspiracy\b",
+            r"\bopinion\b",
+        )
+        if any(re.search(p, lower) for p in non_factual_patterns):
+            return False
+        return True
+
+    def _filter_truth_grounded_facts(self, facts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        kept: List[Dict[str, Any]] = []
+        for fact in facts:
+            stmt = str(fact.get("statement", "") or "")
+            if self._is_truth_grounded_statement(stmt):
+                kept.append(fact)
+        return kept
 
     @staticmethod
     def _build_fact_prompt(content: str, predicate_target: Optional[Dict[str, str]] = None) -> str:
@@ -309,6 +355,7 @@ class FactExtractor:
                     facts.append(fact)
 
             facts = self._normalize_atomic_facts(facts)
+            facts = self._filter_truth_grounded_facts(facts)
             dedup_by_id: Dict[str, Dict[str, Any]] = {}
             for fact in facts:
                 fact_id = str(fact.get("fact_id", ""))
@@ -377,6 +424,7 @@ class FactExtractor:
                 continue
 
         facts = self._normalize_atomic_facts(facts)
+        facts = self._filter_truth_grounded_facts(facts)
         log_value_payload(
             logger,
             "fact_extraction_fallback",

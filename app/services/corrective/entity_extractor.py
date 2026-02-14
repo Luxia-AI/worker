@@ -11,6 +11,9 @@ logger = get_logger(__name__)
 # Batch entity extraction prompt - extract entities for multiple facts at once
 BATCH_NER_PROMPT = """Extract biomedical entities from each fact below.
 For each fact, identify: genes, proteins, diseases, drugs, chemicals, biological processes, anatomical terms.
+Keep only entities explicitly present in factual assertions.
+Do not infer entities from speculative/hedged clauses.
+Do not return generic meta terms (e.g., study, research, evidence, article, claim).
 
 IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
 Respond with JSON in this exact format:
@@ -42,6 +45,32 @@ class EntityExtractor:
     def __init__(self) -> None:
         self.llm = HybridLLMService()
 
+    @staticmethod
+    def _filter_truth_entities(entities: List[str]) -> List[str]:
+        blocked = {
+            "study",
+            "studies",
+            "research",
+            "evidence",
+            "article",
+            "paper",
+            "claim",
+            "claims",
+            "myth",
+            "rumor",
+            "rumour",
+            "opinion",
+        }
+        cleaned: List[str] = []
+        for entity in entities:
+            e = str(entity).lower().strip()
+            if not e or e in blocked:
+                continue
+            if len(e) < 2:
+                continue
+            cleaned.append(e)
+        return dedupe_list(cleaned)
+
     async def extract_entities(self, statement: str) -> List[str]:
         """Extract entities from a single statement (used for claim extraction)."""
         prompt = f"{BIOMED_NER_PROMPT}\n\nFACT:\n{statement}"
@@ -58,6 +87,7 @@ class EntityExtractor:
             logger.info(f"[EntityExtractor] LLM returned: {result}")
             ents = result.get("entities", [])
             cleaned = [e.lower().strip() for e in ents if isinstance(e, str)]
+            cleaned = self._filter_truth_entities(cleaned)
             logger.info(f"[EntityExtractor] Extracted entities: {cleaned}")
             return dedupe_list(cleaned)
         except Exception as e:
@@ -171,7 +201,7 @@ class EntityExtractor:
                 if not isinstance(ents, list):
                     ents = []
                 cleaned = [e.lower().strip() for e in ents if isinstance(e, str)]
-                results_map[idx] = dedupe_list(cleaned)
+                results_map[idx] = self._filter_truth_entities(cleaned)
 
             # Apply entities to facts
             for i, fact in enumerate(facts):

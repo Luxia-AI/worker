@@ -8,7 +8,9 @@ Centralized prompt definitions used across the corrective and ranking pipelines.
 # ============================================================================
 
 BIOMED_NER_PROMPT = """You are a biomedical Named Entity Recognition (NER) model.
-Extract ALL medically relevant entities from the following fact.
+Extract only medically relevant entities that are explicitly asserted in the fact.
+Do not infer entities not directly present in the statement.
+Do not return entities from speculative/hedged parts (may, might, could, possible, hypothesis).
 Entities: diseases, conditions, symptoms, chemicals, nutrients, organs, viruses,
 medication names, biological processes.
 Return ONLY valid JSON (no markdown, no extra text):
@@ -21,7 +23,13 @@ Fact: {statement}"""
 # ============================================================================
 
 FACT_EXTRACTION_PROMPT = """Extract key factual statements from this content.
+IMPORTANT: Return only truth-grounded statements explicitly supported by the provided content.
 IMPORTANT: Return only atomic, single-claim facts (no conjunctions, no multi-part statements).
+Exclude:
+- speculation/hedging (may, might, could, possible, potentially, suggests, appears)
+- opinion/normative language
+- rumors, claims-about-claims, rhetorical questions, anecdotal statements
+- generic background not tied to a concrete assertion in the text
 Return ONLY valid JSON with this exact structure (no extra text, no markdown):
 {{"facts": [{{"statement": "...", "confidence": 0.85}}, {{"statement": "...", "confidence": 0.90}}]}}
 
