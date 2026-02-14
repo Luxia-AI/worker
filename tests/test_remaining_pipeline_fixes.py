@@ -162,3 +162,36 @@ def test_predicate_targeted_query_generation_patterns():
     assert "cannot" in text
     assert "no evidence" in text
     assert "does not" in text
+
+
+def test_valid_support_segment_not_downgraded_to_unverifiable():
+    vg = _vg()
+    claim = "Calcium builds strong bones"
+    evidence = [
+        {
+            "statement": "Calcium is needed to build and maintain strong bones.",
+            "source_url": "https://ods.od.nih.gov/factsheets/Calcium-Consumer/",
+            "final_score": 0.58,
+            "sem_score": 0.88,
+            "credibility": 0.95,
+        },
+        {
+            "statement": "Calcium is stored in bones and teeth.",
+            "source_url": "https://ods.od.nih.gov/factsheets/Calcium-Consumer/",
+            "final_score": 0.66,
+            "credibility": 0.95,
+        },
+    ]
+    llm = {
+        "verdict": "TRUE",
+        "confidence": 0.78,
+        "rationale": "Claim is partially supported but phrasing is somewhat ambiguous.",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.73},
+            {"evidence_id": 1, "statement": evidence[1]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.36},
+        ],
+    }
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    assert out["claim_breakdown"][0]["status"] in {"VALID", "PARTIALLY_VALID"}
+    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}

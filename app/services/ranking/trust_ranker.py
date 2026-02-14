@@ -715,7 +715,13 @@ class TrustRanker:
             entity_overlap = result.get("entity_overlap", 0.0)
             recency = result.get("recency", 0.0)
 
-            grade = TrustRanker.assign_grade(final_score)
+            blended_score = max(
+                float(final_score or 0.0),
+                (0.55 * float(final_score or 0.0))
+                + (0.25 * float(sem_score or 0.0))
+                + (0.20 * float(credibility or 0.0)),
+            )
+            grade = TrustRanker.assign_grade(blended_score)
             sem_confidence = TrustRanker.assign_semantic_confidence(sem_score)
 
             # Build rationale

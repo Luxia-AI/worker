@@ -25,5 +25,5 @@ def test_log_value_payload_emits_phase_output(caplog):
     caplog.set_level(logging.INFO, logger="test.value.payload")
     log_value_payload(logger, "ranking", {"top_score": 0.71, "queries_used": ["a", "b", "c"]})
     assert "[PhaseOutput]" in caplog.text
-    assert '"phase": "ranking"' in caplog.text
-    assert '"top_score": 0.71' in caplog.text
+    assert '"phase":"ranking"' in caplog.text
+    assert '"top_score":0.71' in caplog.text

@@ -74,8 +74,7 @@ def log_value_payload(
         return
     data = {"phase": phase, **(payload or {})}
     compact = truncate_list_payload(data, max_items=sample_limit)
-    pretty = json.dumps(compact, ensure_ascii=True, default=str, indent=2, sort_keys=True)
-    line = f"[PhaseOutput][{phase}]\n{pretty}"
+    line = f"[PhaseOutput] {json.dumps(compact, ensure_ascii=True, default=str, separators=(',', ':'))}"
     if level == "debug":
         logger.debug(line)
     elif level == "warning":

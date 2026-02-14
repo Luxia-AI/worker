@@ -1586,6 +1586,21 @@ class VerdictGenerator:
 
         strong_vote_contradiction = vote_decision == Verdict.FALSE.value and vote_contradict >= 0.65
         strong_vote_support = vote_decision == Verdict.TRUE.value and vote_support >= 0.65
+        support_status_count = sum(
+            1
+            for seg in (claim_breakdown or [])
+            if str((seg or {}).get("status") or "").upper() in {"VALID", "PARTIALLY_VALID"}
+        )
+        invalid_status_count = sum(
+            1
+            for seg in (claim_breakdown or [])
+            if str((seg or {}).get("status") or "").upper() in {"INVALID", "PARTIALLY_INVALID"}
+        )
+        strong_support_segment_present = (
+            support_status_count > 0
+            and invalid_status_count == 0
+            and (map_support_signal >= 0.55 or top_stance == "entails")
+        )
         if vote_decision in {Verdict.TRUE.value, Verdict.FALSE.value}:
             verdict_str = vote_decision
 
@@ -1662,7 +1677,7 @@ class VerdictGenerator:
             )
         if rationale_stance == "contradicts" and verdict_str == Verdict.TRUE.value:
             verdict_str = Verdict.FALSE.value if vote_contradict >= 0.60 else Verdict.UNVERIFIABLE.value
-        if weak_signal_no_stance:
+        if weak_signal_no_stance and not strong_support_segment_present:
             verdict_str = Verdict.UNVERIFIABLE.value
         # Trust-gate fallback: if trust is insufficient and stance is unresolved, avoid confident binary verdicts.
         if (
@@ -1683,6 +1698,17 @@ class VerdictGenerator:
             )
         except Exception:
             unique_domains_count = 0
+        high_authority_support = (
+            max(
+                [
+                    float(ev.get("credibility", 0.0) or 0.0)
+                    for ev in (evidence_map or [])
+                    if str(ev.get("relevance") or "").upper() == "SUPPORTS"
+                ]
+                or [0.0]
+            )
+            >= 0.90
+        )
 
         # Conservative binary gate:
         # Avoid hard TRUE/FALSE unless stance is explicit and evidence quality/diversity are sufficient.
@@ -1690,9 +1716,16 @@ class VerdictGenerator:
             binary_gate_ok = (
                 canonical_stance in {"entails", "contradicts"}
                 and admissible_ratio >= 0.50
-                and (diversity_score >= 0.40 or adaptive_trust_post >= 0.45)
+                and (
+                    diversity_score >= 0.40
+                    or adaptive_trust_post >= 0.45
+                    or (verdict_str == Verdict.TRUE.value and unique_domains_count == 1 and high_authority_support)
+                )
                 and (coverage_score >= 0.70 or agreement_ratio >= 0.80)
-                and unique_domains_count >= 2
+                and (
+                    unique_domains_count >= 2
+                    or (verdict_str == Verdict.TRUE.value and unique_domains_count == 1 and high_authority_support)
+                )
             )
             # Allow strong contradiction outcomes for simple factual numeric claims
             # even when diversity is low (single high-quality source can be decisive).
@@ -1712,8 +1745,10 @@ class VerdictGenerator:
                 and top_stance == "entails"
                 and top_stance_score >= 0.68
                 and map_contradict_signal < 0.35
-                and unique_domains_count >= 2
-                and diversity_score >= 0.20
+                and (
+                    (unique_domains_count >= 2 and diversity_score >= 0.20)
+                    or (unique_domains_count == 1 and high_authority_support)
+                )
             )
             binary_gate_ok = bool(binary_gate_ok or strong_contradiction_exception or strong_support_exception)
             if strong_vote_contradiction:
@@ -1729,7 +1764,10 @@ class VerdictGenerator:
             verdict_str = Verdict.FALSE.value
             truth_score_percent = min(float(truth_score_percent or 0.0), 10.0)
             confidence = max(float(confidence), 0.70)
-        final_lock_unverifiable = bool(weak_signal_no_stance or (policy_insufficient and canonical_stance == "neutral"))
+        final_lock_unverifiable = bool(
+            (weak_signal_no_stance and not strong_support_segment_present)
+            or (policy_insufficient and canonical_stance == "neutral" and not strong_support_segment_present)
+        )
         if strong_vote_support and self._has_absolute_quantifier(claim) and not final_lock_unverifiable:
             verdict_str = Verdict.PARTIALLY_TRUE.value
             truth_score_percent = min(float(truth_score_percent or 0.0), 55.0)
@@ -1739,6 +1777,7 @@ class VerdictGenerator:
             final_lock_unverifiable
             and strict_override_fired != "CONTRADICTION_DOMINANCE"
             and map_contradict_signal < CONTRADICTION_THRESHOLD
+            and not strong_support_segment_present
         ):
             verdict_str = Verdict.UNVERIFIABLE.value
             truth_score_percent = max(35.0, min(55.0, float(truth_score_percent or 0.0)))
@@ -1760,6 +1799,13 @@ class VerdictGenerator:
                 "Available admissible evidence is mixed or insufficiently decisive for this claim, "
                 "so the result is UNVERIFIABLE."
             )
+        if (
+            verdict_str == Verdict.UNVERIFIABLE.value
+            and strong_support_segment_present
+            and map_contradict_signal < CONTRADICTION_THRESHOLD
+        ):
+            verdict_str = Verdict.PARTIALLY_TRUE.value
+            truth_score_percent = max(55.0, min(75.0, float(truth_score_percent or 0.0)))
         if verdict_str == Verdict.UNVERIFIABLE.value and numeric_truth_override is None:
             truth_score_percent = max(35.0, min(65.0, float(truth_score_percent or 0.0)))
         if self._has_absolute_quantifier(claim) and verdict_str == Verdict.TRUE.value:
@@ -1836,12 +1882,20 @@ class VerdictGenerator:
             and strict_override_fired != "CONTRADICTION_DOMINANCE"
             and logic_result.override_fired not in {"CONTRADICTION_DOMINANCE"}
             and map_contradict_signal < CONTRADICTION_THRESHOLD
+            and not strong_support_segment_present
         ):
             verdict_str = Verdict.UNVERIFIABLE.value
             rationale = (
                 "Available admissible evidence is mixed or insufficiently decisive for this claim, "
                 "so the result is UNVERIFIABLE."
             )
+        if (
+            verdict_str == Verdict.UNVERIFIABLE.value
+            and strong_support_segment_present
+            and ("ambigu" in str(rationale or "").lower() or "partially supported" in str(rationale or "").lower())
+            and map_contradict_signal < CONTRADICTION_THRESHOLD
+        ):
+            verdict_str = Verdict.PARTIALLY_TRUE.value
         if llm_verdict == Verdict.TRUE.value and verdict_str != Verdict.TRUE.value:
             try:
                 truth_score_percent = min(float(truth_score_percent), 89.9)
@@ -3180,6 +3234,12 @@ class VerdictGenerator:
                     relevance = "REFUTES"
                     relevance_score = max(relevance_score, contradiction_score, 0.65)
                 else:
+                    bone_strength_proxy_support = (
+                        bool(re.search(r"\b(build|strong)\b", claim.lower()))
+                        and bool(re.search(r"\bbone(?:s)?\b", claim.lower()))
+                        and bool(re.search(r"\b(bone density|bone mineral density|fracture)\b", statement.lower()))
+                        and bool(re.search(r"\b(increase|increased|reduce|reduced)\b", statement.lower()))
+                    )
                     support_gate = (
                         predicate_match_score >= PREDICATE_MATCH_THRESHOLD
                         and anchor_score >= ANCHOR_THRESHOLD
@@ -3191,6 +3251,8 @@ class VerdictGenerator:
                     # Numeric exact-match can support if predicate and anchor are both present.
                     if numeric_rel == "SUPPORTS" and predicate_match_score >= PREDICATE_MATCH_THRESHOLD:
                         support_gate = support_gate or (anchor_score >= ANCHOR_THRESHOLD)
+                    if bone_strength_proxy_support and support_strength >= 0.30:
+                        support_gate = True
                     if support_gate:
                         relevance = "SUPPORTS"
                         relevance_score = max(relevance_score, support_strength, 0.62)

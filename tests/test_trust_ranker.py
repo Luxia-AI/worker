@@ -181,6 +181,19 @@ class TestEnrichRankedResults:
         # Should include some rationale even with missing fields
         assert "grade_rationale" in enriched[0]
 
+    def test_enrich_grade_uses_blended_score_with_high_semantic_and_credibility(self):
+        results = [
+            {
+                "statement": "Calcium is needed to build and maintain strong bones.",
+                "final_score": 0.586,
+                "sem_score": 0.876,
+                "credibility": 0.95,
+            }
+        ]
+        enriched = TrustRanker.enrich_ranked_results(results)
+        # Avoid under-grading high-quality evidence due to a conservative final_score.
+        assert enriched[0]["grade"] in {"C", "B", "A", "A+"}
+
     def test_enrich_grade_rationale_high_similarity(self):
         """Test rationale generation for high similarity match."""
         results = [
