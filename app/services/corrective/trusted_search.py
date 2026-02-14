@@ -763,6 +763,10 @@ class TrustedSearch:
                 raw_queries = result.get("queries", []) or []
             elif isinstance(result, list):
                 raw_queries = result
+            logger.info(
+                "[TrustedSearch][ConfidenceMode][LLM] raw_queries=%s",
+                raw_queries if isinstance(raw_queries, list) else [raw_queries],
+            )
             queries = [self._sanitize_query(str(q)) for q in raw_queries if str(q).strip()]
             with_negatives: List[str] = []
             suffix = " ".join(self._CONFIDENCE_NEGATIVE_TERMS)
@@ -773,7 +777,12 @@ class TrustedSearch:
                     with_negatives.append(q)
                 else:
                     with_negatives.append(self._sanitize_query(f"{q} {suffix}"))
-            return dedupe_list([q for q in with_negatives if q])[: max(1, max_queries)]
+            final_queries = dedupe_list([q for q in with_negatives if q])[: max(1, max_queries)]
+            logger.info(
+                "[TrustedSearch][ConfidenceMode][LLM] final_queries=%s",
+                final_queries,
+            )
+            return final_queries
         except Exception as e:
             logger.warning("[TrustedSearch][ConfidenceMode] LLM query expansion failed: %s", e)
             return []
@@ -1235,10 +1244,22 @@ FAILED ENTITIES:
                 call_tag="query_reformulation",
             )
             queries = result.get("queries", [])
+            logger.info(
+                "[TrustedSearch][QueryReformulation][LLM] raw_queries=%s",
+                queries if isinstance(queries, list) else [queries],
+            )
             cleaned = [self._sanitize_query(q.strip().lower()) for q in queries if isinstance(q, str)]
             cleaned = [q for q in cleaned if q]
+            logger.info(
+                "[TrustedSearch][QueryReformulation][LLM] cleaned_queries=%s",
+                cleaned,
+            )
             merged = [direct_query] + cleaned if direct_query else cleaned
             filtered = self._filter_queries(merged, key_terms, key_numbers)
+            logger.info(
+                "[TrustedSearch][QueryReformulation][LLM] filtered_queries=%s",
+                filtered,
+            )
             return dedupe_list(filtered)  # dedupe but preserve order
 
         except Exception as e:
@@ -1926,6 +1947,10 @@ FAILED ENTITIES:
             )
             llm_queries = [self._sanitize_query(q) for q in llm_queries if q]
             llm_queries = self._filter_queries(llm_queries, key_terms, key_numbers)
+            logger.info(
+                "[TrustedSearch][QueryGeneration][LLM] llm_queries_after_filter=%s",
+                llm_queries,
+            )
         else:
             logger.info(
                 "[TrustedSearch] Skipping LLM reformulation (deterministic queries already sufficient: %d)",
@@ -2240,6 +2265,10 @@ FAILED ENTITIES:
                 call_tag="query_reformulation",
             )
             queries = result.get("queries", [])
+            logger.info(
+                "[TrustedSearch][Reinforcement][LLM] queries=%s",
+                queries if isinstance(queries, list) else [queries],
+            )
 
             # safety: ensure list[str]
             return [q for q in queries if isinstance(q, str) and q.strip()]

@@ -47,6 +47,11 @@ async def do_search(
             if hasattr(search_agent, "reformulate_queries")
             else [post_text]
         )
+        logger.info(
+            "[SearchPhase:%s] Query reformulation output queries=%s",
+            round_id,
+            queries,
+        )
     except Exception as e:
         logger.warning(f"[SearchPhase:{round_id}] Query reformulation failed: {e}")
         if log_manager:
