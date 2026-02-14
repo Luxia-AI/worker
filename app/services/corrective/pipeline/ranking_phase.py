@@ -4,7 +4,7 @@ Ranking Phase: Hybrid ranking of semantic and KG candidates with trust-based gra
 
 from typing import Any, Dict, List, Optional
 
-from app.core.logger import get_logger
+from app.core.logger import get_logger, log_value_payload
 from app.services.logging.log_manager import LogManager
 from app.services.ranking.contradiction_scorer import ContradictionScorer
 from app.services.ranking.hybrid_ranker import hybrid_rank
@@ -103,26 +103,55 @@ async def rank_candidates(
     kg_in_ranked = sum(1 for r in ranked if float(r.get("kg_score", 0.0) or 0.0) > 0.0)
     sem_in_top = sum(1 for r in graded_results if float(r.get("sem_score", 0.0) or 0.0) > 0.0)
 
-    score_str = top_ranked[0]["final_score"] if top_ranked else "N/A"
-    logger.info(
-        f"[RankingPhase:{round_id}] Ranked {len(ranked)} candidates (final score: {score_str}), "
-        f"returned {len(graded_results)} top-k with trust grades "
-        f"(kg_in_ranked={kg_in_ranked}, kg_in_top={kg_in_top}, sem_in_top={sem_in_top}, "
-        f"contradicting_in_ranked={contradicting_count})"
+    top_score = float(top_ranked[0]["final_score"]) if top_ranked else 0.0
+    avg_score = sum(float(r.get("final_score", 0.0) or 0.0) for r in ranked) / len(ranked) if ranked else 0.0
+    top_k_selected = [
+        {
+            "statement": r.get("statement", ""),
+            "source": r.get("source_url", ""),
+            "semantic": round(float(r.get("sem_score", 0.0) or 0.0), 4),
+            "kg": round(float(r.get("kg_score", 0.0) or 0.0), 4),
+            "final": round(float(r.get("final_score", 0.0) or 0.0), 4),
+            "stance": r.get("stance", "neutral"),
+            "credibility": round(float(r.get("credibility", 0.0) or 0.0), 4),
+        }
+        for r in graded_results
+    ]
+    vdb_signal_sum_top5 = sum(float(r.get("sem_score", 0.0) or 0.0) for r in graded_results[:5])
+    kg_signal_sum_top5 = sum(float(r.get("kg_score", 0.0) or 0.0) for r in graded_results[:5])
+    log_value_payload(
+        logger,
+        "ranking",
+        {
+            "round_id": round_id,
+            "top_k_selected": top_k_selected,
+            "top_score": round(top_score, 4),
+            "avg_score": round(avg_score, 4),
+            "vdb_signal_sum_top5": round(vdb_signal_sum_top5, 4),
+            "kg_signal_sum_top5": round(kg_signal_sum_top5, 4),
+            "kg_in_ranked": kg_in_ranked,
+            "kg_in_top": kg_in_top,
+            "sem_in_top": sem_in_top,
+            "contradicting_in_ranked": contradicting_count,
+        },
     )
 
     if log_manager:
         await log_manager.add_log(
             level="INFO",
-            message=f"Ranking completed: {len(ranked)} candidates, top score: {score_str}",
+            message=f"[PhaseOutput] ranking total_ranked={len(ranked)} top_k={len(graded_results)}",
             module=__name__,
             request_id=f"claim-{round_id}",
             round_id=round_id,
             context={
                 "total_ranked": len(ranked),
                 "top_k_returned": len(graded_results),
-                "top_score": top_ranked[0]["final_score"] if top_ranked else 0.0,
+                "top_score": top_score,
                 "top_grade": top_ranked[0].get("grade") if top_ranked else "N/A",
+                "avg_score": avg_score,
+                "top_k_selected": top_k_selected,
+                "vdb_signal_sum_top5": vdb_signal_sum_top5,
+                "kg_signal_sum_top5": kg_signal_sum_top5,
                 "kg_in_ranked": kg_in_ranked,
                 "kg_in_top": kg_in_top,
                 "sem_in_top": sem_in_top,

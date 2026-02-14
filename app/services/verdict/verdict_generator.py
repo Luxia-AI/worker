@@ -34,7 +34,7 @@ from app.constants.config import (
     UNVERIFIABLE_CONFIDENCE_CAP,
 )
 from app.core.config import settings
-from app.core.logger import get_logger
+from app.core.logger import get_logger, log_value_payload
 from app.services.common.claim_segmentation import split_claim_into_segments
 from app.services.corrective.fact_extractor import FactExtractor
 from app.services.corrective.scraper import Scraper
@@ -674,7 +674,7 @@ class VerdictGenerator:
                 )
                 return self._unverifiable_result(claim, "No evidence retrieved (VDB/KG empty after web search)")
             if cache_sufficient:
-                logger.info("[VerdictGenerator] Cache sufficient; skipping web boost despite empty evidence")
+                logger.debug("[VerdictGenerator] Cache sufficient; skipping web boost despite empty evidence")
                 return self._unverifiable_result(claim, "Cache marked sufficient but no evidence available")
             logger.warning("[VerdictGenerator] No VDB/KG evidence -> trying web boost")
             segments = self._split_claim_into_segments(claim)[:3]
@@ -706,12 +706,12 @@ class VerdictGenerator:
         enriched_evidence = self._merge_evidence(ranked_evidence, segment_evidence)
 
         if segment_evidence:
-            logger.info(
+            logger.debug(
                 f"[VerdictGenerator] Evidence: {len(ranked_evidence)} ranked + "
                 f"{len(segment_evidence)} segment-specific = {len(enriched_evidence)} total"
             )
         else:
-            logger.info(f"[VerdictGenerator] Using {len(ranked_evidence)} ranked evidence (segment retrieval skipped)")
+            logger.debug(f"[VerdictGenerator] Using {len(ranked_evidence)} ranked evidence (segment retrieval skipped)")
 
         # Step 2) PRE-VERDICT web-boost loop driven by *sufficiency*
         pre_evidence = enriched_evidence[: min(len(enriched_evidence), max(top_k, 12), 20)]
@@ -723,9 +723,9 @@ class VerdictGenerator:
                     insufficient = self._policy_says_insufficient(claim, pre_evidence, adaptive_metrics=None)
                 weak = self._needs_web_boost(pre_evidence[: min(len(pre_evidence), 6)], claim=claim)
                 if not insufficient and not weak:
-                    logger.info(f"[VerdictGenerator] Pre-verdict evidence sufficient (round={round_i}). Skipping web.")
+                    logger.debug(f"[VerdictGenerator] Pre-verdict evidence sufficient (round={round_i}). Skipping web.")
                     break
-                logger.info(
+                logger.debug(
                     f"[VerdictGenerator] Pre-verdict evidence insufficient/weak (round={round_i}). "
                     f"insufficient={insufficient} weak={weak} -> web search"
                 )
@@ -734,7 +734,7 @@ class VerdictGenerator:
                 if not web_boost:
                     logger.warning("[VerdictGenerator] Web boost returned no facts.")
                     break
-                logger.info(f"[VerdictGenerator] Web boost facts: {len(web_boost)}")
+                logger.debug(f"[VerdictGenerator] Web boost facts: {len(web_boost)}")
                 merged_with_web = pre_evidence + web_boost
                 merged_with_web.sort(key=self._deterministic_evidence_sort_key)
                 pre_evidence = merged_with_web[: min(len(merged_with_web), 18)]
@@ -767,7 +767,7 @@ class VerdictGenerator:
                 evidence_snapshot_id=evidence_snapshot_id,
             )
 
-            logger.info(
+            logger.debug(
                 f"[VerdictGenerator] Generated verdict: {verdict_result['verdict']} "
                 f"(confidence: {verdict_result['confidence']:.2f})"
             )
@@ -781,7 +781,7 @@ class VerdictGenerator:
                     unknown_segments = self._get_unknown_segments(verdict_result)
                     if not unknown_segments:
                         break
-                    logger.info(
+                    logger.debug(
                         "[VerdictGenerator] Found %d UNKNOWN segments, running targeted recovery...",
                         len(unknown_segments),
                     )
@@ -791,7 +791,7 @@ class VerdictGenerator:
                         top_k=3 if self.confidence_mode else 2,
                     )
                     if candidate_boost:
-                        logger.info(
+                        logger.debug(
                             "[VerdictGenerator] Retrieved %d targeted facts from VDB for UNKNOWN segments",
                             len(candidate_boost),
                         )
@@ -825,13 +825,13 @@ class VerdictGenerator:
                         )
                         candidate_boost = web_evidence
                         if web_evidence:
-                            logger.info(
+                            logger.debug(
                                 "[VerdictGenerator] Retrieved %d additional facts from targeted web search",
                                 len(web_evidence),
                             )
 
                     if not candidate_boost:
-                        logger.info(
+                        logger.debug(
                             "[VerdictGenerator] No additional targeted evidence found for UNKNOWN segments; stopping."
                         )
                         break
@@ -858,7 +858,7 @@ class VerdictGenerator:
                             adaptive_metrics=adaptive_metrics,
                             evidence_snapshot_id=evidence_snapshot_id,
                         )
-                        logger.info(
+                        logger.debug(
                             "[VerdictGenerator] Re-generated verdict after targeted recovery: %s (confidence: %.2f)",
                             verdict_result["verdict"],
                             verdict_result["confidence"],
@@ -1330,7 +1330,7 @@ class VerdictGenerator:
                 skip_targeted_recovery = True
                 if verdict_str == Verdict.UNVERIFIABLE.value:
                     numeric_conf_floor = 0.42
-            logger.info(
+            logger.debug(
                 "[VerdictGenerator][NumericOverride] verdict=%s status=%s reason=%s",
                 verdict_str,
                 status_override or "-",
@@ -1369,7 +1369,7 @@ class VerdictGenerator:
             agreement_ratio = float(adaptive_metrics.get("agreement", agreement_ratio) or agreement_ratio)
             diversity_score = float(adaptive_metrics.get("diversity", diversity_score) or diversity_score)
             adaptive_trust_post = float(adaptive_metrics.get("trust_post", 0.0) or 0.0)
-            logger.info(
+            logger.debug(
                 "[VerdictGenerator] Using memoized adaptive trust snapshot=%s trust_post=%.3f",
                 (evidence_snapshot_id or "none")[:12],
                 adaptive_trust_post,
@@ -1438,7 +1438,7 @@ class VerdictGenerator:
                 )
                 reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
                 verdict_str = reconciled["verdict"]
-                logger.info(
+                logger.debug(
                     "[VerdictGenerator][SingleSubclaimPromote] Promoted PARTIALLY_VALID -> VALID "
                     "under strong adaptive support (coverage=%.2f agreement=%.2f trust_post=%.3f).",
                     coverage_score,
@@ -1470,7 +1470,7 @@ class VerdictGenerator:
                 Verdict.UNVERIFIABLE.value,
             }:
                 verdict_str = override_verdict
-            logger.info(
+            logger.debug(
                 "[VerdictGenerator][PolicyOverride] type=%s strength=%s polarity=%s subject=%s object=%s "
                 "high_grade_support=%d high_grade_contra=%d weak_support=%d scope_mismatch=%d verdict=%s reason=%s",
                 claim_frame["claim_type"],
@@ -1901,7 +1901,7 @@ class VerdictGenerator:
                 }
             )
 
-        return {
+        verdict_payload = {
             "verdict": verdict_str,
             "confidence": confidence,
             # Backward-compatibility: keep `truthfulness_percent` but now make it a status-driven truth score.
@@ -1969,6 +1969,41 @@ class VerdictGenerator:
                 "llm_verdict_changed": bool(llm_verdict != verdict_str),
             },
         }
+        log_value_payload(
+            logger,
+            "verdict",
+            {
+                "verdict": verdict_payload["verdict"],
+                "truthfulness_percent": verdict_payload["truthfulness_percent"],
+                "confidence": verdict_payload["confidence"],
+                "coverage": coverage_score,
+                "agreement": agreement_ratio,
+                "diversity": diversity_score,
+                "trust_post": adaptive_trust_post,
+                "override_fired": verdict_payload["override_fired"],
+                "override_reason": verdict_payload["override_reason"],
+                "explicit_refutes_found": verdict_payload["explicit_refutes_found"],
+                "predicate_match_score_used": verdict_payload["predicate_match_score_used"],
+                "contradict_signal": verdict_payload["analysis_counts"]["map_contradict_signal_max"],
+            },
+        )
+        log_value_payload(
+            logger,
+            "verdict",
+            {
+                "claim_breakdown_full": verdict_payload["claim_breakdown"],
+                "evidence_map_full": verdict_payload["evidence_map"],
+                "analysis_counts_full": verdict_payload["analysis_counts"],
+                "truthfulness_invariant_applied": verdict_payload["truthfulness_invariant_applied"],
+                "unverifiable_confidence_cap_applied": bool(
+                    verdict_payload["override_fired"] == "UNVERIFIABLE_CONFIDENCE_CAP"
+                ),
+                "predicate_queries_generated": verdict_payload["predicate_queries_generated"],
+            },
+            level="debug",
+            debug_only=True,
+        )
+        return verdict_payload
 
     def _segment_anchor_overlap(self, segment: str, statement: str) -> float:
         eval_result = evaluate_anchor_match(segment, statement)
@@ -2427,7 +2462,7 @@ class VerdictGenerator:
         # negative + negative over same predicate => support, not contradiction.
         if same_predicate and seg_neg and stmt_neg:
             if _POLARITY_DEBUG:
-                logger.info(
+                logger.debug(
                     "[VerdictGenerator][Polarity] seg_neg=%s stmt_neg=%s same_predicate=%s stance=%s => entails",
                     seg_neg,
                     stmt_neg,
@@ -2438,7 +2473,7 @@ class VerdictGenerator:
         # Same predicate with polarity mismatch => contradiction.
         if same_predicate and (seg_neg ^ stmt_neg):
             if _POLARITY_DEBUG:
-                logger.info(
+                logger.debug(
                     "[VerdictGenerator][Polarity] seg_neg=%s stmt_neg=%s same_predicate=%s stance=%s => contradicts",
                     seg_neg,
                     stmt_neg,
@@ -2449,7 +2484,7 @@ class VerdictGenerator:
 
         if stance_l in {"entails", "contradicts"}:
             if _POLARITY_DEBUG:
-                logger.info(
+                logger.debug(
                     "[VerdictGenerator][Polarity] seg_neg=%s stmt_neg=%s same_predicate=%s stance=%s => %s",
                     seg_neg,
                     stmt_neg,
@@ -2496,7 +2531,7 @@ class VerdictGenerator:
         if seg_pos and stmt_pos and not stmt_hedged_pos:
             return "entails"
         if _POLARITY_DEBUG:
-            logger.info(
+            logger.debug(
                 "[VerdictGenerator][Polarity] seg_neg=%s stmt_neg=%s same_predicate=%s stance=%s => neutral",
                 seg_neg,
                 stmt_neg,
@@ -3302,7 +3337,7 @@ class VerdictGenerator:
                     status_weight.get(str(seg.get("status", "UNKNOWN")).upper(), 0.0) for seg in (claim_breakdown or [])
                 )
                 verdict_cov = verdict_weighted / max(1, len(claim_breakdown or []))
-                logger.info(
+                logger.debug(
                     "[VerdictGenerator][Coverage] subclaims=%d weighted_covered=%.2f strong=%d partial=%d invalid=%d "
                     "unknown=%d coverage=%.2f",
                     len(claim_breakdown or []),
@@ -3313,7 +3348,7 @@ class VerdictGenerator:
                     sum(1 for seg in (claim_breakdown or []) if str(seg.get("status", "UNKNOWN")).upper() == "UNKNOWN"),
                     verdict_cov,
                 )
-                logger.info(
+                logger.debug(
                     "[VerdictGenerator][Coverage][Aligned] verdict_coverage=%.2f adaptive_coverage=%.2f",
                     verdict_cov,
                     weighted,
@@ -3337,7 +3372,9 @@ class VerdictGenerator:
         )
         details = cov.get("details", [])
         if not details:
-            logger.info("[VerdictGenerator][Coverage] subclaims=0 covered=0 strong=0 partial=0 unknown=0 coverage=0.00")
+            logger.debug(
+                "[VerdictGenerator][Coverage] subclaims=0 covered=0 " "strong=0 partial=0 unknown=0 coverage=0.00"
+            )
             return
 
         strong = 0
@@ -3354,7 +3391,7 @@ class VerdictGenerator:
                 invalid += 1
             else:
                 unknown += 1
-            logger.info(
+            logger.debug(
                 "[VerdictGenerator][Coverage] subclaim=%d status=%s best_evidence_id=%s "
                 "semantic=%.3f relevance=%.3f overlap=%.3f anchors=%d/%d terms=%s segment=%s",
                 d.get("subclaim_id"),
@@ -3369,7 +3406,7 @@ class VerdictGenerator:
                 (d.get("subclaim") or "")[:80],
             )
 
-        logger.info(
+        logger.debug(
             "[VerdictGenerator][Coverage] subclaims=%d weighted_covered=%.2f strong=%d partial=%d invalid=%d "
             "unknown=%d coverage=%.2f",
             int(cov.get("subclaims", len(details))),
@@ -3382,7 +3419,7 @@ class VerdictGenerator:
         )
         try:
             if adaptive_metrics is not None:
-                logger.info(
+                logger.debug(
                     "[VerdictGenerator][Coverage][Aligned] verdict_coverage=%.2f adaptive_coverage=%.2f",
                     float(cov.get("coverage", 0.0)),
                     float(adaptive_metrics.get("coverage", 0.0) or 0.0),
@@ -3412,7 +3449,7 @@ class VerdictGenerator:
                 [_Ev(d) for d in evidence if (d.get("statement") or d.get("text"))],
                 top_k=min(12, len(evidence)),
             )
-            logger.info(
+            logger.debug(
                 "[VerdictGenerator][Coverage][Aligned] verdict_coverage=%.2f adaptive_coverage=%.2f",
                 float(cov.get("coverage", 0.0)),
                 float(adaptive.get("coverage", 0.0)),
@@ -3518,7 +3555,7 @@ class VerdictGenerator:
             seg["status"] = "PARTIALLY_VALID"
             seg["supporting_fact"] = fallback_fact
             seg["source_url"] = fallback_src
-        logger.info(
+        logger.debug(
             "[VerdictGenerator][Coverage][Fallback] Applied adaptive fallback "
             "(adaptive_coverage=%.2f, evidence_sem=%.3f)",
             adaptive_coverage,
@@ -4463,7 +4500,7 @@ class VerdictGenerator:
                 min(1.0, avg_support - contradiction_penalty - neg_alignment_penalty),
             )
             if best_src:
-                logger.info(
+                logger.debug(
                     "[VerdictGenerator] Segment truthfulness best=%.3f src=%s segment=%s",
                     best,
                     best_src,
@@ -4666,7 +4703,7 @@ class VerdictGenerator:
             except Exception as e:
                 logger.warning(f"[VerdictGenerator] Segment retrieval failed for '{segment[:30]}...': {e}")
 
-        logger.info(
+        logger.debug(
             f"[VerdictGenerator] Segment retrieval: {len(segments)} segments -> "
             f"{len(all_segment_evidence)} unique facts"
         )
@@ -4861,7 +4898,7 @@ class VerdictGenerator:
 
         for segment in unknown_segments:
             try:
-                logger.info(f"[VerdictGenerator] Searching web for UNKNOWN segment: '{segment[:50]}...'")
+                logger.debug(f"[VerdictGenerator] Searching web for UNKNOWN segment: '{segment[:50]}...'")
                 triplet = self._extract_canonical_predicate_triplet(segment)
                 if not predicate_target and triplet.get("canonical_predicate"):
                     predicate_target = {
@@ -4894,7 +4931,7 @@ class VerdictGenerator:
                 force_query_count = 2 if (enable_predicate_refute_queries and predicate_hints) else 0
                 effective_query_count = max(int(max_queries_per_segment), force_query_count)
                 for query in queries[:effective_query_count]:
-                    logger.info(f"[VerdictGenerator] Using search query: '{query}'")
+                    logger.debug(f"[VerdictGenerator] Using search query: '{query}'")
 
                     # Perform the search
                     search_results = await self.trusted_search.search(query, max_results=5)
@@ -4957,7 +4994,7 @@ class VerdictGenerator:
                 or [0.0]
             )
             if pred_match_max <= 0.0:
-                logger.info(
+                logger.debug(
                     "[VerdictGenerator] Predicate forcing mode: re-extracting authoritative pages for "
                     "subject='%s' predicate='%s' object='%s'",
                     predicate_target.get("subject", ""),
@@ -4986,7 +5023,7 @@ class VerdictGenerator:
                         }
                     )
 
-        logger.info(
+        logger.debug(
             f"[VerdictGenerator] Retrieved {len(all_web_evidence)} web evidence items "
             f"for {len(unknown_segments)} UNKNOWN segments"
         )

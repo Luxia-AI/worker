@@ -11,7 +11,7 @@ from app.config.trusted_domains import TRUSTED_ROOT_DOMAINS, is_trusted_domain
 from app.constants.config import GOOGLE_CSE_SEARCH_URL, GOOGLE_CSE_TIMEOUT, PIPELINE_MAX_URLS_PER_QUERY
 from app.constants.llm_prompts import QUERY_REFORMULATION_PROMPT, REINFORCEMENT_QUERY_PROMPT
 from app.core.config import settings
-from app.core.logger import get_logger
+from app.core.logger import get_logger, is_debug_enabled, log_value_payload
 from app.core.rate_limit import throttled
 from app.services.common.list_ops import dedupe_list
 from app.services.common.url_helpers import dedup_urls
@@ -157,24 +157,24 @@ class TrustedSearch:
         self.trust_config = get_trust_config()
 
         if has_google:
-            logger.info("[TrustedSearch] Google CSE configured")
+            logger.debug("[TrustedSearch] Google CSE configured")
         if has_serper:
-            logger.info("[TrustedSearch] Serper.dev fallback configured")
-        logger.info(
+            logger.debug("[TrustedSearch] Serper.dev fallback configured")
+        logger.debug(
             "[TrustedSearch] Trusted domain allowlist loaded: count=%d checksum=%s",
             len(self.strict_allowlist),
             allowlist_fingerprint,
         )
-        logger.info(
+        logger.debug(
             "[TrustedSearch] Serper site-boost domains: %s",
             self.serper_site_boost_domains,
         )
-        logger.info(
+        logger.debug(
             "[TrustedSearch] Query fetch size: num=%d (scrape_cap=%d)",
             self.fetch_num_per_query,
             scrape_cap,
         )
-        logger.info("[TrustedSearch] Confidence mode: %s", self.confidence_mode)
+        logger.debug("[TrustedSearch] Confidence mode: %s", self.confidence_mode)
 
         try:
             self.llm_client = HybridLLMService()
@@ -763,7 +763,7 @@ class TrustedSearch:
                 raw_queries = result.get("queries", []) or []
             elif isinstance(result, list):
                 raw_queries = result
-            logger.info(
+            logger.debug(
                 "[TrustedSearch][ConfidenceMode][LLM] raw_queries=%s",
                 raw_queries if isinstance(raw_queries, list) else [raw_queries],
             )
@@ -778,7 +778,7 @@ class TrustedSearch:
                 else:
                     with_negatives.append(self._sanitize_query(f"{q} {suffix}"))
             final_queries = dedupe_list([q for q in with_negatives if q])[: max(1, max_queries)]
-            logger.info(
+            logger.debug(
                 "[TrustedSearch][ConfidenceMode][LLM] final_queries=%s",
                 final_queries,
             )
@@ -807,7 +807,7 @@ class TrustedSearch:
             merged = dedupe_list(deterministic + llm_queries)
         else:
             merged = dedupe_list(llm_queries + deterministic)
-        logger.info(
+        logger.debug(
             "[TrustedSearch][ConfidenceMode] Query expansion: llm=%d deterministic=%d merged=%d",
             len(llm_queries),
             len(deterministic),
@@ -1212,7 +1212,7 @@ class TrustedSearch:
         key_terms, key_numbers = self._collect_key_terms(texts=[text] + subclaims, entities=entities)
 
         if self.llm_client is None:
-            logger.info("[TrustedSearch] LLM unavailable; using fallback reformulation only")
+            logger.debug("[TrustedSearch] LLM unavailable; using fallback reformulation only")
             fallback = self._fallback_queries(text, failed_entities)
             fallback = [self._sanitize_query(q) for q in fallback if q]
             merged = [direct_query] + fallback if direct_query else fallback
@@ -1244,19 +1244,19 @@ FAILED ENTITIES:
                 call_tag="query_reformulation",
             )
             queries = result.get("queries", [])
-            logger.info(
+            logger.debug(
                 "[TrustedSearch][QueryReformulation][LLM] raw_queries=%s",
                 queries if isinstance(queries, list) else [queries],
             )
             cleaned = [self._sanitize_query(q.strip().lower()) for q in queries if isinstance(q, str)]
             cleaned = [q for q in cleaned if q]
-            logger.info(
+            logger.debug(
                 "[TrustedSearch][QueryReformulation][LLM] cleaned_queries=%s",
                 cleaned,
             )
             merged = [direct_query] + cleaned if direct_query else cleaned
             filtered = self._filter_queries(merged, key_terms, key_numbers)
-            logger.info(
+            logger.debug(
                 "[TrustedSearch][QueryReformulation][LLM] filtered_queries=%s",
                 filtered,
             )
@@ -1332,7 +1332,7 @@ FAILED ENTITIES:
                     return [], False
 
                 all_urls = [item.get("link", "N/A") for item in data["items"]]
-                logger.info(f"[TrustedSearch:Google] '{query}' raw: {all_urls[:3]}...")
+                logger.debug(f"[TrustedSearch:Google] '{query}' raw: {all_urls[:3]}...")
 
                 items = [
                     {
@@ -1392,7 +1392,7 @@ FAILED ENTITIES:
                     return []
 
                 all_urls = [r.get("link", "N/A") for r in organic]
-                logger.info(f"[TrustedSearch:Serper] '{query}' raw: {all_urls[:3]}...")
+                logger.debug(f"[TrustedSearch:Serper] '{query}' raw: {all_urls[:3]}...")
 
                 items = [
                     {
@@ -1428,7 +1428,7 @@ FAILED ENTITIES:
                 data = await resp.json()
             id_list = ((data.get("esearchresult") or {}).get("idlist") or [])[:max_results]
             urls = [f"https://pubmed.ncbi.nlm.nih.gov/{pmid}/" for pmid in id_list if pmid]
-            logger.info(f"[TrustedSearch:PubMed] '{query}' -> {len(urls)} pmids")
+            logger.debug(f"[TrustedSearch:PubMed] '{query}' -> {len(urls)} pmids")
             return urls
         except Exception as e:
             logger.warning(f"[TrustedSearch:PubMed] Failed for '{query}': {e}")
@@ -1484,7 +1484,7 @@ FAILED ENTITIES:
             preserve_site_scope = "site:" in (query or "").lower()
             google_query = query if preserve_site_scope else self._strip_site_operators(query)
             if google_query != query:
-                logger.info(
+                logger.debug(
                     "[TrustedSearch] Google general-first rewrite: '%s' -> '%s'",
                     query,
                     google_query,
@@ -1522,7 +1522,7 @@ FAILED ENTITIES:
             if len(google_urls) >= self.min_allowlist_pass:
                 return google_urls
 
-            logger.info(
+            logger.debug(
                 "[TrustedSearch] Google trusted results below threshold (%d < %d), merging Serper fallback",
                 len(google_urls),
                 self.min_allowlist_pass,
@@ -1652,7 +1652,7 @@ FAILED ENTITIES:
                 continue
             urls.append(normalized_link)
 
-        logger.info(
+        logger.debug(
             "[TrustedSearch:%s] query='%s' count_rejected_by_allowlist=%d count_rejected_by_quality=%d "
             "final_trusted_count=%d",
             provider,
@@ -1772,7 +1772,7 @@ FAILED ENTITIES:
                 )
 
         urls, _ = self._filter_trusted_urls(normalized_items, provider=provider, query=query)
-        logger.info(f"[TrustedSearch:{provider}] '{query}' -> {len(urls)}/{len(normalized_items)} trusted")
+        logger.debug(f"[TrustedSearch:{provider}] '{query}' -> {len(urls)}/{len(normalized_items)} trusted")
 
         if not claim or not claim_type:
             return urls
@@ -1832,7 +1832,7 @@ FAILED ENTITIES:
                 break
 
         merged = dedupe_list(base_urls + boosted_urls)
-        logger.info(
+        logger.debug(
             "[TrustedSearch] Serper site-boost merged results: base=%d boosted=%d merged=%d",
             len(base_urls),
             len(boosted_urls),
@@ -1871,7 +1871,7 @@ FAILED ENTITIES:
                 entity_obj=entity_obj,
                 max_queries=max_queries,
             )
-            logger.info(
+            logger.debug(
                 "[TrustedSearch][ConfidenceMode] Generated %d deterministic queries (max=%d)",
                 len(confidence_queries),
                 max_queries,
@@ -1902,7 +1902,7 @@ FAILED ENTITIES:
                         required_query_for_subclaim = aq
                     anchor_queries.append(aq)
                     qmeta = self._query_quality(aq, anchors)
-                    logger.info(
+                    logger.debug(
                         "[TrustedSearch][QueryQuality] subclaim=%d query='%s' anchors=%d/%d junk=%d tokens=%d",
                         idx + 1,
                         aq,
@@ -1947,15 +1947,19 @@ FAILED ENTITIES:
             )
             llm_queries = [self._sanitize_query(q) for q in llm_queries if q]
             llm_queries = self._filter_queries(llm_queries, key_terms, key_numbers)
-            logger.info(
-                "[TrustedSearch][QueryGeneration][LLM] llm_queries_after_filter=%s",
-                llm_queries,
+            log_value_payload(
+                logger,
+                "search_query_generation",
+                {"llm_filtered_queries": llm_queries},
+                level="debug",
+                debug_only=True,
             )
         else:
-            logger.info(
-                "[TrustedSearch] Skipping LLM reformulation (deterministic queries already sufficient: %d)",
-                len(deterministic_pool),
-            )
+            if is_debug_enabled():
+                logger.debug(
+                    "[TrustedSearch] skipping llm reformulation deterministic_pool=%d",
+                    len(deterministic_pool),
+                )
 
         # 4) Site-specific variants for top direct/LLM/operator queries
         site_queries: List[str] = []
@@ -1995,29 +1999,40 @@ FAILED ENTITIES:
         # Ensure query planner retains at least one query per detected subclaim when possible.
         all_queries = required_filtered + [q for q in all_queries if q not in required_filtered]
         all_queries = all_queries[:max_queries]
+        query_quality_rows = []
         for i, q in enumerate(all_queries):
             qmeta = self._query_quality(q, key_terms)
-            logger.info(
-                "[TrustedSearch][QueryQuality][Final] idx=%d query='%s' anchors=%d/%d junk=%d tokens=%d",
-                i + 1,
-                q,
-                qmeta["anchor_hits"],
-                qmeta["anchor_total"],
-                qmeta["junk_hits"],
-                qmeta["token_count"],
+            query_quality_rows.append(
+                {
+                    "idx": i + 1,
+                    "query": q,
+                    "anchor_hits": qmeta["anchor_hits"],
+                    "anchor_total": qmeta["anchor_total"],
+                    "junk_hits": qmeta["junk_hits"],
+                    "token_count": qmeta["token_count"],
+                }
             )
-        logger.info(
-            "[TrustedSearch][QueryQuality][Summary] subclaims=%d anchor=%d direct=%d advanced=%d "
-            "domain=%d llm=%d final=%d",
-            len(merged_subclaims),
-            len(anchor_queries),
-            len(direct_queries),
-            len(advanced_queries),
-            len(domain_queries),
-            len(llm_queries),
-            len(all_queries),
+        log_value_payload(
+            logger,
+            "search_query_generation",
+            {
+                "subclaims_count": len(merged_subclaims),
+                "anchor_queries": anchor_queries,
+                "direct_queries": direct_queries,
+                "advanced_queries": advanced_queries,
+                "domain_queries": domain_queries,
+                "llm_filtered_queries": llm_queries,
+                "queries_final": all_queries,
+                "queries_total": len(all_queries),
+            },
         )
-        logger.info(f"[TrustedSearch] Generated {len(all_queries)} queries for quota-optimized search")
+        log_value_payload(
+            logger,
+            "search_query_generation",
+            {"query_quality_map": query_quality_rows},
+            level="debug",
+            debug_only=True,
+        )
 
         return all_queries
 
@@ -2038,7 +2053,7 @@ FAILED ENTITIES:
         Returns:
             List of trusted URLs from this single query
         """
-        logger.info(f"[TrustedSearch] Executing single query: '{query}'")
+        logger.debug(f"[TrustedSearch] Executing single query: '{query}'")
 
         async with aiohttp.ClientSession() as session:
             try:
@@ -2049,7 +2064,7 @@ FAILED ENTITIES:
                     claim_type=claim_type,
                     entities=entities,
                 )
-                logger.info(f"[TrustedSearch] Single query returned {len(urls)} trusted URLs")
+                logger.debug(f"[TrustedSearch] Single query returned {len(urls)} trusted URLs")
                 return urls
             except Exception as e:
                 logger.error(f"[TrustedSearch] Single query failed: {e}")
@@ -2070,19 +2085,24 @@ FAILED ENTITIES:
         else:
             deterministic_queries = [self._sanitize_query(spec.q) for spec in plan.queries[:max_queries] if spec.q]
 
-        logger.info(
-            "[TrustedSearch] search_for_claim: claim_type=%s queries=%d min_urls=%d max_queries=%d",
-            plan.claim_type,
-            len(deterministic_queries),
-            min_urls,
-            max_queries,
+        log_value_payload(
+            logger,
+            "search",
+            {
+                "claim_type": plan.claim_type,
+                "queries_total": len(deterministic_queries),
+                "queries_used": deterministic_queries,
+                "min_urls": min_urls,
+                "max_queries": max_queries,
+            },
         )
 
         async with aiohttp.ClientSession() as session:
             for idx, query in enumerate(deterministic_queries, start=1):
                 if not query:
                     continue
-                logger.info("[TrustedSearch] Executing claim query %d/%d: '%s'", idx, max_queries, query)
+                if is_debug_enabled():
+                    logger.debug("[TrustedSearch] claim_query_%d=%s", idx, query)
                 urls = await self.search_query(
                     session,
                     query,
@@ -2095,19 +2115,21 @@ FAILED ENTITIES:
                 if self.confidence_mode and len(selected_urls) >= int(
                     get_trust_config().search_max_urls_confidence_mode
                 ):
-                    logger.info(
-                        "[TrustedSearch][ConfidenceMode] URL cap reached (%d), stopping query loop",
-                        len(selected_urls),
-                    )
+                    if is_debug_enabled():
+                        logger.debug("[TrustedSearch][ConfidenceMode] url_cap_reached=%d", len(selected_urls))
                     break
                 if len(selected_urls) >= min_urls:
                     break
 
             if self.confidence_mode and len(selected_urls) < 3 and self.llm_client is not None:
-                logger.info(
-                    "[TrustedSearch][ConfidenceMode] Deterministic queries returned %d trusted URLs (<3), "
-                    "running LLM reformulation fallback",
-                    len(selected_urls),
+                log_value_payload(
+                    logger,
+                    "search",
+                    {
+                        "confidence_mode_llm_fallback": True,
+                        "urls_found_total": len(selected_urls),
+                        "queries_used": deterministic_queries,
+                    },
                 )
                 reformulated = await self.reformulate_queries(
                     plan.claim,
@@ -2118,12 +2140,8 @@ FAILED ENTITIES:
                 for idx, query in enumerate(reformulated[:max_queries], start=1):
                     if not query:
                         continue
-                    logger.info(
-                        "[TrustedSearch][ConfidenceMode] Executing reformulated query %d/%d: '%s'",
-                        idx,
-                        max_queries,
-                        query,
-                    )
+                    if is_debug_enabled():
+                        logger.debug("[TrustedSearch][ConfidenceMode] reformulated_query_%d=%s", idx, query)
                     urls = await self.search_query(
                         session,
                         query,
@@ -2173,7 +2191,6 @@ FAILED ENTITIES:
 
         # 1) Generate reformulated queries
         queries = await self.reformulate_queries(post_text, failed_entities)
-        logger.info(f"[TrustedSearch] Reformulated queries: {queries}")
 
         # 2) Also generate site-specific queries for better targeting
         if queries:
@@ -2192,27 +2209,37 @@ FAILED ENTITIES:
 
         # Limit total queries
         all_queries = all_queries[:max_queries]
-        logger.info(f"[TrustedSearch] Total queries to try: {len(all_queries)}")
+        log_value_payload(
+            logger,
+            "search",
+            {
+                "queries_total": len(all_queries),
+                "queries_used": all_queries,
+                "providers_used": [
+                    p for p, ok in [("google", self.google_available), ("serper", self.serper_available)] if ok
+                ],
+            },
+        )
 
         # 3) Execute queries sequentially until we have enough URLs
         collected_urls: set[str] = set()
 
         async with aiohttp.ClientSession() as session:
             for i, query in enumerate(all_queries):
-                logger.info(f"[TrustedSearch] Executing query {i + 1}/{len(all_queries)}: '{query}'")
+                if is_debug_enabled():
+                    logger.debug("[TrustedSearch] query_%d_of_%d=%s", i + 1, len(all_queries), query)
 
                 try:
                     urls = await self.search_query(session, query)
                     collected_urls.update(urls)
 
-                    logger.info(f"[TrustedSearch] Progress: {len(collected_urls)} URLs " f"(need {min_urls})")
+                    if is_debug_enabled():
+                        logger.debug("[TrustedSearch] urls_progress=%d need=%d", len(collected_urls), min_urls)
 
                     # Early exit if we have enough
                     if len(collected_urls) >= min_urls:
-                        logger.info(
-                            f"[TrustedSearch] Threshold reached ({len(collected_urls)} >= "
-                            f"{min_urls}), stopping search"
-                        )
+                        if is_debug_enabled():
+                            logger.debug("[TrustedSearch] threshold_reached=%d", len(collected_urls))
                         break
 
                 except Exception as e:
@@ -2221,7 +2248,15 @@ FAILED ENTITIES:
 
         # 4) Dedupe and return
         urls = dedup_urls(list(collected_urls))
-        logger.info(f"[TrustedSearch] Final result: {len(urls)} trusted URLs")
+        log_value_payload(
+            logger,
+            "search",
+            {
+                "queries_executed": len(all_queries),
+                "urls_found_total": len(urls),
+                "trusted_urls": urls,
+            },
+        )
         return list(urls)
 
     async def google_search(self, post_text: str, failed_entities: List[str] | None = None) -> List[str]:
@@ -2265,7 +2300,7 @@ FAILED ENTITIES:
                 call_tag="query_reformulation",
             )
             queries = result.get("queries", [])
-            logger.info(
+            logger.debug(
                 "[TrustedSearch][Reinforcement][LLM] queries=%s",
                 queries if isinstance(queries, list) else [queries],
             )
@@ -2306,7 +2341,7 @@ FAILED ENTITIES:
         queries = await self.llm_reformulate_for_reinforcement(low_conf_items, failed_entities)
         queries = queries[:max_queries]  # cap
 
-        logger.info(f"[TrustedSearch] Reinforcement queries: {queries}")
+        logger.debug(f"[TrustedSearch] Reinforcement queries: {queries}")
 
         # 2) Perform Google CSE search
         all_urls = []

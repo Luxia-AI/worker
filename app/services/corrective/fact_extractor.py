@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from app.constants.llm_prompts import FACT_EXTRACTION_PREDICATE_FORCING_PROMPT, FACT_EXTRACTION_PROMPT
 from app.core.config import settings
-from app.core.logger import get_logger
+from app.core.logger import get_logger, log_value_payload
 from app.services.common.dedup import generate_fact_id
 from app.services.common.text_cleaner import clean_statement, truncate_content
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
@@ -222,14 +222,18 @@ class FactExtractor:
         max_chunks_per_page = int(os.getenv("CONFIDENCE_MAX_CHUNKS_PER_PAGE", "3")) if confidence_mode else 1
         target_facts_per_page = int(os.getenv("CONFIDENCE_FACTS_PER_PAGE_TARGET", "20")) if confidence_mode else 8
 
-        logger.info(
-            "[FactExtractor] Batch extracting facts from %d pages (1 LLM call, confidence_mode=%s, "
-            "chunk_chars=%d, max_chunks_per_page=%d, target_facts_per_page=%d)",
-            len(valid_pages),
-            confidence_mode,
-            chunk_chars,
-            max_chunks_per_page,
-            target_facts_per_page,
+        log_value_payload(
+            logger,
+            "fact_extraction",
+            {
+                "pages_input": len(valid_pages),
+                "confidence_mode": confidence_mode,
+                "chunk_chars": chunk_chars,
+                "max_chunks_per_page": max_chunks_per_page,
+                "target_facts_per_page": target_facts_per_page,
+                "predicate_forcing_mode": bool(predicate_target),
+                "predicate_target": predicate_target or {},
+            },
         )
 
         # Build batch prompt with all page contents
@@ -312,7 +316,19 @@ class FactExtractor:
                     dedup_by_id[fact_id] = fact
             if dedup_by_id:
                 facts = list(dedup_by_id.values())
-            logger.info(f"[FactExtractor] Extracted {len(facts)} facts from {len(valid_pages)} pages (batched)")
+            confidences = [float(f.get("confidence") or 0.0) for f in facts if f.get("confidence") is not None]
+            log_value_payload(
+                logger,
+                "fact_extraction",
+                {
+                    "facts_count": len(facts),
+                    "pages_input": len(valid_pages),
+                    "facts_sample": facts,
+                    "fact_conf_min": min(confidences) if confidences else 0.0,
+                    "fact_conf_max": max(confidences) if confidences else 0.0,
+                    "fact_conf_avg": (sum(confidences) / len(confidences)) if confidences else 0.0,
+                },
+            )
             return facts
 
         except Exception as e:
@@ -361,5 +377,14 @@ class FactExtractor:
                 continue
 
         facts = self._normalize_atomic_facts(facts)
-        logger.info(f"[FactExtractor] Extracted {len(facts)} facts (fallback mode)")
+        log_value_payload(
+            logger,
+            "fact_extraction_fallback",
+            {
+                "facts_count": len(facts),
+                "facts_sample": facts,
+                "predicate_forcing_mode": bool(predicate_target),
+                "predicate_target": predicate_target or {},
+            },
+        )
         return facts

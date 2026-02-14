@@ -5,7 +5,7 @@ Retrieval Phase: Retrieve semantic and KG candidates.
 import math
 from typing import Any, Dict, List, Optional
 
-from app.core.logger import get_logger
+from app.core.logger import get_logger, is_debug_enabled, log_value_payload
 from app.services.common.dedup import dedup_candidates_by_score
 from app.services.embedding.model import embed_async
 from app.services.kg.kg_retrieval import KGRetrieval
@@ -149,15 +149,29 @@ async def retrieve_candidates(
     for c in dedup_sem:
         c["candidate_type"] = c.get("candidate_type") or "VDB"
         c["is_backfill"] = bool(c.get("is_backfill", False))
-    logger.info(
-        f"[RetrievalPhase:{round_id}] Retrieved {len(dedup_sem)} semantic candidates "
-        f"(from {len(semantic_candidates)} raw)"
+    log_value_payload(
+        logger,
+        "retrieval",
+        {
+            "round_id": round_id,
+            "semantic_raw_count": len(semantic_candidates or []),
+            "semantic_dedup_count": len(dedup_sem or []),
+            "semantic_candidates_sample": [
+                {
+                    "statement": c.get("statement", ""),
+                    "source_url": c.get("source_url", ""),
+                    "score": c.get("score", 0.0),
+                    "candidate_type": c.get("candidate_type", "VDB"),
+                }
+                for c in dedup_sem
+            ],
+        },
     )
 
     if log_manager:
         await log_manager.add_log(
             level="INFO",
-            message=f"Semantic retrieval completed: {len(dedup_sem)} candidates",
+            message=f"[PhaseOutput] retrieval semantic_dedup_count={len(dedup_sem)}",
             module=__name__,
             request_id=f"claim-{round_id}",
             round_id=round_id,
@@ -198,13 +212,37 @@ async def retrieve_candidates(
             kg_with_positive_score += 1
         kg_max_score = max(kg_max_score, raw)
 
-    logger.info(f"[RetrievalPhase:{round_id}] Retrieved {len(kg_candidates)} KG candidates")
+    log_value_payload(
+        logger,
+        "retrieval",
+        {
+            "round_id": round_id,
+            "kg_candidates_count": len(kg_candidates or []),
+            "kg_with_score": kg_with_positive_score,
+            "kg_max_score": round(kg_max_score, 4),
+            "kg_candidates_sample": [
+                {
+                    "statement": c.get("statement", ""),
+                    "source_url": c.get("source_url", ""),
+                    "kg_score": c.get("kg_score", 0.0),
+                }
+                for c in kg_candidates
+            ],
+        },
+    )
     kg_with_text = sum(1 for c in kg_candidates if (c.get("statement") or "").strip())
     kg_with_source = sum(1 for c in kg_candidates if (c.get("source_url") or "").strip())
-    logger.info(
-        f"[RetrievalPhase:{round_id}] KG->evidence conversion: total={len(kg_candidates)}, "
-        f"textualized={kg_with_text}, with_source={kg_with_source}, "
-        f"kg_with_score={kg_with_positive_score}, max_kg_score={kg_max_score:.3f}"
+    log_value_payload(
+        logger,
+        "retrieval",
+        {
+            "round_id": round_id,
+            "kg_textualized": kg_with_text,
+            "kg_with_source": kg_with_source,
+            "kg_with_positive_score": kg_with_positive_score,
+            "kg_max_score": round(kg_max_score, 4),
+        },
+        level="debug" if is_debug_enabled() else "info",
     )
 
     metrics = {

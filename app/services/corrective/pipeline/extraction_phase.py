@@ -2,9 +2,10 @@
 Extraction Phase: Fact, entity, and relation extraction from scraped content.
 """
 
+import os
 from typing import Any, Dict, List, Optional
 
-from app.core.logger import get_logger
+from app.core.logger import get_logger, is_debug_enabled, log_value_payload
 from app.services.corrective.entity_extractor import EntityExtractor
 from app.services.corrective.fact_extractor import FactExtractor
 from app.services.corrective.relation_extractor import RelationExtractor
@@ -56,12 +57,21 @@ async def scrape_pages(
         )
     # Filter out pages with no content
     valid_pages = [p for p in scraped_pages if p.get("content")]
-    logger.info(f"[ExtractionPhase:{round_id}] Scraped {len(valid_pages)} pages from {len(urls)} URLs")
+    log_value_payload(
+        logger,
+        "scrape",
+        {
+            "round_id": round_id,
+            "urls_requested": len(urls or []),
+            "pages_scraped": len(valid_pages or []),
+            "scraped_urls": [p.get("url") for p in valid_pages if p.get("url")],
+        },
+    )
 
     if log_manager:
         await log_manager.add_log(
             level="INFO",
-            message=f"Scraping completed: {len(valid_pages)}/{len(urls)} pages extracted",
+            message=f"[PhaseOutput] scrape pages_scraped={len(valid_pages)}/{len(urls)}",
             module=__name__,
             request_id=f"claim-{round_id}",
             round_id=round_id,
@@ -102,12 +112,15 @@ async def extract_all(
             input_data={"scraped_pages_count": len(scraped_pages)},
             output_data=extracted_facts,
         )
-    logger.info(f"[ExtractionPhase:{round_id}] Extracted {len(extracted_facts)} facts")
+    fact_confidences = [float(f.get("confidence") or 0.0) for f in extracted_facts if f.get("confidence") is not None]
+    conf_min = min(fact_confidences) if fact_confidences else 0.0
+    conf_max = max(fact_confidences) if fact_confidences else 0.0
+    conf_avg = (sum(fact_confidences) / len(fact_confidences)) if fact_confidences else 0.0
 
     if log_manager:
         await log_manager.add_log(
             level="INFO",
-            message=f"Fact extraction completed: {len(extracted_facts)} facts",
+            message=f"[PhaseOutput] extraction facts_count={len(extracted_facts)}",
             module=__name__,
             request_id=f"claim-{round_id}",
             round_id=round_id,
@@ -120,18 +133,6 @@ async def extract_all(
     # 4) Entity annotation
     extracted_facts = await entity_extractor.annotate_entities(extracted_facts)
     all_entities = list({e for f in extracted_facts for e in (f.get("entities") or [])})
-    logger.info(f"[ExtractionPhase:{round_id}] Extracted {len(all_entities)} entities")
-
-    if log_manager:
-        await log_manager.add_log(
-            level="INFO",
-            message=f"Entity extraction completed: {len(all_entities)} entities",
-            module=__name__,
-            request_id=f"claim-{round_id}",
-            round_id=round_id,
-            context={"entities_count": len(all_entities)},
-        )
-
     # 5) Relation extraction
     triples = await relation_extractor.extract_relations(extracted_facts, all_entities)
     if debug_reporter:
@@ -141,16 +142,55 @@ async def extract_all(
             input_data={"facts_count": len(extracted_facts), "entities_count": len(all_entities)},
             output_data=triples,
         )
-    logger.info(f"[ExtractionPhase:{round_id}] Extracted {len(triples)} triples")
+    log_value_payload(
+        logger,
+        "extraction",
+        {
+            "round_id": round_id,
+            "facts_sample": [
+                {
+                    "statement": f.get("statement", ""),
+                    "source_url": f.get("source_url", ""),
+                    "confidence": f.get("confidence"),
+                }
+                for f in extracted_facts
+            ],
+            "entities_sample": all_entities,
+            "triples_sample": triples,
+            "fact_conf_min": round(conf_min, 4),
+            "fact_conf_max": round(conf_max, 4),
+            "fact_conf_avg": round(conf_avg, 4),
+        },
+    )
+    log_value_payload(
+        logger,
+        "extraction",
+        {
+            "round_id": round_id,
+            "facts_all": extracted_facts,
+            "entities_all": all_entities,
+            "triples_all": triples,
+        },
+        level="debug",
+        debug_only=True,
+        sample_limit=int(os.getenv("LOG_VALUE_MAX_ITEMS", "20") or 20),
+    )
 
     if log_manager:
         await log_manager.add_log(
             level="INFO",
-            message=f"Relation extraction completed: {len(triples)} triples",
+            message=f"[PhaseOutput] extraction triples_count={len(triples)} entities_count={len(all_entities)}",
             module=__name__,
             request_id=f"claim-{round_id}",
             round_id=round_id,
-            context={"triples_count": len(triples)},
+            context={
+                "phase": "extraction",
+                "facts_sample": [f.get("statement", "") for f in extracted_facts[:5]],
+                "entities_sample": all_entities[:10],
+                "triples_sample": triples[:5],
+                "fact_conf_stats": {"min": conf_min, "max": conf_max, "avg": conf_avg},
+                "debug_mode": is_debug_enabled(),
+            },
         )
 
     return extracted_facts, all_entities, triples

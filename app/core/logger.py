@@ -1,5 +1,8 @@
+import json
 import logging
+import os
 import sys
+from typing import Any, Dict
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -17,7 +20,7 @@ def get_logger(name: str) -> logging.Logger:
     logger = logging.getLogger(name)
 
     if not logger.handlers:
-        logger.setLevel(logging.INFO)
+        logger.setLevel(logging.DEBUG if is_debug_enabled() else logging.INFO)
 
         handler = logging.StreamHandler(sys.stdout)
         formatter = logging.Formatter(
@@ -40,3 +43,43 @@ def get_logger(name: str) -> logging.Logger:
             pass
 
     return logger
+
+
+def is_debug_enabled() -> bool:
+    return (os.getenv("DEBUG", "false") or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def truncate_list_payload(payload: Any, max_items: int | None = None) -> Any:
+    if max_items is None:
+        max_items = int(os.getenv("LOG_VALUE_SAMPLE_LIMIT", "5") or 5)
+    hard_max = int(os.getenv("LOG_VALUE_MAX_ITEMS", "20") or 20)
+    max_items = max(1, min(int(max_items), hard_max))
+    if isinstance(payload, list):
+        return [truncate_list_payload(x, max_items=max_items) for x in payload[:max_items]]
+    if isinstance(payload, dict):
+        return {k: truncate_list_payload(v, max_items=max_items) for k, v in payload.items()}
+    return payload
+
+
+def log_value_payload(
+    logger: logging.Logger,
+    phase: str,
+    payload: Dict[str, Any],
+    *,
+    level: str = "info",
+    debug_only: bool = False,
+    sample_limit: int | None = None,
+) -> None:
+    if debug_only and not is_debug_enabled():
+        return
+    data = {"phase": phase, **(payload or {})}
+    compact = truncate_list_payload(data, max_items=sample_limit)
+    line = f"[PhaseOutput] {json.dumps(compact, ensure_ascii=True, default=str, separators=(',', ':'))}"
+    if level == "debug":
+        logger.debug(line)
+    elif level == "warning":
+        logger.warning(line)
+    elif level == "error":
+        logger.error(line)
+    else:
+        logger.info(line)

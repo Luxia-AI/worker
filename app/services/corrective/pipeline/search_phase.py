@@ -4,7 +4,7 @@ Search Phase: Query reformulation and trusted domain search.
 
 from typing import List, Optional
 
-from app.core.logger import get_logger
+from app.core.logger import get_logger, log_value_payload
 from app.services.corrective.trusted_search import TrustedSearch
 from app.services.logging.log_manager import LogManager
 
@@ -31,26 +31,11 @@ async def do_search(
         Tuple of (search_urls, reformulated_queries)
     """
     # 1) Reformulate queries using LLM
-    if log_manager:
-        await log_manager.add_log(
-            level="INFO",
-            message="Starting search phase: query reformulation",
-            module=__name__,
-            request_id=f"claim-{round_id}",
-            round_id=round_id,
-            context={"post_text": post_text[:100], "failed_entities": failed_entities},
-        )
-
     try:
         queries = (
             await search_agent.reformulate_queries(post_text, failed_entities)
             if hasattr(search_agent, "reformulate_queries")
             else [post_text]
-        )
-        logger.info(
-            "[SearchPhase:%s] Query reformulation output queries=%s",
-            round_id,
-            queries,
         )
     except Exception as e:
         logger.warning(f"[SearchPhase:{round_id}] Query reformulation failed: {e}")
@@ -66,16 +51,41 @@ async def do_search(
 
     # 2) Trusted search: produce trusted URLs
     search_urls = await search_agent.run(post_text, failed_entities)
-    logger.info(f"[SearchPhase:{round_id}] Trusted search found {len(search_urls)} URLs")
+    providers_used = []
+    if getattr(search_agent, "google_available", False):
+        providers_used.append("google")
+    if getattr(search_agent, "serper_available", False):
+        providers_used.append("serper")
+    if not providers_used:
+        providers_used.append("unknown")
+    log_value_payload(
+        logger,
+        "search",
+        {
+            "round_id": round_id,
+            "queries_total": len(queries or []),
+            "queries_executed": len(queries or []),
+            "queries_used": queries or [],
+            "providers_used": providers_used,
+            "urls_found_total": len(search_urls or []),
+            "trusted_urls": search_urls or [],
+        },
+    )
 
     if log_manager:
         await log_manager.add_log(
             level="INFO",
-            message=f"Search phase completed: {len(search_urls)} URLs found",
+            message=f"[PhaseOutput] search urls_found_total={len(search_urls)} queries_total={len(queries)}",
             module=__name__,
             request_id=f"claim-{round_id}",
             round_id=round_id,
-            context={"url_count": len(search_urls), "queries": queries},
+            context={
+                "phase": "search",
+                "queries_total": len(queries or []),
+                "queries_used": queries or [],
+                "urls_found_total": len(search_urls or []),
+                "trusted_urls": search_urls[:5] if search_urls else [],
+            },
         )
 
     return search_urls, queries
