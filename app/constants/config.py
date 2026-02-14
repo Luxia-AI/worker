@@ -201,3 +201,14 @@ SEMANTIC_THRESHOLD_HIGH = 0.90  # A+ candidate
 SEMANTIC_THRESHOLD_GOOD = 0.75  # A/B candidate
 SEMANTIC_THRESHOLD_FAIR = 0.60  # C/D candidate
 SEMANTIC_THRESHOLD_MIN = 0.40  # Minimum acceptable (below = no grade)
+
+# ============================================================================
+# STRICT LOGIC LAYER THRESHOLDS
+# ============================================================================
+
+PREDICATE_MATCH_THRESHOLD = float(os.getenv("PREDICATE_MATCH_THRESHOLD", "0.45"))
+ANCHOR_THRESHOLD = float(os.getenv("ANCHOR_THRESHOLD", "0.30"))
+CONTRADICTION_THRESHOLD = float(os.getenv("CONTRADICTION_THRESHOLD", "0.55"))
+CONTRADICT_RATIO_FORCE_FALSE = float(os.getenv("CONTRADICT_RATIO_FORCE_FALSE", "0.5"))
+DIVERSITY_FORCE_FALSE = float(os.getenv("DIVERSITY_FORCE_FALSE", "0.4"))
+UNVERIFIABLE_CONFIDENCE_CAP = float(os.getenv("UNVERIFIABLE_CONFIDENCE_CAP", "0.60"))

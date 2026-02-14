@@ -23,7 +23,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from prometheus_client import Counter
 
-from app.constants.config import LLM_TEMPERATURE_VERDICT
+from app.constants.config import (
+    ANCHOR_THRESHOLD,
+    CONTRADICT_RATIO_FORCE_FALSE,
+    CONTRADICTION_THRESHOLD,
+    DIVERSITY_FORCE_FALSE,
+    LLM_TEMPERATURE_VERDICT,
+    PREDICATE_MATCH_THRESHOLD,
+    UNVERIFIABLE_CONFIDENCE_CAP,
+)
 from app.core.config import settings
 from app.core.logger import get_logger
 from app.services.common.claim_segmentation import split_claim_into_segments
@@ -1507,6 +1515,7 @@ class VerdictGenerator:
             map_admissible_count,
             map_offtopic_count,
         ) = self._evidence_map_signal_strengths(claim, evidence_map)
+        contradiction_metrics = self._contradiction_dominance_metrics(claim, evidence_map)
         decisive_support = map_support_signal >= 0.58 and map_contradict_signal <= 0.40
         decisive_contradict = map_contradict_signal >= 0.58 and map_support_signal <= 0.40
         conflicting_signals = map_support_signal >= 0.45 and map_contradict_signal >= 0.45
@@ -1525,6 +1534,31 @@ class VerdictGenerator:
         strong_vote_support = vote_decision == Verdict.TRUE.value and vote_support >= 0.65
         if vote_decision in {Verdict.TRUE.value, Verdict.FALSE.value}:
             verdict_str = vote_decision
+
+        strict_override_fired = "NONE"
+        strict_override_reason = "none"
+        if (
+            contradiction_metrics["contradict_ratio"] >= CONTRADICT_RATIO_FORCE_FALSE
+            and contradiction_metrics["contradict_diversity"] >= DIVERSITY_FORCE_FALSE
+        ):
+            for seg in claim_breakdown or []:
+                seg["status"] = "INVALID"
+            verdict_str = Verdict.FALSE.value
+            truth_score_percent = min(float(truth_score_percent or 0.0), 20.0)
+            confidence = max(float(confidence or 0.0), 0.75)
+            strict_override_fired = "CONTRADICTION_DOMINANCE"
+            strict_override_reason = "CONTRADICTION_DOMINANCE"
+            logger.warning(
+                (
+                    "[VerdictGenerator][StrictOverride] "
+                    "type=CONTRADICTION_DOMINANCE ratio=%.3f coverage=%.3f "
+                    "diversity=%.3f support_cov=%.3f"
+                ),
+                contradiction_metrics["contradict_ratio"],
+                contradiction_metrics["contradict_coverage"],
+                contradiction_metrics["contradict_diversity"],
+                contradiction_metrics["support_coverage"],
+            )
 
         # Hard polarity guardrails to keep verdict and rationale/segment stance consistent.
         if canonical_stance == "contradicts" and verdict_str == Verdict.TRUE.value:
@@ -1634,20 +1668,26 @@ class VerdictGenerator:
             truth_score_percent = min(float(truth_score_percent or 0.0), 55.0)
         if numeric_conf_floor is not None:
             confidence = max(float(confidence), float(numeric_conf_floor))
-        if final_lock_unverifiable:
+        if (
+            final_lock_unverifiable
+            and strict_override_fired != "CONTRADICTION_DOMINANCE"
+            and map_contradict_signal < CONTRADICTION_THRESHOLD
+        ):
             verdict_str = Verdict.UNVERIFIABLE.value
             truth_score_percent = max(35.0, min(55.0, float(truth_score_percent or 0.0)))
-            confidence = min(float(confidence), 0.55)
+            confidence = min(float(confidence), UNVERIFIABLE_CONFIDENCE_CAP)
             for seg in claim_breakdown or []:
-                seg["status"] = "UNKNOWN"
-                seg["supporting_fact"] = ""
-                seg["source_url"] = ""
-                seg["evidence_used_ids"] = []
-                seg["alignment_debug"] = {
-                    "reason": "insufficient_admissible_evidence",
-                    "support_signal": round(map_support_signal, 3),
-                    "contradict_signal": round(map_contradict_signal, 3),
-                }
+                status_u = str(seg.get("status") or "UNKNOWN").upper()
+                if status_u not in {"INVALID", "PARTIALLY_INVALID"}:
+                    seg["status"] = "UNKNOWN"
+                    seg["supporting_fact"] = ""
+                    seg["source_url"] = ""
+                    seg["evidence_used_ids"] = []
+                    seg["alignment_debug"] = {
+                        "reason": "insufficient_admissible_evidence",
+                        "support_signal": round(map_support_signal, 3),
+                        "contradict_signal": round(map_contradict_signal, 3),
+                    }
             reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
             rationale = (
                 "Available admissible evidence is mixed or insufficiently decisive for this claim, "
@@ -1658,6 +1698,11 @@ class VerdictGenerator:
         if self._has_absolute_quantifier(claim) and verdict_str == Verdict.TRUE.value:
             verdict_str = Verdict.PARTIALLY_TRUE.value
             truth_score_percent = min(float(truth_score_percent or 0.0), 55.0)
+
+        if strict_override_fired == "CONTRADICTION_DOMINANCE":
+            verdict_str = Verdict.FALSE.value
+            truth_score_percent = min(float(truth_score_percent or 0.0), 20.0)
+            confidence = max(float(confidence or 0.0), 0.75)
 
         logic_result = apply_claim_logic_overrides(
             claim=claim,
@@ -1686,6 +1731,9 @@ class VerdictGenerator:
                 strictness_profile.to_dict(),
                 logic_result.key_numbers,
             )
+        if strict_override_fired == "CONTRADICTION_DOMINANCE":
+            logic_overrides_total.labels(type="CONTRADICTION_DOMINANCE").inc()
+            contradiction_override_total.inc()
         if logic_result.confidence_cap is not None and float(confidence or 0.0) > float(logic_result.confidence_cap):
             confidence_capped_total.inc()
             confidence = float(logic_result.confidence_cap)
@@ -1696,10 +1744,20 @@ class VerdictGenerator:
         verdict_str = str(logic_result.verdict or verdict_str)
         if verdict_str == Verdict.FALSE.value:
             confidence = max(float(confidence or 0.0), float(os.getenv("FALSE_VERDICT_MIN_CONFIDENCE", "0.55")))
+        unverifiable_cap_applied = False
+        if verdict_str == Verdict.UNVERIFIABLE.value and float(confidence or 0.0) > float(UNVERIFIABLE_CONFIDENCE_CAP):
+            confidence = float(UNVERIFIABLE_CONFIDENCE_CAP)
+            unverifiable_cap_applied = True
+            confidence_capped_total.inc()
         confidence = max(0.05, min(0.98, float(confidence or 0.0)))
 
         rationale = self._rewrite_rationale_from_breakdown(rationale, claim_breakdown, reconciled)
-        if final_lock_unverifiable and logic_result.override_fired not in {"CONTRADICTION_DOMINANCE"}:
+        if (
+            final_lock_unverifiable
+            and strict_override_fired != "CONTRADICTION_DOMINANCE"
+            and logic_result.override_fired not in {"CONTRADICTION_DOMINANCE"}
+            and map_contradict_signal < CONTRADICTION_THRESHOLD
+        ):
             verdict_str = Verdict.UNVERIFIABLE.value
             rationale = (
                 "Available admissible evidence is mixed or insufficiently decisive for this claim, "
@@ -1741,6 +1799,29 @@ class VerdictGenerator:
             except Exception:
                 continue
 
+        effective_override_fired = logic_result.override_fired
+        effective_override_reason = logic_result.override_reason
+        effective_override_key_numbers = dict(logic_result.key_numbers or {})
+        if strict_override_fired == "CONTRADICTION_DOMINANCE":
+            effective_override_fired = "CONTRADICTION_DOMINANCE"
+            effective_override_reason = strict_override_reason
+            effective_override_key_numbers.update(
+                {
+                    "contradict_ratio": round(contradiction_metrics["contradict_ratio"], 4),
+                    "contradict_coverage": round(contradiction_metrics["contradict_coverage"], 4),
+                    "contradict_diversity": round(contradiction_metrics["contradict_diversity"], 4),
+                    "support_coverage": round(contradiction_metrics["support_coverage"], 4),
+                }
+            )
+        elif unverifiable_cap_applied:
+            effective_override_fired = "UNVERIFIABLE_CONFIDENCE_CAP"
+            effective_override_reason = "UNVERIFIABLE_CONFIDENCE_CAP"
+            effective_override_key_numbers.update(
+                {
+                    "unverifiable_confidence_cap": float(UNVERIFIABLE_CONFIDENCE_CAP),
+                }
+            )
+
         return {
             "verdict": verdict_str,
             "confidence": confidence,
@@ -1765,9 +1846,9 @@ class VerdictGenerator:
             "verdict_reconciled": bool(verdict_str != llm_verdict),
             "skip_targeted_recovery": bool(skip_targeted_recovery),
             "strictness_profile": strictness_profile.to_dict(),
-            "override_fired": logic_result.override_fired,
-            "override_reason": logic_result.override_reason,
-            "override_key_numbers": logic_result.key_numbers,
+            "override_fired": effective_override_fired,
+            "override_reason": effective_override_reason,
+            "override_key_numbers": effective_override_key_numbers,
             "analysis_counts": {
                 "evidence_total_input": len(evidence),
                 "evidence_map_count": len(evidence_map or []),
@@ -1790,6 +1871,10 @@ class VerdictGenerator:
                 "map_contradict_signal_max": round(map_contradict_signal, 4),
                 "map_admissible_signal_count": int(map_admissible_count),
                 "map_offtopic_count": int(map_offtopic_count),
+                "contradict_ratio": round(contradiction_metrics["contradict_ratio"], 4),
+                "contradict_coverage": round(contradiction_metrics["contradict_coverage"], 4),
+                "contradict_diversity": round(contradiction_metrics["contradict_diversity"], 4),
+                "support_coverage": round(contradiction_metrics["support_coverage"], 4),
                 "weak_signal_no_stance": bool(weak_signal_no_stance),
                 "decisive_support_signal": bool(decisive_support),
                 "decisive_contradict_signal": bool(decisive_contradict),
@@ -2566,6 +2651,109 @@ class VerdictGenerator:
     def _statement_tokens(statement: str) -> set[str]:
         return set(re.findall(r"\b[a-z][a-z0-9_-]+\b", (statement or "").lower()))
 
+    @staticmethod
+    def _normalize_relevance_label(relevance: str) -> str:
+        rel = str(relevance or "NEUTRAL").upper()
+        if rel in {"CONTRADICTS", "REFUTES", "INVALID", "PARTIALLY_INVALID", "PARTIALLY_CONTRADICTS"}:
+            return "REFUTES"
+        if rel in {"SUPPORTS", "VALID", "PARTIALLY_VALID", "PARTIAL", "PARTIALLY_SUPPORTS"}:
+            return "SUPPORTS"
+        return "NEUTRAL"
+
+    @staticmethod
+    def _predicate_phrase_tokens(text: str) -> set[str]:
+        low = (text or "").lower()
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "that",
+            "this",
+            "it",
+            "its",
+            "as",
+            "from",
+            "can",
+            "could",
+            "may",
+            "might",
+            "would",
+            "should",
+            "will",
+            "do",
+            "does",
+            "did",
+            "not",
+            "no",
+        }
+        cue_patterns = (
+            r"\b(cause|causes|caused|causing|lead|leads|led|leading|result|results|resulted|"
+            r"increase|increases|increased|raise|raises|raised|reduce|reduces|reduced|lower|lowers|lowered|"
+            r"prevent|prevents|prevented|preventing|cure|cures|cured|curing|treat|treats|treated|treating|"
+            r"integrate|integrates|integrated|integration|alter|alters|altered|change|changes|changed|"
+            r"risk|risks|effective|ineffective|efficacy|harm|harms|safe|unsafe)\b",
+            r"\b(more|less|higher|lower)\b",
+        )
+        cues = set()
+        for pat in cue_patterns:
+            cues.update(re.findall(pat, low))
+        if not cues:
+            return set()
+        tokens = {t for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", low) if t not in stop}
+        return tokens
+
+    def compute_predicate_match(self, claim_text: str, evidence_text: str) -> float:
+        claim_pred = self._predicate_phrase_tokens(claim_text)
+        ev_pred = self._predicate_phrase_tokens(evidence_text)
+        if not claim_pred:
+            return 0.0
+        overlap = len(claim_pred & ev_pred) / max(1, len(claim_pred))
+        seg_pol = self._segment_polarity(claim_text, evidence_text, stance="neutral")
+        polarity_bonus = 0.2 if seg_pol in {"entails", "contradicts"} else 0.0
+        raw = (0.8 * overlap) + polarity_bonus
+        return max(0.0, min(1.0, raw))
+
+    def _contradiction_score(self, claim_text: str, evidence_text: str) -> float:
+        pol = self._segment_polarity(claim_text, evidence_text, stance="neutral")
+        anchor_overlap = self._segment_anchor_overlap(claim_text, evidence_text)
+        explicit_refute = 1.0 if self._is_explicit_refutation_statement(evidence_text) else 0.0
+        predicate = self.compute_predicate_match(claim_text, evidence_text)
+        claim_neg = bool(
+            re.search(r"\b(no|not|never|cannot|can't|does not|do not|without)\b", (claim_text or "").lower())
+        )
+        ev_neg = bool(
+            re.search(
+                r"\b(no|not|never|cannot|can't|does not|do not|without|doesn't|don't)\b", (evidence_text or "").lower()
+            )
+        )
+        negation_mismatch = 1.0 if claim_neg != ev_neg else 0.0
+        polarity_signal = 1.0 if pol == "contradicts" else 0.0
+        score = (
+            (0.35 * predicate)
+            + (0.25 * anchor_overlap)
+            + (0.20 * explicit_refute)
+            + (0.20 * max(negation_mismatch, polarity_signal))
+        )
+        return max(0.0, min(1.0, score))
+
     def _evidence_score(self, ev: Dict[str, Any]) -> float:
         score = ev.get("final_score")
         if score is None:
@@ -2664,43 +2852,58 @@ class VerdictGenerator:
             ev = evidence_by_id.get(ev_idx, {})
             statement = (item.get("statement") or ev.get("statement") or ev.get("text") or "").strip()
             source_url = (item.get("source_url") or ev.get("source_url") or ev.get("source") or "").strip()
-            relevance_score = float(item.get("relevance_score", ev.get("final_score", ev.get("score", 0.0))) or 0.0)
+            base_score = float(item.get("relevance_score", ev.get("final_score", ev.get("score", 0.0))) or 0.0)
             anchor_score = float(ev.get("anchor_match_score", self._segment_anchor_overlap(claim, statement)) or 0.0)
-            relevance = str(item.get("relevance", "NEUTRAL") or "NEUTRAL").upper()
+            predicate_match_score = self.compute_predicate_match(claim, statement)
+            contradiction_score = self._contradiction_score(claim, statement)
+            strength = compute_evidence_strength(
+                claim_text=claim,
+                text_snippet=statement,
+                source_meta=ev,
+                stance_hint=item.get("relevance"),
+            )
+            support_strength = float(strength.support_strength or 0.0)
+            polarity_rel = self._segment_polarity(claim, statement, stance="neutral")
+            seed_rel = self._normalize_relevance_label(item.get("relevance", "NEUTRAL"))
+
+            relevance = "NEUTRAL"
+            relevance_score = max(0.0, min(1.0, base_score))
             if not self._segment_topic_guard_ok(claim, statement):
-                relevance = "OFFTOPIC"
                 relevance_score *= 0.10
-            if anchor_score < 0.2:
-                relevance = "NEUTRAL"
-                relevance_score *= 0.6
-            if self._is_reporting_statement(statement):
-                relevance = "NEUTRAL"
-                relevance_score *= 0.35
-            if self._is_claim_mention_statement(statement):
-                relevance = "NEUTRAL"
-                relevance_score *= 0.25
-            dna_rel = self._dna_integration_relevance(claim, statement)
-            if dna_rel == "SUPPORTS":
-                relevance = "SUPPORTS"
-                relevance_score = max(relevance_score, 0.70)
-            elif dna_rel == "CONTRADICTS":
-                relevance = "CONTRADICTS"
-                relevance_score = max(relevance_score, 0.70)
-            numeric_rel = self._numeric_relation_relevance(claim, statement)
-            if numeric_rel == "CONTRADICTS":
-                relevance = "CONTRADICTS"
-                relevance_score = max(relevance_score, 0.75)
-            elif numeric_rel == "SUPPORTS":
-                relevance = "SUPPORTS"
-                relevance_score = max(relevance_score, 0.70)
-            if relevance != "OFFTOPIC" and anchor_score >= 0.25:
-                polarity_rel = self._segment_polarity(claim, statement, stance="neutral")
-                if polarity_rel == "entails":
-                    relevance = "SUPPORTS"
-                    relevance_score = max(relevance_score, 0.62)
-                elif polarity_rel == "contradicts":
-                    relevance = "CONTRADICTS"
-                    relevance_score = max(relevance_score, 0.62)
+            else:
+                # Refutation can be decided by direct contradiction, independent of support gates.
+                numeric_rel = self._numeric_relation_relevance(claim, statement)
+                dna_rel = self._dna_integration_relevance(claim, statement)
+                refute_by_rule = (
+                    contradiction_score >= CONTRADICTION_THRESHOLD
+                    or polarity_rel == "contradicts"
+                    or numeric_rel == "CONTRADICTS"
+                    or dna_rel == "CONTRADICTS"
+                )
+                if refute_by_rule:
+                    relevance = "REFUTES"
+                    relevance_score = max(relevance_score, contradiction_score, 0.65)
+                else:
+                    support_gate = (
+                        predicate_match_score >= PREDICATE_MATCH_THRESHOLD
+                        and anchor_score >= ANCHOR_THRESHOLD
+                        and polarity_rel == "entails"
+                        and support_strength >= 0.35
+                        and not self._is_reporting_statement(statement)
+                        and not self._is_claim_mention_statement(statement)
+                    )
+                    # Numeric exact-match can support if predicate and anchor are both present.
+                    if numeric_rel == "SUPPORTS" and predicate_match_score >= PREDICATE_MATCH_THRESHOLD:
+                        support_gate = support_gate or (anchor_score >= ANCHOR_THRESHOLD)
+                    if support_gate:
+                        relevance = "SUPPORTS"
+                        relevance_score = max(relevance_score, support_strength, 0.62)
+                    elif seed_rel == "REFUTES" and contradiction_score >= 0.45:
+                        relevance = "REFUTES"
+                        relevance_score = max(relevance_score, contradiction_score)
+                    else:
+                        relevance = "NEUTRAL"
+                        relevance_score *= 0.55
             normalized.append(
                 {
                     "evidence_id": ev_idx if ev_idx >= 0 else len(normalized),
@@ -2709,6 +2912,9 @@ class VerdictGenerator:
                     "relevance_score": max(0.0, min(1.0, relevance_score)),
                     "source_url": source_url,
                     "anchor_match_score": anchor_score,
+                    "predicate_match_score": max(0.0, min(1.0, predicate_match_score)),
+                    "support_strength": max(0.0, min(1.0, support_strength)),
+                    "contradiction_score": max(0.0, min(1.0, contradiction_score)),
                 }
             )
         return normalized
@@ -2723,49 +2929,118 @@ class VerdictGenerator:
             return claim_breakdown
 
         evidence_by_id: Dict[int, Dict[str, Any]] = {idx: ev for idx, ev in enumerate(evidence)}
-        allowed_rel = {
-            "SUPPORTS",
-            "CONTRADICTS",
-            "PARTIAL",
-            "PARTIALLY_SUPPORTS",
-            "PARTIALLY_CONTRADICTS",
-        }
+        support_strength_threshold = float(os.getenv("SEGMENT_SUPPORT_STRENGTH_THRESHOLD", "0.35"))
 
         for seg in claim_breakdown:
             segment = (seg.get("claim_segment") or "").strip()
             segment_belief_mode = self._segment_is_belief_or_survey_claim(segment)
-            best_item: Dict[str, Any] | None = None
-            best_score = -1.0
-            for em in evidence_map:
-                rel = str(em.get("relevance", "NEUTRAL") or "NEUTRAL").upper()
-                if rel not in allowed_rel:
-                    continue
+            best_support_item: Dict[str, Any] | None = None
+            best_refute_item: Dict[str, Any] | None = None
+            weak_support_item: Dict[str, Any] | None = None
+            best_support_score = -1.0
+            best_refute_score = -1.0
+            best_weak_support_score = -1.0
+            saw_neutral = False
+
+            def _consider_item(em: Dict[str, Any], ev_idx: int | None = None) -> None:
+                nonlocal best_support_item
+                nonlocal best_refute_item
+                nonlocal weak_support_item
+                nonlocal best_support_score
+                nonlocal best_refute_score
+                nonlocal best_weak_support_score
+                nonlocal saw_neutral
+
                 statement = (em.get("statement") or "").strip()
                 if not statement:
-                    continue
+                    return
                 if self._is_claim_mention_statement(statement) and not segment_belief_mode:
-                    continue
+                    return
                 if not self._segment_topic_guard_ok(segment, statement):
-                    continue
+                    return
                 anchor_eval = evaluate_anchor_match(segment, statement)
-                if not bool(anchor_eval.get("anchor_ok", False)):
-                    continue
                 anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
                 if anchor_overlap < _SEGMENT_EVIDENCE_MIN_OVERLAP:
-                    continue
+                    return
                 object_tokens = self._segment_object_tokens(segment)
                 if object_tokens and not segment_belief_mode:
                     statement_tokens = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", statement.lower()))
                     no_object_overlap = len(object_tokens & statement_tokens) == 0
                     if no_object_overlap and not self._is_explicit_refutation_statement(statement):
-                        continue
-                rel_score = float(em.get("relevance_score", 0.0) or 0.0)
-                score = (0.8 * rel_score) + (0.2 * anchor_overlap)
-                if score > best_score:
-                    best_item = em
-                    best_score = score
+                        return
 
-            if best_item is None:
+                rel = self._normalize_relevance_label(em.get("relevance", "NEUTRAL"))
+                rel_score = float(em.get("relevance_score", 0.0) or 0.0)
+                predicate_match_score = float(
+                    em.get("predicate_match_score", self.compute_predicate_match(segment, statement)) or 0.0
+                )
+                support_strength = float(em.get("support_strength", 0.0) or 0.0)
+                contradiction_score = float(
+                    em.get("contradiction_score", self._contradiction_score(segment, statement))
+                )
+                strict_support_ok = (
+                    rel == "SUPPORTS"
+                    and predicate_match_score >= PREDICATE_MATCH_THRESHOLD
+                    and anchor_overlap >= ANCHOR_THRESHOLD
+                    and support_strength >= support_strength_threshold
+                )
+                refute_ok = rel == "REFUTES" and (
+                    contradiction_score >= CONTRADICTION_THRESHOLD
+                    or self._segment_polarity(segment, statement, stance="neutral") == "contradicts"
+                )
+                score = (0.55 * rel_score) + (0.25 * anchor_overlap) + (0.20 * predicate_match_score)
+                if strict_support_ok and score > best_support_score:
+                    best_support_score = score
+                    best_support_item = {
+                        **em,
+                        "evidence_id": em.get("evidence_id", ev_idx if ev_idx is not None else -1),
+                        "statement": statement,
+                        "anchor_match_score": anchor_overlap,
+                        "predicate_match_score": predicate_match_score,
+                        "support_strength": support_strength,
+                        "contradiction_score": contradiction_score,
+                        "stance_used": rel,
+                    }
+                elif refute_ok and score > best_refute_score:
+                    best_refute_score = score
+                    best_refute_item = {
+                        **em,
+                        "evidence_id": em.get("evidence_id", ev_idx if ev_idx is not None else -1),
+                        "statement": statement,
+                        "anchor_match_score": anchor_overlap,
+                        "predicate_match_score": predicate_match_score,
+                        "support_strength": support_strength,
+                        "contradiction_score": contradiction_score,
+                        "stance_used": rel,
+                    }
+                elif rel == "SUPPORTS":
+                    # Keep weak/hedged support for PARTIALLY_VALID fallback.
+                    weakness = 1.0 - max(0.0, min(1.0, support_strength))
+                    weak_score = (
+                        (0.45 * rel_score)
+                        + (0.30 * anchor_overlap)
+                        + (0.25 * predicate_match_score)
+                        - (0.20 * weakness)
+                    )
+                    if weak_score > best_weak_support_score:
+                        best_weak_support_score = weak_score
+                        weak_support_item = {
+                            **em,
+                            "evidence_id": em.get("evidence_id", ev_idx if ev_idx is not None else -1),
+                            "statement": statement,
+                            "anchor_match_score": anchor_overlap,
+                            "predicate_match_score": predicate_match_score,
+                            "support_strength": support_strength,
+                            "contradiction_score": contradiction_score,
+                            "stance_used": rel,
+                        }
+                else:
+                    saw_neutral = True
+
+            for em in evidence_map:
+                _consider_item(em)
+
+            if best_support_item is None and best_refute_item is None and weak_support_item is None:
                 # Fallback to segment-retrieved evidence pool.
                 for idx, ev in enumerate(evidence):
                     seg_q = (ev.get("_segment_query") or "").strip().lower()
@@ -2776,53 +3051,42 @@ class VerdictGenerator:
                         continue
                     if seg_q and seg_q not in segment.lower():
                         continue
-                    if not self._segment_topic_guard_ok(segment, statement):
-                        continue
-                    anchor_eval = evaluate_anchor_match(segment, statement)
-                    if not bool(anchor_eval.get("anchor_ok", False)):
-                        continue
-                    anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
-                    if anchor_overlap < _SEGMENT_EVIDENCE_MIN_OVERLAP:
-                        continue
-                    object_tokens = self._segment_object_tokens(segment)
-                    if object_tokens and not segment_belief_mode:
-                        statement_tokens = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", statement.lower()))
-                        no_object_overlap = len(object_tokens & statement_tokens) == 0
-                        if no_object_overlap and not self._is_explicit_refutation_statement(statement):
-                            continue
-                    score = (0.7 * float(ev.get("final_score", ev.get("score", 0.0)) or 0.0)) + (0.3 * anchor_overlap)
-                    if score > best_score:
-                        best_score = score
-                        best_item = {
-                            "evidence_id": idx,
-                            "statement": statement,
-                            "source_url": ev.get("source_url") or ev.get("source") or "",
-                            "relevance_score": float(ev.get("final_score", ev.get("score", 0.0)) or 0.0),
-                        }
+                    fallback_item = {
+                        "evidence_id": idx,
+                        "statement": statement,
+                        "source_url": ev.get("source_url") or ev.get("source") or "",
+                        "relevance_score": float(ev.get("final_score", ev.get("score", 0.0)) or 0.0),
+                        "relevance": self._normalize_relevance_label(ev.get("relevance", "NEUTRAL")),
+                        "support_strength": float(ev.get("final_score", ev.get("score", 0.0)) or 0.0),
+                    }
+                    _consider_item(fallback_item, ev_idx=idx)
 
-            if best_item is not None:
-                ev_id = int(best_item.get("evidence_id", -1) or -1)
+            chosen: Dict[str, Any] | None = best_support_item or best_refute_item or weak_support_item
+            if chosen is not None:
+                ev_id = int(chosen.get("evidence_id", -1) or -1)
                 ev = evidence_by_id.get(ev_id, {})
-                statement = (best_item.get("statement") or ev.get("statement") or ev.get("text") or "").strip()
-                source_url = (best_item.get("source_url") or ev.get("source_url") or ev.get("source") or "").strip()
-                rel = str(best_item.get("relevance") or "NEUTRAL").upper()
-                if rel == "CONTRADICTS":
-                    seg["status"] = "INVALID"
-                elif rel in {"SUPPORTS", "VALID"}:
+                statement = (chosen.get("statement") or ev.get("statement") or ev.get("text") or "").strip()
+                source_url = (chosen.get("source_url") or ev.get("source_url") or ev.get("source") or "").strip()
+                if best_support_item is not None:
                     seg["status"] = "VALID"
-                elif rel in {"PARTIALLY_SUPPORTS", "PARTIAL"}:
+                elif best_refute_item is not None:
+                    seg["status"] = "INVALID"
+                else:
                     seg["status"] = "PARTIALLY_VALID"
-                elif rel in {"PARTIALLY_CONTRADICTS"}:
-                    seg["status"] = "PARTIALLY_INVALID"
                 if statement:
                     seg["supporting_fact"] = statement
                 if statement and source_url:
                     seg["source_url"] = source_url
                 seg["evidence_used_ids"] = [ev_id] if ev_id >= 0 else []
                 seg["alignment_debug"] = {
-                    "reason": "mapped_from_evidence_map",
-                    "anchor_overlap": round(self._segment_anchor_overlap(segment, statement), 3),
-                    "score": round(best_score, 3),
+                    "reason": "strict_predicate_gate",
+                    "anchor_overlap": round(float(chosen.get("anchor_match_score", 0.0) or 0.0), 3),
+                    "predicate_match_score": round(float(chosen.get("predicate_match_score", 0.0) or 0.0), 3),
+                    "support_strength": round(float(chosen.get("support_strength", 0.0) or 0.0), 3),
+                    "stance_used": str(
+                        chosen.get("stance_used") or self._normalize_relevance_label(chosen.get("relevance"))
+                    ),
+                    "score": round(max(best_support_score, best_refute_score, best_weak_support_score), 3),
                 }
             else:
                 seg.setdefault("evidence_used_ids", [])
@@ -2830,7 +3094,10 @@ class VerdictGenerator:
                 seg["supporting_fact"] = ""
                 seg["source_url"] = ""
                 seg["alignment_debug"] = {
-                    "reason": "no_relevant_evidence",
+                    "reason": "strict_gate_no_match",
+                    "stance_used": "NEUTRAL" if saw_neutral else "NONE",
+                    "predicate_match_score": 0.0,
+                    "support_strength": 0.0,
                     "min_overlap": _SEGMENT_EVIDENCE_MIN_OVERLAP,
                 }
         return claim_breakdown
@@ -3400,7 +3667,7 @@ class VerdictGenerator:
         supports = 0.0
         contradicts = 0.0
         for ev in evidence_map or []:
-            rel = str(ev.get("relevance") or "").upper()
+            rel = VerdictGenerator._normalize_relevance_label(ev.get("relevance"))
             try:
                 score = float(ev.get("relevance_score", 0.0) or 0.0)
             except Exception:
@@ -3408,7 +3675,7 @@ class VerdictGenerator:
             weight = max(0.2, min(1.0, score))
             if rel == "SUPPORTS":
                 supports += weight
-            elif rel == "CONTRADICTS":
+            elif rel == "REFUTES":
                 contradicts += weight
         if contradicts >= (supports * 1.15) and (contradicts - supports) >= 0.15:
             return "contradicts"
@@ -3425,12 +3692,8 @@ class VerdictGenerator:
                 continue
             if not self._evidence_is_admissible_for_claim(claim, stmt):
                 continue
-            rel = str(ev.get("relevance") or "").upper()
-            if rel in {"PARTIALLY_VALID", "VALID"}:
-                rel = "SUPPORTS"
-            elif rel in {"PARTIALLY_INVALID", "INVALID"}:
-                rel = "CONTRADICTS"
-            if rel not in {"SUPPORTS", "CONTRADICTS"}:
+            rel = self._normalize_relevance_label(ev.get("relevance"))
+            if rel not in {"SUPPORTS", "REFUTES"}:
                 continue
             try:
                 score = float(ev.get("relevance_score", 0.0) or 0.0)
@@ -3448,18 +3711,14 @@ class VerdictGenerator:
             stmt = str(ev.get("statement") or "")
             if not stmt or not self._evidence_is_admissible_for_claim(claim, stmt):
                 continue
-            rel = str(ev.get("relevance") or "").upper()
-            if rel in {"PARTIALLY_VALID", "VALID"}:
-                rel = "SUPPORTS"
-            elif rel in {"PARTIALLY_INVALID", "INVALID"}:
-                rel = "CONTRADICTS"
+            rel = self._normalize_relevance_label(ev.get("relevance"))
             try:
                 score = float(ev.get("relevance_score", 0.0) or 0.0)
             except Exception:
                 score = 0.0
             if rel == "SUPPORTS":
                 support = max(support, score)
-            elif rel == "CONTRADICTS":
+            elif rel == "REFUTES":
                 contradict = max(contradict, score)
 
         decision: str | None = None
@@ -3478,23 +3737,16 @@ class VerdictGenerator:
         contradict_max = 0.0
         admissible_count = 0
         offtopic_count = 0
-        support_labels = {"SUPPORTS", "PARTIALLY_SUPPORTS", "VALID", "PARTIALLY_VALID"}
-        contradict_labels = {
-            "CONTRADICTS",
-            "PARTIALLY_CONTRADICTS",
-            "INVALID",
-            "PARTIALLY_INVALID",
-        }
+        support_labels = {"SUPPORTS"}
+        contradict_labels = {"REFUTES"}
 
         for ev in evidence_map or []:
             stmt = str(ev.get("statement") or "").strip()
             if not stmt:
                 continue
-            rel = str(ev.get("relevance") or "").upper()
-            if rel == "OFFTOPIC":
-                offtopic_count += 1
-                continue
+            rel = self._normalize_relevance_label(ev.get("relevance"))
             if not self._segment_topic_guard_ok(claim, stmt):
+                offtopic_count += 1
                 continue
             if not self._evidence_is_admissible_for_claim(claim, stmt):
                 continue
@@ -3510,6 +3762,51 @@ class VerdictGenerator:
                 contradict_max = max(contradict_max, score)
 
         return support_max, contradict_max, admissible_count, offtopic_count
+
+    def _contradiction_dominance_metrics(
+        self,
+        claim: str,
+        evidence_map: List[Dict[str, Any]],
+    ) -> Dict[str, float]:
+        support_weight = 0.0
+        refute_weight = 0.0
+        refute_domains: set[str] = set()
+        seen_domains: set[str] = set()
+
+        for ev in evidence_map or []:
+            stmt = str(ev.get("statement") or "").strip()
+            if not stmt or not self._segment_topic_guard_ok(claim, stmt):
+                continue
+            rel = self._normalize_relevance_label(ev.get("relevance"))
+            score = max(0.0, min(1.0, float(ev.get("relevance_score", 0.0) or 0.0)))
+            src = str(ev.get("source_url") or "").strip().lower()
+            domain = ""
+            if src.startswith("http"):
+                try:
+                    domain = src.split("/")[2].removeprefix("www.")
+                except Exception:
+                    domain = ""
+            if domain:
+                seen_domains.add(domain)
+            if rel == "SUPPORTS":
+                support_weight += score
+            elif rel == "REFUTES":
+                refute_weight += score
+                if domain:
+                    refute_domains.add(domain)
+
+        total = support_weight + refute_weight
+        contradict_ratio = (refute_weight / total) if total > 0 else 0.0
+        support_coverage = support_weight / max(1.0, total)
+        contradict_coverage = contradict_ratio
+        denom_domains = max(1, len(seen_domains))
+        contradict_diversity = len(refute_domains) / denom_domains
+        return {
+            "contradict_ratio": max(0.0, min(1.0, contradict_ratio)),
+            "contradict_coverage": max(0.0, min(1.0, contradict_coverage)),
+            "contradict_diversity": max(0.0, min(1.0, contradict_diversity)),
+            "support_coverage": max(0.0, min(1.0, support_coverage)),
+        }
 
     @staticmethod
     def _dna_integration_relevance(claim: str, statement: str) -> str:
