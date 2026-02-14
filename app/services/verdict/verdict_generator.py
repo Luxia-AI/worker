@@ -25,6 +25,7 @@ from prometheus_client import Counter
 
 from app.constants.config import (
     ANCHOR_THRESHOLD,
+    CONTRADICT_RATIO_FOR_FORCE_FALSE,
     CONTRADICT_RATIO_FORCE_FALSE,
     CONTRADICTION_THRESHOLD,
     DIVERSITY_FORCE_FALSE,
@@ -196,6 +197,7 @@ class VerdictGenerator:
         self.MAX_WEB_ROUNDS_PRE_VERDICT = 2
         self.WEB_SEGMENTS_LIMIT = 3
         self.MAX_UNKNOWN_ROUNDS_POST_VERDICT = 2
+        self._last_predicate_queries_generated: List[str] = []
         env_flag = os.getenv("LUXIA_CONFIDENCE_MODE")
         if env_flag is None:
             self.confidence_mode = bool(getattr(settings, "LUXIA_CONFIDENCE_MODE", False))
@@ -662,6 +664,7 @@ class VerdictGenerator:
                 - evidence_map: List of evidence with relevance annotations
                 - key_findings: List of key findings
         """
+        self._last_predicate_queries_generated = []
         if self.confidence_mode:
             top_k = max(top_k, int(os.getenv("CONFIDENCE_VERDICT_TOP_K", "10")))
         if not ranked_evidence:
@@ -793,10 +796,20 @@ class VerdictGenerator:
                             len(candidate_boost),
                         )
                     else:
+                        analysis_counts = verdict_result.get("analysis_counts", {}) or {}
+                        explicit_refutes_found = bool(verdict_result.get("explicit_refutes_found", False))
+                        contradict_cov = float(
+                            analysis_counts.get("contradict_coverage", analysis_counts.get("contradict_ratio", 0.0))
+                            or 0.0
+                        )
+                        need_predicate_refute = (not explicit_refutes_found) or (
+                            contradict_cov < float(CONTRADICT_RATIO_FOR_FORCE_FALSE)
+                        )
                         web_evidence = await self._fetch_web_evidence_for_unknown_segments(
                             unknown_segments,
                             max_queries_per_segment=1 if used_web_search else 2,
                             max_urls_per_query=1 if used_web_search else 3,
+                            enable_predicate_refute_queries=need_predicate_refute,
                         )
                         candidate_boost = web_evidence
                         if web_evidence:
@@ -907,6 +920,16 @@ class VerdictGenerator:
         if not evidence_map:
             evidence_map = self._build_default_evidence_map(evidence)
         evidence_map = self._normalize_evidence_map(claim, evidence_map, evidence)
+        predicate_queries_generated = list(getattr(self, "_last_predicate_queries_generated", []) or [])
+        explicit_refutes_found = any(
+            self._normalize_relevance_label(ev.get("relevance")) == "REFUTES"
+            and float(ev.get("contradiction_score", 0.0) or 0.0) >= CONTRADICTION_THRESHOLD
+            for ev in (evidence_map or [])
+        )
+        predicate_match_score_used = max(
+            [float(ev.get("predicate_match_score", 0.0) or 0.0) for ev in (evidence_map or [])] or [0.0]
+        )
+        truthfulness_invariant_applied = False
 
         # Extract key findings
         key_findings = llm_result.get("key_findings", [])
@@ -1315,6 +1338,16 @@ class VerdictGenerator:
             # Strongly penalize confidence when most evidence is belief/reporting style.
             policy_insufficient = True
         truth_score_percent = self._calculate_truth_score_from_contract(reconciled)
+        (
+            truth_score_percent,
+            invariant_applied_now,
+            max_status_weight_claim_segment,
+        ) = self._apply_truthfulness_invariant(
+            truth_score_percent,
+            claim_breakdown,
+            explicit_refutes_found=explicit_refutes_found,
+        )
+        truthfulness_invariant_applied = truthfulness_invariant_applied or invariant_applied_now
         agreement_ratio = self._calculate_evidence_agreement_ratio(claim, evidence)
         coverage_score = float(reconciled.get("weighted_truth", 0.0) or 0.0)
         adaptive_trust_post = 0.0
@@ -1537,8 +1570,15 @@ class VerdictGenerator:
 
         strict_override_fired = "NONE"
         strict_override_reason = "none"
+        contradict_ratio_threshold = float(
+            os.getenv(
+                "CONTRADICT_RATIO_FOR_FORCE_FALSE",
+                str(max(float(CONTRADICT_RATIO_FOR_FORCE_FALSE), float(CONTRADICT_RATIO_FORCE_FALSE))),
+            )
+        )
         if (
-            contradiction_metrics["contradict_ratio"] >= CONTRADICT_RATIO_FORCE_FALSE
+            explicit_refutes_found
+            and contradiction_metrics["contradict_ratio"] >= contradict_ratio_threshold
             and contradiction_metrics["contradict_diversity"] >= DIVERSITY_FORCE_FALSE
         ):
             for seg in claim_breakdown or []:
@@ -1742,6 +1782,16 @@ class VerdictGenerator:
         if logic_result.truthfulness_cap_percent is not None:
             truth_score_percent = min(float(truth_score_percent or 0.0), float(logic_result.truthfulness_cap_percent))
         verdict_str = str(logic_result.verdict or verdict_str)
+        (
+            truth_score_percent,
+            invariant_applied_now,
+            max_status_weight_claim_segment,
+        ) = self._apply_truthfulness_invariant(
+            truth_score_percent,
+            claim_breakdown,
+            explicit_refutes_found=explicit_refutes_found,
+        )
+        truthfulness_invariant_applied = truthfulness_invariant_applied or invariant_applied_now
         if verdict_str == Verdict.FALSE.value:
             confidence = max(float(confidence or 0.0), float(os.getenv("FALSE_VERDICT_MIN_CONFIDENCE", "0.55")))
         unverifiable_cap_applied = False
@@ -1849,6 +1899,11 @@ class VerdictGenerator:
             "override_fired": effective_override_fired,
             "override_reason": effective_override_reason,
             "override_key_numbers": effective_override_key_numbers,
+            "explicit_refutes_found": bool(explicit_refutes_found),
+            "predicate_queries_generated": predicate_queries_generated,
+            "predicate_match_score_used": round(float(predicate_match_score_used or 0.0), 4),
+            "contradiction_override_fired": bool(strict_override_fired == "CONTRADICTION_DOMINANCE"),
+            "truthfulness_invariant_applied": bool(truthfulness_invariant_applied),
             "analysis_counts": {
                 "evidence_total_input": len(evidence),
                 "evidence_map_count": len(evidence_map or []),
@@ -1871,6 +1926,7 @@ class VerdictGenerator:
                 "map_contradict_signal_max": round(map_contradict_signal, 4),
                 "map_admissible_signal_count": int(map_admissible_count),
                 "map_offtopic_count": int(map_offtopic_count),
+                "max_status_weight_claim_segment": round(float(max_status_weight_claim_segment or 0.0), 4),
                 "contradict_ratio": round(contradiction_metrics["contradict_ratio"], 4),
                 "contradict_coverage": round(contradiction_metrics["contradict_coverage"], 4),
                 "contradict_diversity": round(contradiction_metrics["contradict_diversity"], 4),
@@ -3061,16 +3117,19 @@ class VerdictGenerator:
                     }
                     _consider_item(fallback_item, ev_idx=idx)
 
-            chosen: Dict[str, Any] | None = best_support_item or best_refute_item or weak_support_item
+            explicit_refute_present = best_refute_item is not None
+            chosen: Dict[str, Any] | None = best_refute_item or best_support_item or weak_support_item
             if chosen is not None:
                 ev_id = int(chosen.get("evidence_id", -1) or -1)
                 ev = evidence_by_id.get(ev_id, {})
                 statement = (chosen.get("statement") or ev.get("statement") or ev.get("text") or "").strip()
                 source_url = (chosen.get("source_url") or ev.get("source_url") or ev.get("source") or "").strip()
-                if best_support_item is not None:
-                    seg["status"] = "VALID"
-                elif best_refute_item is not None:
+                if explicit_refute_present and best_support_item is not None:
+                    seg["status"] = "PARTIALLY_INVALID"
+                elif explicit_refute_present:
                     seg["status"] = "INVALID"
+                elif best_support_item is not None:
+                    seg["status"] = "VALID"
                 else:
                     seg["status"] = "PARTIALLY_VALID"
                 if statement:
@@ -3455,11 +3514,12 @@ class VerdictGenerator:
     @staticmethod
     def _status_truth_weight(status: str) -> float:
         weights = {
+            "STRONGLY_VALID": 1.0,
             "VALID": 1.0,
-            "PARTIALLY_VALID": 0.65,
-            "PARTIALLY_INVALID": 0.35,
-            "INVALID": 0.0,
-            "UNKNOWN": 0.0,
+            "PARTIALLY_VALID": 0.75,
+            "PARTIALLY_INVALID": 0.25,
+            "INVALID": 0.20,
+            "UNKNOWN": 0.45,
         }
         return float(weights.get((status or "UNKNOWN").upper(), 0.0))
 
@@ -3510,7 +3570,7 @@ class VerdictGenerator:
             "PARTIALLY_VALID": 0.75,
             "UNKNOWN": 0.45,
             "PARTIALLY_INVALID": 0.25,
-            "INVALID": 0.0,
+            "INVALID": 0.20,
         }
         total = len(statuses)
         base = sum(float(weights.get(s, 0.0)) for s in statuses) / max(1, total)
@@ -3550,6 +3610,35 @@ class VerdictGenerator:
 
         score = max(0.0, min(1.0, score))
         return round(score * 100.0, 1)
+
+    def _apply_truthfulness_invariant(
+        self,
+        truthfulness_percent: float,
+        claim_breakdown: List[Dict[str, Any]],
+        explicit_refutes_found: bool,
+    ) -> tuple[float, bool, float]:
+        statuses = [str((seg or {}).get("status") or "UNKNOWN").upper() for seg in (claim_breakdown or [])]
+        if not statuses:
+            return max(0.0, float(truthfulness_percent or 0.0)), False, 0.0
+
+        max_status_weight = max(self._status_truth_weight(s) for s in statuses)
+        score = max(0.0, float(truthfulness_percent or 0.0))
+        applied = False
+
+        # Invariant A: unknown/partially-valid only, without explicit refutation, cannot inflate.
+        if all(s in {"UNKNOWN", "PARTIALLY_VALID"} for s in statuses) and not explicit_refutes_found:
+            score = min(score, 45.0)
+            applied = True
+
+        # Invariant B: enforce status-bound upper cap.
+        bound = max_status_weight * 100.0
+        if score > bound:
+            score = bound
+            applied = True
+
+        # Explicit invariant assertion for audit safety.
+        assert score <= (max_status_weight * 100.0) + 1e-9
+        return round(score, 1), applied, max_status_weight
 
     def _cap_confidence_with_contract(
         self,
@@ -4600,14 +4689,64 @@ class VerdictGenerator:
             hints.append("type 2 diabetes reduce or stop medication under medical supervision remission")
         return hints
 
+    @staticmethod
+    def _extract_predicate_object_phrase(segment: str) -> tuple[str, str]:
+        seg = (segment or "").strip().lower()
+        if not seg:
+            return "", ""
+        match = re.search(
+            r"\b(?:can|may|might|does|do|is|are|will|would|should)?\s*"
+            r"(cause|causes|prevent|prevents|treat|treats|cure|cures|alter|alters|change|changes|"
+            r"integrate|integrates|increase|increases|reduce|reduces|lead to|leads to|result in|results in)\b"
+            r"\s+(?P<object>.+)$",
+            seg,
+        )
+        if not match:
+            return "", ""
+        predicate = str(match.group(1) or "").strip()
+        obj = str(match.group("object") or "").strip(" .,")
+        return predicate, obj
+
+    def _predicate_refute_query_hints(self, segment: str) -> List[str]:
+        seg = (segment or "").strip()
+        low = seg.lower()
+        predicate, obj = self._extract_predicate_object_phrase(seg)
+        subject_tokens = sorted(self._segment_subject_tokens(seg))
+        subject_phrase = " ".join(subject_tokens[:4]).strip() if subject_tokens else ""
+
+        if not predicate:
+            # Fallback to generic mechanism refutation patterns when predicate extraction is weak.
+            if "mrna" in low and "dna" in low:
+                return [
+                    "mRNA vaccines do not change DNA",
+                    "mRNA vaccines cannot alter human DNA",
+                    "no evidence mRNA vaccines integrate into human genome",
+                    "studies show mRNA does not enter nucleus DNA integration",
+                ]
+            return []
+
+        anchor_subject = subject_phrase or seg.split()[0]
+        pred_obj = " ".join([predicate, obj]).strip()
+        hints = [
+            f"{anchor_subject} do not {pred_obj}".strip(),
+            f"{anchor_subject} cannot {pred_obj}".strip(),
+            f"no evidence that {anchor_subject} {pred_obj}".strip(),
+            f"{anchor_subject} does not {pred_obj}".strip(),
+        ]
+        if "mrna" in low and "dna" in low:
+            hints.append("studies show mRNA does not enter nucleus DNA integration")
+        return [h for h in hints if h]
+
     async def _fetch_web_evidence_for_unknown_segments(
         self,
         unknown_segments: List[str],
         max_queries_per_segment: int = 2,
         max_urls_per_query: int = 3,
+        enable_predicate_refute_queries: bool = False,
     ) -> List[Dict[str, Any]]:
         """Fetch web evidence for UNKNOWN claim segments."""
         all_web_evidence = []
+        generated_predicate_queries: List[str] = []
 
         for segment in unknown_segments:
             try:
@@ -4622,8 +4761,14 @@ class VerdictGenerator:
                     entities=[],
                 )
                 hinted = [q for q in self._segment_recovery_query_hints(segment) if q]
+                predicate_hints: List[str] = []
+                if enable_predicate_refute_queries:
+                    predicate_hints = [q for q in self._predicate_refute_query_hints(segment) if q]
+                    generated_predicate_queries.extend(predicate_hints)
                 if hinted:
-                    queries = list(dict.fromkeys(hinted + (queries or [])))
+                    queries = list(dict.fromkeys(predicate_hints + hinted + (queries or [])))
+                elif predicate_hints:
+                    queries = list(dict.fromkeys(predicate_hints + (queries or [])))
                 if not queries:
                     logger.warning(f"[VerdictGenerator] No search queries generated for segment: {segment[:30]}...")
                     continue
@@ -4685,6 +4830,7 @@ class VerdictGenerator:
             f"[VerdictGenerator] Retrieved {len(all_web_evidence)} web evidence items "
             f"for {len(unknown_segments)} UNKNOWN segments"
         )
+        self._last_predicate_queries_generated = list(dict.fromkeys(generated_predicate_queries))
         return all_web_evidence
 
 

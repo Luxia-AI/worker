@@ -346,6 +346,7 @@ New claim strictness / override tuning variables:
 - `PREDICATE_MATCH_THRESHOLD` (default `0.45`)
 - `ANCHOR_THRESHOLD` (default `0.30`)
 - `CONTRADICTION_THRESHOLD` (default `0.55`)
+- `CONTRADICT_RATIO_FOR_FORCE_FALSE` (default `0.50`)
 - `CONTRADICT_RATIO_FORCE_FALSE` (default `0.50`)
 - `DIVERSITY_FORCE_FALSE` (default `0.40`)
 - `UNVERIFIABLE_CONFIDENCE_CAP` (default `0.60`)
