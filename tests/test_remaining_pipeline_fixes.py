@@ -272,6 +272,44 @@ def test_vitamin_c_immune_function_paraphrase_is_not_unknown():
     assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
 
 
+def test_vitamin_d_necessary_for_bone_growth_not_unknown():
+    vg = _vg()
+    claim = "Vitamin D is needed for the normal growth and development of bone in children"
+    evidence = [
+        {
+            "statement": "Vitamin D is necessary for normal bone growth.",
+            "source_url": "https://pubmed.ncbi.nlm.nih.gov/21911908/",
+            "final_score": 0.71,
+            "sem_score": 0.0,
+            "kg_score": 0.95,
+            "credibility": 0.95,
+        },
+        {
+            "statement": "Vitamin D helps the body use calcium and phosphorus to make strong bones and teeth.",
+            "source_url": "https://www.cancer.gov/about-cancer/causes-prevention/risk/diet",
+            "final_score": 0.42,
+            "sem_score": 0.77,
+            "kg_score": 0.0,
+            "credibility": 0.95,
+        },
+    ]
+    llm = {
+        "verdict": "TRUE",
+        "confidence": 0.8,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.71},
+            {"evidence_id": 1, "statement": evidence[1]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.42},
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    segment = out["claim_breakdown"][0]
+    assert segment["status"] in {"VALID", "PARTIALLY_VALID"}
+    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
+
+
 def test_vitamin_c_immune_function_paraphrase_not_unverifiable():
     vg = _vg()
     claim = "Vitamin C contributes to the normal function of the immune system"

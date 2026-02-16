@@ -2864,7 +2864,13 @@ class VerdictGenerator:
         if re.search(r"\bvitamin d\b", seg) and re.search(r"\b(bone|growth|development|children|child)\b", seg):
             has_subject = "vitamin d" in stmt
             has_object_proxy = bool(re.search(r"\b(bone|growth|development|rickets|strong bones?)\b", stmt))
-            has_predicate = bool(re.search(r"\b(need|required|important|help|support|maintain|make)\b", stmt))
+            has_predicate = bool(
+                re.search(
+                    r"\b(need|required|important|necessary|essential|help|support|maintain|make|"
+                    r"contribut|regulat|modulat|function)\b",
+                    stmt,
+                )
+            )
             return has_subject and has_object_proxy and has_predicate
 
         # Diabetes management claims require management/medication predicates, not etiology-only facts.
@@ -3595,8 +3601,11 @@ class VerdictGenerator:
                 strict_support_ok = (
                     rel == "SUPPORTS"
                     and predicate_match_score >= PREDICATE_MATCH_THRESHOLD
-                    and anchor_overlap >= ANCHOR_THRESHOLD
-                    and support_strength >= support_strength_threshold
+                    and (
+                        anchor_overlap >= max(0.20, ANCHOR_THRESHOLD - 0.10)
+                        or (predicate_match_score >= 0.7 and support_strength >= 0.55 and rel_score >= 0.45)
+                    )
+                    and (support_strength >= support_strength_threshold or rel_score >= 0.55)
                 )
                 refute_ok = rel == "REFUTES" and (
                     bool(em.get("intervention_match", False))
