@@ -2860,18 +2860,44 @@ class VerdictGenerator:
             has_predicate = bool(re.search(r"\b(improv|effective|accelerat|reduce|promot)\b", stmt))
             return has_subject and has_object_proxy and has_predicate
 
-        # Vitamin D bone-development in children claims.
-        if re.search(r"\bvitamin d\b", seg) and re.search(r"\b(bone|growth|development|children|child)\b", seg):
-            has_subject = "vitamin d" in stmt
-            has_object_proxy = bool(re.search(r"\b(bone|growth|development|rickets|strong bones?)\b", stmt))
-            has_predicate = bool(
+        # Generic requirement/necessity claims:
+        # "X is needed/required/necessary for Y" should match semantically
+        # equivalent evidence without claim-specific hardcoding.
+        if re.search(r"\b(need(?:ed)?|required?|necessary|essential|important)\b", seg):
+            token_re = r"\b[a-z][a-z0-9_-]+\b"
+            stop_words = {
+                "is",
+                "are",
+                "was",
+                "were",
+                "be",
+                "been",
+                "being",
+                "the",
+                "a",
+                "an",
+                "and",
+                "or",
+                "of",
+                "in",
+                "on",
+                "for",
+                "with",
+                "to",
+                "normal",
+                "function",
+            }
+            seg_tokens = {t for t in re.findall(token_re, seg) if t not in stop_words}
+            stmt_tokens = {t for t in re.findall(token_re, stmt) if t not in stop_words}
+            token_overlap = len(seg_tokens & stmt_tokens) / max(1, len(seg_tokens))
+            has_requirement_predicate = bool(
                 re.search(
-                    r"\b(need|required|important|necessary|essential|help|support|maintain|make|"
-                    r"contribut|regulat|modulat|function)\b",
+                    r"\b(need(?:ed)?|required?|necessary|essential|important|help(?:s)?|support(?:s|ed)?|"
+                    r"maintain(?:s|ed)?|contribut(?:e|es|ed|ing)|regulat(?:e|es|ed|ing)|modulat(?:e|es|ed|ing))\b",
                     stmt,
                 )
             )
-            return has_subject and has_object_proxy and has_predicate
+            return token_overlap >= 0.30 and has_requirement_predicate
 
         # Diabetes management claims require management/medication predicates, not etiology-only facts.
         if "diabetes" in seg and bool(
