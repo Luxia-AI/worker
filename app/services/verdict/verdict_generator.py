@@ -2492,6 +2492,10 @@ class VerdictGenerator:
                     r"\b(?:build|builds|built|maintain|maintains|maintained|support|supports|supported|"
                     r"strengthen|strengthens|strengthened|need|needs|needed|required|requires|essential|necessary)\b"
                 ),
+                "source_relation": (
+                    r"\b(?:contain|contains|contained|include|includes|included|found in|source of|"
+                    r"rich in|high in|low in|from|part of|as part of)\b"
+                ),
             }
             hits: set[str] = set()
             for group, pattern in groups.items():
@@ -2734,6 +2738,7 @@ class VerdictGenerator:
     def _segment_object_tokens(segment: str) -> set[str]:
         text = (segment or "").lower()
         patterns = (
+            r"\b(?:as\s+part\s+of|part\s+of)\s+(?P<object>.+)$",
             (
                 r"\b(?:reduce|reduces|reduced|lower|lowers|lowered)\b(?:\s+the)?\s*"
                 r"(?:risk|chance|likelihood)?(?:\s+of)?\s+(?P<object>.+)$"
@@ -2763,6 +2768,7 @@ class VerdictGenerator:
             "",
             object_text,
         )
+        object_text = re.sub(r"^(?:a\s+|an\s+)?diet\s+", "", object_text)
         stop = {
             "to",
             "the",
@@ -2855,6 +2861,10 @@ class VerdictGenerator:
                 r"strengthen|strengthens|strengthened|needed|need|needs|required|requires|essential|necessary|"
                 r"contribut(?:e|es|ed|ing))\b"
             ),
+            "source_relation": (
+                r"\b(contain|contains|contained|include|includes|included|found in|source of|"
+                r"rich in|high in|low in|from|part of|as part of)\b"
+            ),
         }
         for name, pattern in groups.items():
             if re.search(pattern, low):
@@ -2904,8 +2914,24 @@ class VerdictGenerator:
             "will",
             "not",
         }
-        prepositions = {"to", "in", "on", "of", "for", "with", "into", "from"}
-        stop = {"the", "a", "an", "and", "or", "of", "in", "on", "for", "with", "that", "this", "your", "our"}
+        prepositions = {"to", "in", "on", "of", "for", "with", "into", "from", "as"}
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "of",
+            "in",
+            "on",
+            "for",
+            "with",
+            "that",
+            "this",
+            "your",
+            "our",
+            "as",
+        }
         adjective_stop = {
             "strong",
             "weak",
@@ -3056,6 +3082,30 @@ class VerdictGenerator:
             if x
         )
         if overlap > 0.0:
+            return 0.7
+        # Nominal/attribution claims often omit explicit verbs (e.g., "X from foods such as Y").
+        # Treat source/composition relations as a predicate family when anchors align.
+        claim_low = (claim_text or "").lower()
+        evidence_low = (evidence_text or "").lower()
+        claim_nominal_relation = bool(
+            re.search(
+                r"\b("
+                r"from|such as|including|include|contains?|source of|"
+                r"rich in|high in|low in|found in|part of|as part of"
+                r")\b",
+                claim_low,
+            )
+        )
+        evidence_nominal_relation = bool(
+            re.search(
+                r"\b("
+                r"found in|source of|contains?|including|include|"
+                r"rich in|high in|low in|from|part of|as part of"
+                r")\b",
+                evidence_low,
+            )
+        )
+        if claim_nominal_relation and evidence_nominal_relation and (anchor_overlap >= 0.25 or obj_overlap >= 0.35):
             return 0.7
         # Robust fallback: use full-sentence predicate families when token-level extraction is noisy.
         if full_bucket_overlap and (obj_overlap >= 0.35 or anchor_overlap >= 0.25):

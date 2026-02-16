@@ -310,6 +310,74 @@ def test_vitamin_d_necessary_for_bone_growth_not_unknown():
     assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
 
 
+def test_as_part_of_low_saturated_fat_claim_not_unknown():
+    vg = _vg()
+    claim = "as part of a diet low in saturated fat and cholesterol"
+    evidence = [
+        {
+            "statement": "Extra virgin olive oil is low in saturated fat and high in monounsaturated fatty acids.",
+            "source_url": "https://health.clevelandclinic.org/foods-that-lower-cholesterol",
+            "final_score": 0.57,
+            "credibility": 0.95,
+        },
+        {
+            "statement": "Saturated fat and cholesterol are mainly found in animal products.",
+            "source_url": "https://health.clevelandclinic.org/foods-that-lower-cholesterol",
+            "final_score": 0.55,
+            "credibility": 0.95,
+        },
+    ]
+    llm = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.60,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.35},
+            {"evidence_id": 1, "statement": evidence[1]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.31},
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    segment = out["claim_breakdown"][0]
+    assert segment["status"] in {"VALID", "PARTIALLY_VALID"}
+    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
+
+
+def test_soluble_fiber_from_foods_claim_not_unknown():
+    vg = _vg()
+    claim = "Soluble fiber from foods such as oat bran"
+    evidence = [
+        {
+            "statement": "Soluble fiber is found in oats, beans, peas, and most fruits.",
+            "source_url": "https://newsinhealth.nih.gov/2019/07/rough-up-your-diet",
+            "final_score": 0.58,
+            "credibility": 0.95,
+        },
+        {
+            "statement": "Oats are a great source of soluble fiber.",
+            "source_url": "https://newsinhealth.nih.gov/2019/07/rough-up-your-diet",
+            "final_score": 0.55,
+            "credibility": 0.95,
+        },
+    ]
+    llm = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.60,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.38},
+            {"evidence_id": 1, "statement": evidence[1]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.36},
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    segment = out["claim_breakdown"][0]
+    assert segment["status"] in {"VALID", "PARTIALLY_VALID"}
+    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
+
+
 def test_vitamin_c_immune_function_paraphrase_not_unverifiable():
     vg = _vg()
     claim = "Vitamin C contributes to the normal function of the immune system"
