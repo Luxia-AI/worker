@@ -358,3 +358,15 @@ def test_segment_recovery_query_hints_are_generic():
     joined = " ".join(hints).lower()
     assert "evidence" in joined
     assert "mechanism" in joined
+
+
+def test_intervention_alignment_not_broken_by_plain_vitamin_mentions():
+    vg = _vg()
+    claim = (
+        "Low-fat diets rich in fruits and vegetables may contain dietary fiber and Vitamin A or Vitamin C "
+        "and may reduce cancer risk"
+    )
+    evidence = "Fruits and vegetables can help reduce risk of some cancers."
+    intervention_match, anchors_ok = vg._intervention_alignment(claim, evidence)
+    assert intervention_match is True
+    assert anchors_ok is True

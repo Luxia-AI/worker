@@ -2600,7 +2600,8 @@ class VerdictGenerator:
             ),
             "supplement": (
                 r"\b(supplement|supplements|supplementation|pill|capsule|tablet|dose|dosage|"
-                r"vitamin\s+[a-z0-9]+|mineral supplement)\b"
+                r"vitamin\s+[a-z0-9]+\s+supplement(?:ation)?|supplement(?:ation)?\s+of\s+vitamin|"
+                r"mineral supplement)\b"
             ),
             "drug": (
                 r"\b(drug|drugs|medication|medications|medicine|medicines|pharmaceutical|therapy|"
@@ -2704,6 +2705,7 @@ class VerdictGenerator:
         stmt_buckets = VerdictGenerator._predicate_bucket_tokens(stmt)
 
         # Predicate families must align. Allow requirement-like claims to map into support/maintenance language.
+        predicate_overlap = False
         if seg_buckets and stmt_buckets:
             predicate_overlap = bool(seg_buckets & stmt_buckets)
             requirement_like = "build_support" in seg_buckets
@@ -2715,7 +2717,13 @@ class VerdictGenerator:
         has_subject_constraint = bool(seg_subject_lem)
         has_object_constraint = bool(seg_object_lem)
         if has_subject_constraint and has_object_constraint:
-            return subject_overlap >= 0.20 and object_overlap >= 0.20
+            # Robust fallback for long/compound segments where subject parsing can be noisy:
+            # strong object + predicate alignment can still establish predicate-level relevance.
+            if subject_overlap >= 0.20 and object_overlap >= 0.20:
+                return True
+            if object_overlap >= 0.35 and predicate_overlap:
+                return True
+            return False
         if has_subject_constraint:
             return subject_overlap >= 0.20
         if has_object_constraint:

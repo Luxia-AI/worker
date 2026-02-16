@@ -50,3 +50,16 @@ def test_segments_require_predicates_and_merge_fragments():
     segment = segments[0].lower()
     assert "may help reduce" in segment
     assert not segment.startswith("and ")
+
+
+def test_parenthetical_and_does_not_split_into_fragment_segments():
+    claim = (
+        "Low-fat diets rich in fruits and vegetables (foods that are low in fat and may contain dietary fiber "
+        "and Vitamin A or Vitamin C) may reduce the risk of some types of cancer."
+    )
+    segments = split_claim_into_segments(claim)
+
+    # Should not produce fragmentary parts from conjunctions inside parentheses.
+    assert all("(" not in s or ")" in s for s in segments)
+    assert not any(s.strip().lower().startswith("may contain dietary fiber") for s in segments)
+    assert all(any(v in s.lower() for v in ["may", "reduce", "contain", "helps", "is", "are"]) for s in segments)

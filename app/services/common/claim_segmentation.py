@@ -203,12 +203,37 @@ def _split_on_contrast_not(text: str) -> List[str]:
 
 
 def _split_on_conjunctives(text: str) -> List[str]:
+    def _split_top_level(raw: str, conj_token: str) -> List[str]:
+        low = (raw or "").lower()
+        parts: List[str] = []
+        depth = 0
+        last = 0
+        i = 0
+        while i < len(raw):
+            ch = raw[i]
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}" and depth > 0:
+                depth -= 1
+            if depth == 0 and low.startswith(conj_token, i):
+                chunk = _clean(raw[last:i])
+                if chunk:
+                    parts.append(chunk)
+                i += len(conj_token)
+                last = i
+                continue
+            i += 1
+        tail = _clean(raw[last:])
+        if tail:
+            parts.append(tail)
+        return parts
+
     for conj in _CONJUNCTIVES:
-        low = (text or "").lower()
-        if conj not in low:
+        low_full = (text or "").lower()
+        if conj not in low_full:
             continue
 
-        parts = [_clean(p) for p in (text or "").split(conj) if _clean(p)]
+        parts = _split_top_level((text or ""), conj)
         if len(parts) <= 1:
             continue
 
