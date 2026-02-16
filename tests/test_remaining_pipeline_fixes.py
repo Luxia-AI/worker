@@ -342,3 +342,19 @@ def test_vitamin_c_immune_function_paraphrase_not_unverifiable():
     out = vg._parse_verdict_result(llm, claim, evidence)
     assert out["claim_breakdown"][0]["status"] in {"VALID", "PARTIALLY_VALID"}
     assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
+
+
+def test_predicate_guard_generic_requirement_paraphrase():
+    # Claim-agnostic requirement/support mapping.
+    assert VerdictGenerator._predicate_guard_ok(
+        "Magnesium is needed for normal muscle function",
+        "Magnesium supports normal muscle function.",
+    )
+
+
+def test_segment_recovery_query_hints_are_generic():
+    vg = _vg()
+    hints = vg._segment_recovery_query_hints("Zinc contributes to normal cognitive performance")
+    joined = " ".join(hints).lower()
+    assert "evidence" in joined
+    assert "mechanism" in joined

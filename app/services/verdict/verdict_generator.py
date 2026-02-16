@@ -2079,8 +2079,7 @@ class VerdictGenerator:
         total = len(groups)
         base = (matched / total) if total > 0 else 0.0
 
-        # Paraphrase/lemma fallback so "oats reduce cholesterol" can match
-        # "oat fiber helps lower cholesterol" even when strict anchors miss.
+        # Paraphrase/lemma fallback when strict anchors miss.
         seg_tokens = self._content_tokens(segment)
         stmt_tokens = self._content_tokens(statement)
         if not seg_tokens:
@@ -2119,19 +2118,17 @@ class VerdictGenerator:
             "promotes",
         }
         syn = {
-            "oats": "oat",
+            # Generic normalization only; avoid claim-specific mappings.
             "fibre": "fiber",
             "lower": "reduce",
             "decrease": "reduce",
             "decreases": "reduce",
             "decreased": "reduce",
-            "cholesterol-lowering": "cholesterol",
-            "regularity": "constipation",
-            "transit": "constipation",
-            "stools": "constipation",
-            "development": "growth",
-            "bones": "bone",
+            # Irregular plurals.
             "children": "child",
+            "men": "man",
+            "women": "woman",
+            "teeth": "tooth",
         }
         out: set[str] = set()
         for t in raw:
@@ -2502,91 +2499,11 @@ class VerdictGenerator:
                     hits.add(group)
             return hits
 
-        def _is_antibiotic_viral_inefficacy_claim(text: str) -> bool:
-            low = (text or "").lower()
-            has_antibiotic = bool(re.search(r"\bantibiotic(?:s|al)?\b", low))
-            has_viral_target = bool(re.search(r"\b(viral?|virus(?:es)?|common cold|flu|influenza)\b", low))
-            has_negative_efficacy = bool(
-                re.search(
-                    r"\b(do(?:es)?\s+not|cannot|can't|ineffective|no effect|not effective)\b.{0,30}\b"
-                    r"(work|treat|help|cure|prevent)\b",
-                    low,
-                )
-            )
-            return has_antibiotic and has_viral_target and has_negative_efficacy
-
-        def _misuse_implies_inefficacy(text: str) -> bool:
-            low = (text or "").lower()
-            has_antibiotic = bool(re.search(r"\bantibiotic(?:s|al)?\b", low))
-            has_viral_target = bool(re.search(r"\b(viral?|virus(?:es)?|common cold|flu|influenza)\b", low))
-            misuse_pattern = bool(
-                re.search(
-                    r"\b(misus(?:e|ed)|inappropriate|unnecessary|overprescrib(?:e|ed|ing)|" r"not recommended)\b",
-                    low,
-                )
-            )
-            return has_antibiotic and has_viral_target and misuse_pattern
-
-        def _is_hypertension_symptom_claim(text: str) -> bool:
-            low = (text or "").lower()
-            has_condition = bool(re.search(r"\b(hypertension|high blood pressure|blood pressure)\b", low))
-            has_symptom_focus = bool(
-                re.search(
-                    r"\b(symptom|symptoms|headache|headaches|noticeable|silent|asymptomatic)\b",
-                    low,
-                )
-            )
-            return has_condition and has_symptom_focus
-
-        def _hypertension_symptom_polarity(text: str) -> str:
-            low = (text or "").lower()
-            has_condition = bool(re.search(r"\b(hypertension|high blood pressure|blood pressure)\b", low))
-            if not has_condition:
-                return "neutral"
-            no_symptoms = bool(
-                re.search(
-                    r"\b(no symptoms?|asymptomatic|silent (condition|killer)|"
-                    r"often has no symptoms?|usually has no symptoms?)\b",
-                    low,
-                )
-            )
-            has_symptoms = bool(
-                re.search(
-                    r"\b(has symptoms?|noticeable symptoms?|symptoms? like headaches?|"
-                    r"headaches? (are|is) (common|typical|reliable))\b",
-                    low,
-                )
-            )
-            if no_symptoms and not has_symptoms:
-                return "contradicts"
-            if has_symptoms and not no_symptoms:
-                return "entails"
-            return "neutral"
-
         seg_neg = _has_semantic_negation(seg)
         stmt_neg = _has_semantic_negation(stmt)
         seg_groups = _predicate_groups(seg)
         stmt_groups = _predicate_groups(stmt)
         same_predicate = bool(seg_groups & stmt_groups)
-
-        # Special-case biomedical efficacy framing:
-        # "misused/inappropriate for viral infections" supports claims that antibiotics
-        # do not work against viruses, even when statement phrasing includes "treating".
-        if _is_antibiotic_viral_inefficacy_claim(seg) and _misuse_implies_inefficacy(stmt):
-            return "entails"
-
-        # Hypertension symptom framing:
-        # "silent/asymptomatic/no symptoms" should contradict claims that BP usually
-        # has noticeable symptoms (e.g., headaches).
-        if _is_hypertension_symptom_claim(seg):
-            seg_h = _hypertension_symptom_polarity(seg)
-            stmt_h = _hypertension_symptom_polarity(stmt)
-            if seg_h == "entails" and stmt_h == "contradicts":
-                return "contradicts"
-            if seg_h == "contradicts" and stmt_h == "entails":
-                return "contradicts"
-            if seg_h != "neutral" and seg_h == stmt_h:
-                return "entails"
 
         # Negation symmetry guard (runs before stance fallback):
         # negative + negative over same predicate => support, not contradiction.
@@ -2742,22 +2659,6 @@ class VerdictGenerator:
     def _segment_topic_guard_ok(self, segment: str, statement: str) -> bool:
         seg_concepts = self._concept_hits(segment)
         stmt_concepts = self._concept_hits(statement)
-        if {"vaccine", "flu"}.issubset(seg_concepts) and not {
-            "vaccine",
-            "flu",
-        }.issubset(stmt_concepts):
-            return False
-        if "antibiotic" in seg_concepts and ({"cold", "flu", "virus"} & seg_concepts):
-            if "antibiotic" not in stmt_concepts:
-                return False
-            if not ({"cold", "flu", "virus"} & stmt_concepts):
-                return False
-        if {"sugar", "hyperactivity"}.issubset(seg_concepts) and not {
-            "sugar",
-            "hyperactivity",
-        }.issubset(stmt_concepts):
-            return False
-
         # Whole-food claims should not be invalidated by supplement-only evidence.
         seg_l = (segment or "").lower()
         stmt_l = (statement or "").lower()
@@ -2788,174 +2689,37 @@ class VerdictGenerator:
         if not seg or not stmt:
             return False
 
-        # DNA integration claims need integration/genomic predicate evidence (or explicit negation).
-        if ("integrate" in seg or "integration" in seg) and "dna" in seg:
-            has_predicate = bool(
-                re.search(
-                    r"\b(integrat(?:e|es|ed|ion)|genom(?:e|ic)|incorporat(?:e|ed|ion)|reverse transcription)\b",
-                    stmt,
-                )
-            )
-            has_explicit_neg = bool(
-                re.search(
-                    r"\b(do(?:es)?\s+not|cannot|can't|not)\b.{0,30}\b(integrat(?:e|ion)|alter|change)\b.{0,30}\bdna\b",
-                    stmt,
-                )
-            )
-            return has_predicate or has_explicit_neg
+        seg_subject_tokens = VerdictGenerator._segment_subject_tokens(seg)
+        seg_object_tokens = VerdictGenerator._segment_object_tokens(seg)
+        stmt_tokens = VerdictGenerator._statement_tokens(stmt)
 
-        # Smoking -> lung cancer risk claims require both entities and risk predicate.
-        if "smoking" in seg and "lung" in seg and "cancer" in seg:
-            has_entities = ("smoking" in stmt) and ("lung" in stmt) and ("cancer" in stmt)
-            has_predicate = bool(re.search(r"\b(risk|increase|increases|cause|causes|associated)\b", stmt))
-            return has_entities and has_predicate
+        seg_subject_lem = {VerdictGenerator._lemma_token(t) for t in seg_subject_tokens}
+        seg_object_lem = {VerdictGenerator._lemma_token(t) for t in seg_object_tokens}
+        stmt_lem = {VerdictGenerator._lemma_token(t) for t in stmt_tokens}
 
-        # Smoking vascular-risk claims should keep disease target alignment strict.
-        if "smoking" in seg and bool(re.search(r"\b(risk|increase|increases|cause|causes|associated)\b", seg)):
-            requires_stroke = "stroke" in seg
-            requires_heart = bool(
-                re.search(
-                    r"\b(heart disease|cardiovascular disease|coronary heart disease|heart attack)\b",
-                    seg,
-                )
-            )
-            if requires_stroke or requires_heart:
-                has_smoking = "smoking" in stmt
-                has_predicate = bool(re.search(r"\b(risk|increase|increases|cause|causes|associated)\b", stmt))
-                has_stroke = bool(re.search(r"\bstroke\b", stmt))
-                has_heart = bool(
-                    re.search(
-                        r"\b(heart disease|cardiovascular disease|coronary heart disease|heart attack)\b",
-                        stmt,
-                    )
-                )
-                if requires_stroke and not has_stroke:
-                    return False
-                if requires_heart and not has_heart:
-                    return False
-                return has_smoking and has_predicate
+        subject_overlap = len(seg_subject_lem & stmt_lem) / max(1, len(seg_subject_lem)) if seg_subject_lem else 0.0
+        object_overlap = len(seg_object_lem & stmt_lem) / max(1, len(seg_object_lem)) if seg_object_lem else 0.0
 
-        # Vitamin C -> common cold claims require both entities and prevention/treatment predicate.
-        if "vitamin" in seg and "cold" in seg:
-            has_entities = ("vitamin c" in stmt or ("vitamin" in stmt and "c" in stmt)) and ("cold" in stmt)
-            has_predicate = bool(
-                re.search(
-                    r"\b(prevent|prevents|prevention|reduce|reduces|treat|treatment|duration)\b",
-                    stmt,
-                )
-            )
-            return has_entities and has_predicate
+        seg_buckets = VerdictGenerator._predicate_bucket_tokens(seg)
+        stmt_buckets = VerdictGenerator._predicate_bucket_tokens(stmt)
 
-        # Oat fiber cholesterol claims: allow reduce/lower/decrease cholesterol phrasing.
-        if re.search(r"\b(oat|oats?|oat bran|fiber|fibre)\b", seg) and "cholesterol" in seg:
-            has_subject = bool(re.search(r"\b(oat|oats?|oat bran|fiber|fibre)\b", stmt))
-            has_object = "cholesterol" in stmt
-            has_predicate = bool(re.search(r"\b(help|reduce|lower|decrease|improv)\b", stmt))
-            return has_subject and has_object and has_predicate
-
-        # GI regularity claims: regularity may be evidenced via constipation/transit outcomes.
-        if re.search(r"\bregularity\b", seg):
-            has_subject = bool(re.search(r"\b(wheat bran|bran|fiber|fibre)\b", stmt))
-            has_object_proxy = bool(re.search(r"\b(constipation|gut transit|transit time|stool|bowel)\b", stmt))
-            has_predicate = bool(re.search(r"\b(improv|effective|accelerat|reduce|promot)\b", stmt))
-            return has_subject and has_object_proxy and has_predicate
-
-        # Generic requirement/necessity claims:
-        # "X is needed/required/necessary for Y" should match semantically
-        # equivalent evidence without claim-specific hardcoding.
-        if re.search(r"\b(need(?:ed)?|required?|necessary|essential|important)\b", seg):
-            token_re = r"\b[a-z][a-z0-9_-]+\b"
-            stop_words = {
-                "is",
-                "are",
-                "was",
-                "were",
-                "be",
-                "been",
-                "being",
-                "the",
-                "a",
-                "an",
-                "and",
-                "or",
-                "of",
-                "in",
-                "on",
-                "for",
-                "with",
-                "to",
-                "normal",
-                "function",
-            }
-            seg_tokens = {t for t in re.findall(token_re, seg) if t not in stop_words}
-            stmt_tokens = {t for t in re.findall(token_re, stmt) if t not in stop_words}
-            token_overlap = len(seg_tokens & stmt_tokens) / max(1, len(seg_tokens))
-            has_requirement_predicate = bool(
-                re.search(
-                    r"\b(need(?:ed)?|required?|necessary|essential|important|help(?:s)?|support(?:s|ed)?|"
-                    r"maintain(?:s|ed)?|contribut(?:e|es|ed|ing)|regulat(?:e|es|ed|ing)|modulat(?:e|es|ed|ing))\b",
-                    stmt,
-                )
-            )
-            return token_overlap >= 0.30 and has_requirement_predicate
-
-        # Diabetes management claims require management/medication predicates, not etiology-only facts.
-        if "diabetes" in seg and bool(
-            re.search(
-                r"\b(manage|managed|management|lifestyle|medication|medications|reduce|stop)\b",
-                seg,
-            )
-        ):
-            has_diabetes = bool(re.search(r"\b(type\s*2\s+diabetes|type ii diabetes|diabetes)\b", stmt))
-            if not has_diabetes:
+        # Predicate families must align. Allow requirement-like claims to map into support/maintenance language.
+        if seg_buckets and stmt_buckets:
+            predicate_overlap = bool(seg_buckets & stmt_buckets)
+            requirement_like = "build_support" in seg_buckets
+            support_like_stmt = bool(stmt_buckets & {"build_support", "therapeutic", "causal"})
+            if not predicate_overlap and not (requirement_like and support_like_stmt):
                 return False
 
-            medication_change_claim = bool(
-                re.search(
-                    r"\b(reduce|stop|discontinue|withdraw)\b.{0,30}\b(medication|medications|drug|drugs)\b",
-                    seg,
-                )
-            )
-            if medication_change_claim:
-                has_medication_change = bool(
-                    re.search(
-                        r"\b(reduce|reduced|stop|stopped|discontinue|discontinued|withdraw|withdrawn)\b.{0,40}\b"
-                        r"(medication|medications|drug|drugs|insulin)\b",
-                        stmt,
-                    )
-                )
-                has_supervision_or_context = bool(
-                    re.search(
-                        r"\b(medical supervision|doctor|clinician|supervised|healthcare provider)\b",
-                        stmt,
-                    )
-                ) or bool(re.search(r"\b(lifestyle|diet|exercise|weight loss|remission)\b", stmt))
-                return has_medication_change and has_supervision_or_context
-
-            lifestyle_manage_claim = bool(re.search(r"\b(manage|managed|management|lifestyle)\b", seg))
-            if lifestyle_manage_claim:
-                has_lifestyle_signal = bool(
-                    re.search(
-                        r"\b(lifestyle|diet|exercise|weight loss|physical activity|remission|managed?)\b",
-                        stmt,
-                    )
-                )
-                return has_lifestyle_signal
-
-        # Hypertension symptom claims require symptom-language evidence.
-        if re.search(r"\b(hypertension|high blood pressure|blood pressure)\b", seg) and re.search(
-            r"\b(symptom|symptoms|headache|headaches|noticeable|silent|asymptomatic)\b",
-            seg,
-        ):
-            has_condition = bool(re.search(r"\b(hypertension|high blood pressure|blood pressure)\b", stmt))
-            has_symptom_signal = bool(
-                re.search(
-                    r"\b(symptom|symptoms|headache|headaches|asymptomatic|silent|no symptoms?)\b",
-                    stmt,
-                )
-            )
-            return has_condition and has_symptom_signal
-
+        # When segment has explicit subject/object anchors, require at least partial lexical support.
+        has_subject_constraint = bool(seg_subject_lem)
+        has_object_constraint = bool(seg_object_lem)
+        if has_subject_constraint and has_object_constraint:
+            return subject_overlap >= 0.20 and object_overlap >= 0.20
+        if has_subject_constraint:
+            return subject_overlap >= 0.20
+        if has_object_constraint:
+            return object_overlap >= 0.20
         return True
 
     @staticmethod
@@ -3096,21 +2860,14 @@ class VerdictGenerator:
 
     @staticmethod
     def _object_semantic_equivalent(claim_text: str, evidence_text: str) -> bool:
-        c = str(claim_text or "").lower()
-        e = str(evidence_text or "").lower()
-        # GI regularity equivalence: regularity ~ constipation/transit/stool.
-        if re.search(r"\bregularity\b", c):
-            if re.search(r"\b(constipation|gut transit|transit time|stool|bowel movement)\b", e):
-                return True
-        # Bone growth/development equivalence.
-        if re.search(r"\b(bone|growth|development|children|child)\b", c):
-            if re.search(r"\b(bone|growth|development|rickets|strong bones?|bone density)\b", e):
-                return True
-        # Cholesterol lowering equivalence.
-        if re.search(r"\bcholesterol\b", c):
-            if re.search(r"\b(cholesterol|ldl|lipid)\b", e) and re.search(r"\b(reduce|lower|decrease|improv)\b", e):
-                return True
-        return False
+        claim_obj = VerdictGenerator._segment_object_tokens(claim_text)
+        if not claim_obj:
+            return False
+        ev_tokens = VerdictGenerator._statement_tokens(evidence_text)
+        claim_obj_lem = {VerdictGenerator._lemma_token(t) for t in claim_obj}
+        ev_lem = {VerdictGenerator._lemma_token(t) for t in ev_tokens}
+        overlap = len(claim_obj_lem & ev_lem) / max(1, len(claim_obj_lem))
+        return overlap >= 0.40
 
     def _extract_canonical_predicate_triplet(self, text: str) -> Dict[str, str]:
         low = (text or "").strip().lower()
@@ -5269,27 +5026,27 @@ class VerdictGenerator:
 
         return unknown_segments
 
-    @staticmethod
-    def _segment_recovery_query_hints(segment: str) -> List[str]:
-        """Deterministic query hints for hard claim patterns."""
+    def _segment_recovery_query_hints(self, segment: str) -> List[str]:
+        """Deterministic, claim-agnostic query hints derived from predicate triplets."""
         seg = (segment or "").strip()
-        low = seg.lower()
-        hints: List[str] = []
-        if re.search(r"\b(hypertension|high blood pressure|blood pressure)\b", low) and re.search(
-            r"\b(symptom|symptoms|headache|headaches|noticeable)\b",
-            low,
-        ):
-            hints.append("high blood pressure symptoms silent condition no symptoms headaches not reliable indicator")
-            hints.append("hypertension usually no symptoms headaches not a reliable sign")
-        if "smoking" in low and ("stroke" in low or "heart disease" in low or "cardiovascular" in low):
-            hints.append("smoking increases risk of stroke and heart disease evidence")
-            hints.append("cdc smoking causes stroke and heart disease")
-        if "diabetes" in low and (
-            "lifestyle" in low or "managed" in low or "medication" in low or "supervision" in low
-        ):
-            hints.append("type 2 diabetes can be managed with lifestyle changes diet exercise")
-            hints.append("type 2 diabetes reduce or stop medication under medical supervision remission")
-        return hints
+        if not seg:
+            return []
+        triplet = self._extract_canonical_predicate_triplet(seg)
+        subject = str(triplet.get("subject_span") or "").strip()
+        predicate = str(triplet.get("predicate_span") or "").strip()
+        obj = str(triplet.get("object_span") or "").strip()
+        if not predicate:
+            return [f"{seg} evidence", f"{seg} guideline"]
+
+        core = " ".join(x for x in [subject, predicate, obj] if x).strip()
+        if not core:
+            core = seg
+        hints = [
+            f"{core} evidence",
+            f"{core} mechanism",
+            f"{core} clinical guideline",
+        ]
+        return [h for h in hints if h]
 
     def _predicate_refute_query_hints(self, segment: str) -> List[str]:
         seg = (segment or "").strip()
