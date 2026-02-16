@@ -8,7 +8,12 @@ from typing import Any, Dict, List, Tuple
 import aiohttp
 
 from app.config.trusted_domains import TRUSTED_ROOT_DOMAINS, is_trusted_domain
-from app.constants.config import GOOGLE_CSE_SEARCH_URL, GOOGLE_CSE_TIMEOUT, PIPELINE_MAX_URLS_PER_QUERY
+from app.constants.config import (
+    GOOGLE_CSE_SEARCH_URL,
+    GOOGLE_CSE_TIMEOUT,
+    LLM_MAX_TOKENS_QUERY_REFORMULATION,
+    PIPELINE_MAX_URLS_PER_QUERY,
+)
 from app.constants.llm_prompts import QUERY_REFORMULATION_PROMPT, REINFORCEMENT_QUERY_PROMPT
 from app.core.config import settings
 from app.core.logger import get_logger, is_debug_enabled, log_value_payload
@@ -489,6 +494,32 @@ class TrustedSearch:
         q = " ".join(tokens[:18]).strip()
         return q
 
+    @staticmethod
+    def _query_reformulation_max_items() -> int:
+        return 3 if int(LLM_MAX_TOKENS_QUERY_REFORMULATION) <= 256 else 6
+
+    def _extract_llm_queries(self, result: Any, max_items: int) -> List[str]:
+        raw_queries: List[Any] = []
+        if isinstance(result, dict):
+            value = result.get("queries", [])
+            if isinstance(value, list):
+                raw_queries = value
+            elif isinstance(value, str):
+                raw_queries = [value]
+        elif isinstance(result, list):
+            raw_queries = result
+
+        cleaned: List[str] = []
+        for item in raw_queries:
+            if not isinstance(item, str):
+                continue
+            q = self._sanitize_query(item.strip().lower())
+            if q:
+                cleaned.append(q)
+            if len(cleaned) >= max_items:
+                break
+        return dedupe_list(cleaned)[:max_items]
+
     def _simplify_query_for_fallback(self, query: str) -> str:
         """
         Simplify operator-heavy Google query for Serper fallback.
@@ -739,9 +770,10 @@ class TrustedSearch:
         if not self.llm_client:
             return []
         anchors = ", ".join(entity_obj.anchors[:8]) if entity_obj.anchors else "none"
+        max_items = min(max(1, int(max_queries)), self._query_reformulation_max_items())
         prompt = (
-            "Generate 6-10 high-precision health fact-check search queries.\n"
-            'Return JSON only: {"queries": ["..."]}\n'
+            f"Generate up to {max_items} high-precision health fact-check search queries.\n"
+            'Return JSON only in this exact form: {"queries":["..."]}\n'
             "Rules:\n"
             "- prioritize exact claim verification wording\n"
             "- prefer broad semantic queries first (do not force site: operators)\n"
@@ -751,23 +783,33 @@ class TrustedSearch:
             f"Claim: {claim}\n"
             f"Anchors: {anchors}\n"
         )
-        try:
-            result = await self.llm_client.ainvoke(
-                prompt,
+        retry_prompt = (
+            "Return exactly the JSON object with key 'queries' and an array of strings. No other text.\n"
+            f'Format: {{"queries":["..."]}}\n'
+            f"Claim: {claim}\n"
+        )
+
+        async def _invoke(prompt_text: str) -> Any:
+            return await self.llm_client.ainvoke(
+                prompt_text,
                 response_format="json",
                 priority=LLMPriority.HIGH,
+                temperature=0.0,
                 call_tag="query_reformulation",
             )
-            raw_queries = []
-            if isinstance(result, dict):
-                raw_queries = result.get("queries", []) or []
-            elif isinstance(result, list):
-                raw_queries = result
+
+        try:
+            result = await _invoke(prompt)
+            queries = self._extract_llm_queries(result, max_items=max_items)
+            if not queries:
+                result = await _invoke(retry_prompt)
+                queries = self._extract_llm_queries(result, max_items=max_items)
             logger.debug(
                 "[TrustedSearch][ConfidenceMode][LLM] raw_queries=%s",
-                raw_queries if isinstance(raw_queries, list) else [raw_queries],
+                queries,
             )
-            queries = [self._sanitize_query(str(q)) for q in raw_queries if str(q).strip()]
+            if not queries:
+                return []
             with_negatives: List[str] = []
             suffix = " ".join(self._CONFIDENCE_NEGATIVE_TERMS)
             for q in queries:
@@ -777,7 +819,7 @@ class TrustedSearch:
                     with_negatives.append(q)
                 else:
                     with_negatives.append(self._sanitize_query(f"{q} {suffix}"))
-            final_queries = dedupe_list([q for q in with_negatives if q])[: max(1, max_queries)]
+            final_queries = dedupe_list([q for q in with_negatives if q])[:max_items]
             logger.debug(
                 "[TrustedSearch][ConfidenceMode][LLM] final_queries=%s",
                 final_queries,
@@ -785,6 +827,13 @@ class TrustedSearch:
             return final_queries
         except Exception as e:
             logger.warning("[TrustedSearch][ConfidenceMode] LLM query expansion failed: %s", e)
+            try:
+                result = await _invoke(retry_prompt)
+                queries = self._extract_llm_queries(result, max_items=max_items)
+                if queries:
+                    return dedupe_list(queries)[:max_items]
+            except Exception as retry_exc:
+                logger.warning("[TrustedSearch][ConfidenceMode] Retry failed: %s", retry_exc)
             return []
 
     async def _build_confidence_mode_queries_with_fallback(
@@ -1219,8 +1268,15 @@ class TrustedSearch:
             filtered = self._filter_queries(merged, key_terms, key_numbers)
             return dedupe_list(filtered)
 
+        max_items = self._query_reformulation_max_items()
         prompt = f"""
 {QUERY_REFORMULATION_PROMPT}
+
+Return JSON only in this exact format: {{"queries":["..."]}}
+Constraints:
+- Return at most {max_items} queries
+- queries must be short strings
+- no markdown, no prose
 
 POST TEXT:
 {text}
@@ -1234,6 +1290,12 @@ ENTITIES:
 FAILED ENTITIES:
 {failed_entities}
 """
+        retry_prompt = (
+            "Return exactly the JSON object with key 'queries' and an array of strings. No other text.\n"
+            f'Format: {{"queries":["..."]}}\n'
+            f"Max queries: {max_items}\n"
+            f"Claim: {text}\n"
+        )
 
         try:
             # HIGH priority: Query reformulation is crucial for good search results
@@ -1241,15 +1303,25 @@ FAILED ENTITIES:
                 prompt,
                 response_format="json",
                 priority=LLMPriority.HIGH,
+                temperature=0.0,
                 call_tag="query_reformulation",
             )
-            queries = result.get("queries", [])
+            queries = self._extract_llm_queries(result, max_items=max_items)
+            if not queries:
+                result = await self.llm_client.ainvoke(
+                    retry_prompt,
+                    response_format="json",
+                    priority=LLMPriority.HIGH,
+                    temperature=0.0,
+                    call_tag="query_reformulation",
+                )
+                queries = self._extract_llm_queries(result, max_items=max_items)
             logger.debug(
                 "[TrustedSearch][QueryReformulation][LLM] raw_queries=%s",
                 queries if isinstance(queries, list) else [queries],
             )
             cleaned = [self._sanitize_query(q.strip().lower()) for q in queries if isinstance(q, str)]
-            cleaned = [q for q in cleaned if q]
+            cleaned = [q for q in cleaned if q][:max_items]
             logger.debug(
                 "[TrustedSearch][QueryReformulation][LLM] cleaned_queries=%s",
                 cleaned,
@@ -1264,6 +1336,21 @@ FAILED ENTITIES:
 
         except Exception as e:
             logger.error(f"[TrustedSearch] LLM query reformulation failed: {e}")
+            try:
+                result = await self.llm_client.ainvoke(
+                    retry_prompt,
+                    response_format="json",
+                    priority=LLMPriority.HIGH,
+                    temperature=0.0,
+                    call_tag="query_reformulation",
+                )
+                retry_queries = self._extract_llm_queries(result, max_items=max_items)
+                if retry_queries:
+                    merged = [direct_query] + retry_queries if direct_query else retry_queries
+                    filtered = self._filter_queries(merged, key_terms, key_numbers)
+                    return dedupe_list(filtered)
+            except Exception as retry_exc:
+                logger.error(f"[TrustedSearch] LLM query reformulation retry failed: {retry_exc}")
             # fallback -> old heuristic (plus direct query)
             fallback = self._fallback_queries(text, failed_entities)
             fallback = [self._sanitize_query(q) for q in fallback if q]
@@ -2289,7 +2376,17 @@ FAILED ENTITIES:
         base_statements = [item.get("statement", "") for item in low_conf_items]
         base_entities = failed_entities or []
 
-        prompt = REINFORCEMENT_QUERY_PROMPT.format(statements=base_statements, entities=base_entities)
+        max_items = self._query_reformulation_max_items()
+        prompt = (
+            REINFORCEMENT_QUERY_PROMPT.format(statements=base_statements, entities=base_entities)
+            + f'\nReturn JSON only: {{"queries":["..."]}} with max {max_items} queries.'
+        )
+        retry_prompt = (
+            "Return exactly the JSON object with key 'queries' and an array of strings. No other text.\n"
+            f'Format: {{"queries":["..."]}}\n'
+            f"Max queries: {max_items}\n"
+            f"Statements: {base_statements}\n"
+        )
 
         try:
             # HIGH priority: Reinforcement query generation is crucial for finding evidence
@@ -2297,19 +2394,42 @@ FAILED ENTITIES:
                 prompt,
                 response_format="json",
                 priority=LLMPriority.HIGH,
+                temperature=0.0,
                 call_tag="query_reformulation",
             )
-            queries = result.get("queries", [])
+            queries = self._extract_llm_queries(result, max_items=max_items)
+            if not queries:
+                result = await self.llm_client.ainvoke(
+                    retry_prompt,
+                    response_format="json",
+                    priority=LLMPriority.HIGH,
+                    temperature=0.0,
+                    call_tag="query_reformulation",
+                )
+                queries = self._extract_llm_queries(result, max_items=max_items)
             logger.debug(
                 "[TrustedSearch][Reinforcement][LLM] queries=%s",
                 queries if isinstance(queries, list) else [queries],
             )
 
             # safety: ensure list[str]
-            return [q for q in queries if isinstance(q, str) and q.strip()]
+            return [q for q in queries if isinstance(q, str) and q.strip()][:max_items]
 
         except Exception as e:
             logger.warning(f"[TrustedSearch] LLM reinforcement query generation failed: {e}")
+            try:
+                result = await self.llm_client.ainvoke(
+                    retry_prompt,
+                    response_format="json",
+                    priority=LLMPriority.HIGH,
+                    temperature=0.0,
+                    call_tag="query_reformulation",
+                )
+                retry_queries = self._extract_llm_queries(result, max_items=max_items)
+                if retry_queries:
+                    return retry_queries
+            except Exception as retry_exc:
+                logger.warning("[TrustedSearch] Reinforcement retry failed: %s", retry_exc)
 
             # fallback to simple heuristics
             fallback = []

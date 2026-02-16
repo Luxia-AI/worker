@@ -934,10 +934,16 @@ class VerdictGenerator:
         evidence_map = self._normalize_evidence_map(claim, evidence_map, evidence)
         claim_triplet = self._extract_canonical_predicate_triplet(claim)
         predicate_queries_generated = list(getattr(self, "_last_predicate_queries_generated", []) or [])
-        explicit_refutes_found = any(
-            self._normalize_relevance_label(ev.get("relevance")) == "REFUTES"
-            and float(ev.get("contradiction_score", 0.0) or 0.0) >= CONTRADICTION_THRESHOLD
+        eligible_refute_items = [
+            ev
             for ev in (evidence_map or [])
+            if self._normalize_relevance_label(ev.get("relevance")) == "REFUTES"
+            and bool(ev.get("intervention_match", False))
+            and float(ev.get("predicate_match_score", 0.0) or 0.0) >= 0.4
+            and float(ev.get("credibility", 0.0) or 0.0) >= 0.8
+        ]
+        explicit_refutes_found = any(
+            float(ev.get("contradiction_score", 0.0) or 0.0) >= CONTRADICTION_THRESHOLD for ev in eligible_refute_items
         )
         predicate_match_score_used = max(
             [float(ev.get("predicate_match_score", 0.0) or 0.0) for ev in (evidence_map or [])] or [0.0]
@@ -1571,14 +1577,7 @@ class VerdictGenerator:
             map_offtopic_count,
         ) = self._evidence_map_signal_strengths(claim, evidence_map)
         contradiction_metrics = self._contradiction_dominance_metrics(claim, evidence_map)
-        refute_cred_max = max(
-            [
-                float(ev.get("credibility", 0.0) or 0.0)
-                for ev in (evidence_map or [])
-                if self._normalize_relevance_label(ev.get("relevance")) == "REFUTES"
-            ]
-            or [0.0]
-        )
+        refute_cred_max = max([float(ev.get("credibility", 0.0) or 0.0) for ev in eligible_refute_items] or [0.0])
         decisive_support = map_support_signal >= 0.58 and map_contradict_signal <= 0.40
         decisive_contradict = map_contradict_signal >= 0.58 and map_support_signal <= 0.40
         conflicting_signals = map_support_signal >= 0.45 and map_contradict_signal >= 0.45
@@ -1621,15 +1620,19 @@ class VerdictGenerator:
                 str(max(float(CONTRADICT_RATIO_FOR_FORCE_FALSE), float(CONTRADICT_RATIO_FORCE_FALSE))),
             )
         )
-        if explicit_refutes_found and (
-            (
-                contradiction_metrics["contradict_ratio"] >= contradict_ratio_threshold
-                and contradiction_metrics["contradict_diversity"] >= DIVERSITY_FORCE_FALSE
-            )
-            or (
-                map_contradict_signal >= 0.35
-                and refute_cred_max >= 0.85
-                and contradiction_metrics["contradict_diversity"] >= 0.5
+        if (
+            eligible_refute_items
+            and explicit_refutes_found
+            and (
+                (
+                    contradiction_metrics["contradict_ratio"] >= contradict_ratio_threshold
+                    and contradiction_metrics["contradict_diversity"] >= DIVERSITY_FORCE_FALSE
+                )
+                or (
+                    map_contradict_signal >= 0.35
+                    and refute_cred_max >= 0.85
+                    and contradiction_metrics["contradict_diversity"] >= 0.5
+                )
             )
         ):
             for seg in claim_breakdown or []:
@@ -1992,6 +1995,7 @@ class VerdictGenerator:
             "override_reason": effective_override_reason,
             "override_key_numbers": effective_override_key_numbers,
             "explicit_refutes_found": bool(explicit_refutes_found),
+            "eligible_refutes_count": len(eligible_refute_items),
             "predicate_queries_generated": predicate_queries_generated,
             "predicate_match_score_used": round(float(predicate_match_score_used or 0.0), 4),
             "canonical_predicate": str(claim_triplet.get("canonical_predicate") or ""),
@@ -2669,6 +2673,72 @@ class VerdictGenerator:
             )
         return "neutral"
 
+    @staticmethod
+    def _intervention_anchor_tokens(text: str) -> set[str]:
+        low = (text or "").lower()
+        categories = {
+            "food": (
+                r"\b(diet|dietary|food|foods|meal|nutrition|nutritional|fruit|fruits|vegetable|vegetables|"
+                r"fiber|fibre|whole[-\s]?grain|legume|plant[-\s]?based)\b"
+            ),
+            "supplement": (
+                r"\b(supplement|supplements|supplementation|pill|capsule|tablet|dose|dosage|"
+                r"vitamin\s+[a-z0-9]+|mineral supplement)\b"
+            ),
+            "drug": (
+                r"\b(drug|drugs|medication|medications|medicine|medicines|pharmaceutical|therapy|"
+                r"antibiotic|insulin|statin|metformin)\b"
+            ),
+        }
+        out: set[str] = set()
+        for label, pattern in categories.items():
+            if re.search(pattern, low):
+                out.add(label)
+        return out
+
+    def _intervention_alignment(self, claim_text: str, evidence_text: str) -> tuple[bool, bool]:
+        claim_anchors = self._intervention_anchor_tokens(claim_text)
+        evidence_anchors = self._intervention_anchor_tokens(evidence_text)
+        claim_low = (claim_text or "").lower()
+        evidence_low = (evidence_text or "").lower()
+
+        # If claim has no intervention anchors, do not block refutation eligibility.
+        if not claim_anchors:
+            return True, False
+
+        # If category extraction fails on evidence, require exact lexical overlap on intervention tokens.
+        if not evidence_anchors:
+            lexical = {
+                t
+                for t in re.findall(
+                    r"\b(diet|dietary|food|foods|fruit|fruits|vegetable|vegetables|fiber|fibre|supplement|"
+                    r"supplementation|drug|drugs|medication|medications|medicine|medicines|therapy|dose|dosage)\b",
+                    claim_low,
+                )
+            }
+            if not lexical:
+                return False, False
+            has_match = any(t in evidence_low for t in lexical)
+            return bool(has_match), False
+
+        # Intervention mismatch guard: food/diet evidence cannot refute supplement/drug claims and vice versa.
+        claim_food = "food" in claim_anchors
+        claim_med = bool({"supplement", "drug"} & claim_anchors)
+        ev_food = "food" in evidence_anchors
+        ev_med = bool({"supplement", "drug"} & evidence_anchors)
+        claim_food_terms = set(
+            re.findall(r"\b(fruit|fruits|vegetable|vegetables|whole[-\s]?grain|legume|fiber|fibre|diet)\b", claim_low)
+        )
+        ev_food_terms = set(
+            re.findall(
+                r"\b(fruit|fruits|vegetable|vegetables|whole[-\s]?grain|legume|fiber|fibre|diet)\b",
+                evidence_low,
+            )
+        )
+        shared_food_specific = {t for t in (claim_food_terms & ev_food_terms) if t not in {"diet"}}
+        mismatch = (claim_food and ev_med and len(shared_food_specific) == 0) or (claim_med and ev_food and not ev_med)
+        return (not mismatch), True
+
     def _segment_topic_guard_ok(self, segment: str, statement: str) -> bool:
         seg_concepts = self._concept_hits(segment)
         stmt_concepts = self._concept_hits(statement)
@@ -3345,9 +3415,12 @@ class VerdictGenerator:
             support_strength = float(strength.support_strength or 0.0)
             polarity_rel = self._segment_polarity(claim, statement, stance="neutral")
             seed_rel = self._normalize_relevance_label(item.get("relevance", "NEUTRAL"))
+            intervention_match, intervention_anchors_ok = self._intervention_alignment(claim, statement)
+            credibility = float(ev.get("credibility", 0.5) or 0.5)
 
             relevance = "NEUTRAL"
             relevance_score = max(0.0, min(1.0, base_score))
+            refute_eligible = False
             if not self._segment_topic_guard_ok(claim, statement):
                 relevance_score *= 0.10
             else:
@@ -3372,8 +3445,13 @@ class VerdictGenerator:
                     or dna_rel == "CONTRADICTS"
                 )
                 if refute_by_rule:
-                    relevance = "REFUTES"
-                    relevance_score = max(relevance_score, contradiction_score, 0.65)
+                    if intervention_match:
+                        relevance = "REFUTES"
+                        relevance_score = max(relevance_score, contradiction_score, 0.65)
+                        refute_eligible = predicate_match_score >= 0.4 and intervention_match and credibility >= 0.8
+                    else:
+                        relevance = "NEUTRAL"
+                        relevance_score *= 0.55
                 else:
                     bone_strength_proxy_support = (
                         bool(re.search(r"\b(build|strong)\b", claim.lower()))
@@ -3403,9 +3481,10 @@ class VerdictGenerator:
                         relevance = "SUPPORTS"
                         relevance_score = max(relevance_score, support_strength, 0.62)
                     elif seed_rel == "REFUTES" and contradiction_score >= 0.45:
-                        if predicate_match_score >= 0.4:
+                        if predicate_match_score >= 0.4 and intervention_match:
                             relevance = "REFUTES"
                             relevance_score = max(relevance_score, contradiction_score)
+                            refute_eligible = predicate_match_score >= 0.4 and intervention_match and credibility >= 0.8
                         else:
                             relevance = "NEUTRAL"
                             relevance_score *= 0.55
@@ -3428,7 +3507,10 @@ class VerdictGenerator:
                     "predicate_span": str(claim_triplet.get("predicate_span") or ""),
                     "object_span": str(claim_triplet.get("object_span") or ""),
                     "evidence_predicate": str(evidence_triplet.get("canonical_predicate") or ""),
-                    "credibility": float(ev.get("credibility", 0.5) or 0.5),
+                    "credibility": credibility,
+                    "intervention_match": bool(intervention_match),
+                    "intervention_anchors_ok": bool(intervention_anchors_ok),
+                    "refute_eligible": bool(refute_eligible),
                 }
             )
         return normalized
@@ -3500,8 +3582,13 @@ class VerdictGenerator:
                     and support_strength >= support_strength_threshold
                 )
                 refute_ok = rel == "REFUTES" and (
-                    contradiction_score >= CONTRADICTION_THRESHOLD
-                    or self._segment_polarity(segment, statement, stance="neutral") == "contradicts"
+                    bool(em.get("intervention_match", False))
+                    and predicate_match_score >= 0.4
+                    and float(em.get("credibility", 0.0) or 0.0) >= 0.8
+                    and (
+                        contradiction_score >= CONTRADICTION_THRESHOLD
+                        or self._segment_polarity(segment, statement, stance="neutral") == "contradicts"
+                    )
                 )
                 score = (0.55 * rel_score) + (0.25 * anchor_overlap) + (0.20 * predicate_match_score)
                 if strict_support_ok and score > best_support_score:

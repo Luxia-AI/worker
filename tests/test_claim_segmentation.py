@@ -40,3 +40,13 @@ def test_contrast_not_clause_is_split_into_two_verifiable_segments():
     assert "kill bacteria" in joined
     assert "virus" in joined
     assert "not" in joined
+
+
+def test_segments_require_predicates_and_merge_fragments():
+    claim = "A healthy diet rich in vegetables and fruit may help reduce the risk of some cancers."
+    segments = split_claim_into_segments(claim)
+
+    assert len(segments) == 1
+    segment = segments[0].lower()
+    assert "may help reduce" in segment
+    assert not segment.startswith("and ")

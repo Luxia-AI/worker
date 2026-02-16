@@ -195,3 +195,42 @@ def test_valid_support_segment_not_downgraded_to_unverifiable():
     out = vg._parse_verdict_result(llm, claim, evidence)
     assert out["claim_breakdown"][0]["status"] in {"VALID", "PARTIALLY_VALID"}
     assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
+
+
+def test_food_claim_not_refuted_by_supplement_only_evidence():
+    vg = _vg()
+    claim = "A healthy diet rich in vegetables and fruit may help reduce the risk of some cancers"
+    evidence = [
+        {
+            "statement": (
+                "There is no clear evidence that vitamin A supplementation decreases cancer risk "
+                "in people consuming a healthy diet."
+            ),
+            "source_url": "https://www.ncbi.nlm.nih.gov/books/NBK13273/",
+            "final_score": 0.62,
+            "credibility": 0.95,
+        },
+        {
+            "statement": "Fruit and vegetables can help reduce risk of some cancers.",
+            "source_url": "https://pmc.ncbi.nlm.nih.gov/article/abc",
+            "final_score": 0.71,
+            "credibility": 0.95,
+        },
+    ]
+    llm = {
+        "verdict": "FALSE",
+        "confidence": 0.92,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "REFUTES", "relevance_score": 0.8},
+            {"evidence_id": 1, "statement": evidence[1]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.8},
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    ev_map = out["evidence_map"]
+    supplement_row = next(x for x in ev_map if "supplementation" in x["statement"].lower())
+    assert supplement_row["intervention_match"] is False
+    assert supplement_row["relevance"] != "REFUTES"
+    assert out["verdict"] != "FALSE"

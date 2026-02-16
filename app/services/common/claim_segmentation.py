@@ -279,9 +279,46 @@ def split_claim_into_segments(claim: str, min_segment_chars: int = 10) -> List[s
         by_semicolon = [_clean(p, keep_conj_prefix=False) for p in re.split(r"\s*;\s*", sentence) if _clean(p)]
         raw_segments.extend(by_semicolon or [_clean(sentence, keep_conj_prefix=False)])
 
+    def _has_predicate_tokens(text: str) -> bool:
+        t = (text or "").lower().strip()
+        if not t:
+            return False
+        verb_like = re.search(
+            r"\b("
+            r"is|are|was|were|be|been|being|"
+            r"has|have|had|do|does|did|can|could|may|might|must|should|would|will|"
+            r"helps?|prevents?|reduces?|decreases?|lowers?|increases?|causes?|improves?|worsens?|protects?|"
+            r"needed|required|important|"
+            r"associated|linked|leads?|results?|"
+            r"treats?|cures?|supports?|maintains?|builds?|promotes?|regulates?"
+            r")\b",
+            t,
+            flags=re.IGNORECASE,
+        )
+        if verb_like:
+            return True
+        return bool(re.search(r"\b\w+(?:ed|ing)\b", t))
+
+    # Merge noun-phrase fragments forward so each segment contains a predicate.
+    normalized_segments: List[str] = []
+    i = 0
+    while i < len(raw_segments):
+        current = _clean(raw_segments[i], keep_conj_prefix=False)
+        if not current:
+            i += 1
+            continue
+        if not _has_predicate_tokens(current) and i + 1 < len(raw_segments):
+            merged = _clean(f"{current} {raw_segments[i + 1]}", keep_conj_prefix=False)
+            if merged:
+                normalized_segments.append(merged)
+            i += 2
+            continue
+        normalized_segments.append(current)
+        i += 1
+
     seen = set()
     out: List[str] = []
-    for seg in raw_segments:
+    for seg in normalized_segments:
         s = _clean(seg)
         key = s.lower().strip()
         if len(key) < min_segment_chars:
