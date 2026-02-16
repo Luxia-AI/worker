@@ -234,3 +234,73 @@ def test_food_claim_not_refuted_by_supplement_only_evidence():
     assert supplement_row["intervention_match"] is False
     assert supplement_row["relevance"] != "REFUTES"
     assert out["verdict"] != "FALSE"
+
+
+def test_vitamin_c_immune_function_paraphrase_is_not_unknown():
+    vg = _vg()
+    claim = "Vitamin C contributes to the normal function of the immune system"
+    evidence = [
+        {
+            "statement": "Vitamin C helps your immune system.",
+            "source_url": "https://health.clevelandclinic.org/vitamin-c",
+            "final_score": 0.60,
+            "sem_score": 1.0,
+            "credibility": 0.95,
+        },
+        {
+            "statement": "Vitamin C supports immune health.",
+            "source_url": "https://health.clevelandclinic.org/vitamin-c",
+            "final_score": 0.50,
+            "sem_score": 0.99,
+            "credibility": 0.95,
+        },
+    ]
+    llm = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.6,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.60},
+            {"evidence_id": 1, "statement": evidence[1]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.50},
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    segment = out["claim_breakdown"][0]
+    assert segment["status"] in {"VALID", "PARTIALLY_VALID"}
+    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
+
+
+def test_vitamin_c_immune_function_paraphrase_not_unverifiable():
+    vg = _vg()
+    claim = "Vitamin C contributes to the normal function of the immune system"
+    evidence = [
+        {
+            "statement": "Vitamin C helps your immune system.",
+            "source_url": "https://health.clevelandclinic.org/vitamin-c",
+            "final_score": 0.60,
+            "sem_score": 1.0,
+            "credibility": 0.95,
+        },
+        {
+            "statement": "Vitamin C supports immune health.",
+            "source_url": "https://health.clevelandclinic.org/vitamin-c",
+            "final_score": 0.50,
+            "sem_score": 0.99,
+            "credibility": 0.95,
+        },
+    ]
+    llm = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.6,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.6},
+            {"evidence_id": 1, "statement": evidence[1]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.5},
+        ],
+    }
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    assert out["claim_breakdown"][0]["status"] in {"VALID", "PARTIALLY_VALID"}
+    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}

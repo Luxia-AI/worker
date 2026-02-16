@@ -3032,7 +3032,7 @@ class VerdictGenerator:
         groups = {
             "causal": (
                 r"\b(cause|causes|caused|causing|lead|leads|leading|result|results|resulting|"
-                r"associate|associated|link|linked)\b"
+                r"associate|associated|link|linked|contribut(?:e|es|ed|ing))\b"
             ),
             "preventive": (
                 r"\b(prevent|prevents|prevention|reduce|reduces|reduced|decrease|decreases|decreased|"
@@ -3048,7 +3048,8 @@ class VerdictGenerator:
             ),
             "build_support": (
                 r"\b(build|builds|built|maintain|maintains|maintained|support|supports|supported|"
-                r"strengthen|strengthens|strengthened|needed|need|needs|required|requires|essential|necessary)\b"
+                r"strengthen|strengthens|strengthened|needed|need|needs|required|requires|essential|necessary|"
+                r"contribut(?:e|es|ed|ing))\b"
             ),
         }
         for name, pattern in groups.items():
@@ -3104,9 +3105,9 @@ class VerdictGenerator:
             "should",
             "would",
             "will",
-            "to",
             "not",
         }
+        prepositions = {"to", "in", "on", "of", "for", "with", "into", "from"}
         stop = {"the", "a", "an", "and", "or", "of", "in", "on", "for", "with", "that", "this", "your", "our"}
         adjective_stop = {
             "strong",
@@ -3145,12 +3146,15 @@ class VerdictGenerator:
             "work",
             "contain",
             "manage",
+            "contribut",
         }
         pred_idx = -1
         best_score = -1
         for i in range(1, len(tokens) - 1):
             tok = tokens[i]
             if tok in stop:
+                continue
+            if tok in prepositions:
                 continue
             if tok in adjective_stop:
                 continue
@@ -3401,7 +3405,12 @@ class VerdictGenerator:
             statement = (item.get("statement") or ev.get("statement") or ev.get("text") or "").strip()
             source_url = (item.get("source_url") or ev.get("source_url") or ev.get("source") or "").strip()
             base_score = float(item.get("relevance_score", ev.get("final_score", ev.get("score", 0.0))) or 0.0)
-            anchor_score = float(ev.get("anchor_match_score", self._segment_anchor_overlap(claim, statement)) or 0.0)
+            recomputed_anchor = self._segment_anchor_overlap(claim, statement)
+            anchor_score = max(
+                float(item.get("anchor_match_score", 0.0) or 0.0),
+                float(ev.get("anchor_match_score", 0.0) or 0.0),
+                float(recomputed_anchor or 0.0),
+            )
             claim_triplet = self._extract_canonical_predicate_triplet(claim)
             evidence_triplet = self._extract_canonical_predicate_triplet(statement)
             predicate_match_score = self.compute_predicate_match(claim, statement)
@@ -3460,10 +3469,15 @@ class VerdictGenerator:
                         and bool(re.search(r"\b(increase|increased|reduce|reduced)\b", statement.lower()))
                     )
                     support_strength_threshold = float(os.getenv("SEGMENT_SUPPORT_STRENGTH_THRESHOLD", "0.30"))
+                    support_polarity_ok = polarity_rel == "entails" or (
+                        polarity_rel == "neutral"
+                        and predicate_match_score >= 0.7
+                        and not self._is_explicit_refutation_statement(statement)
+                    )
                     support_gate = (
                         predicate_match_score >= PREDICATE_MATCH_THRESHOLD
-                        and anchor_score >= ANCHOR_THRESHOLD
-                        and polarity_rel == "entails"
+                        and anchor_score >= max(0.25, ANCHOR_THRESHOLD - 0.05)
+                        and support_polarity_ok
                         and (
                             support_strength >= support_strength_threshold
                             or base_score >= 0.40
@@ -3556,7 +3570,10 @@ class VerdictGenerator:
                 if not self._segment_topic_guard_ok(segment, statement):
                     return
                 anchor_eval = evaluate_anchor_match(segment, statement)
-                anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
+                anchor_overlap = max(
+                    float(anchor_eval.get("anchor_overlap", 0.0) or 0.0),
+                    float(self._segment_anchor_overlap(segment, statement) or 0.0),
+                )
                 if anchor_overlap < _SEGMENT_EVIDENCE_MIN_OVERLAP:
                     return
                 object_tokens = self._segment_object_tokens(segment)
