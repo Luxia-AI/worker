@@ -8,6 +8,7 @@ _PREDICATE_RE = re.compile(
     (
         r"\b("
         r"helps?|prevents?|reduces?|increases?|causes?|improves?|worsens?|protects?|"
+        r"needed for|required for|important for|"
         r"associated with|linked to|leads to|"
         r"do not cause|does not cause|don't cause|doesn't cause|cannot cause|can't cause|"
         r"is|are|was|were"
@@ -20,6 +21,7 @@ _CLAUSE_VERB_RE = re.compile(
         r"\b("
         r"is|are|was|were|be|been|being|do|does|did|have|has|had|"
         r"helps?|prevents?|reduces?|increases?|causes?|improves?|worsens?|protects?|"
+        r"needed|required|important|"
         r"linked|associated|leads?"
         r")\b"
     ),
@@ -214,6 +216,15 @@ def _split_on_conjunctives(text: str) -> List[str]:
         if conj.strip() in {"and", "or"} and len(parts) == 2:
             left = parts[0]
             right = _clean(parts[1], keep_conj_prefix=False)
+            # Avoid bad splits for coordinated noun phrases under one predicate:
+            # "needed for growth and development ..."
+            if (
+                conj.strip() == "and"
+                and not _looks_independent_clause(right)
+                and re.search(r"\b(needed for|required for|important for|growth)\b", left, flags=re.IGNORECASE)
+                and re.search(r"\b(development|growth|maturation|bone)\b", right, flags=re.IGNORECASE)
+            ):
+                return [_clean(text, keep_conj_prefix=False)]
             if right and not _looks_independent_clause(right):
                 subject_pred = _extract_subject_predicate(left)
                 if subject_pred:

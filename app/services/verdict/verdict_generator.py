@@ -1180,14 +1180,21 @@ class VerdictGenerator:
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
             if status in {"VALID", "PARTIALLY_VALID"} and polarity == "contradicts":
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
-            if status in {"VALID", "PARTIALLY_VALID"} and high_semantic_negation_mismatch:
+            if (
+                status in {"VALID", "PARTIALLY_VALID"}
+                and high_semantic_negation_mismatch
+                and (polarity == "contradicts" or self._is_explicit_refutation_statement(polarity_text))
+            ):
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
             if status in {"VALID", "PARTIALLY_VALID"} and polarity_text:
                 object_tokens = self._segment_object_tokens(seg_text)
                 statement_tokens = self._statement_tokens(polarity_text)
                 no_object_overlap = bool(object_tokens) and len(object_tokens & statement_tokens) == 0
                 if no_object_overlap and not self._is_explicit_refutation_statement(polarity_text):
-                    seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
+                    seg["status"] = "UNKNOWN"
+                    seg["supporting_fact"] = ""
+                    seg["source_url"] = ""
+                    seg["evidence_used_ids"] = []
             status = (seg.get("status") or "UNKNOWN").upper()
             if status in {
                 "VALID",
@@ -1223,7 +1230,9 @@ class VerdictGenerator:
                 if not fact:
                     seg["supporting_fact"] = polarity_text
                     fact = polarity_text
-                if high_semantic_negation_mismatch:
+                if high_semantic_negation_mismatch and (
+                    polarity == "contradicts" or self._is_explicit_refutation_statement(polarity_text)
+                ):
                     seg["status"] = "INVALID"
                     seg["supporting_fact"] = fact
                     seg["source_url"] = src
@@ -2064,9 +2073,68 @@ class VerdictGenerator:
         groups = eval_result.get("anchor_groups", []) or []
         matched = int(eval_result.get("matched_groups", 0) or 0)
         total = len(groups)
-        if total <= 0:
-            return 0.0
-        return max(0.0, min(1.0, matched / total))
+        base = (matched / total) if total > 0 else 0.0
+
+        # Paraphrase/lemma fallback so "oats reduce cholesterol" can match
+        # "oat fiber helps lower cholesterol" even when strict anchors miss.
+        seg_tokens = self._content_tokens(segment)
+        stmt_tokens = self._content_tokens(statement)
+        if not seg_tokens:
+            return max(0.0, min(1.0, base))
+        overlap = len(seg_tokens & stmt_tokens) / max(1, len(seg_tokens))
+        return max(0.0, min(1.0, max(base, overlap)))
+
+    def _content_tokens(self, text: str) -> set[str]:
+        raw = [self._lemma_token(t) for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", (text or "").lower())]
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "of",
+            "in",
+            "on",
+            "for",
+            "with",
+            "to",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "can",
+            "could",
+            "may",
+            "might",
+            "help",
+            "helps",
+            "promote",
+            "promotes",
+        }
+        syn = {
+            "oats": "oat",
+            "fibre": "fiber",
+            "lower": "reduce",
+            "decrease": "reduce",
+            "decreases": "reduce",
+            "decreased": "reduce",
+            "cholesterol-lowering": "cholesterol",
+            "regularity": "constipation",
+            "transit": "constipation",
+            "stools": "constipation",
+            "development": "growth",
+            "bones": "bone",
+            "children": "child",
+        }
+        out: set[str] = set()
+        for t in raw:
+            if not t or t in stop:
+                continue
+            out.add(syn.get(t, t))
+        return out
 
     def _calculate_evidence_agreement_ratio(self, claim: str, evidence: List[Dict[str, Any]]) -> float:
         """
@@ -2620,9 +2688,24 @@ class VerdictGenerator:
         }.issubset(stmt_concepts):
             return False
 
+        # Whole-food claims should not be invalidated by supplement-only evidence.
+        seg_l = (segment or "").lower()
+        stmt_l = (statement or "").lower()
+        whole_food_claim = bool(
+            re.search(r"\b(diet|vegetable|vegetables|fruit|fruits|whole food|foods)\b", seg_l)
+        ) and not bool(re.search(r"\bsupplement(?:ation)?\b", seg_l))
+        supplement_stmt = bool(re.search(r"\bsupplement(?:ation)?\b", stmt_l))
+        if whole_food_claim and supplement_stmt and not re.search(r"\b(vegetable|fruit|diet)\b", stmt_l):
+            return False
+
         seg_tokens = self._topic_tokens(segment)
         stmt_tokens = self._topic_tokens(statement)
-        if len(seg_tokens) >= 3 and len(seg_tokens & stmt_tokens) == 0 and not (seg_concepts & stmt_concepts):
+        overlap_tokens = len(seg_tokens & stmt_tokens)
+        if len(seg_tokens) >= 3 and overlap_tokens == 0 and not (seg_concepts & stmt_concepts):
+            return False
+        # Penalize generic overlap only (e.g., "helps", "risk") by requiring at least one content token hit.
+        content_overlap = len(self._content_tokens(segment) & self._content_tokens(statement))
+        if content_overlap == 0 and not self._object_semantic_equivalent(segment, statement):
             return False
         if not self._predicate_guard_ok(segment, statement):
             return False
@@ -2692,6 +2775,27 @@ class VerdictGenerator:
                 )
             )
             return has_entities and has_predicate
+
+        # Oat fiber cholesterol claims: allow reduce/lower/decrease cholesterol phrasing.
+        if re.search(r"\b(oat|oats?|oat bran|fiber|fibre)\b", seg) and "cholesterol" in seg:
+            has_subject = bool(re.search(r"\b(oat|oats?|oat bran|fiber|fibre)\b", stmt))
+            has_object = "cholesterol" in stmt
+            has_predicate = bool(re.search(r"\b(help|reduce|lower|decrease|improv)\b", stmt))
+            return has_subject and has_object and has_predicate
+
+        # GI regularity claims: regularity may be evidenced via constipation/transit outcomes.
+        if re.search(r"\bregularity\b", seg):
+            has_subject = bool(re.search(r"\b(wheat bran|bran|fiber|fibre)\b", stmt))
+            has_object_proxy = bool(re.search(r"\b(constipation|gut transit|transit time|stool|bowel)\b", stmt))
+            has_predicate = bool(re.search(r"\b(improv|effective|accelerat|reduce|promot)\b", stmt))
+            return has_subject and has_object_proxy and has_predicate
+
+        # Vitamin D bone-development in children claims.
+        if re.search(r"\bvitamin d\b", seg) and re.search(r"\b(bone|growth|development|children|child)\b", seg):
+            has_subject = "vitamin d" in stmt
+            has_object_proxy = bool(re.search(r"\b(bone|growth|development|rickets|strong bones?)\b", stmt))
+            has_predicate = bool(re.search(r"\b(need|required|important|help|support|maintain|make)\b", stmt))
+            return has_subject and has_object_proxy and has_predicate
 
         # Diabetes management claims require management/medication predicates, not etiology-only facts.
         if "diabetes" in seg and bool(
@@ -2860,8 +2964,14 @@ class VerdictGenerator:
                 r"\b(cause|causes|caused|causing|lead|leads|leading|result|results|resulting|"
                 r"associate|associated|link|linked)\b"
             ),
-            "preventive": r"\b(prevent|prevents|prevention|reduce|reduces|reduced|protect|protects)\b",
-            "therapeutic": r"\b(treat|treats|treatment|cure|cures|help|helps|effective|efficacious)\b",
+            "preventive": (
+                r"\b(prevent|prevents|prevention|reduce|reduces|reduced|decrease|decreases|decreased|"
+                r"lower|lowers|lowered|protect|protects)\b"
+            ),
+            "therapeutic": (
+                r"\b(treat|treats|treatment|cure|cures|help|helps|promote|promotes|improve|improves|"
+                r"effective|efficacious)\b"
+            ),
             "genomic_change": (
                 r"\b(alter|alters|altered|change|changes|changed|integrate|integration|"
                 r"incorporat|modify|modifies)\b"
@@ -2880,6 +2990,24 @@ class VerdictGenerator:
         c_b = self._predicate_bucket_tokens(claim_predicate)
         e_b = self._predicate_bucket_tokens(evidence_predicate)
         return bool(c_b and e_b and (c_b & e_b))
+
+    @staticmethod
+    def _object_semantic_equivalent(claim_text: str, evidence_text: str) -> bool:
+        c = str(claim_text or "").lower()
+        e = str(evidence_text or "").lower()
+        # GI regularity equivalence: regularity ~ constipation/transit/stool.
+        if re.search(r"\bregularity\b", c):
+            if re.search(r"\b(constipation|gut transit|transit time|stool|bowel movement)\b", e):
+                return True
+        # Bone growth/development equivalence.
+        if re.search(r"\b(bone|growth|development|children|child)\b", c):
+            if re.search(r"\b(bone|growth|development|rickets|strong bones?|bone density)\b", e):
+                return True
+        # Cholesterol lowering equivalence.
+        if re.search(r"\bcholesterol\b", c):
+            if re.search(r"\b(cholesterol|ldl|lipid)\b", e) and re.search(r"\b(reduce|lower|decrease|improv)\b", e):
+                return True
+        return False
 
     def _extract_canonical_predicate_triplet(self, text: str) -> Dict[str, str]:
         low = (text or "").strip().lower()
@@ -2981,6 +3109,14 @@ class VerdictGenerator:
         if tokens[pred_idx] in aux and pred_idx + 1 < len(tokens):
             predicate_tokens.append(tokens[pred_idx + 1])
             obj_start = pred_idx + 2
+        elif (
+            self._lemma_token(tokens[pred_idx]) in {"help", "promote", "improve"}
+            and pred_idx + 1 < len(tokens)
+            and self._lemma_token(tokens[pred_idx + 1])
+            in {"lower", "reduce", "decrease", "maintain", "support", "build", "regulate"}
+        ):
+            predicate_tokens.append(tokens[pred_idx + 1])
+            obj_start = pred_idx + 2
         elif pred_idx + 1 < len(tokens) and tokens[pred_idx + 1] in {"to", "in", "into", "on", "of", "for", "with"}:
             predicate_tokens.append(tokens[pred_idx + 1])
             obj_start = pred_idx + 2
@@ -3048,6 +3184,11 @@ class VerdictGenerator:
             return 0.7
         if self._predicate_semantic_equivalent(cp_full, ep_full) and (
             obj_overlap >= 0.5 or anchor_overlap >= ANCHOR_THRESHOLD
+        ):
+            return 0.7
+        if self._object_semantic_equivalent(claim_text, evidence_text) and (
+            self._predicate_semantic_equivalent(cp_full + " " + claim_text, ep_full + " " + evidence_text)
+            or pol in {"entails", "contradicts"}
         ):
             return 0.7
 
@@ -3240,11 +3381,16 @@ class VerdictGenerator:
                         and bool(re.search(r"\b(bone density|bone mineral density|fracture)\b", statement.lower()))
                         and bool(re.search(r"\b(increase|increased|reduce|reduced)\b", statement.lower()))
                     )
+                    support_strength_threshold = float(os.getenv("SEGMENT_SUPPORT_STRENGTH_THRESHOLD", "0.30"))
                     support_gate = (
                         predicate_match_score >= PREDICATE_MATCH_THRESHOLD
                         and anchor_score >= ANCHOR_THRESHOLD
                         and polarity_rel == "entails"
-                        and support_strength >= 0.35
+                        and (
+                            support_strength >= support_strength_threshold
+                            or base_score >= 0.40
+                            or seed_rel == "SUPPORTS"
+                        )
                         and not self._is_reporting_statement(statement)
                         and not self._is_claim_mention_statement(statement)
                     )
@@ -3297,7 +3443,7 @@ class VerdictGenerator:
             return claim_breakdown
 
         evidence_by_id: Dict[int, Dict[str, Any]] = {idx: ev for idx, ev in enumerate(evidence)}
-        support_strength_threshold = float(os.getenv("SEGMENT_SUPPORT_STRENGTH_THRESHOLD", "0.35"))
+        support_strength_threshold = float(os.getenv("SEGMENT_SUPPORT_STRENGTH_THRESHOLD", "0.30"))
 
         for seg in claim_breakdown:
             segment = (seg.get("claim_segment") or "").strip()
