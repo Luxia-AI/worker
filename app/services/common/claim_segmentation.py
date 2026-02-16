@@ -203,6 +203,11 @@ def _split_on_contrast_not(text: str) -> List[str]:
 
 
 def _split_on_conjunctives(text: str) -> List[str]:
+    # Let semicolons drive top-level segmentation first; conjunction splitting across
+    # semicolon boundaries can create malformed segments by borrowing the wrong subject.
+    if ";" in (text or ""):
+        return []
+
     def _split_top_level(raw: str, conj_token: str) -> List[str]:
         low = (raw or "").lower()
         parts: List[str] = []

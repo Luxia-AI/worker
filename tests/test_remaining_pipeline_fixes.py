@@ -447,6 +447,42 @@ def test_stanol_and_risk_factor_semicolon_claim_not_unknown():
     assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
 
 
+def test_event_schedule_snippet_not_treated_as_medical_support():
+    vg = _vg()
+    claim = "Regular caffeine consumption from coffee is linked to a lower risk of depression"
+    statement = "Welcome & networking coffee took place from 08:30-10:00"
+
+    assert vg._segment_topic_guard_ok(claim, statement) is False
+    assert vg.compute_predicate_match(claim, statement) == 0.0
+
+
+def test_true_verdict_downgraded_when_only_partial_support():
+    vg = _vg()
+    claim = "Iron contributes to the normal formation of red blood cells and hemoglobin"
+    evidence = [
+        {
+            "statement": (
+                "Cell content of hemoglobin precursors can help clarify heme synthesis " "and iron incorporation."
+            ),
+            "source_url": "https://www.ncbi.nlm.nih.gov/books/NBK13273/",
+            "final_score": 0.58,
+            "credibility": 0.95,
+        }
+    ]
+    llm = {
+        "verdict": "TRUE",
+        "confidence": 0.82,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.58}
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    assert out["verdict"] != "TRUE"
+
+
 def test_vitamin_c_immune_function_paraphrase_not_unverifiable():
     vg = _vg()
     claim = "Vitamin C contributes to the normal function of the immune system"

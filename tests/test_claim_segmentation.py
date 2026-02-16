@@ -63,3 +63,16 @@ def test_parenthetical_and_does_not_split_into_fragment_segments():
     assert all("(" not in s or ")" in s for s in segments)
     assert not any(s.strip().lower().startswith("may contain dietary fiber") for s in segments)
     assert all(any(v in s.lower() for v in ["may", "reduce", "contain", "helps", "is", "are"]) for s in segments)
+
+
+def test_semicolon_claim_does_not_cross_merge_subjects():
+    claim = (
+        "Most of your body's tissues are constantly renewing; "
+        "your skeleton replaces itself roughly every 10 years and your stomach lining every 3-4 days"
+    )
+    segments = split_claim_into_segments(claim)
+
+    assert len(segments) == 2
+    second = segments[1].lower()
+    assert "your stomach lining" in second
+    assert "most of your body's tissues are your stomach lining" not in second

@@ -1915,6 +1915,20 @@ class VerdictGenerator:
             except Exception:
                 truth_score_percent = 89.9
 
+        # Consistency guard: TRUE cannot coexist with low truthfulness or unresolved
+        # segment coverage.
+        if verdict_str == Verdict.TRUE.value:
+            total_segments = max(1, len(claim_breakdown or []))
+            unresolved_segments = int(reconciled.get("unresolved_segments", 0) or 0)
+            if (
+                unresolved_segments > 0
+                or support_status_count < total_segments
+                or float(truth_score_percent or 0.0) < 70.0
+            ):
+                verdict_str = Verdict.PARTIALLY_TRUE.value
+                truth_score_percent = max(55.0, min(79.9, float(truth_score_percent or 0.0)))
+                confidence = min(float(confidence or 0.0), 0.85)
+
         rel_counts: Dict[str, int] = {}
         for evm in evidence_map or []:
             rel = str(evm.get("relevance") or "NEUTRAL").upper()
@@ -2495,7 +2509,7 @@ class VerdictGenerator:
                 ),
                 "source_relation": (
                     r"\b(?:contain|contains|contained|include|includes|included|found in|source of|"
-                    r"rich in|high in|low in|from|part of|as part of)\b"
+                    r"rich in|high in|low in|such as|including|part of|as part of)\b"
                 ),
             }
             hits: set[str] = set()
@@ -2668,6 +2682,16 @@ class VerdictGenerator:
         # Whole-food claims should not be invalidated by supplement-only evidence.
         seg_l = (segment or "").lower()
         stmt_l = (statement or "").lower()
+        # Filter obvious event/schedule snippets that can leak into crawled corpora.
+        event_like = bool(
+            re.search(r"\b(welcome|networking|agenda|registration|session|workshop|conference|symposium)\b", stmt_l)
+            or re.search(r"\b\d{1,2}:\d{2}(?:\s*[-–]\s*\d{1,2}:\d{2})?\b", stmt_l)
+        )
+        if event_like:
+            shared_content = len(self._content_tokens(segment) & self._content_tokens(statement))
+            if shared_content < 2:
+                return False
+
         whole_food_claim = bool(
             re.search(r"\b(diet|vegetable|vegetables|fruit|fruits|whole food|foods)\b", seg_l)
         ) and not bool(re.search(r"\bsupplement(?:ation)?\b", seg_l))
@@ -2849,6 +2873,7 @@ class VerdictGenerator:
             "shown",
             "as",
             "part",
+            "from",
         }
         return {t for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", subject_text) if t not in stop}
 
@@ -2896,7 +2921,7 @@ class VerdictGenerator:
             ),
             "source_relation": (
                 r"\b(contain|contains|contained|include|includes|included|found in|source of|"
-                r"rich in|high in|low in|from|part of|as part of)\b"
+                r"rich in|high in|low in|such as|including|part of|as part of)\b"
             ),
         }
         for name, pattern in groups.items():
@@ -3087,6 +3112,7 @@ class VerdictGenerator:
         cp_tokens = [self._lemma_token(t) for t in cp.split() if t]
         ep_tokens = [self._lemma_token(t) for t in ep.split() if t]
         overlap = len(set(cp_tokens) & set(ep_tokens)) / max(1, len(set(cp_tokens)))
+        lexical_predicate_overlap = overlap > 0.0
         pol = self._segment_polarity(claim_text, evidence_text, stance="neutral")
         anchor_overlap = self._segment_anchor_overlap(claim_text, evidence_text)
         claim_subject_tokens = {
@@ -3108,6 +3134,7 @@ class VerdictGenerator:
                 "shown",
                 "as",
                 "part",
+                "from",
             }
         }
         evidence_tokens = self._statement_tokens(evidence_text)
@@ -3143,7 +3170,11 @@ class VerdictGenerator:
             ]
             if x
         )
-        if overlap > 0.0:
+        if (
+            lexical_predicate_overlap
+            and subject_guard_ok
+            and (obj_overlap >= 0.35 or (anchor_overlap >= ANCHOR_THRESHOLD and pol in {"entails", "contradicts"}))
+        ):
             return 0.7
         # Nominal/attribution claims often omit explicit verbs (e.g., "X from foods such as Y").
         # Treat source/composition relations as a predicate family when anchors align.
@@ -3152,7 +3183,7 @@ class VerdictGenerator:
         claim_nominal_relation = bool(
             re.search(
                 r"\b("
-                r"from|such as|including|include|contains?|source of|"
+                r"such as|including|include|contains?|source of|"
                 r"rich in|high in|low in|found in|part of|as part of"
                 r")\b",
                 claim_low,
@@ -3162,7 +3193,7 @@ class VerdictGenerator:
             re.search(
                 r"\b("
                 r"found in|source of|contains?|including|include|"
-                r"rich in|high in|low in|from|part of|as part of"
+                r"rich in|high in|low in|part of|as part of"
                 r")\b",
                 evidence_low,
             )
@@ -3170,7 +3201,7 @@ class VerdictGenerator:
         if (
             claim_nominal_relation
             and evidence_nominal_relation
-            and (anchor_overlap >= 0.25 or obj_overlap >= 0.35)
+            and (obj_overlap >= 0.35 or (anchor_overlap >= 0.25 and pol in {"entails", "contradicts"}))
             and subject_guard_ok
         ):
             return 0.7
