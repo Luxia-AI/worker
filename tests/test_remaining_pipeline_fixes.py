@@ -523,6 +523,33 @@ def test_laughter_claim_does_not_validate_blood_sugar_segment_with_unrelated_fac
     assert out["verdict"] != "TRUE"
 
 
+def test_key_findings_are_grounded_and_empty_when_all_segments_unknown():
+    vg = _vg()
+    claim = "Regular caffeine consumption from coffee is linked to a lower risk of depression"
+    evidence = [
+        {
+            "statement": "Welcome & networking coffee took place from 08:30-10:00",
+            "source_url": "https://example.org/event",
+            "final_score": 0.40,
+            "credibility": 0.5,
+        }
+    ]
+    llm = {
+        "verdict": "TRUE",
+        "confidence": 0.9,
+        "rationale": "test",
+        "key_findings": ["Caffeine reduces depression risk."],
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.4}
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    assert out["claim_breakdown"][0]["status"] == "UNKNOWN"
+    assert out["key_findings"] == []
+
+
 def test_vitamin_c_immune_function_paraphrase_not_unverifiable():
     vg = _vg()
     claim = "Vitamin C contributes to the normal function of the immune system"

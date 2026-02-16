@@ -950,7 +950,7 @@ class VerdictGenerator:
         )
         truthfulness_invariant_applied = False
 
-        # Extract key findings
+        # Extract key findings (grounded later from aligned evidence).
         key_findings = llm_result.get("key_findings", [])
 
         # Extract claim breakdown for client display
@@ -1981,6 +1981,8 @@ class VerdictGenerator:
                     "unverifiable_confidence_cap": float(UNVERIFIABLE_CONFIDENCE_CAP),
                 }
             )
+
+        key_findings = self._build_evidence_grounded_key_findings(claim_breakdown, evidence_map)
 
         verdict_payload = {
             "verdict": verdict_str,
@@ -4586,6 +4588,55 @@ class VerdictGenerator:
             original or "Verdict is based on segment-level evidence evaluation.",
             verdict,
         )
+
+    @staticmethod
+    def _build_evidence_grounded_key_findings(
+        claim_breakdown: List[Dict[str, Any]],
+        evidence_map: List[Dict[str, Any]],
+    ) -> List[str]:
+        """
+        Build key findings from aligned segment evidence only.
+        Prevents unsupported LLM key-findings from leaking into final output.
+        """
+        findings: List[str] = []
+        seen: set[str] = set()
+
+        for seg in claim_breakdown or []:
+            status = str(seg.get("status") or "UNKNOWN").upper()
+            if status not in {"VALID", "PARTIALLY_VALID", "INVALID", "PARTIALLY_INVALID"}:
+                continue
+            segment = str(seg.get("claim_segment") or "").strip()
+            fact = str(seg.get("supporting_fact") or "").strip()
+            if not segment or not fact:
+                continue
+            if status in {"INVALID", "PARTIALLY_INVALID"}:
+                text = f"Contradicted: {segment}. Evidence: {fact}"
+            else:
+                text = f"{segment}. Evidence: {fact}"
+            key = re.sub(r"\s+", " ", text).strip().lower()
+            if key and key not in seen:
+                findings.append(text)
+                seen.add(key)
+            if len(findings) >= 3:
+                return findings
+
+        # Fallback to strongly labeled evidence rows if segment alignment is sparse.
+        for em in evidence_map or []:
+            rel = str(em.get("relevance") or "").upper()
+            if rel not in {"SUPPORTS", "REFUTES"}:
+                continue
+            stmt = str(em.get("statement") or "").strip()
+            if not stmt:
+                continue
+            text = f"Evidence ({rel.lower()}): {stmt}"
+            key = re.sub(r"\s+", " ", text).strip().lower()
+            if key and key not in seen:
+                findings.append(text)
+                seen.add(key)
+            if len(findings) >= 3:
+                break
+
+        return findings
 
     def _build_deterministic_claim_breakdown(self, claim: str, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
