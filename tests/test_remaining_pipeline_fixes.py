@@ -378,6 +378,75 @@ def test_soluble_fiber_from_foods_claim_not_unknown():
     assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
 
 
+def test_iron_claim_not_validated_by_unrelated_vitamin_k_fact():
+    vg = _vg()
+    claim = "Iron contributes to the normal formation of red blood cells and hemoglobin"
+    evidence = [
+        {
+            "statement": "Vitamin K is needed in the liver for formation of several blood clotting factors.",
+            "source_url": "https://www.ncbi.nlm.nih.gov/books/NBK13273/",
+            "final_score": 0.62,
+            "credibility": 0.95,
+        }
+    ]
+    llm = {
+        "verdict": "TRUE",
+        "confidence": 0.8,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.62}
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    assert out["claim_breakdown"][0]["status"] == "UNKNOWN"
+    assert out["verdict"] == "UNVERIFIABLE"
+
+
+def test_stanol_and_risk_factor_semicolon_claim_not_unknown():
+    vg = _vg()
+    claim = (
+        "Plant stanol esters have been shown to reduce blood cholesterol; "
+        "blood cholesterol is a risk factor in the development of coronary heart disease"
+    )
+    evidence = [
+        {
+            "statement": "Plant stanol esters have been shown to reduce blood cholesterol.",
+            "source_url": "https://pubmed.ncbi.nlm.nih.gov/25411276/",
+            "final_score": 0.70,
+            "credibility": 0.95,
+        },
+        {
+            "statement": "Blood cholesterol is a risk factor in the development of coronary heart disease.",
+            "source_url": "https://www.ncbi.nlm.nih.gov/books/NBK13273/",
+            "final_score": 0.68,
+            "credibility": 0.95,
+        },
+    ]
+    llm = {
+        "verdict": "PARTIALLY_TRUE",
+        "confidence": 0.6,
+        "rationale": "test",
+        "claim_breakdown": [
+            {"claim_segment": "Plant stanol esters have been shown to reduce blood cholesterol", "status": "UNKNOWN"},
+            {
+                "claim_segment": "blood cholesterol is a risk factor in the development of coronary heart disease",
+                "status": "UNKNOWN",
+            },
+        ],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.70},
+            {"evidence_id": 1, "statement": evidence[1]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.68},
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    statuses = {s["status"] for s in out["claim_breakdown"]}
+    assert "UNKNOWN" not in statuses
+    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
+
+
 def test_vitamin_c_immune_function_paraphrase_not_unverifiable():
     vg = _vg()
     claim = "Vitamin C contributes to the normal function of the immune system"

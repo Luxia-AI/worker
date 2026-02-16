@@ -1604,10 +1604,11 @@ class VerdictGenerator:
             for seg in (claim_breakdown or [])
             if str((seg or {}).get("status") or "").upper() in {"INVALID", "PARTIALLY_INVALID"}
         )
+        all_segments_supported = bool(claim_breakdown) and support_status_count == len(claim_breakdown)
         strong_support_segment_present = (
             support_status_count > 0
             and invalid_status_count == 0
-            and (map_support_signal >= 0.55 or top_stance == "entails")
+            and (all_segments_supported or map_support_signal >= 0.55 or top_stance == "entails")
         )
         if vote_decision in {Verdict.TRUE.value, Verdict.FALSE.value}:
             verdict_str = vote_decision
@@ -2740,6 +2741,14 @@ class VerdictGenerator:
         patterns = (
             r"\b(?:as\s+part\s+of|part\s+of)\s+(?P<object>.+)$",
             (
+                r"\b(?:contribut(?:e|es|ed|ing)|help|helps|support|supports|needed|required)\s+"
+                r"(?:to|for)\s+(?P<object>.+)$"
+            ),
+            (
+                r"\b(?:is|are|was|were)\s+(?:an?\s+)?risk\s+factor"
+                r"(?:\s+for|\s+in\s+the\s+development\s+of)\s+(?P<object>.+)$"
+            ),
+            (
                 r"\b(?:reduce|reduces|reduced|lower|lowers|lowered)\b(?:\s+the)?\s*"
                 r"(?:risk|chance|likelihood)?(?:\s+of)?\s+(?P<object>.+)$"
             ),
@@ -2789,6 +2798,14 @@ class VerdictGenerator:
             "medical",
             "supervision",
             "under",
+            "normal",
+            "development",
+            "formation",
+            "shown",
+            "been",
+            "have",
+            "has",
+            "had",
         }
         return {t for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", object_text) if t not in stop}
 
@@ -2797,7 +2814,9 @@ class VerdictGenerator:
         text = (segment or "").lower()
         match = re.search(
             r"^(?P<subject>.+?)\b(?:increase|increases|increased|cause|causes|caused|"
-            r"reduce|reduces|reduced|prevent|prevents|prevented|contain|contains|work|works|has|have)\b",
+            r"reduce|reduces|reduced|prevent|prevents|prevented|contain|contains|work|works|"
+            r"contribut(?:e|es|ed|ing)|help|helps|support|supports|needed|required|"
+            r"is|are|was|were|has|have)\b",
             text,
         )
         if not match:
@@ -2816,6 +2835,20 @@ class VerdictGenerator:
             "for",
             "with",
             "risk",
+            "may",
+            "might",
+            "can",
+            "could",
+            "should",
+            "would",
+            "will",
+            "have",
+            "has",
+            "had",
+            "been",
+            "shown",
+            "as",
+            "part",
         }
         return {t for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", subject_text) if t not in stop}
 
@@ -3056,6 +3089,35 @@ class VerdictGenerator:
         overlap = len(set(cp_tokens) & set(ep_tokens)) / max(1, len(set(cp_tokens)))
         pol = self._segment_polarity(claim_text, evidence_text, stance="neutral")
         anchor_overlap = self._segment_anchor_overlap(claim_text, evidence_text)
+        claim_subject_tokens = {
+            t
+            for t in self._segment_subject_tokens(claim_text)
+            if t
+            not in {
+                "may",
+                "might",
+                "can",
+                "could",
+                "should",
+                "would",
+                "will",
+                "have",
+                "has",
+                "had",
+                "been",
+                "shown",
+                "as",
+                "part",
+            }
+        }
+        evidence_tokens = self._statement_tokens(evidence_text)
+        subject_overlap_ratio = (
+            len({self._lemma_token(t) for t in claim_subject_tokens} & {self._lemma_token(t) for t in evidence_tokens})
+            / max(1, len(claim_subject_tokens))
+            if claim_subject_tokens
+            else 0.0
+        )
+        subject_guard_ok = (not claim_subject_tokens) or subject_overlap_ratio >= 0.2 or anchor_overlap >= 0.55
         full_claim_buckets = self._predicate_bucket_tokens(claim_text)
         full_ev_buckets = self._predicate_bucket_tokens(evidence_text)
         full_bucket_overlap = bool(full_claim_buckets and full_ev_buckets and (full_claim_buckets & full_ev_buckets))
@@ -3105,25 +3167,41 @@ class VerdictGenerator:
                 evidence_low,
             )
         )
-        if claim_nominal_relation and evidence_nominal_relation and (anchor_overlap >= 0.25 or obj_overlap >= 0.35):
+        if (
+            claim_nominal_relation
+            and evidence_nominal_relation
+            and (anchor_overlap >= 0.25 or obj_overlap >= 0.35)
+            and subject_guard_ok
+        ):
             return 0.7
         # Robust fallback: use full-sentence predicate families when token-level extraction is noisy.
-        if full_bucket_overlap and (obj_overlap >= 0.35 or anchor_overlap >= 0.25):
+        if full_bucket_overlap and (obj_overlap >= 0.35 or anchor_overlap >= 0.25) and subject_guard_ok:
             return 0.7
-        if self._predicate_semantic_equivalent(cp_full, ep_full) and (
-            obj_overlap >= 0.5 or anchor_overlap >= ANCHOR_THRESHOLD
+        if (
+            self._predicate_semantic_equivalent(cp_full, ep_full)
+            and (obj_overlap >= 0.5 or anchor_overlap >= ANCHOR_THRESHOLD)
+            and subject_guard_ok
         ):
             return 0.7
-        if self._object_semantic_equivalent(claim_text, evidence_text) and (
-            self._predicate_semantic_equivalent(cp_full + " " + claim_text, ep_full + " " + evidence_text)
-            or pol in {"entails", "contradicts"}
+        if (
+            self._object_semantic_equivalent(claim_text, evidence_text)
+            and (
+                self._predicate_semantic_equivalent(cp_full + " " + claim_text, ep_full + " " + evidence_text)
+                or pol in {"entails", "contradicts"}
+            )
+            and subject_guard_ok
         ):
             return 0.7
 
-        if anchor_overlap >= 0.2 and sub_overlap >= 0.5 and obj_overlap >= 0.5:
+        if anchor_overlap >= 0.2 and sub_overlap >= 0.5 and obj_overlap >= 0.5 and subject_guard_ok:
             return 0.7
 
-        if pol in {"entails", "contradicts"} and anchor_overlap >= ANCHOR_THRESHOLD and obj_overlap >= 0.5:
+        if (
+            pol in {"entails", "contradicts"}
+            and anchor_overlap >= ANCHOR_THRESHOLD
+            and obj_overlap >= 0.5
+            and subject_guard_ok
+        ):
             return 0.7
 
         if pol == "contradicts" and anchor_overlap >= ANCHOR_THRESHOLD:
@@ -3439,9 +3517,7 @@ class VerdictGenerator:
 
                 rel = self._normalize_relevance_label(em.get("relevance", "NEUTRAL"))
                 rel_score = float(em.get("relevance_score", 0.0) or 0.0)
-                predicate_match_score = float(
-                    em.get("predicate_match_score", self.compute_predicate_match(segment, statement)) or 0.0
-                )
+                predicate_match_score = float(self.compute_predicate_match(segment, statement) or 0.0)
                 support_strength = float(em.get("support_strength", 0.0) or 0.0)
                 contradiction_score = float(
                     em.get("contradiction_score", self._contradiction_score(segment, statement))
