@@ -2734,16 +2734,16 @@ class VerdictGenerator:
     def _segment_object_tokens(segment: str) -> set[str]:
         text = (segment or "").lower()
         patterns = (
-            r"\b(?:contain|contains|contained|work|works|effective|effectiveness)\b(?:\s+against)?\s+(?P<object>.+)$",
-            (
-                r"\b(?:increase|increases|increased|raise|raises|raised)\b(?:\s+the)?\s*"
-                r"(?:risk|chance|likelihood)?(?:\s+of)?\s+(?P<object>.+)$"
-            ),
             (
                 r"\b(?:reduce|reduces|reduced|lower|lowers|lowered)\b(?:\s+the)?\s*"
                 r"(?:risk|chance|likelihood)?(?:\s+of)?\s+(?P<object>.+)$"
             ),
+            (
+                r"\b(?:increase|increases|increased|raise|raises|raised)\b(?:\s+the)?\s*"
+                r"(?:risk|chance|likelihood)?(?:\s+of)?\s+(?P<object>.+)$"
+            ),
             r"\b(?:prevent|prevents|prevented|preventing|cause|causes|caused|causing)\s+(?P<object>.+)$",
+            r"\b(?:contain|contains|contained|work|works|effective|effectiveness)\b(?:\s+against)?\s+(?P<object>.+)$",
             r"\b(?:managed?|management)\s+(?:with|by|through)\s+(?P<object>.+)$",
             (
                 r"\b(?:reduce|reduces|reduced|stop|stops|stopped|discontinue|discontinues|discontinued)\s+"
@@ -2969,7 +2969,8 @@ class VerdictGenerator:
                 score += 1
             if tok in {"not", "no"}:
                 score -= 2
-            if score > best_score or (score == best_score and i > pred_idx):
+            # Prefer earlier verb-like heads on ties; later tokens are often objects/nouns.
+            if score > best_score or (score == best_score and (pred_idx < 0 or i < pred_idx)):
                 best_score = score
                 pred_idx = i
         if pred_idx < 0:
@@ -3029,6 +3030,9 @@ class VerdictGenerator:
         overlap = len(set(cp_tokens) & set(ep_tokens)) / max(1, len(set(cp_tokens)))
         pol = self._segment_polarity(claim_text, evidence_text, stance="neutral")
         anchor_overlap = self._segment_anchor_overlap(claim_text, evidence_text)
+        full_claim_buckets = self._predicate_bucket_tokens(claim_text)
+        full_ev_buckets = self._predicate_bucket_tokens(evidence_text)
+        full_bucket_overlap = bool(full_claim_buckets and full_ev_buckets and (full_claim_buckets & full_ev_buckets))
         claim_sub = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", claim_t.get("subject_span", "")))
         ev_sub = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", ev_t.get("subject_span", "")))
         sub_overlap = (len(claim_sub & ev_sub) / max(1, len(claim_sub))) if claim_sub else 0.0
@@ -3052,6 +3056,9 @@ class VerdictGenerator:
             if x
         )
         if overlap > 0.0:
+            return 0.7
+        # Robust fallback: use full-sentence predicate families when token-level extraction is noisy.
+        if full_bucket_overlap and (obj_overlap >= 0.35 or anchor_overlap >= 0.25):
             return 0.7
         if self._predicate_semantic_equivalent(cp_full, ep_full) and (
             obj_overlap >= 0.5 or anchor_overlap >= ANCHOR_THRESHOLD
@@ -3389,8 +3396,16 @@ class VerdictGenerator:
                 contradiction_score = float(
                     em.get("contradiction_score", self._contradiction_score(segment, statement))
                 )
+                polarity = self._segment_polarity(segment, statement, stance="neutral")
+                strong_neutral_support = (
+                    rel == "NEUTRAL"
+                    and predicate_match_score >= PREDICATE_MATCH_THRESHOLD
+                    and anchor_overlap >= max(0.20, ANCHOR_THRESHOLD - 0.10)
+                    and (support_strength >= support_strength_threshold or rel_score >= 0.55)
+                    and polarity != "contradicts"
+                )
                 strict_support_ok = (
-                    rel == "SUPPORTS"
+                    (rel == "SUPPORTS" or strong_neutral_support)
                     and predicate_match_score >= PREDICATE_MATCH_THRESHOLD
                     and (
                         anchor_overlap >= max(0.20, ANCHOR_THRESHOLD - 0.10)

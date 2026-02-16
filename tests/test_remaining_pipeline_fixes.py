@@ -370,3 +370,38 @@ def test_intervention_alignment_not_broken_by_plain_vitamin_mentions():
     intervention_match, anchors_ok = vg._intervention_alignment(claim, evidence)
     assert intervention_match is True
     assert anchors_ok is True
+
+
+def test_parenthetical_diet_claim_not_stuck_unknown_with_clear_support():
+    vg = _vg()
+    claim = (
+        "Low-fat diets rich in fruits and vegetables (foods that are low in fat and may contain dietary fiber "
+        "& Vitamin A or Vitamin C) may reduce the risk of some types of cancer"
+    )
+    evidence = [
+        {
+            "statement": "Fruits and vegetables lower the risk of certain types of cancer.",
+            "source_url": "https://health.clevelandclinic.org/example",
+            "final_score": 0.52,
+            "credibility": 0.95,
+        },
+        {
+            "statement": "Grains, fruits, and vegetables contain dietary fiber.",
+            "source_url": "https://pubmed.ncbi.nlm.nih.gov/10089116/",
+            "final_score": 0.56,
+            "credibility": 0.95,
+        },
+    ]
+    llm = {
+        "verdict": "PARTIALLY_TRUE",
+        "confidence": 0.6,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.52},
+            {"evidence_id": 1, "statement": evidence[1]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.56},
+        ],
+    }
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    assert out["claim_breakdown"][0]["status"] in {"VALID", "PARTIALLY_VALID"}
+    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
