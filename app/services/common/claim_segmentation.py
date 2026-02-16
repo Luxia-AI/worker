@@ -32,6 +32,10 @@ _CONTRAST_VERB_RE = re.compile(
     r"\b(kills?|cures?|treats?|prevents?|causes?|contains?|targets?|affects?|works?)\b",
     flags=re.IGNORECASE,
 )
+_AUX_LEADING_RE = re.compile(
+    r"^(?:has|have|had|is|are|was|were|can|could|may|might|must|should|would|will|been|being)\b",
+    flags=re.IGNORECASE,
+)
 
 
 def _clean(text: str, keep_conj_prefix: bool = True) -> str:
@@ -49,6 +53,87 @@ def _extract_subject_predicate(text: str) -> str:
     if not last:
         return ""
     return _clean((text or "")[: last.end()])
+
+
+def _extract_subject_head(text: str) -> str:
+    t = _clean(text, keep_conj_prefix=False)
+    if not t:
+        return ""
+    tokens = re.findall(r"[A-Za-z][\w'-]*", t)
+    if not tokens:
+        return ""
+    boundaries = {
+        "that",
+        "which",
+        "who",
+        "whom",
+        "whose",
+        "because",
+        "while",
+        "although",
+        "though",
+        "if",
+        "when",
+        "where",
+        "after",
+        "before",
+    }
+    verb_like = {
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+        "has",
+        "have",
+        "had",
+        "do",
+        "does",
+        "did",
+        "can",
+        "could",
+        "may",
+        "might",
+        "must",
+        "should",
+        "would",
+        "will",
+        "help",
+        "helps",
+        "reduce",
+        "reduces",
+        "increase",
+        "increases",
+        "decrease",
+        "decreases",
+        "improve",
+        "improves",
+        "cause",
+        "causes",
+        "prevent",
+        "prevents",
+        "contain",
+        "contains",
+        "link",
+        "linked",
+    }
+    head: List[str] = []
+    for idx, tok in enumerate(tokens):
+        low = tok.lower()
+        if idx > 0 and low in boundaries:
+            break
+        if idx > 0 and (
+            low in verb_like or low.endswith("ed") or low.endswith("ing") or (low.endswith("s") and len(low) > 3)
+        ):
+            break
+        head.append(tok)
+        if len(head) >= 5:
+            break
+    if not head:
+        return tokens[0]
+    return _clean(" ".join(head), keep_conj_prefix=False)
 
 
 def _looks_independent_clause(text: str) -> bool:
@@ -345,6 +430,17 @@ def split_claim_into_segments(claim: str, min_segment_chars: int = 10) -> List[s
             continue
         normalized_segments.append(current)
         i += 1
+
+    # If a segment starts with an auxiliary ("has been shown ..."), inherit
+    # the subject head from the previous segment to keep it verifiable.
+    for i in range(1, len(normalized_segments)):
+        seg = _clean(normalized_segments[i], keep_conj_prefix=False)
+        if not seg or not _AUX_LEADING_RE.match(seg):
+            continue
+        subject_head = _extract_subject_head(normalized_segments[i - 1])
+        if not subject_head:
+            continue
+        normalized_segments[i] = _clean(f"{subject_head} {seg}", keep_conj_prefix=False)
 
     seen = set()
     out: List[str] = []

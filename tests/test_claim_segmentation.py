@@ -76,3 +76,14 @@ def test_semicolon_claim_does_not_cross_merge_subjects():
     second = segments[1].lower()
     assert "your stomach lining" in second
     assert "most of your body's tissues are your stomach lining" not in second
+
+
+def test_aux_clause_inherits_subject_after_and_split():
+    claim = (
+        "Laughter releases endorphins that can decrease pain and "
+        "has been shown to help lower blood sugar levels after a meal"
+    )
+    segments = split_claim_into_segments(claim)
+
+    assert len(segments) == 2
+    assert segments[1].lower().startswith("laughter has been shown to help lower blood sugar")

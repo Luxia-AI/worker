@@ -483,6 +483,46 @@ def test_true_verdict_downgraded_when_only_partial_support():
     assert out["verdict"] != "TRUE"
 
 
+def test_laughter_claim_does_not_validate_blood_sugar_segment_with_unrelated_fact():
+    vg = _vg()
+    claim = (
+        "Laughter releases endorphins that can decrease pain and "
+        "has been shown to help lower blood sugar levels after a meal"
+    )
+    evidence = [
+        {
+            "statement": "Regular exercise can boost endorphins, which are natural pain fighters.",
+            "source_url": "https://health.clevelandclinic.org/foods-to-reduce-uterine-fibroids",
+            "final_score": 0.49,
+            "credibility": 0.95,
+        },
+        {
+            "statement": "Carbohydrates help control blood glucose and insulin metabolism.",
+            "source_url": "https://www.ncbi.nlm.nih.gov/books/NBK459280/",
+            "final_score": 0.29,
+            "credibility": 0.95,
+        },
+    ]
+    llm = {
+        "verdict": "TRUE",
+        "confidence": 0.92,
+        "rationale": "test",
+        "claim_breakdown": [
+            {"claim_segment": "Laughter releases endorphins that can decrease pain", "status": "VALID"},
+            {"claim_segment": "has been shown to help lower blood sugar levels after a meal", "status": "VALID"},
+        ],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.49},
+            {"evidence_id": 1, "statement": evidence[1]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.29},
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    statuses = [s.get("status") for s in (out.get("claim_breakdown") or [])]
+    assert "UNKNOWN" in statuses
+    assert out["verdict"] != "TRUE"
+
+
 def test_vitamin_c_immune_function_paraphrase_not_unverifiable():
     vg = _vg()
     claim = "Vitamin C contributes to the normal function of the immune system"
