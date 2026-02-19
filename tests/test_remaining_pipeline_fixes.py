@@ -678,3 +678,33 @@ def test_hybrid_rank_filters_off_action_evidence_for_assertive_claim():
     ranked = hybrid_rank(semantic_results=semantic, kg_results=[], query_entities=[], query_text=query)
     assert ranked
     assert "improved clinical outcomes for lactose digestion" in ranked[0]["statement"].lower()
+
+
+def test_subjectless_fragment_claim_is_evaluated_conservatively():
+    vg = _vg()
+    claim = "may reduce the risk of type 2 diabetes"
+    evidence = [
+        {
+            "statement": "staying active lowers risk of type 2 diabetes",
+            "source_url": (
+                "https://odphp.health.gov/myhealthfinder/health-conditions/obesity/"
+                "stay-active-you-get-older-quick-tips"
+            ),
+            "final_score": 0.77,
+            "credibility": 0.95,
+        }
+    ]
+    llm = {
+        "verdict": "TRUE",
+        "confidence": 0.92,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.77}
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    assert out["verdict"] != "TRUE"
+    assert out["truthfulness_percent"] <= 60.0
+    assert out["analysis_counts"]["claim_fragmentary"] is True

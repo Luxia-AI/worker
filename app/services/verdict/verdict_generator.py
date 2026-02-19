@@ -1016,6 +1016,16 @@ class VerdictGenerator:
             elif evidence:
                 claim_breakdown = self._build_deterministic_claim_breakdown(claim, evidence)
         claim_breakdown = self._align_segments_with_evidence(claim_breakdown, evidence_map, evidence)
+        fragmentary_claim = self._is_subjectless_predicate_fragment(claim)
+        if fragmentary_claim:
+            for seg in claim_breakdown or []:
+                status = str(seg.get("status") or "UNKNOWN").upper()
+                if status == "VALID":
+                    seg["status"] = "PARTIALLY_VALID"
+                align_dbg = seg.get("alignment_debug") or {}
+                if isinstance(align_dbg, dict):
+                    align_dbg.setdefault("claim_fragment", "subjectless_predicate_fragment")
+                    seg["alignment_debug"] = align_dbg
 
         # Guardrail: prevent hallucinated support (source_url / supporting_fact must map to provided evidence)
         ev_urls = set((e.get("source_url") or e.get("source") or "") for e in evidence)
@@ -2012,6 +2022,18 @@ class VerdictGenerator:
                 verdict_str = Verdict.PARTIALLY_TRUE.value
                 truth_score_percent = max(55.0, min(79.9, float(truth_score_percent or 0.0)))
                 confidence = min(float(confidence or 0.0), 0.85)
+        if fragmentary_claim:
+            if verdict_str == Verdict.TRUE.value:
+                verdict_str = Verdict.PARTIALLY_TRUE.value
+            elif verdict_str == Verdict.FALSE.value:
+                verdict_str = Verdict.UNVERIFIABLE.value
+            truth_score_percent = min(float(truth_score_percent or 0.0), 60.0)
+            confidence = min(float(confidence or 0.0), 0.72)
+            if "incomplete claim fragment" not in str(rationale or "").lower():
+                rationale = (
+                    "Incomplete claim fragment without an explicit subject/intervention; "
+                    "evaluated conservatively against available evidence."
+                )
 
         rel_counts: Dict[str, int] = {}
         for evm in evidence_map or []:
@@ -2137,6 +2159,7 @@ class VerdictGenerator:
                 "decisive_support_signal": bool(decisive_support),
                 "decisive_contradict_signal": bool(decisive_contradict),
                 "conflicting_signal_band": bool(conflicting_signals),
+                "claim_fragmentary": bool(fragmentary_claim),
                 "llm_verdict_raw": llm_verdict,
                 "llm_verdict_changed": bool(llm_verdict != verdict_str),
             },
@@ -2400,6 +2423,64 @@ class VerdictGenerator:
                 low,
             )
         )
+
+    @staticmethod
+    def _is_subjectless_predicate_fragment(text: str) -> bool:
+        low = re.sub(r"\s+", " ", str(text or "").strip().lower())
+        if not low:
+            return True
+        starts_predicate_like = bool(
+            re.match(
+                (
+                    r"^(may|might|can|could|should|would|will|to|reduce|reduces|"
+                    r"lower|lowers|help|helps|prevent|prevents)\b"
+                ),
+                low,
+            )
+        )
+        if not starts_predicate_like:
+            return False
+        tokens = [t for t in re.findall(r"\b[a-z][a-z0-9_-]*\b", low) if t]
+        non_subject = {
+            "the",
+            "a",
+            "an",
+            "of",
+            "in",
+            "on",
+            "for",
+            "and",
+            "or",
+            "to",
+            "may",
+            "might",
+            "can",
+            "could",
+            "should",
+            "would",
+            "will",
+            "to",
+            "reduce",
+            "reduces",
+            "reducing",
+            "lower",
+            "lowers",
+            "lowering",
+            "prevent",
+            "prevents",
+            "preventing",
+            "help",
+            "helps",
+            "helping",
+            "risk",
+            "type",
+            "diabetes",
+            "fatigue",
+            "tiredness",
+            "disease",
+        }
+        candidate_subject_tokens = [t for t in tokens[:4] if t not in non_subject]
+        return len(candidate_subject_tokens) == 0
 
     def _evidence_is_admissible_for_claim(self, claim: str, statement: str) -> bool:
         """
