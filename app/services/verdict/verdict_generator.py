@@ -5259,7 +5259,30 @@ class VerdictGenerator:
                         f"[VerdictGenerator] No topics for segment '{segment[:30]}...'; "
                         "running VDB retrieval without topic filter"
                     )
-                results = await self.vdb_retriever.search(segment, top_k=top_k, topics=topic_filter)
+                retrieval_k = max(int(top_k), 2)
+                # Pull a wider candidate pool, then rerank for segment-object alignment.
+                results = await self.vdb_retriever.search(segment, top_k=min(12, retrieval_k * 4), topics=topic_filter)
+                seg_obj_tokens = {self._lemma_token(t) for t in self._segment_object_tokens(segment)}
+
+                def _segment_rank_key(item: Dict[str, Any]) -> tuple[float, float, float]:
+                    stmt = str(item.get("statement") or item.get("text") or "")
+                    stmt_tokens = {self._lemma_token(t) for t in self._statement_tokens(stmt)}
+                    if seg_obj_tokens:
+                        obj_overlap = len(seg_obj_tokens & stmt_tokens) / max(1, len(seg_obj_tokens))
+                    else:
+                        obj_overlap = 0.0
+                    pred_match = float(self.compute_predicate_match(segment, stmt) or 0.0)
+                    base = float(
+                        item.get("final_score")
+                        or item.get("score")
+                        or item.get("sem_score")
+                        or item.get("semantic_score")
+                        or 0.0
+                    )
+                    # Prefer object-aligned and predicate-aligned candidates for segment recovery.
+                    return (obj_overlap, pred_match, base)
+
+                results = sorted(results, key=_segment_rank_key, reverse=True)[: min(10, retrieval_k * 3)]
                 for result in results:
                     stmt = result.get("statement", "")
                     # Deduplicate by statement
@@ -5410,6 +5433,15 @@ class VerdictGenerator:
             f"{core} mechanism",
             f"{core} clinical guideline",
         ]
+        low = seg.lower()
+        if ("tiredness" in low or "fatigue" in low) and re.search(r"\biron\b", low):
+            hints.extend(
+                [
+                    "iron supplementation fatigue randomized trial",
+                    "iron deficiency fatigue improvement evidence",
+                    "iron contributes to reduction of tiredness and fatigue",
+                ]
+            )
         return [h for h in hints if h]
 
     def _predicate_refute_query_hints(self, segment: str) -> List[str]:
