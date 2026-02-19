@@ -771,6 +771,14 @@ class TrustedSearch:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned
 
+    @staticmethod
+    def _strip_boolean_scaffolding(query: str) -> str:
+        cleaned = query or ""
+        cleaned = re.sub(r"[()]+", " ", cleaned)
+        cleaned = re.sub(r"\b(?:and|or)\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
     @classmethod
     def _strip_negative_operators(cls, query: str) -> str:
         cleaned = query or ""
@@ -841,7 +849,17 @@ class TrustedSearch:
             )
             if not queries:
                 return []
-            final_queries = dedupe_list([self._sanitize_query(q) for q in queries if q])[:max_items]
+            cleaned_queries: List[str] = []
+            for q in queries:
+                if not q:
+                    continue
+                c = self._strip_site_operators(q)
+                c = self._strip_negative_operators(c)
+                c = self._strip_boolean_scaffolding(c)
+                c = self._sanitize_query(c)
+                if c:
+                    cleaned_queries.append(c)
+            final_queries = dedupe_list(cleaned_queries)[:max_items]
             logger.debug(
                 "[TrustedSearch][ConfidenceMode][LLM] final_queries=%s",
                 final_queries,
@@ -874,17 +892,40 @@ class TrustedSearch:
         if not llm_queries:
             return deterministic[: max(1, max_queries)]
 
-        if is_strong_therapeutic:
-            merged = dedupe_list(deterministic + llm_queries)
-        else:
-            merged = dedupe_list(llm_queries + deterministic)
+        # Keep deterministic anchors guaranteed in the final pool and interleave
+        # LLM perspectives to reduce drift from noisy reformulations.
+        merged: List[str] = []
+        det = dedupe_list(deterministic)
+        llm = dedupe_list(llm_queries)
+        max_cap = max(1, max_queries)
+        min_det = min(len(det), max(1, max_cap // 2))
+        for q in det[:min_det]:
+            if q and q not in merged:
+                merged.append(q)
+        i = 0
+        while len(merged) < max_cap and (i < len(llm) or i < len(det)):
+            if i < len(llm) and llm[i] and llm[i] not in merged:
+                merged.append(llm[i])
+                if len(merged) >= max_cap:
+                    break
+            if i + min_det < len(det) and det[i + min_det] and det[i + min_det] not in merged:
+                merged.append(det[i + min_det])
+                if len(merged) >= max_cap:
+                    break
+            i += 1
+        if is_strong_therapeutic and len(merged) < max_cap:
+            for q in llm:
+                if q and q not in merged:
+                    merged.append(q)
+                if len(merged) >= max_cap:
+                    break
         logger.debug(
             "[TrustedSearch][ConfidenceMode] Query expansion: llm=%d deterministic=%d merged=%d",
             len(llm_queries),
             len(deterministic),
             len(merged),
         )
-        return merged[: max(1, max_queries)]
+        return merged[:max_cap]
 
     def _build_research_instruction_query(self, text: str, entities: List[str] | None = None) -> str:
         entities = entities or []

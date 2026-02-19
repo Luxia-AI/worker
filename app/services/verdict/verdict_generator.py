@@ -3009,6 +3009,9 @@ class VerdictGenerator:
             "maintain",
             "support",
             "help",
+            "improve",
+            "enhance",
+            "relieve",
             "need",
             "require",
             "prevent",
@@ -3055,6 +3058,10 @@ class VerdictGenerator:
                 score += 1
             if tok in {"not", "no"}:
                 score -= 2
+            # Penalize likely noun+preposition heads (e.g., "cultures in ...")
+            # unless token is recognized as a verb hint.
+            if tok.endswith("s") and i + 1 < len(tokens) and tokens[i + 1] in prepositions and lemma not in verb_hints:
+                score -= 3
             # Prefer earlier verb-like heads on ties; later tokens are often objects/nouns.
             if score > best_score or (score == best_score and (pred_idx < 0 or i < pred_idx)):
                 best_score = score

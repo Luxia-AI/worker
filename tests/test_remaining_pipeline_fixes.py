@@ -645,3 +645,12 @@ def test_parenthetical_diet_claim_not_stuck_unknown_with_clear_support():
     out = vg._parse_verdict_result(llm, claim, evidence)
     assert out["claim_breakdown"][0]["status"] in {"VALID", "PARTIALLY_VALID"}
     assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
+
+
+def test_cultures_in_claim_uses_improve_as_canonical_predicate():
+    vg = _vg()
+    triplet = vg._extract_canonical_predicate_triplet(
+        "Live cultures in yogurt improve lactose digestion in individuals who have difficulty digesting lactose"
+    )
+    canonical = str(triplet.get("canonical_predicate") or "")
+    assert canonical == "improve"

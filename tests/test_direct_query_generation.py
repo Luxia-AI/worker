@@ -305,3 +305,52 @@ def test_confidence_mode_queries_include_problem_solution_perspective():
     assert "solutions for difficulty digesting lactose" in joined
     assert "-facebook" not in joined
     assert "site:" not in joined
+
+
+@pytest.mark.asyncio
+async def test_confidence_mode_llm_queries_are_sanitized_without_site_or_boolean_scaffolding():
+    ts = _init_trusted_search()
+
+    class _LLMStub:
+        async def ainvoke(self, *args, **kwargs):
+            return {
+                "queries": [
+                    "site:ncbi.nlm.nih.gov (lactose intolerance) and (yogurt live cultures)",
+                    'site:mayoclinic.org "lactose digestion" OR "live cultures"',
+                ]
+            }
+
+    ts.llm_client = _LLMStub()
+    out = await ts._llm_expand_confidence_queries(
+        claim="Live cultures in yogurt improve lactose digestion",
+        entity_obj=ClaimEntities(anchors=["lactose digestion", "yogurt", "live cultures"]),
+        max_queries=6,
+    )
+    assert out
+    joined = " | ".join(out).lower()
+    assert "site:" not in joined
+    assert " and " not in joined
+    assert "(" not in joined and ")" not in joined
+
+
+@pytest.mark.asyncio
+async def test_confidence_mode_query_merge_keeps_deterministic_coverage():
+    ts = _init_trusted_search()
+    ts._build_confidence_mode_queries = lambda claim, entity_obj, max_queries=10: [  # noqa: E731
+        "det one",
+        "det two",
+        "det three",
+    ]
+
+    async def _fake_llm(*args, **kwargs):
+        return ["llm one", "llm two", "llm three", "llm four", "llm five", "llm six"]
+
+    ts._llm_expand_confidence_queries = _fake_llm  # type: ignore[assignment]
+
+    out = await ts._build_confidence_mode_queries_with_fallback(
+        claim="claim text",
+        entity_obj=ClaimEntities(anchors=["a", "b"]),
+        max_queries=6,
+    )
+    assert any(q.startswith("det ") for q in out)
+    assert len(out) == 6
