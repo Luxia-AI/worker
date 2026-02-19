@@ -1,5 +1,6 @@
 import pytest
 
+from app.services.corrective.query_designer import ClaimEntities
 from app.services.corrective.trusted_search import TrustedSearch
 from app.services.ranking.adaptive_trust_policy import AdaptiveTrustPolicy
 from app.services.ranking.trust_ranker import EvidenceItem
@@ -291,3 +292,16 @@ def test_negation_tokens_not_emitted_as_raw_anchor_terms():
     assert "not" not in anchors
     assert "no" not in anchors
     assert "detox diets" in joined
+
+
+def test_confidence_mode_queries_include_problem_solution_perspective():
+    ts = _init_trusted_search()
+    queries = ts._build_confidence_mode_queries(
+        claim="Live cultures in yogurt improve lactose digestion in individuals who have difficulty digesting lactose",
+        entity_obj=ClaimEntities(anchors=["live cultures", "yogurt", "lactose digestion"]),
+        max_queries=10,
+    )
+    joined = " | ".join(queries).lower()
+    assert "solutions for difficulty digesting lactose" in joined
+    assert "-facebook" not in joined
+    assert "site:" not in joined

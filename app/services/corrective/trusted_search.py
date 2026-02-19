@@ -678,40 +678,50 @@ class TrustedSearch:
                 if v not in b_variants:
                     b_variants.append(v)
 
-        negatives = " ".join(self._CONFIDENCE_NEGATIVE_TERMS)
+        action_term = "effect"
+        if re.search(r"\b(improve|improves|improved)\b", text_low):
+            action_term = "improve"
+        elif re.search(r"\b(reduce|reduces|reduced|lower|lowers)\b", text_low):
+            action_term = "reduce"
+        elif re.search(r"\b(prevent|prevents|prevention)\b", text_low):
+            action_term = "prevent"
+        elif re.search(r"\b(treat|treats|treatment)\b", text_low):
+            action_term = "treat"
+
         queries: List[str] = [
-            f'"{claim_clean}" {negatives}',
-            f"{a_term} {negations[0]} {verb_variants[0]} {b_variants[0]} {negatives}",
-            f"{a_term} {b_variants[0]} {negations[1]} {negatives}",
-            f'"{a_term}" "{b_variants[0]}" guideline OR advice OR recommend {negatives}',
-            f"{a_term} {b_variants[0]} evidence review {negatives}",
-            f"{a_term} {b_variants[0]} systematic review meta-analysis {negatives}",
-            f"{a_term} {b_variants[0]} public health evidence {negatives}",
-            f"{a_term} {b_variants[0]} clinical study {negatives}",
+            f'"{claim_clean}"',
+            f"{a_term} {action_term} {b_variants[0]}",
+            f"{a_term} {b_variants[0]} evidence",
+            f"{a_term} {b_variants[0]} systematic review meta-analysis",
+            f"{a_term} {b_variants[0]} randomized trial",
+            f"{a_term} {b_variants[0]} guideline recommendation",
+            f"{a_term} {b_variants[0]} mechanism",
+            f"{a_term} {b_variants[0]} does not {action_term}",
         ]
+        queries.extend(self._build_problem_solution_queries(claim_clean))
 
         # Numeric-comparison claims need broader scientific phrasing before site-scoped fallback.
         if self._is_numeric_comparison_claim(claim_clean):
             queries = [
-                f'"{claim_clean}" {negatives}',
-                f'"oral microbiome" estimated oral bacteria count "human mouth" {negatives}',
-                f'"bacteria in human mouth" estimated count comparison "world population" {negatives}',
-                f'"estimated oral bacteria" "people in the world" comparison {negatives}',
-                f'"oral bacteria" "human population" comparative estimate {negatives}',
-                f'"oral microbiome" "global population" quantitative comparison {negatives}',
-                f'"pubmed" oral microbiome bacteria count estimate {negatives}',
-                f'"ncbi" oral bacteria population estimate {negatives}',
+                f'"{claim_clean}"',
+                '"oral microbiome" estimated oral bacteria count "human mouth"',
+                '"bacteria in human mouth" estimated count comparison "world population"',
+                '"estimated oral bacteria" "people in the world" comparison',
+                '"oral bacteria" "human population" comparative estimate',
+                '"oral microbiome" "global population" quantitative comparison',
+                '"pubmed" oral microbiome bacteria count estimate',
+                '"ncbi" oral bacteria population estimate',
             ]
 
         if re.search(r"\b(cure|cures|curing|eradicate|eliminate)\b", text_low):
             clinical_queries = [
-                f"{a_term} {b_term} randomized trial {negatives}",
-                f"{a_term} {b_term} systematic review meta-analysis {negatives}",
-                f"{a_term} {b_term} clinical trial humans {negatives}",
-                f"{a_term} {b_term} cure evidence {negatives}",
-                f"site:cancer.gov {a_term} {b_term} clinical trial {negatives}",
-                f"site:nih.gov {a_term} {b_term} evidence {negatives}",
-                f"site:cochranelibrary.com {a_term} {b_term} {negatives}",
+                f"{a_term} {b_term} randomized trial",
+                f"{a_term} {b_term} systematic review meta-analysis",
+                f"{a_term} {b_term} clinical trial humans",
+                f"{a_term} {b_term} cure evidence",
+                f"{a_term} {b_term} oncology clinical trial",
+                f"{a_term} {b_term} evidence summary",
+                f"{a_term} {b_term} safety efficacy",
             ]
             # Prioritize clinical-efficacy queries for strong therapeutic claims.
             merged = clinical_queries + queries
@@ -727,9 +737,9 @@ class TrustedSearch:
             queries = ordered
 
         if len(b_variants) > 1 and len(queries) < max_queries:
-            queries.append(f"{a_term} {negations[0]} {verb_variants[0]} {b_variants[1]} {negatives}")
+            queries.append(f"{a_term} {negations[0]} {verb_variants[0]} {b_variants[1]}")
         if len(negations) > 3 and len(queries) < max_queries:
-            queries.append(f"{a_term} {b_variants[0]} {negations[3]} {negatives}")
+            queries.append(f"{a_term} {b_variants[0]} {negations[3]}")
 
         cleaned = [self._sanitize_query(q) for q in queries if q]
         return dedupe_list([q for q in cleaned if q])[: max(1, max_queries)]
@@ -761,6 +771,27 @@ class TrustedSearch:
         cleaned = re.sub(r"\s+", " ", cleaned).strip()
         return cleaned
 
+    @classmethod
+    def _strip_negative_operators(cls, query: str) -> str:
+        cleaned = query or ""
+        for term in cls._CONFIDENCE_NEGATIVE_TERMS:
+            cleaned = re.sub(rf"(?<!\S){re.escape(term)}\b", " ", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+        return cleaned
+
+    @staticmethod
+    def _build_problem_solution_queries(claim: str) -> List[str]:
+        low = (claim or "").lower()
+        queries: List[str] = []
+        match = re.search(r"difficulty\s+(?:digesting|processing|tolerating)\s+([a-z0-9\-\s]{3,40})", low)
+        if match:
+            target = re.sub(r"\s+", " ", match.group(1)).strip()
+            if target:
+                queries.append(f"solutions for difficulty digesting {target}")
+                queries.append(f"improve {target} digestion evidence")
+                queries.append(f"{target} intolerance management evidence")
+        return dedupe_list([q for q in queries if q])
+
     async def _llm_expand_confidence_queries(
         self,
         claim: str,
@@ -776,10 +807,10 @@ class TrustedSearch:
             'Return JSON only in this exact form: {"queries":["..."]}\n'
             "Rules:\n"
             "- prioritize exact claim verification wording\n"
+            "- generate diverse perspectives: direct evidence, mechanism, guideline, review, opposing view\n"
             "- prefer broad semantic queries first (do not force site: operators)\n"
             "- include numeric comparison phrasing when claim compares magnitudes/counts\n"
-            "- include negation variants when relevant\n"
-            "- avoid social media domains\n\n"
+            "- keep each query concise and content-rich\n\n"
             f"Claim: {claim}\n"
             f"Anchors: {anchors}\n"
         )
@@ -810,16 +841,7 @@ class TrustedSearch:
             )
             if not queries:
                 return []
-            with_negatives: List[str] = []
-            suffix = " ".join(self._CONFIDENCE_NEGATIVE_TERMS)
-            for q in queries:
-                if not q:
-                    continue
-                if any(term in q.lower() for term in self._CONFIDENCE_NEGATIVE_TERMS):
-                    with_negatives.append(q)
-                else:
-                    with_negatives.append(self._sanitize_query(f"{q} {suffix}"))
-            final_queries = dedupe_list([q for q in with_negatives if q])[:max_items]
+            final_queries = dedupe_list([self._sanitize_query(q) for q in queries if q])[:max_items]
             logger.debug(
                 "[TrustedSearch][ConfidenceMode][LLM] final_queries=%s",
                 final_queries,
@@ -1570,6 +1592,7 @@ FAILED ENTITIES:
         if self.google_available:
             preserve_site_scope = "site:" in (query or "").lower()
             google_query = query if preserve_site_scope else self._strip_site_operators(query)
+            google_query = self._strip_negative_operators(google_query)
             if google_query != query:
                 logger.debug(
                     "[TrustedSearch] Google general-first rewrite: '%s' -> '%s'",

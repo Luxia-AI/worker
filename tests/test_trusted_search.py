@@ -46,3 +46,27 @@ def test_filter_trusted_urls_reports_rejection_counts(trusted_search):
     assert metrics["count_rejected_by_allowlist"] == 2
     assert metrics["count_rejected_by_quality"] == 0
     assert metrics["final_trusted_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_google_query_cleanup_strips_confidence_negatives(monkeypatch, trusted_search):
+    trusted_search.google_available = True
+    trusted_search.serper_available = False
+    trusted_search.google_quota_exceeded = False
+    trusted_search.min_allowlist_pass = 1
+
+    captured = {}
+
+    async def _fake_google_search(session, query):
+        captured["query"] = query
+        return ([{"link": "https://pubmed.ncbi.nlm.nih.gov/123456/"}], False)
+
+    monkeypatch.setattr(trusted_search, "search_query_google", _fake_google_search)
+
+    urls = await trusted_search.search_query(
+        session=None,
+        query='site:nih.gov "lactose digestion" -facebook -quora',
+    )
+    assert urls == ["https://pubmed.ncbi.nlm.nih.gov/123456/"]
+    assert "-facebook" not in captured["query"].lower()
+    assert "-quora" not in captured["query"].lower()
