@@ -19,6 +19,7 @@ import os
 import re
 from enum import Enum
 from hashlib import sha1
+from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
 
 from prometheus_client import Counter
@@ -51,6 +52,10 @@ from app.services.retrieval.metadata_enricher import TopicClassifier
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 from app.services.verdict.policy_override import OverrideSignals, therapeutic_strong_override
 from app.services.verdict.rationale_filter import is_efficacy_relevant
+from app.services.verdict.v2.calibration import ConfidenceCalibrator
+from app.services.verdict.v2.normalizer import is_blocked_content
+from app.services.verdict.v2.reconciler import reconcile_verdict
+from app.services.verdict.v2.shadow import compute_shadow_diff
 from app.shared.anchor_extraction import AnchorExtractor
 
 logger = get_logger(__name__)
@@ -78,6 +83,15 @@ contradiction_override_total = Counter(
 hedge_mismatch_total = Counter(
     "hedge_mismatch_total",
     "Total hedge mismatch overrides",
+)
+verdict_v2_shadow_total = Counter(
+    "verdict_v2_shadow_total",
+    "Total v2 shadow evaluations",
+    ["parity"],
+)
+verdict_v2_fail_open_total = Counter(
+    "verdict_v2_fail_open_total",
+    "Total v2 fail-open fallbacks",
 )
 
 
@@ -197,6 +211,26 @@ class VerdictGenerator:
         self.MAX_WEB_ROUNDS_PRE_VERDICT = 2
         self.WEB_SEGMENTS_LIMIT = 3
         self.MAX_UNKNOWN_ROUNDS_POST_VERDICT = 2
+        self.v2_enabled = os.getenv("VERDICT_ENGINE_V2_ENABLED", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.v2_shadow = os.getenv("VERDICT_ENGINE_V2_SHADOW", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.v2_fail_open = os.getenv("VERDICT_ENGINE_V2_FAIL_OPEN", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        self.v2_latency_budget_ms = int(os.getenv("VERDICT_ENGINE_V2_LATENCY_BUDGET_MS", "2500"))
+        self.v2_calibrator = ConfidenceCalibrator(os.getenv("VERDICT_ENGINE_V2_CALIBRATOR_PATH"))
         self._last_predicate_queries_generated: List[str] = []
         env_flag = os.getenv("LUXIA_CONFIDENCE_MODE")
         if env_flag is None:
@@ -919,6 +953,12 @@ class VerdictGenerator:
         if verdict_str not in [v.value for v in Verdict]:
             verdict_str = "UNVERIFIABLE"
         llm_verdict = verdict_str
+        v2_enabled = bool(getattr(self, "v2_enabled", False))
+        v2_shadow = bool(getattr(self, "v2_shadow", True))
+        v2_fail_open = bool(getattr(self, "v2_fail_open", True))
+        calibrator = getattr(self, "v2_calibrator", None) or ConfidenceCalibrator(None)
+        decision_trace_id = self._build_decision_trace_id(claim, evidence)
+        engine_version = "v2" if v2_enabled else "v1"
 
         # Extract confidence (will be re-scored from evidence if possible)
         confidence = llm_result.get("confidence", 0.5)
@@ -938,6 +978,7 @@ class VerdictGenerator:
             ev
             for ev in (evidence_map or [])
             if self._normalize_relevance_label(ev.get("relevance")) == "REFUTES"
+            and not bool(ev.get("blocked_content", False))
             and bool(ev.get("intervention_match", False))
             and float(ev.get("predicate_match_score", 0.0) or 0.0) >= 0.4
             and float(ev.get("credibility", 0.0) or 0.0) >= 0.8
@@ -1311,7 +1352,25 @@ class VerdictGenerator:
             evidence=evidence,
         )
         self._log_subclaim_coverage(claim, evidence, claim_breakdown, adaptive_metrics=adaptive_metrics)
-        reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
+        reconciled_v1 = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
+        reconciled = dict(reconciled_v1)
+        shadow_diff: Dict[str, Any] | None = None
+        if v2_enabled or v2_shadow:
+            shadow_start = perf_counter()
+            try:
+                reconciled_v2 = self._reconcile_verdict_v2(claim, claim_breakdown)
+                if v2_enabled:
+                    reconciled = dict(reconciled_v2)
+                if v2_shadow:
+                    shadow_diff = compute_shadow_diff(reconciled_v1, reconciled_v2)
+                    verdict_v2_shadow_total.labels(parity="true" if shadow_diff.get("parity") else "false").inc()
+                    shadow_diff["latency_ms"] = round((perf_counter() - shadow_start) * 1000.0, 2)
+            except Exception as shadow_exc:
+                if v2_fail_open:
+                    verdict_v2_fail_open_total.inc()
+                    logger.warning("[VerdictGenerator][v2] fail-open engaged in shadow/reconcile: %s", shadow_exc)
+                else:
+                    raise
         verdict_str = reconciled["verdict"]
         numeric_override = self._resolve_numeric_comparison_override(claim, evidence, claim_breakdown)
         numeric_truth_override: Optional[float] = None
@@ -1333,6 +1392,8 @@ class VerdictGenerator:
                     claim_breakdown[0]["source_url"] = ""
                     claim_breakdown[0]["evidence_used_ids"] = []
             reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
+            if v2_enabled:
+                reconciled = self._reconcile_verdict_v2(claim, claim_breakdown)
             numeric_reason = str(numeric_override.get("reason") or "").strip()
             if numeric_reason:
                 rationale = numeric_reason
@@ -1452,6 +1513,8 @@ class VerdictGenerator:
                     direct_support.get("source_url") or direct_support.get("source") or ""
                 )
                 reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
+                if v2_enabled:
+                    reconciled = self._reconcile_verdict_v2(claim, claim_breakdown)
                 verdict_str = reconciled["verdict"]
                 logger.debug(
                     "[VerdictGenerator][SingleSubclaimPromote] Promoted PARTIALLY_VALID -> VALID "
@@ -1655,6 +1718,11 @@ class VerdictGenerator:
                 contradiction_metrics["support_coverage"],
             )
 
+        matched_statuses_now = [str(s or "UNKNOWN").upper() for s in (reconciled.get("matched_statuses") or [])]
+        has_partial_or_unknown_status = any(
+            s in {"PARTIALLY_VALID", "PARTIALLY_INVALID", "UNKNOWN"} for s in matched_statuses_now
+        )
+
         # Hard polarity guardrails to keep verdict and rationale/segment stance consistent.
         if canonical_stance == "contradicts" and verdict_str == Verdict.TRUE.value:
             verdict_str = Verdict.FALSE.value
@@ -1677,10 +1745,11 @@ class VerdictGenerator:
             and top_stance_score >= 0.70
             and coverage_score >= 0.70
             and admissible_ratio >= 0.60
+            and not has_partial_or_unknown_status
             and not self._has_absolute_quantifier(claim)
         ):
             verdict_str = Verdict.TRUE.value
-        elif canonical_stance == "entails" and verdict_str == Verdict.FALSE.value:
+        elif canonical_stance == "entails" and verdict_str == Verdict.FALSE.value and not has_partial_or_unknown_status:
             verdict_str = Verdict.TRUE.value
             logger.warning(
                 "[VerdictGenerator][Consistency] Flipped FALSE->TRUE " "(breakdown=%s map=%s rationale=%s)",
@@ -1808,6 +1877,8 @@ class VerdictGenerator:
                         "contradict_signal": round(map_contradict_signal, 3),
                     }
             reconciled = self._reconcile_verdict_with_breakdown(claim, claim_breakdown)
+            if v2_enabled:
+                reconciled = self._reconcile_verdict_v2(claim, claim_breakdown)
             rationale = (
                 "Available admissible evidence is mixed or insufficiently decisive for this claim, "
                 "so the result is UNVERIFIABLE."
@@ -1882,6 +1953,14 @@ class VerdictGenerator:
             confidence = max(float(confidence or 0.0), float(os.getenv("FALSE_VERDICT_MIN_CONFIDENCE", "0.55")))
             if explicit_refutes_found and map_contradict_signal >= 0.35:
                 confidence = max(float(confidence or 0.0), 0.80)
+        confidence = calibrator.calibrate(
+            float(confidence or 0.0),
+            features={
+                "coverage": float(coverage_score or 0.0),
+                "agreement": float(agreement_ratio or 0.0),
+                "diversity": float(diversity_score or 0.0),
+            },
+        )
         unverifiable_cap_applied = False
         if verdict_str == Verdict.UNVERIFIABLE.value and float(confidence or 0.0) > float(UNVERIFIABLE_CONFIDENCE_CAP):
             confidence = float(UNVERIFIABLE_CONFIDENCE_CAP)
@@ -1920,9 +1999,14 @@ class VerdictGenerator:
         if verdict_str == Verdict.TRUE.value:
             total_segments = max(1, len(claim_breakdown or []))
             unresolved_segments = int(reconciled.get("unresolved_segments", 0) or 0)
+            has_partial_or_unknown_status = any(
+                str(s or "UNKNOWN").upper() in {"PARTIALLY_VALID", "PARTIALLY_INVALID", "UNKNOWN"}
+                for s in (reconciled.get("matched_statuses") or [])
+            )
             if (
                 unresolved_segments > 0
                 or support_status_count < total_segments
+                or has_partial_or_unknown_status
                 or float(truth_score_percent or 0.0) < 70.0
             ):
                 verdict_str = Verdict.PARTIALLY_TRUE.value
@@ -2018,6 +2102,10 @@ class VerdictGenerator:
             "canonical_predicate": str(claim_triplet.get("canonical_predicate") or ""),
             "contradiction_override_fired": bool(strict_override_fired == "CONTRADICTION_DOMINANCE"),
             "truthfulness_invariant_applied": bool(truthfulness_invariant_applied),
+            "engine_version": engine_version,
+            "decision_trace_id": decision_trace_id,
+            "calibration_version": calibrator.version,
+            "shadow_diff": shadow_diff if v2_shadow else None,
             "analysis_counts": {
                 "evidence_total_input": len(evidence),
                 "evidence_map_count": len(evidence_map or []),
@@ -2319,6 +2407,8 @@ class VerdictGenerator:
         for factual composition/efficacy claims unless the claim itself is about belief.
         """
         if not statement:
+            return False
+        if is_blocked_content(statement):
             return False
         if self._segment_is_belief_or_survey_claim(claim):
             return True
@@ -3402,7 +3492,11 @@ class VerdictGenerator:
             relevance = "NEUTRAL"
             relevance_score = max(0.0, min(1.0, base_score))
             refute_eligible = False
-            if not self._segment_topic_guard_ok(claim, statement):
+            blocked_content = is_blocked_content(statement)
+            if blocked_content:
+                relevance = "NEUTRAL"
+                relevance_score = 0.0
+            elif not self._segment_topic_guard_ok(claim, statement):
                 relevance_score *= 0.10
             else:
                 # Refutation can be decided by direct contradiction, independent of support gates.
@@ -3497,6 +3591,7 @@ class VerdictGenerator:
                     "intervention_match": bool(intervention_match),
                     "intervention_anchors_ok": bool(intervention_anchors_ok),
                     "refute_eligible": bool(refute_eligible),
+                    "blocked_content": bool(blocked_content),
                 }
             )
         return normalized
@@ -3668,12 +3763,21 @@ class VerdictGenerator:
                 ev = evidence_by_id.get(ev_id, {})
                 statement = (chosen.get("statement") or ev.get("statement") or ev.get("text") or "").strip()
                 source_url = (chosen.get("source_url") or ev.get("source_url") or ev.get("source") or "").strip()
+                hedge_support_language = bool(
+                    re.search(
+                        (
+                            r"\b(may|might|could|suggest(?:s|ed)?|associated with|linked to|"
+                            r"not been shown|insufficient evidence)\b"
+                        ),
+                        statement.lower(),
+                    )
+                )
                 if explicit_refute_present and best_support_item is not None:
                     seg["status"] = "PARTIALLY_INVALID"
                 elif explicit_refute_present:
                     seg["status"] = "INVALID"
                 elif best_support_item is not None:
-                    seg["status"] = "VALID"
+                    seg["status"] = "PARTIALLY_VALID" if hedge_support_language else "VALID"
                 else:
                     seg["status"] = "PARTIALLY_VALID"
                 if statement:
@@ -4059,6 +4163,28 @@ class VerdictGenerator:
                 matched_statuses.append("UNKNOWN")
         return matched_statuses
 
+    def _build_decision_trace_id(self, claim: str, evidence: List[Dict[str, Any]]) -> str:
+        statement_len_sum = sum(len(str(e.get("statement") or e.get("text") or "")) for e in (evidence or []))
+        raw = f"{claim}|{len(evidence)}|{statement_len_sum}"
+        return sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+    def _reconcile_verdict_v2(self, claim: str, claim_breakdown: List[Dict[str, Any]]) -> Dict[str, Any]:
+        statuses = self._match_required_segment_statuses(claim, claim_breakdown)
+        decision = reconcile_verdict(statuses)
+        return {
+            "verdict": decision.verdict,
+            "required_segments_count": decision.required_segments_count,
+            "resolved_segments_count": decision.resolved_segments_count,
+            "required_segments_resolved": decision.required_segments_resolved,
+            "unresolved_segments": decision.unresolved_segments,
+            "matched_statuses": decision.matched_statuses,
+            "weighted_truth": decision.weighted_truth,
+            "truthfulness_cap": decision.truthfulness_cap,
+            "resolved_ratio": decision.resolved_ratio,
+            "has_support": decision.has_support,
+            "has_invalid": decision.has_invalid,
+        }
+
     @staticmethod
     def _status_truth_weight(status: str) -> float:
         weights = {
@@ -4239,6 +4365,7 @@ class VerdictGenerator:
         all_invalid = bool(statuses) and all(s == "INVALID" for s in statuses)
         all_invalid_like = bool(statuses) and all((s in invalid_like) for s in statuses)
         all_support_like = bool(statuses) and all((s in support_like) for s in statuses)
+        has_partial = any(s in {"PARTIALLY_VALID", "PARTIALLY_INVALID"} for s in statuses)
 
         if unresolved_segments > 0:
             if has_support and has_invalid:
@@ -4247,7 +4374,7 @@ class VerdictGenerator:
                 verdict = Verdict.PARTIALLY_TRUE.value
             else:
                 verdict = Verdict.UNVERIFIABLE.value
-        elif all_valid or (all_support_like and not has_invalid):
+        elif all_valid or (all_support_like and not has_invalid and not has_partial):
             verdict = Verdict.TRUE.value
         elif all_invalid or (all_invalid_like and not has_support):
             verdict = Verdict.FALSE.value
@@ -4258,16 +4385,15 @@ class VerdictGenerator:
         else:
             verdict = Verdict.PARTIALLY_TRUE.value
 
-        # Safety guard: do not emit FALSE when there is support and no contradiction.
         if verdict == Verdict.FALSE.value and has_support and contradict_count == 0:
             verdict = Verdict.PARTIALLY_TRUE.value
 
-        # Narrow override for fully resolved, strongly supported outcomes.
         if (
             unresolved_segments == 0
             and weighted_truth >= 0.8
             and strong_covered >= required_segments_count
             and contradict_count == 0
+            and not has_partial
         ):
             verdict = Verdict.TRUE.value
 
