@@ -3844,6 +3844,19 @@ class VerdictGenerator:
                 ev = evidence_by_id.get(ev_id, {})
                 statement = (chosen.get("statement") or ev.get("statement") or ev.get("text") or "").strip()
                 source_url = (chosen.get("source_url") or ev.get("source_url") or ev.get("source") or "").strip()
+                seg_neg = bool(
+                    re.search(
+                        r"\b(?:no|not|never|without|cannot|can't|does not|do not|is not|are not|was not|were not)\b",
+                        segment.lower(),
+                    )
+                )
+                stmt_neg = bool(
+                    re.search(
+                        r"\b(?:no|not|never|without|cannot|can't|does not|do not|is not|are not|was not|were not)\b",
+                        statement.lower(),
+                    )
+                )
+                pred_match = float(chosen.get("predicate_match_score", 0.0) or 0.0)
                 hedge_support_language = bool(
                     re.search(
                         (
@@ -3858,7 +3871,10 @@ class VerdictGenerator:
                 elif explicit_refute_present:
                     seg["status"] = "INVALID"
                 elif best_support_item is not None:
-                    seg["status"] = "PARTIALLY_VALID" if hedge_support_language else "VALID"
+                    if seg_neg != stmt_neg and pred_match >= 0.45:
+                        seg["status"] = "INVALID"
+                    else:
+                        seg["status"] = "PARTIALLY_VALID" if hedge_support_language else "VALID"
                 else:
                     seg["status"] = "PARTIALLY_VALID"
                 if statement:

@@ -708,3 +708,28 @@ def test_subjectless_fragment_claim_is_evaluated_conservatively():
     assert out["verdict"] != "TRUE"
     assert out["truthfulness_percent"] <= 60.0
     assert out["analysis_counts"]["claim_fragmentary"] is True
+
+
+def test_negated_claim_not_validated_by_positive_support_fact():
+    vg = _vg()
+    claim = "Vitamin C does not support immune health"
+    evidence = [
+        {
+            "statement": "Vitamin C supports immune health.",
+            "source_url": "https://health.clevelandclinic.org/vitamin-c",
+            "final_score": 0.70,
+            "credibility": 0.95,
+        }
+    ]
+    llm = {
+        "verdict": "TRUE",
+        "confidence": 0.9,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.7}
+        ],
+    }
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    assert out["verdict"] != "TRUE"
+    assert out["claim_breakdown"][0]["status"] in {"INVALID", "PARTIALLY_INVALID", "UNKNOWN"}
