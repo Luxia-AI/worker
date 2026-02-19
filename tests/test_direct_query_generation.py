@@ -354,3 +354,25 @@ async def test_confidence_mode_query_merge_keeps_deterministic_coverage():
     )
     assert any(q.startswith("det ") for q in out)
     assert len(out) == 6
+
+
+def test_confidence_anchor_parts_prioritize_intervention_over_generic_people_tokens():
+    ts = _init_trusted_search()
+    a_term, b_term = ts._extract_confidence_anchor_parts(
+        "Live cultures in yogurt improve lactose digestion in individuals who have difficulty digesting lactose",
+        ClaimEntities(anchors=["lactose", "individuals", "difficulty", "digesting", "digestion", "cultures", "yogurt"]),
+    )
+    assert "individual" not in a_term
+    assert any(k in a_term for k in ["yogurt", "cultures"])
+    assert any(k in b_term for k in ["lactose", "digestion", "intolerance"])
+
+
+def test_confidence_mode_queries_start_with_concise_direct_query_not_full_quote():
+    ts = _init_trusted_search()
+    queries = ts._build_confidence_mode_queries(
+        claim="Live cultures in yogurt improve lactose digestion in individuals who have difficulty digesting lactose",
+        entity_obj=ClaimEntities(anchors=["yogurt", "lactose digestion", "live cultures"]),
+        max_queries=6,
+    )
+    assert queries
+    assert not queries[0].startswith('"Live cultures in yogurt improve lactose digestion')

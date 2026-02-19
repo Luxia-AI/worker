@@ -1,3 +1,4 @@
+from app.services.ranking.hybrid_ranker import hybrid_rank
 from app.services.verdict.verdict_generator import VerdictGenerator
 
 
@@ -654,3 +655,26 @@ def test_cultures_in_claim_uses_improve_as_canonical_predicate():
     )
     canonical = str(triplet.get("canonical_predicate") or "")
     assert canonical == "improve"
+
+
+def test_hybrid_rank_filters_off_action_evidence_for_assertive_claim():
+    query = "Live cultures in yogurt improve lactose digestion in individuals who have difficulty digesting lactose"
+    semantic = [
+        {
+            "statement": "Probiotics are often found in yogurt and dietary supplements.",
+            "source_url": "https://www.mayoclinic.org/example",
+            "score": 0.95,
+            "entities": ["probiotics", "yogurt"],
+        },
+        {
+            "statement": (
+                "Administration improved clinical outcomes for lactose digestion " "in lactose-intolerant individuals."
+            ),
+            "source_url": "https://pmc.ncbi.nlm.nih.gov/example",
+            "score": 0.72,
+            "entities": ["lactose digestion", "lactose intolerance"],
+        },
+    ]
+    ranked = hybrid_rank(semantic_results=semantic, kg_results=[], query_entities=[], query_text=query)
+    assert ranked
+    assert "improved clinical outcomes for lactose digestion" in ranked[0]["statement"].lower()

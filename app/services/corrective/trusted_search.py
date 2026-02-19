@@ -616,35 +616,110 @@ class TrustedSearch:
             negatives.extend(["-veterinary"])
         return negatives
 
-    @staticmethod
-    def _extract_confidence_anchor_parts(claim: str, entity_obj: ClaimEntities) -> tuple[str, str]:
+    def _extract_confidence_anchor_parts(self, claim: str, entity_obj: ClaimEntities) -> tuple[str, str]:
+        weak_tokens = {
+            "individual",
+            "individuals",
+            "person",
+            "people",
+            "have",
+            "has",
+            "difficulty",
+            "effect",
+            "effects",
+            "study",
+            "studies",
+            "evidence",
+            "public",
+            "health",
+        }
+        intervention_cues = {
+            "diet",
+            "intake",
+            "consumption",
+            "treatment",
+            "therapy",
+            "probiotic",
+            "probiotics",
+            "culture",
+            "cultures",
+            "yogurt",
+            "supplement",
+            "supplements",
+        }
+        outcome_cues = {
+            "digestion",
+            "digest",
+            "digested",
+            "digesting",
+            "absorption",
+            "intolerance",
+            "symptom",
+            "symptoms",
+            "risk",
+            "disease",
+            "pain",
+            "level",
+            "levels",
+        }
+
         anchors = [a.strip() for a in (entity_obj.anchors or entity_obj.topic or []) if str(a).strip()]
-        if not anchors:
-            tokens = re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (claim or "").lower())
-            stop = {
-                "the",
-                "and",
-                "with",
-                "from",
-                "that",
-                "this",
-                "these",
-                "those",
-                "does",
-                "doesnt",
-                "not",
-                "have",
-                "has",
-                "for",
-                "are",
-                "is",
-            }
-            anchors = [t for t in tokens if t not in stop][:4]
-        if not anchors:
-            return "health claim", "outcome"
-        if len(anchors) == 1:
-            return anchors[0], anchors[0]
-        return anchors[0], anchors[1]
+        phrase_candidates = self._extract_phrase_candidates(claim, entities=anchors)[:8]
+        phrase_candidates = [p for p in phrase_candidates if len(self._tokenize_words(p)) >= 2]
+
+        def _is_weak_phrase(phrase: str) -> bool:
+            toks = [t for t in self._tokenize_words(phrase) if t not in self._STOPWORDS and t not in self._ACTION_WORDS]
+            return not toks or all(t in weak_tokens for t in toks)
+
+        usable_phrases = [p for p in phrase_candidates if not _is_weak_phrase(p)]
+        if not usable_phrases:
+            usable_phrases = phrase_candidates
+
+        def _pick_phrase(cues: set[str], exclude: str = "") -> str:
+            for p in usable_phrases:
+                if exclude and p == exclude:
+                    continue
+                toks = set(self._tokenize_words(p))
+                if toks & cues:
+                    return p
+            for p in usable_phrases:
+                if not exclude or p != exclude:
+                    return p
+            return ""
+
+        a_term = _pick_phrase(intervention_cues)
+        b_term = _pick_phrase(outcome_cues, exclude=a_term)
+
+        b_tokens = set(self._tokenize_words(b_term))
+        if not (b_tokens & outcome_cues):
+            claim_tokens = self._tokenize_words(claim)
+            recovered = ""
+            for i, tok in enumerate(claim_tokens):
+                if tok in outcome_cues:
+                    if i > 0 and claim_tokens[i - 1] not in self._STOPWORDS:
+                        recovered = f"{claim_tokens[i - 1]} {tok}"
+                    else:
+                        recovered = tok
+                    break
+            if recovered:
+                b_term = recovered
+
+        if not a_term:
+            token_fallback = [
+                t
+                for t in self._tokenize_words(claim)
+                if t not in self._STOPWORDS and t not in weak_tokens and t not in self._ACTION_WORDS
+            ]
+            a_term = " ".join(token_fallback[:2]).strip() if token_fallback else "health claim"
+        if not b_term:
+            token_fallback = [
+                t
+                for t in self._tokenize_words(claim)
+                if t not in self._STOPWORDS and t not in self._ACTION_WORDS and t not in weak_tokens
+            ]
+            b_term = " ".join(token_fallback[2:4]).strip() or a_term
+
+        return a_term, b_term
 
     def _build_confidence_mode_queries(
         self,
@@ -688,8 +763,11 @@ class TrustedSearch:
         elif re.search(r"\b(treat|treats|treatment)\b", text_low):
             action_term = "treat"
 
+        concise_direct = self._build_direct_query(claim_clean, entities=entity_obj.anchors)
+        if not concise_direct:
+            concise_direct = f"{a_term} {action_term} {b_variants[0]}".strip()
         queries: List[str] = [
-            f'"{claim_clean}"',
+            concise_direct,
             f"{a_term} {action_term} {b_variants[0]}",
             f"{a_term} {b_variants[0]} evidence",
             f"{a_term} {b_variants[0]} systematic review meta-analysis",

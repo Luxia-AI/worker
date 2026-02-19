@@ -109,6 +109,31 @@ def _statement_tokens(text: str) -> set[str]:
     return {w for w in re.findall(r"\b[\w']+\b", (text or "").lower()) if len(w) > 2}
 
 
+def _action_markers(text: str) -> set[str]:
+    low = (text or "").lower()
+    markers: set[str] = set()
+    if re.search(
+        (
+            r"\b(improv(?:e|es|ed|ing)|enhanc(?:e|es|ed|ing)|"
+            r"benefit(?:s|ed|ing)?|help(?:s|ed|ing)?|"
+            r"reliev(?:e|es|ed|ing)|facilitat(?:e|es|ed|ing))\b"
+        ),
+        low,
+    ):
+        markers.add("improve")
+    if re.search(r"\b(reduc(?:e|es|ed|ing)|lower(?:s|ed|ing)?|decreas(?:e|es|ed|ing))\b", low):
+        markers.add("reduce")
+    if re.search(r"\b(prevent(?:s|ed|ing)?|protect(?:s|ed|ing)?)\b", low):
+        markers.add("prevent")
+    if re.search(r"\b(caus(?:e|es|ed|ing)|trigger(?:s|ed|ing)?|increas(?:e|es|ed|ing))\b", low):
+        markers.add("cause")
+    if re.search(r"\b(treat(?:s|ed|ing)?|cure(?:s|d|ing)?|manag(?:e|es|ed|ing))\b", low):
+        markers.add("treat")
+    if re.search(r"\b(diagnos(?:e|es|ed|ing)|detect(?:s|ed|ing)?|determin(?:e|es|ed|ing)|test(?:s|ed|ing)?)\b", low):
+        markers.add("diagnose")
+    return markers
+
+
 def _has_object_refutation_signal(statement: str) -> bool:
     low = (statement or "").lower()
     patterns = (
@@ -488,6 +513,7 @@ def hybrid_rank(
     query_object_tokens = _object_tokens_for_query(query_text)
     claim_focus_tokens = _claim_focus_tokens(query_text)
     subject_focus_tokens, object_focus_tokens = _relation_focus_tokens(query_text)
+    claim_actions = _action_markers(query_text)
     belief_claim = _claim_is_belief_or_survey(query_text)
 
     for key, item in candidates_map.items():
@@ -546,6 +572,10 @@ def hybrid_rank(
         if is_backfill and not (ent_s >= 0.25 or kg_s >= 0.55 or kg_raw >= 0.55):
             final_score *= 0.85
         stmt_tokens = _statement_tokens(item["statement"])
+        stmt_actions = _action_markers(item["statement"])
+        action_overlap_ok = not claim_actions or bool(claim_actions & stmt_actions)
+        if claim_actions and not action_overlap_ok and sem_s < 0.95 and kg_raw < 0.95:
+            final_score *= 0.72
         object_overlap = len(query_object_tokens & stmt_tokens) if query_object_tokens else 0
         focus_overlap = len(claim_focus_tokens & stmt_tokens) if claim_focus_tokens else 0
         subject_overlap = len(subject_focus_tokens & stmt_tokens) if subject_focus_tokens else 0
@@ -607,6 +637,17 @@ def hybrid_rank(
         if object_focus_tokens and object_relation_overlap == 0 and sem_s < 0.95 and kg_raw < 0.95:
             continue
         if not belief_claim and _is_claim_mention_statement(item["statement"]) and claim_overlap < 0.60:
+            continue
+        if (
+            claim_actions
+            and not action_overlap_ok
+            and object_focus_tokens
+            and object_relation_overlap == 0
+            and claim_overlap < 0.75
+            and kg_raw < 0.95
+        ):
+            continue
+        if claim_actions and not action_overlap_ok and claim_overlap < 0.45 and sem_s < 0.92 and kg_raw < 0.92:
             continue
         if sem_s < 0.20 and claim_overlap < 0.08 and ent_s < 0.20 and kg_raw < 0.40:
             continue
