@@ -347,6 +347,15 @@ def _split_on_conjunctives(text: str) -> List[str]:
                 and re.search(r"\b(development|growth|maturation|bone)\b", right, flags=re.IGNORECASE)
             ):
                 return [_clean(text, keep_conj_prefix=False)]
+            # Avoid splitting coordinated adjective/object phrases such as:
+            # "supports a healthy and balanced digestive system".
+            if (
+                conj.strip() == "and"
+                and not _looks_independent_clause(right)
+                and re.search(r"\b(?:a|an|the)\s+[a-z][a-z-]*\s*$", left, flags=re.IGNORECASE)
+                and len(right.split()) <= 4
+            ):
+                return [_clean(text, keep_conj_prefix=False)]
             # Handle "X ... to/for A and B" by inheriting the governing preposition.
             if right and not _looks_independent_clause(right):
                 prep = re.match(
@@ -384,6 +393,16 @@ def _split_on_relative_clause(text: str) -> List[str]:
     sentence = _clean(text, keep_conj_prefix=False)
     if not sentence:
         return []
+    # Do not split relative clauses that occur inside parenthetical content.
+    if "(" in sentence and ")" in sentence:
+        low = sentence.lower()
+        rel_pos = low.find(" that ")
+        if rel_pos < 0:
+            rel_pos = low.find(" which ")
+        if rel_pos < 0:
+            rel_pos = low.find(" who ")
+        if rel_pos >= 0 and low.find("(") < rel_pos < low.find(")"):
+            return []
     match = _RELATIVE_CLAUSE_RE.match(sentence)
     if not match:
         return []
@@ -400,6 +419,16 @@ def _split_on_relative_clause(text: str) -> List[str]:
     rebuilt_tail = _clean(f"{subject} {tail}", keep_conj_prefix=False)
     if not rebuilt_tail:
         return []
+    tail_parts = _split_on_conjunctives(rebuilt_tail)
+    if tail_parts and len(tail_parts) > 1:
+        normalized_tail_parts = [_clean(p, keep_conj_prefix=False) for p in tail_parts if _clean(p)]
+        if normalized_tail_parts:
+            first_tail = normalized_tail_parts[0]
+            if first_tail.lower().startswith(subject.lower() + " "):
+                first_tail = _clean(first_tail[len(subject) + 1 :], keep_conj_prefix=False)
+            primary = _clean(f"{head} that {first_tail}", keep_conj_prefix=False) if first_tail else head
+            remainder = normalized_tail_parts[1:]
+            return [primary] + remainder
     return [head, rebuilt_tail]
 
 
@@ -455,6 +484,7 @@ def split_claim_into_segments(claim: str, min_segment_chars: int = 10) -> List[s
             r"is|are|was|were|be|been|being|"
             r"has|have|had|do|does|did|can|could|may|might|must|should|would|will|"
             r"helps?|prevents?|reduces?|decreases?|lowers?|increases?|causes?|improves?|worsens?|protects?|"
+            r"releases?|shows?|"
             r"needed|required|important|"
             r"associated|linked|leads?|results?|"
             r"treats?|cures?|supports?|maintains?|builds?|promotes?|regulates?"

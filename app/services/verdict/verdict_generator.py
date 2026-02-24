@@ -3081,7 +3081,7 @@ class VerdictGenerator:
             ),
             "therapeutic": (
                 r"\b(treat|treats|treatment|cure|cures|help|helps|promote|promotes|improve|improves|"
-                r"effective|efficacious)\b"
+                r"enhance|enhances|boost|boosts|effective|efficacious)\b"
             ),
             "genomic_change": (
                 r"\b(alter|alters|altered|change|changes|changed|integrate|integration|"
@@ -3090,6 +3090,7 @@ class VerdictGenerator:
             "build_support": (
                 r"\b(build|builds|built|maintain|maintains|maintained|support|supports|supported|"
                 r"strengthen|strengthens|strengthened|needed|need|needs|required|requires|essential|necessary|"
+                r"increase|increases|increased|enhance|enhances|enhanced|boost|boosts|boosted|"
                 r"contribut(?:e|es|ed|ing))\b"
             ),
             "source_relation": (

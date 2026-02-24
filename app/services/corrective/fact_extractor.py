@@ -256,18 +256,44 @@ class FactExtractor:
             if not stmt_tokens:
                 continue
 
-            if must_have_tokens and not (stmt_tokens & must_have_tokens):
+            has_must_have = bool(must_have_tokens and (stmt_tokens & must_have_tokens))
+            has_claim_entity = bool(claim_entity_tokens and (stmt_tokens & claim_entity_tokens))
+
+            # Primary-entity gate: must-have if available, otherwise any claim entity.
+            if must_have_tokens:
+                if not has_must_have:
+                    continue
+            elif claim_entity_tokens and not has_claim_entity:
                 continue
-            if claim_entity_tokens and not (stmt_tokens & claim_entity_tokens):
-                continue
+
             if claim_tokens and len(stmt_tokens & claim_tokens) == 0:
                 continue
 
             stmt_predicates = self._predicate_family_tokens(stmt)
             if claim_predicates and not (stmt_predicates & claim_predicates):
-                continue
+                # Relax only when anchor/entity alignment is strong to avoid zero-fact runs.
+                lexical_overlap = len(stmt_tokens & claim_tokens)
+                if not ((has_must_have or has_claim_entity) and lexical_overlap >= 2):
+                    continue
             kept.append(fact)
-        return kept
+        # Failsafe: preserve anchor-matching facts when strict predicate filtering empties output.
+        if kept:
+            return kept
+        if not facts:
+            return []
+
+        fallback: List[Dict[str, Any]] = []
+        for fact in facts:
+            stmt = str(fact.get("statement", "") or "")
+            stmt_tokens = self._tokenize(stmt)
+            if not stmt_tokens:
+                continue
+            if must_have_tokens and not (stmt_tokens & must_have_tokens):
+                continue
+            if claim_tokens and len(stmt_tokens & claim_tokens) < 2:
+                continue
+            fallback.append(fact)
+        return fallback
 
     @staticmethod
     def _build_fact_prompt(content: str, predicate_target: Optional[Dict[str, str]] = None) -> str:
