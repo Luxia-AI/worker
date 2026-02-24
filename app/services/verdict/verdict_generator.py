@@ -3557,6 +3557,13 @@ class VerdictGenerator:
             claim_triplet = self._extract_canonical_predicate_triplet(claim)
             evidence_triplet = self._extract_canonical_predicate_triplet(statement)
             predicate_match_score = self.compute_predicate_match(claim, statement)
+            claim_object_tokens = {self._lemma_token(t) for t in self._segment_object_tokens(claim)}
+            evidence_tokens = {self._lemma_token(t) for t in self._statement_tokens(statement)}
+            object_overlap_ok = (
+                not claim_object_tokens
+                or bool(claim_object_tokens & evidence_tokens)
+                or self._is_explicit_refutation_statement(statement)
+            )
             contradiction_score = self._contradiction_score(claim, statement)
             strength = compute_evidence_strength(
                 claim_text=claim,
@@ -3624,6 +3631,7 @@ class VerdictGenerator:
                     support_gate = (
                         predicate_match_score >= PREDICATE_MATCH_THRESHOLD
                         and anchor_score >= max(0.25, ANCHOR_THRESHOLD - 0.05)
+                        and object_overlap_ok
                         and support_polarity_ok
                         and (
                             support_strength >= support_strength_threshold
@@ -3661,6 +3669,7 @@ class VerdictGenerator:
                     "source_url": source_url,
                     "anchor_match_score": anchor_score,
                     "predicate_match_score": max(0.0, min(1.0, predicate_match_score)),
+                    "object_match_ok": bool(object_overlap_ok),
                     "support_strength": max(0.0, min(1.0, support_strength)),
                     "contradiction_score": max(0.0, min(1.0, contradiction_score)),
                     "canonical_predicate": str(claim_triplet.get("canonical_predicate") or ""),
@@ -3696,18 +3705,22 @@ class VerdictGenerator:
             best_support_item: Dict[str, Any] | None = None
             best_refute_item: Dict[str, Any] | None = None
             weak_support_item: Dict[str, Any] | None = None
+            near_miss_support_item: Dict[str, Any] | None = None
             best_support_score = -1.0
             best_refute_score = -1.0
             best_weak_support_score = -1.0
+            best_near_miss_score = -1.0
             saw_neutral = False
 
             def _consider_item(em: Dict[str, Any], ev_idx: int | None = None) -> None:
                 nonlocal best_support_item
                 nonlocal best_refute_item
                 nonlocal weak_support_item
+                nonlocal near_miss_support_item
                 nonlocal best_support_score
                 nonlocal best_refute_score
                 nonlocal best_weak_support_score
+                nonlocal best_near_miss_score
                 nonlocal saw_neutral
 
                 statement = (em.get("statement") or "").strip()
@@ -3729,6 +3742,28 @@ class VerdictGenerator:
                     statement_tokens = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", statement.lower()))
                     no_object_overlap = len(object_tokens & statement_tokens) == 0
                     if no_object_overlap and not self._is_explicit_refutation_statement(statement):
+                        # Keep a near-miss candidate for partial support fallback.
+                        rel = self._normalize_relevance_label(em.get("relevance", "NEUTRAL"))
+                        rel_score = float(em.get("relevance_score", 0.0) or 0.0)
+                        predicate_match_score = float(self.compute_predicate_match(segment, statement) or 0.0)
+                        near_score = (0.55 * rel_score) + (0.20 * anchor_overlap) + (0.25 * predicate_match_score)
+                        if (
+                            rel in {"SUPPORTS", "NEUTRAL"}
+                            and predicate_match_score >= 0.45
+                            and near_score > best_near_miss_score
+                        ):
+                            best_near_miss_score = near_score
+                            near_miss_support_item = {
+                                **em,
+                                "evidence_id": em.get("evidence_id", ev_idx if ev_idx is not None else -1),
+                                "statement": statement,
+                                "anchor_match_score": anchor_overlap,
+                                "predicate_match_score": predicate_match_score,
+                                "support_strength": float(em.get("support_strength", 0.0) or 0.0),
+                                "contradiction_score": float(em.get("contradiction_score", 0.0) or 0.0),
+                                "stance_used": rel,
+                                "reason": "object_mismatch_near_miss",
+                            }
                         return
 
                 rel = self._normalize_relevance_label(em.get("relevance", "NEUTRAL"))
@@ -3839,6 +3874,8 @@ class VerdictGenerator:
 
             explicit_refute_present = best_refute_item is not None
             chosen: Dict[str, Any] | None = best_refute_item or best_support_item or weak_support_item
+            if chosen is None and near_miss_support_item is not None:
+                chosen = near_miss_support_item
             if chosen is not None:
                 ev_id = int(chosen.get("evidence_id", -1) or -1)
                 ev = evidence_by_id.get(ev_id, {})
@@ -3883,7 +3920,7 @@ class VerdictGenerator:
                     seg["source_url"] = source_url
                 seg["evidence_used_ids"] = [ev_id] if ev_id >= 0 else []
                 seg["alignment_debug"] = {
-                    "reason": "strict_predicate_gate",
+                    "reason": str(chosen.get("reason") or "strict_predicate_gate"),
                     "anchor_overlap": round(float(chosen.get("anchor_match_score", 0.0) or 0.0), 3),
                     "predicate_match_score": round(float(chosen.get("predicate_match_score", 0.0) or 0.0), 3),
                     "support_strength": round(float(chosen.get("support_strength", 0.0) or 0.0), 3),
@@ -4893,6 +4930,7 @@ class VerdictGenerator:
         )
         for seg in segments:
             seg_words = set(re.findall(r"\b\w+\b", seg.lower()))
+            seg_obj_tokens = {self._lemma_token(t) for t in self._segment_object_tokens(seg)}
             seg_tokens = {w.lower() for w in re.findall(r"\b[\w']+\b", seg)}
             seg_neg = any(t in seg_tokens for t in {"no", "not", "never", "without", "lack", "lacks", "lacking"})
             best = None
@@ -4908,6 +4946,8 @@ class VerdictGenerator:
                     continue
                 stmt_words = set(re.findall(r"\b\w+\b", stmt.lower()))
                 overlap = len(seg_words & stmt_words) / max(1, len(seg_words))
+                stmt_tokens_lemma = {self._lemma_token(t) for t in self._statement_tokens(stmt)}
+                object_overlap_ok = not seg_obj_tokens or bool(seg_obj_tokens & stmt_tokens_lemma)
                 anchor_eval = evaluate_anchor_match(seg, stmt)
                 anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
                 anchor_ok = bool(anchor_eval.get("anchor_ok", False))
@@ -4959,6 +4999,8 @@ class VerdictGenerator:
                     score *= 0.35
                 elif overlap < 0.20:
                     score *= 0.45
+                if seg_obj_tokens and not object_overlap_ok and not self._is_explicit_refutation_statement(stmt):
+                    score *= 0.25
                 if score > best_score:
                     best_score = score
                     best = ev
@@ -4966,7 +5008,18 @@ class VerdictGenerator:
                     best_idx = idx
                     best_anchor_ok = anchor_ok
 
-            if best and best_anchor_ok and best_score >= 0.55 and (best_neg == seg_neg):
+            best_stmt_tokens = (
+                {self._lemma_token(t) for t in self._statement_tokens(str(best.get("statement") or ""))}
+                if best
+                else set()
+            )
+            if (
+                best
+                and best_anchor_ok
+                and best_score >= 0.55
+                and (best_neg == seg_neg)
+                and (not seg_obj_tokens or bool(seg_obj_tokens & best_stmt_tokens))
+            ):
                 status = "VALID"
             elif best and best_anchor_ok and best_score >= 0.55 and (best_neg != seg_neg):
                 status = "INVALID"

@@ -812,6 +812,11 @@ class AdaptiveTrustPolicy:
             verdict_state = "evidence_insufficiency"
             weak_relevance_guard_applied = True
 
+        if is_sufficient and top_trust < 0.20:
+            is_sufficient = False
+            verdict_state = "evidence_insufficiency"
+            weak_relevance_guard_applied = True
+
         # Final consistency guard: if gate passed and confidence-mode relaxed
         # conditions are met, trust_post should not be zeroed out.
         if trust_post <= 0.0 and coverage >= 0.50 and top_trust > 0.0:

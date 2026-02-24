@@ -1445,12 +1445,63 @@ class CorrectivePipeline:
         This increases recall for multi-part claims while keeping VDB calls bounded.
         """
         queries = [claim.strip()] if claim and claim.strip() else []
+
+        def _tokens(text: str) -> List[str]:
+            stop = {
+                "the",
+                "a",
+                "an",
+                "and",
+                "or",
+                "but",
+                "to",
+                "for",
+                "of",
+                "in",
+                "on",
+                "with",
+                "by",
+                "at",
+                "is",
+                "are",
+                "was",
+                "were",
+                "be",
+                "been",
+                "being",
+            }
+            return [w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (text or "").lower()) if w not in stop]
+
+        def _predicate_object_hint(text: str) -> str:
+            low = str(text or "").strip()
+            if not low:
+                return ""
+            patterns = (
+                r"^(?P<subj>.+?)\s+\b(?:is|are|was|were)\b\s+(?P<pred_obj>.+)$",
+                (
+                    r"^(?P<subj>.+?)\s+\b(?:contribut(?:e|es|ed|ing)|help|helps|support|supports|"
+                    r"reduce|reduces|prevent|prevents|cause|causes)\b\s+(?P<pred_obj>.+)$"
+                ),
+            )
+            for pattern in patterns:
+                m = re.search(pattern, low, flags=re.IGNORECASE)
+                if not m:
+                    continue
+                subj = " ".join(_tokens(m.group("subj")))
+                pred_obj = " ".join(_tokens(m.group("pred_obj")))
+                if subj and pred_obj:
+                    return f"{subj} {pred_obj}".strip()
+            return ""
+
         subclaims = self.trust_ranker.adaptive_policy.decompose_claim(claim)
         # Limit to top 3 subclaims to avoid query explosion
         for sub in subclaims[:3]:
             s = sub.strip()
             if s and s not in queries:
                 queries.append(s)
+            hint = _predicate_object_hint(s)
+            if hint and hint not in queries:
+                queries.append(hint)
         return queries
 
     async def _infer_claim_topics(self, claim: str, entities: List[str]) -> tuple[list[str], float]:

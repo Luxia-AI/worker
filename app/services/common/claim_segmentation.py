@@ -36,6 +36,10 @@ _AUX_LEADING_RE = re.compile(
     r"^(?:has|have|had|is|are|was|were|can|could|may|might|must|should|would|will|been|being)\b",
     flags=re.IGNORECASE,
 )
+_RELATIVE_CLAUSE_RE = re.compile(
+    r"^(?P<head>.+?)\s+\b(?:that|which|who)\b\s+(?P<tail>.+)$",
+    flags=re.IGNORECASE,
+)
 
 
 def _clean(text: str, keep_conj_prefix: bool = True) -> str:
@@ -356,6 +360,37 @@ def _split_on_conjunctives(text: str) -> List[str]:
     return []
 
 
+def _split_on_relative_clause(text: str) -> List[str]:
+    """
+    Split claims like:
+      "X is Y that/which Z ..."
+    into:
+      - "X is Y"
+      - "X Z ..."
+    This improves partial-resolution behavior for general factual claims.
+    """
+    sentence = _clean(text, keep_conj_prefix=False)
+    if not sentence:
+        return []
+    match = _RELATIVE_CLAUSE_RE.match(sentence)
+    if not match:
+        return []
+    head = _clean(match.group("head"), keep_conj_prefix=False)
+    tail = _clean(match.group("tail"), keep_conj_prefix=False)
+    if not head or not tail:
+        return []
+    if not _looks_independent_clause(tail):
+        return []
+
+    subject = _extract_subject_head(head)
+    if not subject:
+        return []
+    rebuilt_tail = _clean(f"{subject} {tail}", keep_conj_prefix=False)
+    if not rebuilt_tail:
+        return []
+    return [head, rebuilt_tail]
+
+
 def split_claim_into_segments(claim: str, min_segment_chars: int = 10) -> List[str]:
     """
     Shared deterministic claim segmentation for adaptive trust and verdict generation.
@@ -384,6 +419,11 @@ def split_claim_into_segments(claim: str, min_segment_chars: int = 10) -> List[s
         by_contrast_not = _split_on_contrast_not(sentence)
         if by_contrast_not:
             raw_segments.extend(by_contrast_not)
+            continue
+
+        by_relative = _split_on_relative_clause(sentence)
+        if by_relative:
+            raw_segments.extend(by_relative)
             continue
 
         by_conjunctive = _split_on_conjunctives(sentence)
