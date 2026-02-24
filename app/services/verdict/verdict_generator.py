@@ -3919,8 +3919,9 @@ class VerdictGenerator:
                 if statement and source_url:
                     seg["source_url"] = source_url
                 seg["evidence_used_ids"] = [ev_id] if ev_id >= 0 else []
+                chosen_reason = str(chosen.get("reason") or "strict_predicate_gate")
                 seg["alignment_debug"] = {
-                    "reason": str(chosen.get("reason") or "strict_predicate_gate"),
+                    "reason": chosen_reason,
                     "anchor_overlap": round(float(chosen.get("anchor_match_score", 0.0) or 0.0), 3),
                     "predicate_match_score": round(float(chosen.get("predicate_match_score", 0.0) or 0.0), 3),
                     "support_strength": round(float(chosen.get("support_strength", 0.0) or 0.0), 3),
@@ -3928,7 +3929,10 @@ class VerdictGenerator:
                         chosen.get("stance_used") or self._normalize_relevance_label(chosen.get("relevance"))
                     ),
                     "canonical_predicate": str(seg_triplet.get("canonical_predicate") or ""),
-                    "score": round(max(best_support_score, best_refute_score, best_weak_support_score), 3),
+                    "score": round(
+                        max(best_support_score, best_refute_score, best_weak_support_score, best_near_miss_score),
+                        3,
+                    ),
                 }
             else:
                 seg.setdefault("evidence_used_ids", [])
@@ -4183,9 +4187,19 @@ class VerdictGenerator:
         if not fallback_fact:
             return
         for seg in claim_breakdown:
+            if str(seg.get("status") or "UNKNOWN").upper() != "UNKNOWN":
+                continue
+            prev_dbg = seg.get("alignment_debug") or {}
+            prev_reason = str(prev_dbg.get("reason") or "") if isinstance(prev_dbg, dict) else ""
             seg["status"] = "PARTIALLY_VALID"
             seg["supporting_fact"] = fallback_fact
             seg["source_url"] = fallback_src
+            seg["alignment_debug"] = {
+                "reason": "adaptive_coverage_fallback",
+                "previous_reason": prev_reason or "unknown",
+                "adaptive_coverage": round(float(adaptive_coverage), 3),
+                "evidence_semantic_score": round(float(best_score), 3),
+            }
         logger.debug(
             "[VerdictGenerator][Coverage][Fallback] Applied adaptive fallback "
             "(adaptive_coverage=%.2f, evidence_sem=%.3f)",

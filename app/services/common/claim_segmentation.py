@@ -10,6 +10,8 @@ _PREDICATE_RE = re.compile(
         r"helps?|prevents?|reduces?|increases?|causes?|improves?|worsens?|protects?|"
         r"needed for|required for|important for|"
         r"associated with|linked to|leads to|"
+        r"contribut(?:e|es|ed|ing)\s+to|support(?:s|ed|ing)?\s+"
+        r"|required for|necessary for|needed for|important for|"
         r"do not cause|does not cause|don't cause|doesn't cause|cannot cause|can't cause|"
         r"is|are|was|were"
         r")\b"
@@ -21,6 +23,7 @@ _CLAUSE_VERB_RE = re.compile(
         r"\b("
         r"is|are|was|were|be|been|being|do|does|did|have|has|had|"
         r"helps?|prevents?|reduces?|increases?|causes?|improves?|worsens?|protects?|"
+        r"contribut(?:e|es|ed|ing)|support(?:s|ed|ing)?|"
         r"needed|required|important|"
         r"linked|associated|leads?"
         r")\b"
@@ -344,6 +347,15 @@ def _split_on_conjunctives(text: str) -> List[str]:
                 and re.search(r"\b(development|growth|maturation|bone)\b", right, flags=re.IGNORECASE)
             ):
                 return [_clean(text, keep_conj_prefix=False)]
+            # Handle "X ... to/for A and B" by inheriting the governing preposition.
+            if right and not _looks_independent_clause(right):
+                prep = re.match(
+                    r"^(?P<prefix>.+?\b(?:to|for|against|in|with|into|from|on)\b)\s+(?P<obj>.+)$",
+                    left,
+                    flags=re.IGNORECASE,
+                )
+                if prep and len(right.split()) <= 8:
+                    return [left, _clean(f"{prep.group('prefix')} {right}", keep_conj_prefix=False)]
             if right and not _looks_independent_clause(right):
                 subject_pred = _extract_subject_predicate(left)
                 if subject_pred:

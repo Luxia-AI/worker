@@ -79,8 +79,16 @@ def _contains_must_have_entity(candidate: Dict[str, Any], must_have_aliases: Lis
     tokens = _tokenize(str(candidate.get("statement") or ""))
     if not tokens:
         return False
-    alias_tokens = _entity_anchor_tokens(must_have_aliases)
-    return bool(alias_tokens and (tokens & alias_tokens))
+    for alias in must_have_aliases:
+        alias_tokens = _tokenize(str(alias or ""))
+        if not alias_tokens:
+            continue
+        overlap = len(tokens & alias_tokens)
+        if len(alias_tokens) == 1 and overlap >= 1:
+            return True
+        if len(alias_tokens) > 1 and overlap >= max(1, len(alias_tokens) - 1):
+            return True
+    return False
 
 
 async def rank_candidates(

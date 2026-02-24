@@ -475,7 +475,7 @@ class CorrectivePipeline:
         # ====================================================================
         claim_entities = await self._extract_claim_entities(post_text, round_id)
         must_have_entities = self._select_must_have_entities(post_text, claim_entities)
-        must_have_aliases = list(dict.fromkeys((must_have_entities or []) + (claim_entities[:3] or [])))
+        must_have_aliases = self._build_must_have_aliases(claim_entities, must_have_entities)
         await debug_reporter.log_step(
             step_name="Claim entities identified",
             description="Entity extraction on incoming claim",
@@ -1288,6 +1288,8 @@ class CorrectivePipeline:
         low = str(entity or "").strip().lower()
         if not low:
             return False
+        if re.search(r"\b(that|which|who|whom|whose)\b", low):
+            return False
         generic = {
             "anatomical terms",
             "medical terms",
@@ -1306,6 +1308,29 @@ class CorrectivePipeline:
             "study",
             "research",
             "evidence",
+            "thing",
+            "things",
+            "factor",
+            "factors",
+            "element",
+            "elements",
+            "chemical",
+            "chemicals",
+            "compound",
+            "compounds",
+            "mineral",
+            "minerals",
+            "nutrient",
+            "nutrients",
+            "substance",
+            "substances",
+            "agent",
+            "agents",
+            "product",
+            "products",
+            "system",
+            "process",
+            "condition",
         }
         verbs = {
             "is",
@@ -1332,28 +1357,115 @@ class CorrectivePipeline:
         toks = CorrectivePipeline._entity_tokenize(low)
         if not toks:
             return False
+        informative = [t for t in toks if t not in generic and t not in verbs]
+        if not informative:
+            return False
         if len(toks) == 1 and toks[0] in generic:
             return False
         return True
 
+    @staticmethod
+    def _normalize_entity_phrase(entity: str) -> str:
+        low = str(entity or "").strip().lower()
+        if not low:
+            return ""
+        low = re.sub(r"^(and|or|but)\s+", "", low)
+        low = re.sub(r"\b(?:that|which|who|whom|whose)\b.*$", "", low).strip(" ,.")
+        tokens = CorrectivePipeline._entity_tokenize(low)
+        if not tokens:
+            return ""
+        noisy = {
+            "necessary",
+            "normal",
+            "overall",
+            "general",
+            "effect",
+            "effects",
+            "evidence",
+            "study",
+            "research",
+            "used",
+            "use",
+            "using",
+        }
+        cleaned = [t for t in tokens if t not in noisy]
+        if not cleaned:
+            return ""
+        return " ".join(cleaned[:4]).strip()
+
     def _select_must_have_entities(self, claim: str, entities: List[str]) -> List[str]:
         if not claim:
             return entities[:1]
-        candidates = [e for e in entities if self._is_high_salience_entity(e)]
+        claim_tokens = self._entity_tokenize(claim)
+        lead_window = max(1, int(len(claim_tokens) * 0.5))
+        lead_tokens = set(claim_tokens[:lead_window])
+        candidates = [self._normalize_entity_phrase(e) for e in entities]
+        candidates = [e for e in candidates if self._is_high_salience_entity(e)]
         if not candidates:
-            candidates = entities
+            candidates = [self._normalize_entity_phrase(e) for e in entities]
+            candidates = [e for e in candidates if e]
         scored: List[tuple[int, int, str]] = []
         claim_low = claim.lower()
+        broad_nouns = {
+            "mineral",
+            "minerals",
+            "chemical",
+            "chemicals",
+            "nutrient",
+            "nutrients",
+            "compound",
+            "compounds",
+            "substance",
+            "substances",
+        }
         for e in candidates:
             text = str(e).strip()
+            toks = self._entity_tokenize(text)
+            if not toks:
+                continue
             score = 0
-            if text and text.lower() in claim_low:
-                score += 3
-            score += min(2, len(self._entity_tokenize(text)))
-            score += min(3, len(text) // 8)
+            if text and re.search(rf"\b{re.escape(text.lower())}\b", claim_low):
+                score += 4
+            if any(t in lead_tokens for t in toks):
+                score += 2
+            if len(toks) == 1:
+                score += 2
+            elif len(toks) == 2:
+                score += 1
+            else:
+                score -= 1
+            if set(toks) <= broad_nouns:
+                score -= 3
             scored.append((score, len(text), text))
         scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
         return [scored[0][2]] if scored else []
+
+    def _build_must_have_aliases(self, claim_entities: List[str], must_have_entities: List[str]) -> List[str]:
+        aliases: List[str] = []
+        for e in must_have_entities or []:
+            n = self._normalize_entity_phrase(e)
+            if n and self._is_high_salience_entity(n) and n not in aliases:
+                aliases.append(n)
+
+        core_tokens = set(self._entity_tokenize(aliases[0])) if aliases else set()
+        for e in claim_entities or []:
+            n = self._normalize_entity_phrase(e)
+            if not n or not self._is_high_salience_entity(n) or n in aliases:
+                continue
+            toks = set(self._entity_tokenize(n))
+            if core_tokens and not (toks & core_tokens):
+                continue
+            aliases.append(n)
+            if len(aliases) >= 3:
+                break
+
+        if not aliases:
+            for e in claim_entities or []:
+                n = self._normalize_entity_phrase(e)
+                if n and self._is_high_salience_entity(n):
+                    aliases.append(n)
+                    break
+        return aliases
 
     async def _extract_claim_entities(self, claim: str, round_id: str) -> List[str]:
         """Extract high-salience claim entities with deterministic noun-phrase fallback."""
@@ -1399,13 +1511,14 @@ class CorrectivePipeline:
                 toks = [t for t in self._entity_tokenize(low) if t not in stop]
                 if not toks:
                     continue
-                candidate = " ".join(toks)
+                candidate = self._normalize_entity_phrase(" ".join(toks))
                 if self._is_high_salience_entity(candidate) and candidate not in preferred:
                     preferred.append(candidate)
             unigram_tokens = [t for t in self._entity_tokenize(text) if t not in stop]
             for t in unigram_tokens:
-                if self._is_high_salience_entity(t) and t not in preferred:
-                    preferred.append(t)
+                normalized = self._normalize_entity_phrase(t)
+                if self._is_high_salience_entity(normalized) and normalized not in preferred:
+                    preferred.append(normalized)
             return preferred[:8]
 
         llm_entities: List[str] = []

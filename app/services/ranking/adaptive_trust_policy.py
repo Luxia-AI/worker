@@ -191,12 +191,13 @@ class AdaptiveTrustPolicy:
             List of subclaim strings
         """
         subclaims = split_claim_into_segments(claim)
-        if (
-            len(subclaims) == 2
-            and re.search(r"\band\b", claim, flags=re.IGNORECASE)
-            and not subclaims[1].strip().lower().startswith(("and ", "or "))
-        ):
-            subclaims[1] = f"and {subclaims[1].strip()}"
+        if len(subclaims) == 2 and re.search(r"\band\b", claim, flags=re.IGNORECASE):
+            second = subclaims[1].strip()
+            if second and not second.lower().startswith(("and ", "or ")):
+                # Preserve conjunction only for pronoun-led continuation clauses
+                # (e.g., "and they reduce ..."), while avoiding malformed noun fragments.
+                if re.match(r"^(they|it|he|she|we|you)\b", second, flags=re.IGNORECASE):
+                    subclaims[1] = f"and {second}"
         logger.info(f"Decomposed claim into {len(subclaims)} subclaims: {subclaims}")
         return subclaims
 
