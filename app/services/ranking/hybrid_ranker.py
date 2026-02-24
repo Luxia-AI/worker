@@ -588,6 +588,9 @@ def hybrid_rank(
             final_score *= 0.60
         if object_focus_tokens and object_relation_overlap == 0 and sem_s < 0.90 and kg_raw < 0.90:
             final_score *= 0.70
+        if subject_focus_tokens and object_focus_tokens and subject_overlap == 0 and object_relation_overlap == 0:
+            # Strong claim-frame penalty when neither subject nor object anchors are present.
+            final_score *= 0.35
         if not belief_claim and _is_claim_mention_statement(item["statement"]):
             final_score *= 0.65
         final_score -= uncertainty_penalty
@@ -595,6 +598,13 @@ def hybrid_rank(
         # small heuristic: if both sem and kg are zero but credibility high, ensure min floor
         if sem_s == 0.0 and kg_s == 0.0 and cred_s >= RANKING_MIN_CREDIBILITY_THRESHOLD:
             final_score = max(final_score, RANKING_MIN_SCORE_FLOOR)
+        predicate_match_score = 0.0
+        if claim_actions:
+            predicate_match_score = 1.0 if action_overlap_ok else 0.0
+            if claim_overlap >= 0.20:
+                predicate_match_score = max(predicate_match_score, min(1.0, claim_overlap))
+        else:
+            predicate_match_score = min(1.0, max(claim_overlap, anchor_match_score))
 
         out = {
             "statement": item["statement"],
@@ -610,10 +620,15 @@ def hybrid_rank(
             "anchors_matched": int(anchor_eval.get("matched_groups", 0)),
             "anchors_required": int(anchor_eval.get("required_groups", 0)),
             "anchor_match_score": anchor_match_score,
+            "predicate_match_score": predicate_match_score,
             "negation_anchor_overlap": negation_anchor_overlap,
             "anchor_ok": bool(anchor_eval.get("anchor_ok", True)),
             "candidate_type": candidate_type,
             "is_backfill": is_backfill,
+            "subject_overlap": subject_overlap,
+            "object_relation_overlap": object_relation_overlap,
+            "focus_overlap": focus_overlap,
+            "action_overlap_ok": bool(action_overlap_ok),
             "recency": recency_s,
             "credibility": cred_s,
             "final_score": max(0.0, min(final_score, 1.0)),

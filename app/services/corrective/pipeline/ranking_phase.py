@@ -2,6 +2,7 @@
 Ranking Phase: Hybrid ranking of semantic and KG candidates with trust-based grading.
 """
 
+import re
 from typing import Any, Dict, List, Optional
 
 from app.core.logger import get_logger, log_value_payload
@@ -14,6 +15,74 @@ from app.services.retrieval.evidence_gate import filter_candidates_for_count_cla
 logger = get_logger(__name__)
 
 
+def _tokenize(text: str) -> set[str]:
+    stop = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "to",
+        "for",
+        "of",
+        "in",
+        "on",
+        "with",
+        "by",
+        "at",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+    }
+    return {w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (text or "").lower()) if w not in stop}
+
+
+def _entity_anchor_tokens(entities: List[str]) -> set[str]:
+    toks: set[str] = set()
+    for e in entities or []:
+        toks |= _tokenize(e)
+    return toks
+
+
+def _topic_aligned_candidate(candidate: Dict[str, Any], claim_text: str, claim_entities: List[str]) -> bool:
+    statement = str(candidate.get("statement") or "")
+    if not statement:
+        return False
+    stmt_toks = _tokenize(statement)
+    if not stmt_toks:
+        return False
+    claim_toks = _tokenize(claim_text)
+    entity_toks = _entity_anchor_tokens(claim_entities)
+
+    predicate_match = float(candidate.get("predicate_match_score", 0.0) or 0.0)
+    object_overlap = int(candidate.get("object_relation_overlap", 0) or 0)
+    claim_overlap = float(candidate.get("claim_overlap", 0.0) or 0.0)
+    anchor_overlap = float(candidate.get("anchor_match_score", 0.0) or 0.0)
+
+    entity_hit = bool(entity_toks and (stmt_toks & entity_toks))
+    lexical_hit = bool(claim_toks and (stmt_toks & claim_toks))
+    if entity_hit and (claim_overlap >= 0.10 or anchor_overlap >= 0.15):
+        return True
+    if lexical_hit and (predicate_match >= 0.20 or object_overlap >= 1):
+        return True
+    return False
+
+
+def _contains_must_have_entity(candidate: Dict[str, Any], must_have_aliases: List[str]) -> bool:
+    if not must_have_aliases:
+        return True
+    tokens = _tokenize(str(candidate.get("statement") or ""))
+    if not tokens:
+        return False
+    alias_tokens = _entity_anchor_tokens(must_have_aliases)
+    return bool(alias_tokens and (tokens & alias_tokens))
+
+
 async def rank_candidates(
     semantic_candidates: List[Dict[str, Any]],
     kg_candidates: List[Dict[str, Any]],
@@ -22,6 +91,7 @@ async def rank_candidates(
     top_k: int,
     round_id: str,
     log_manager: Optional[LogManager] = None,
+    must_have_entities: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
     Perform hybrid ranking on semantic and KG candidates, then assign trust grades.
@@ -68,6 +138,15 @@ async def rank_candidates(
         query_entities=query_entities,
         query_text=query_text,
     )
+    filtered_for_trust: List[Dict[str, Any]] = []
+    for item in ranked:
+        topic_aligned = _topic_aligned_candidate(item, query_text, query_entities)
+        item["topic_aligned"] = bool(topic_aligned)
+        item["admissible_for_trust"] = bool(topic_aligned)
+        if topic_aligned:
+            filtered_for_trust.append(item)
+    if filtered_for_trust:
+        ranked = filtered_for_trust
     stance_classifier = DummyStanceClassifier()
     scorer = ContradictionScorer(semantic_min=0.35)
     for item in ranked:
@@ -96,6 +175,19 @@ async def rank_candidates(
     non_contradicting = [r for r in ranked if (r.get("stance") or "neutral") != "contradicts"]
     contradicting = [r for r in ranked if (r.get("stance") or "neutral") == "contradicts"]
     top_ranked = non_contradicting[:top_k] if non_contradicting else contradicting[:top_k]
+    must_have_aliases = [x for x in (must_have_entities or []) if str(x).strip()]
+    if must_have_aliases and top_ranked:
+        with_core = [r for r in top_ranked if _contains_must_have_entity(r, must_have_aliases)]
+        if with_core:
+            without_core = [r for r in top_ranked if r not in with_core]
+            top_ranked = (with_core + without_core)[:top_k]
+        else:
+            logger.info(
+                "[RankingPhase:%s] Hard gate: top evidence missing core claim entity aliases=%s",
+                round_id,
+                must_have_aliases,
+            )
+            top_ranked = []
 
     # Phase 2: Enrich with trust grades
     graded_results = TrustRanker.enrich_ranked_results(top_ranked)

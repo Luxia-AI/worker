@@ -5180,6 +5180,10 @@ class VerdictGenerator:
         avg_support = sum(segment_scores) / len(segment_scores)
         # Keep diversity as a mild reliability adjustment, not a hard multiplier.
         truthfulness = avg_support * (0.85 + (0.15 * diversity))
+        fully_supported_segments = sum(1 for s in segment_scores if s >= 0.55)
+        if segment_scores and fully_supported_segments == len(segment_scores):
+            # When every segment has strong support, avoid under-reporting due conservative dampening.
+            truthfulness = max(truthfulness, min(0.96, (avg_support * 1.10) + 0.12))
         ceiling = 0.85 + (0.10 * diversity)
         truthfulness = min(truthfulness, ceiling)
         return round(truthfulness * 100.0, 1)

@@ -89,6 +89,10 @@ async def extract_all(
     round_id: str,
     log_manager: Optional[LogManager] = None,
     debug_reporter: Optional[PipelineDebugReporter] = None,
+    claim_text: str = "",
+    claim_entities: Optional[List[str]] = None,
+    must_have_entities: Optional[List[str]] = None,
+    predicate_target: Optional[Dict[str, str]] = None,
 ) -> tuple[List[Dict[str, Any]], List[str], List[Dict[str, Any]]]:
     """
     Extract facts, entities, and relations from scraped pages.
@@ -104,7 +108,13 @@ async def extract_all(
         Tuple of (extracted_facts, all_entities, extracted_triples)
     """
     # 3) Fact extraction
-    extracted_facts = await fact_extractor.extract(scraped_pages)
+    extracted_facts = await fact_extractor.extract(
+        scraped_pages,
+        predicate_target=predicate_target,
+        claim_text=claim_text,
+        claim_entities=claim_entities or [],
+        must_have_entities=must_have_entities or [],
+    )
     if debug_reporter:
         await debug_reporter.log_step(
             step_name="LLM-identified facts",

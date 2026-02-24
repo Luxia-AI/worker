@@ -3,6 +3,7 @@ Retrieval Phase: Retrieve semantic and KG candidates.
 """
 
 import math
+import re
 from typing import Any, Dict, List, Optional
 
 from app.core.logger import get_logger, is_debug_enabled, log_value_payload
@@ -16,6 +17,52 @@ from app.services.vdb.vdb_retrieval import VDBRetrieval, normalize_query_for_emb
 logger = get_logger(__name__)
 
 
+def _tokenize(text: str) -> set[str]:
+    stop = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "to",
+        "for",
+        "of",
+        "in",
+        "on",
+        "with",
+        "by",
+        "at",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+    }
+    return {w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (text or "").lower()) if w not in stop}
+
+
+def _kg_candidate_anchor_overlap(candidate: Dict[str, Any], anchors: List[str], claim_tokens: set[str]) -> bool:
+    subject = str(candidate.get("subject") or "")
+    object_ = str(candidate.get("object") or "")
+    statement = str(candidate.get("statement") or "")
+    relation = str(candidate.get("relation") or "")
+    cand_tokens = _tokenize(" ".join([subject, object_, relation, statement]))
+    if not cand_tokens:
+        return False
+
+    anchor_tokens: set[str] = set()
+    for anchor in anchors or []:
+        anchor_tokens |= _tokenize(anchor)
+    if anchor_tokens and (cand_tokens & anchor_tokens):
+        return True
+    if claim_tokens and (cand_tokens & claim_tokens):
+        return True
+    return False
+
+
 async def retrieve_candidates(
     vdb_retriever: VDBRetrieval,
     kg_retriever: KGRetrieval,
@@ -27,6 +74,7 @@ async def retrieve_candidates(
     lexical_index: Optional[LexicalIndex] = None,
     log_manager: Optional[LogManager] = None,
     query_text: str = "",
+    claim_anchors: Optional[List[str]] = None,
     include_metrics: bool = False,
 ) -> (
     tuple[List[Dict[str, Any]], List[Dict[str, Any]]]
@@ -184,6 +232,28 @@ async def retrieve_candidates(
         kg_candidates = await kg_retriever.retrieve(all_entities, top_k=top_k, query_text=query_text)
     except Exception as e:
         logger.warning(f"[RetrievalPhase:{round_id}] KG retrieval failed: {e}")
+
+    anchors = [str(a).strip() for a in (claim_anchors or all_entities or []) if str(a).strip()]
+    claim_tokens = _tokenize(query_text)
+    if anchors and kg_candidates:
+        filtered_kg: List[Dict[str, Any]] = []
+        for c in kg_candidates:
+            if _kg_candidate_anchor_overlap(c, anchors, claim_tokens):
+                filtered_kg.append(c)
+        dropped = len(kg_candidates) - len(filtered_kg)
+        if dropped > 0:
+            logger.info(
+                "[RetrievalPhase:%s] Dropped %d KG candidates failing claim-anchor overlap prefilter",
+                round_id,
+                dropped,
+            )
+        kg_candidates = filtered_kg
+
+    if not kg_candidates and anchors:
+        logger.info(
+            "[RetrievalPhase:%s] Skipping KG branch for this round: no KG candidates overlap claim anchors",
+            round_id,
+        )
 
     kg_with_positive_score = 0
     kg_max_score = 0.0

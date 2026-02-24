@@ -191,6 +191,12 @@ class AdaptiveTrustPolicy:
             List of subclaim strings
         """
         subclaims = split_claim_into_segments(claim)
+        if (
+            len(subclaims) == 2
+            and re.search(r"\band\b", claim, flags=re.IGNORECASE)
+            and not subclaims[1].strip().lower().startswith(("and ", "or "))
+        ):
+            subclaims[1] = f"and {subclaims[1].strip()}"
         logger.info(f"Decomposed claim into {len(subclaims)} subclaims: {subclaims}")
         return subclaims
 
@@ -493,6 +499,8 @@ class AdaptiveTrustPolicy:
         avg_relevance: float | None = None,
         strong_covered: int = 0,
         contradicted_count: int = 0,
+        avg_predicate_match: float = 0.0,
+        avg_object_match: float = 0.0,
     ) -> bool:
         """
         Apply adaptive gating rules to determine if evidence is sufficient.
@@ -546,18 +554,29 @@ class AdaptiveTrustPolicy:
                 )
                 return True
 
-        if contradicted_count == 0 and (
-            (coverage >= 0.25 and diversity >= 0.75)
-            or strong_covered >= 1
-            or (avg_relevance is not None and avg_relevance >= 0.55)
+        if contradicted_count == 0 and coverage >= 0.25 and diversity >= 0.95 and agreement >= 0.95:
+            logger.info(
+                "Gating: PASS - high-diversity consensus (coverage=%.2f, diversity=%.2f, agreement=%.2f)",
+                coverage,
+                diversity,
+                agreement,
+            )
+            return True
+
+        if (
+            contradicted_count == 0
+            and strong_covered > 0
+            and ((coverage >= 0.25 and diversity >= 0.75) or (avg_relevance is not None and avg_relevance >= 0.55))
         ):
             logger.info(
                 "Gating: PASS - adaptive override (coverage=%.2f, diversity=%.2f, "
-                "strong_covered=%d, avg_relevance=%.2f)",
+                "strong_covered=%d, avg_relevance=%.2f, pred=%.2f, obj=%.2f)",
                 coverage,
                 diversity,
                 strong_covered,
                 float(avg_relevance or 0.0),
+                float(avg_predicate_match or 0.0),
+                float(avg_object_match or 0.0),
             )
             return True
 
@@ -619,8 +638,17 @@ class AdaptiveTrustPolicy:
             }
             self._anchor_cache[claim_key] = anchors_by_subclaim
 
-        # Use top-k evidence
+        # Use top-k evidence and enforce admissibility/topic alignment prior to coverage.
         top_evidence = evidence_list[:top_k] if evidence_list else []
+        admissible_evidence: List[EvidenceItem] = []
+        for ev in top_evidence:
+            components = getattr(ev, "score_components", {}) or {}
+            topic_aligned = bool(components.get("topic_aligned", True))
+            admissible = bool(components.get("admissible_for_trust", topic_aligned))
+            if topic_aligned and admissible:
+                admissible_evidence.append(ev)
+        if admissible_evidence:
+            top_evidence = admissible_evidence
 
         # Calculate metrics
         diversity = self.calculate_diversity(top_evidence)
@@ -665,6 +693,20 @@ class AdaptiveTrustPolicy:
         avg_relevance = (
             sum(float(d.get("relevance_score", 0.0) or 0.0) for d in details) / max(1, len(details)) if details else 0.0
         )
+        predicate_scores: List[float] = []
+        object_scores: List[float] = []
+        for d in details:
+            best_idx = int(d.get("best_evidence_id", -1))
+            if best_idx < 0 or best_idx >= len(top_evidence):
+                continue
+            comp = getattr(top_evidence[best_idx], "score_components", {}) or {}
+            if "predicate_match_score" in comp:
+                predicate_scores.append(float(comp.get("predicate_match_score", 0.0) or 0.0))
+            if "object_relation_overlap" in comp:
+                object_overlap = float(comp.get("object_relation_overlap", 0.0) or 0.0)
+                object_scores.append(1.0 if object_overlap > 0.0 else 0.0)
+        avg_predicate_match = sum(predicate_scores) / len(predicate_scores) if predicate_scores else 0.0
+        avg_object_match = sum(object_scores) / len(object_scores) if object_scores else 0.0
         if contradicted_count > 0:
             contradiction_penalty = 0.10 * (contradicted_count / max(1, len(details)))
             avg_relevance = max(0.0, avg_relevance - contradiction_penalty)
@@ -678,13 +720,23 @@ class AdaptiveTrustPolicy:
             avg_relevance=avg_relevance,
             strong_covered=strong_covered,
             contradicted_count=contradicted_count,
+            avg_predicate_match=avg_predicate_match,
+            avg_object_match=avg_object_match,
         )
-        adaptive_override_possible = contradicted_count == 0 and (
-            (coverage >= 0.25 and diversity >= 0.75) or strong_covered >= 1 or avg_relevance >= 0.55
+        adaptive_override_possible = (
+            contradicted_count == 0
+            and strong_covered > 0
+            and ((coverage >= 0.25 and diversity >= 0.75) or avg_relevance >= 0.55)
         )
         gate_reason = "adaptive_override" if adaptive_override_possible else "strict"
         if contradicted_count > 0 and gate_reason == "strict":
             gate_reason = "strict_contradiction"
+        pred_min = float(os.getenv("ADAPTIVE_MIN_PREDICATE_MATCH", "0.10"))
+        obj_min = float(os.getenv("ADAPTIVE_MIN_OBJECT_MATCH", "0.20"))
+        has_alignment_signals = bool(predicate_scores or object_scores)
+        if has_alignment_signals and is_sufficient and (avg_predicate_match < pred_min or avg_object_match < obj_min):
+            is_sufficient = False
+            gate_reason = "predicate_object_guard"
 
         # Compute adaptive trust score
         sem_scores = [getattr(e, "semantic_score", 0.0) for e in top_evidence] if top_evidence else [0.0]
@@ -793,6 +845,9 @@ class AdaptiveTrustPolicy:
             "contradicted_subclaims": contradicted_count,
             "top_semantic_score": float(top_sem or 0.0),
             "top_trust_score": float(top_trust or 0.0),
+            "admissible_evidence_count": len(top_evidence),
+            "avg_predicate_match": float(avg_predicate_match),
+            "avg_object_match": float(avg_object_match),
         }
 
         logger.info(

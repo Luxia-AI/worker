@@ -193,6 +193,83 @@ class FactExtractor:
         return kept
 
     @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+        }
+        return {w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (text or "").lower()) if w not in stop}
+
+    @staticmethod
+    def _predicate_family_tokens(text: str) -> set[str]:
+        low = (text or "").lower()
+        families: set[str] = set()
+        if re.search(r"\b(reduc|lower|decreas|alleviat|improv|help|benefit|reliev)\w*\b", low):
+            families.add("improve_reduce")
+        if re.search(r"\b(increas|worsen|exacerbat|aggravat|trigger|cause)\w*\b", low):
+            families.add("increase_cause")
+        if re.search(r"\b(treat|cure|prevent|protect|work|effective|effic)\w*\b", low):
+            families.add("treat_prevent")
+        if re.search(r"\b(associat|link|correlat|relat)\w*\b", low):
+            families.add("associate")
+        return families
+
+    def _filter_claim_admissible_facts(
+        self,
+        facts: List[Dict[str, Any]],
+        claim_text: str = "",
+        claim_entities: Optional[List[str]] = None,
+        must_have_entities: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        claim_tokens = self._tokenize(claim_text)
+        claim_predicates = self._predicate_family_tokens(claim_text)
+        claim_entity_tokens: set[str] = set()
+        for ent in claim_entities or []:
+            claim_entity_tokens |= self._tokenize(ent)
+        must_have_tokens: set[str] = set()
+        for ent in must_have_entities or []:
+            must_have_tokens |= self._tokenize(ent)
+
+        kept: List[Dict[str, Any]] = []
+        for fact in facts:
+            stmt = str(fact.get("statement", "") or "")
+            stmt_tokens = self._tokenize(stmt)
+            if not stmt_tokens:
+                continue
+
+            if must_have_tokens and not (stmt_tokens & must_have_tokens):
+                continue
+            if claim_entity_tokens and not (stmt_tokens & claim_entity_tokens):
+                continue
+            if claim_tokens and len(stmt_tokens & claim_tokens) == 0:
+                continue
+
+            stmt_predicates = self._predicate_family_tokens(stmt)
+            if claim_predicates and not (stmt_predicates & claim_predicates):
+                continue
+            kept.append(fact)
+        return kept
+
+    @staticmethod
     def _build_fact_prompt(content: str, predicate_target: Optional[Dict[str, str]] = None) -> str:
         if predicate_target:
             return FACT_EXTRACTION_PREDICATE_FORCING_PROMPT.format(
@@ -239,6 +316,9 @@ class FactExtractor:
         self,
         scraped_pages: List[Dict[str, Any]],
         predicate_target: Optional[Dict[str, str]] = None,
+        claim_text: str = "",
+        claim_entities: Optional[List[str]] = None,
+        must_have_entities: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """
         Extract facts from scraped web pages using BATCHED LLM call.
@@ -356,6 +436,12 @@ class FactExtractor:
 
             facts = self._normalize_atomic_facts(facts)
             facts = self._filter_truth_grounded_facts(facts)
+            facts = self._filter_claim_admissible_facts(
+                facts,
+                claim_text=claim_text,
+                claim_entities=claim_entities,
+                must_have_entities=must_have_entities,
+            )
             dedup_by_id: Dict[str, Dict[str, Any]] = {}
             for fact in facts:
                 fact_id = str(fact.get("fact_id", ""))
@@ -380,12 +466,21 @@ class FactExtractor:
 
         except Exception as e:
             logger.warning(f"[FactExtractor] Batch extraction failed: {e}, falling back to per-page")
-            return await self._extract_per_page_fallback(valid_pages, predicate_target=predicate_target)
+            return await self._extract_per_page_fallback(
+                valid_pages,
+                predicate_target=predicate_target,
+                claim_text=claim_text,
+                claim_entities=claim_entities,
+                must_have_entities=must_have_entities,
+            )
 
     async def _extract_per_page_fallback(
         self,
         pages: List[Dict[str, Any]],
         predicate_target: Optional[Dict[str, str]] = None,
+        claim_text: str = "",
+        claim_entities: Optional[List[str]] = None,
+        must_have_entities: Optional[List[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Fallback: extract facts one page at a time if batch fails."""
         facts: List[Dict[str, Any]] = []
@@ -425,6 +520,12 @@ class FactExtractor:
 
         facts = self._normalize_atomic_facts(facts)
         facts = self._filter_truth_grounded_facts(facts)
+        facts = self._filter_claim_admissible_facts(
+            facts,
+            claim_text=claim_text,
+            claim_entities=claim_entities,
+            must_have_entities=must_have_entities,
+        )
         log_value_payload(
             logger,
             "fact_extraction_fallback",

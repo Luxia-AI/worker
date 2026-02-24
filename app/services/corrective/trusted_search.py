@@ -2089,7 +2089,7 @@ FAILED ENTITIES:
         """
         entities = entities or []
 
-        if self.confidence_mode:
+        if bool(getattr(self, "confidence_mode", False)):
             try:
                 plan = build_plan(post_text)
                 entity_obj = plan.extracted_entities

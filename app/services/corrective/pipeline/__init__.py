@@ -370,6 +370,12 @@ class CorrectivePipeline:
                     "stance_raw": 0.0,
                     "stance_mapped": 0.5,
                     "trust": item.get("final_score", item.get("score", 0.0)),
+                    "claim_overlap": float(item.get("claim_overlap", 0.0) or 0.0),
+                    "anchor_match_score": float(item.get("anchor_match_score", 0.0) or 0.0),
+                    "predicate_match_score": float(item.get("predicate_match_score", 0.0) or 0.0),
+                    "object_relation_overlap": float(item.get("object_relation_overlap", 0.0) or 0.0),
+                    "topic_aligned": bool(item.get("topic_aligned", True)),
+                    "admissible_for_trust": bool(item.get("admissible_for_trust", True)),
                 },
                 candidate_type=str(item.get("candidate_type", "") or ""),
             )
@@ -468,13 +474,22 @@ class CorrectivePipeline:
         # PHASE 1: Extract entities from claim (1 LLM call)
         # ====================================================================
         claim_entities = await self._extract_claim_entities(post_text, round_id)
+        must_have_entities = self._select_must_have_entities(post_text, claim_entities)
+        must_have_aliases = list(dict.fromkeys((must_have_entities or []) + (claim_entities[:3] or [])))
         await debug_reporter.log_step(
             step_name="Claim entities identified",
             description="Entity extraction on incoming claim",
             input_data={"claim": post_text},
-            output_data={"claim_entities": claim_entities},
+            output_data={
+                "claim_entities": claim_entities,
+                "must_have_entities": must_have_entities,
+                "must_have_aliases": must_have_aliases,
+            },
         )
-        logger.info(f"[CorrectivePipeline:{round_id}] Claim entities: {claim_entities}")
+        logger.info(
+            f"[CorrectivePipeline:{round_id}] Claim entities: {claim_entities} | "
+            f"must_have={must_have_entities} aliases={must_have_aliases}"
+        )
 
         # ====================================================================
         # PHASE 2: Retrieve existing evidence from VDB + KG (NO LLM calls)
@@ -501,6 +516,7 @@ class CorrectivePipeline:
             self.lexical_index,
             self.log_manager,
             post_text,
+            claim_anchors=must_have_aliases or claim_entities,
             include_metrics=True,
         )
         debug_counts = {
@@ -548,6 +564,7 @@ class CorrectivePipeline:
                 internal_top_k,
                 round_id,
                 self.log_manager,
+                must_have_entities=must_have_aliases or claim_entities[:1],
             )
         debug_counts["kg_in_ranked"] = sum(1 for r in top_ranked if float(r.get("kg_score", 0.0) or 0.0) > 0.0)
         debug_counts["sem_in_ranked"] = sum(1 for r in top_ranked if float(r.get("sem_score", 0.0) or 0.0) > 0.0)
@@ -919,6 +936,9 @@ class CorrectivePipeline:
                 round_id,
                 self.log_manager,
                 debug_reporter=debug_reporter,
+                claim_text=post_text,
+                claim_entities=claim_entities,
+                must_have_entities=must_have_aliases or claim_entities[:1],
             )
             await _emit_stage(
                 "extraction_done",
@@ -976,6 +996,7 @@ class CorrectivePipeline:
                 self.lexical_index,
                 self.log_manager,
                 post_text,
+                claim_anchors=must_have_aliases or retrieval_entities,
                 include_metrics=True,
             )
             debug_counts["kg_raw"] = int(retrieval_metrics.get("kg_raw", len(kg_candidates)))
@@ -1002,6 +1023,7 @@ class CorrectivePipeline:
                 internal_top_k,
                 round_id,
                 self.log_manager,
+                must_have_entities=must_have_aliases or retrieval_entities[:1],
             )
             debug_counts["kg_in_ranked"] = sum(1 for r in top_ranked if float(r.get("kg_score", 0.0) or 0.0) > 0.0)
             debug_counts["sem_in_ranked"] = sum(1 for r in top_ranked if float(r.get("sem_score", 0.0) or 0.0) > 0.0)
@@ -1257,146 +1279,152 @@ class CorrectivePipeline:
             **adaptive_payload,
         }
 
-    async def _extract_claim_entities(self, claim: str, round_id: str) -> List[str]:
-        """Extract entities from the claim text using LLM (1 call) with a deterministic fallback."""
-        import re
+    @staticmethod
+    def _entity_tokenize(text: str) -> List[str]:
+        return [t.lower() for t in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", text or "")]
 
-        forbidden_entity_tokens = {
-            "not",
-            "no",
-            "never",
-            "cause",
-            "causes",
-            "caused",
-            "causing",
-            "do",
-            "does",
-            "did",
-            "can",
-            "could",
-            "may",
-            "might",
-            "must",
-            "should",
-            "would",
-            "will",
-            "through",
-            "itself",
-            "scientifically",
-            "supported",
+    @staticmethod
+    def _is_high_salience_entity(entity: str) -> bool:
+        low = str(entity or "").strip().lower()
+        if not low:
+            return False
+        generic = {
+            "anatomical terms",
+            "medical terms",
+            "health terms",
+            "general",
+            "unknown",
+            "misc",
+            "medicine",
+            "medicines",
+            "herbal",
+            "sleep",
+            "used",
+            "aid",
+            "effect",
+            "effects",
+            "study",
+            "research",
+            "evidence",
+        }
+        verbs = {
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "being",
+            "been",
+            "use",
+            "used",
+            "using",
+            "help",
+            "helps",
             "support",
             "supports",
-            "claim",
-            "claims",
-            "reported",
-            "reports",
-            "search",
-            "searched",
-            "updated",
+            "cause",
+            "causes",
+            "reduce",
+            "improve",
+        }
+        if low in generic or low in verbs:
+            return False
+        toks = CorrectivePipeline._entity_tokenize(low)
+        if not toks:
+            return False
+        if len(toks) == 1 and toks[0] in generic:
+            return False
+        return True
+
+    def _select_must_have_entities(self, claim: str, entities: List[str]) -> List[str]:
+        if not claim:
+            return entities[:1]
+        candidates = [e for e in entities if self._is_high_salience_entity(e)]
+        if not candidates:
+            candidates = entities
+        scored: List[tuple[int, int, str]] = []
+        claim_low = claim.lower()
+        for e in candidates:
+            text = str(e).strip()
+            score = 0
+            if text and text.lower() in claim_low:
+                score += 3
+            score += min(2, len(self._entity_tokenize(text)))
+            score += min(3, len(text) // 8)
+            scored.append((score, len(text), text))
+        scored.sort(key=lambda x: (-x[0], -x[1], x[2]))
+        return [scored[0][2]] if scored else []
+
+    async def _extract_claim_entities(self, claim: str, round_id: str) -> List[str]:
+        """Extract high-salience claim entities with deterministic noun-phrase fallback."""
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "over",
+            "under",
+            "about",
+            "around",
+            "average",
+            "per",
+            "times",
         }
 
         def _fallback_entities(text: str) -> List[str]:
-            stop = {
-                "the",
-                "a",
-                "an",
-                "and",
-                "or",
-                "but",
-                "to",
-                "for",
-                "of",
-                "in",
-                "on",
-                "with",
-                "by",
-                "at",
-                "is",
-                "are",
-                "was",
-                "were",
-                "be",
-                "been",
-                "being",
-                "over",
-                "under",
-                "about",
-                "around",
-                "average",
-                "per",
-                "times",
-            }
-            negation_or_verbs = {
-                *forbidden_entity_tokens,
-                "none",
-                "done",
-            }
-            junk = {
-                "according",
-                "significantly",
-                "significant",
-                "scientifically",
-                "supported",
-                "every",
-                "morning",
-                "drinking",
-                "improves",
-                "improve",
-                "research",
-                "medical",
-                "through",
-                "itself",
-                "claim",
-                "claims",
-                "reported",
-                "reports",
-                "search",
-                "searched",
-                "updated",
-            }
-            tokens = [t.lower() for t in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", text)]
-            tokens = [t for t in tokens if t not in stop]
-            tokens = [t for t in tokens if t not in junk]
-            tokens = [t for t in tokens if t not in negation_or_verbs]
-            tokens = [t for t in tokens if not t.endswith("ly")]
-            freq: dict[str, int] = {}
-            for t in tokens:
-                freq[t] = freq.get(t, 0) + 1
-            ranked_unigrams = sorted(freq.items(), key=lambda x: (-x[1], -len(x[0]), x[0]))
-            return [w for w, _ in ranked_unigrams[:8]]
+            phrases = re.findall(
+                r"\b([A-Za-z][a-z]+(?:\s+[A-Za-z][a-z]+){0,2})\b",
+                text or "",
+            )
+            preferred: List[str] = []
+            for phrase in phrases:
+                low = phrase.strip().lower()
+                toks = [t for t in self._entity_tokenize(low) if t not in stop]
+                if not toks:
+                    continue
+                candidate = " ".join(toks)
+                if self._is_high_salience_entity(candidate) and candidate not in preferred:
+                    preferred.append(candidate)
+            unigram_tokens = [t for t in self._entity_tokenize(text) if t not in stop]
+            for t in unigram_tokens:
+                if self._is_high_salience_entity(t) and t not in preferred:
+                    preferred.append(t)
+            return preferred[:8]
 
         llm_entities: List[str] = []
         try:
-            # Use entity extractor on a synthetic fact
             synthetic_facts = [{"statement": claim, "source_url": "claim", "fact_id": "claim_0"}]
             annotated = await self.entity_extractor.annotate_entities(synthetic_facts)
             if annotated:
                 entities = annotated[0].get("entities", []) or []
-                # Filter generic/placeholder labels
-                generic = {
-                    "anatomical terms",
-                    "medical terms",
-                    "health terms",
-                    "general",
-                    "unknown",
-                    "misc",
-                }
-                cleaned = [e for e in entities if isinstance(e, str) and e.strip()]
-                cleaned = [e for e in cleaned if e.strip().lower() not in generic]
-                cleaned = [
-                    e
-                    for e in cleaned
-                    if not any(t in forbidden_entity_tokens for t in re.findall(r"\b[a-zA-Z]+\b", e.lower()))
-                ]
-                llm_entities = cleaned
+                cleaned = [str(e).strip() for e in entities if str(e).strip()]
+                llm_entities = [e for e in cleaned if self._is_high_salience_entity(e)]
         except Exception as e:
             logger.warning(f"[CorrectivePipeline:{round_id}] Entity extraction from claim failed: {e}")
 
         fallback = _fallback_entities(claim)
-        merged = []
+        merged: List[str] = []
         for e in llm_entities + fallback:
-            if e and e not in merged:
-                merged.append(e)
+            low = str(e).strip().lower()
+            if low and low not in merged and self._is_high_salience_entity(low):
+                merged.append(low)
 
         if fallback and fallback != llm_entities:
             logger.info(f"[CorrectivePipeline:{round_id}] Fallback entities from claim: {fallback}")
