@@ -35,6 +35,8 @@ class VerifyRequest(BaseModel):
     job_id: str
     claim: str
     room_id: str | None = None
+    client_id: str | None = None
+    client_claim_id: str | None = None
     source: str | None = None
     domain: str = Field(default="general")
     top_k: int = Field(default=5, ge=1, le=20)
@@ -102,6 +104,8 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "status": "completed",
         "job_id": payload.job_id,
         "room_id": payload.room_id,
+        "client_id": payload.client_id,
+        "client_claim_id": payload.client_claim_id,
         "claim": payload.claim,
         "pipeline_status": status,
         "result_status": status,
@@ -158,6 +162,8 @@ def _format_fallback_response(payload: VerifyRequest, error_message: str) -> dic
         "status": "completed",
         "job_id": payload.job_id,
         "room_id": payload.room_id,
+        "client_id": payload.client_id,
+        "client_claim_id": payload.client_claim_id,
         "claim": payload.claim,
         "pipeline_status": "fallback",
         "result_status": "fallback",
