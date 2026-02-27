@@ -2209,6 +2209,8 @@ class VerdictGenerator:
             "status_weighted_truth": reconciled.get("weighted_truth", 0.0),
             "truthfulness_cap": reconciled.get("truthfulness_cap", 100.0),
             "agreement_ratio": agreement_ratio,
+            "coverage_score": float(coverage_score),
+            "trust_post": float(adaptive_trust_post),
             "policy_sufficient": not policy_insufficient,
             "verdict_reconciled": bool(verdict_str != llm_verdict),
             "skip_targeted_recovery": bool(skip_targeted_recovery),
@@ -3242,8 +3244,12 @@ class VerdictGenerator:
                 r"associate|associated|link|linked|contribut(?:e|es|ed|ing))\b"
             ),
             "preventive": (
-                r"\b(prevent|prevents|prevention|reduce|reduces|reduced|decrease|decreases|decreased|"
-                r"lower|lowers|lowered|protect|protects)\b"
+                r"\b(prevent|prevents|prevented|preventing|prevention|protect|protects|protected|"
+                r"avoid|avoids|avoided|avert|averts|stop|stops|stopped)\b"
+            ),
+            "risk_reduction": (
+                r"\b(reduce|reduces|reduced|reducing|decrease|decreases|decreased|decreasing|"
+                r"lower|lowers|lowered|lowering)\b.{0,24}\b(risk|odds|likelihood|chance|incidence)\b"
             ),
             "therapeutic": (
                 r"\b(treat|treats|treatment|cure|cures|help|helps|promote|promotes|improve|improves|"
@@ -3273,6 +3279,27 @@ class VerdictGenerator:
         c_b = self._predicate_bucket_tokens(claim_predicate)
         e_b = self._predicate_bucket_tokens(evidence_predicate)
         return bool(c_b and e_b and (c_b & e_b))
+
+    @staticmethod
+    def _is_prevention_like(text: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(prevent|prevents|prevented|preventing|prevention|protect|protects|protected|avoid|avert|stop)\b",
+                str(text or "").lower(),
+            )
+        )
+
+    @staticmethod
+    def _is_risk_reduction_like(text: str) -> bool:
+        return bool(
+            re.search(
+                (
+                    r"\b(reduce|reduces|reduced|reducing|decrease|decreases|decreased|decreasing|"
+                    r"lower|lowers|lowered|lowering)\b.{0,24}\b(risk|odds|likelihood|chance|incidence)\b"
+                ),
+                str(text or "").lower(),
+            )
+        )
 
     @staticmethod
     def _object_semantic_equivalent(claim_text: str, evidence_text: str) -> bool:
@@ -3560,7 +3587,50 @@ class VerdictGenerator:
         # "trans fats are harmful" must not be treated as full contradiction.
         if self._has_not_all_quantifier(claim_text):
             return self._has_universal_quantifier(statement)
+        claim_low = (claim_text or "").lower()
+        stmt_low = (statement or "").lower()
+        claim_has_universal = self._has_universal_quantifier(claim_low)
+        statement_is_counterexample = bool(
+            re.search(r"\b(not all|not every|some|many|certain|subset|at least one)\b", stmt_low)
+        )
+        # Universal claims can be refuted by one explicit counterexample.
+        if claim_has_universal and statement_is_counterexample:
+            return True
         return True
+
+    def _quantifier_support_allowed(self, claim_text: str, statement: str) -> bool:
+        """
+        Guard support decisions for quantified claims.
+
+        For "not all X are Y", subset-level positive statements like
+        "trans fats are harmful" must not be treated as support. Evidence should
+        indicate at least one non-harmful/beneficial class or explicit non-universal scope.
+        """
+        if not self._has_not_all_quantifier(claim_text):
+            return True
+
+        stmt = (statement or "").lower()
+
+        # Explicit non-universal or exception framing supports "not all".
+        if re.search(r"\b(not all|not every|some|many|certain|subset|only some)\b", stmt):
+            return True
+        if re.search(r"\b(not|no|without)\b.{0,30}\bharm", stmt):
+            return True
+        if re.search(r"\b(beneficial|essential|protective|healthy|not harmful|harmless)\b", stmt):
+            return True
+
+        # Positive harmful assertions about any subset do not establish "not all".
+        if re.search(r"\bharm(?:ful)?\b", stmt):
+            return False
+
+        # Universal claims ("all/every/always/none") should not be marked supported
+        # by explicitly limited-scope evidence.
+        if self._has_universal_quantifier(claim_text) and re.search(
+            r"\b(some|many|certain|subset|often|sometimes|in some)\b", stmt
+        ):
+            return False
+
+        return False
 
     @staticmethod
     def _dose_scope_refute_allowed(claim_text: str, statement: str) -> bool:
@@ -3587,7 +3657,39 @@ class VerdictGenerator:
                 stmt,
             )
         )
+        stmt_has_any_dose_scope = bool(
+            stmt_high_or_excess
+            or stmt_moderate
+            or re.search(r"\b\d+(\.\d+)?\s*(?:cups?|mg|milligrams?|g|grams?)\b", stmt)
+        )
+        # For bounded-dose claims (e.g., "moderate X does not ..."), a generic
+        # unbounded hazard statement is insufficient for contradiction.
+        if claim_moderate and not stmt_has_any_dose_scope:
+            return False
         if claim_moderate and stmt_high_or_excess and not stmt_moderate:
+            return False
+        return True
+
+    @staticmethod
+    def _dose_scope_support_allowed(claim_text: str, statement: str) -> bool:
+        claim = (claim_text or "").lower()
+        stmt = (statement or "").lower()
+        claim_moderate = bool(
+            re.search(
+                r"\b(low|moderate|normal|usual|recommended)\b|\b(?:1|2|3|4)\s*(?:cups?|mg|milligrams?)\b",
+                claim,
+            )
+        )
+        stmt_high_or_excess = bool(
+            re.search(
+                (
+                    r"\b(high|higher|excess|excessive|overload|overconsumption|heavy|very high|large amounts?)\b|"
+                    r"\btoo much\b|\bthroughout the day\b"
+                ),
+                stmt,
+            )
+        )
+        if claim_moderate and stmt_high_or_excess:
             return False
         return True
 
@@ -3641,6 +3743,11 @@ class VerdictGenerator:
         full_claim_buckets = self._predicate_bucket_tokens(claim_text)
         full_ev_buckets = self._predicate_bucket_tokens(evidence_text)
         full_bucket_overlap = bool(full_claim_buckets and full_ev_buckets and (full_claim_buckets & full_ev_buckets))
+        prevention_overclaim = (
+            self._is_prevention_like(claim_text)
+            and self._is_risk_reduction_like(evidence_text)
+            and not self._is_prevention_like(evidence_text)
+        )
         claim_sub = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", claim_t.get("subject_span", "")))
         ev_sub = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", ev_t.get("subject_span", "")))
         sub_overlap = (len(claim_sub & ev_sub) / max(1, len(claim_sub))) if claim_sub else 0.0
@@ -3668,6 +3775,8 @@ class VerdictGenerator:
             and subject_guard_ok
             and (obj_overlap >= 0.35 or (anchor_overlap >= ANCHOR_THRESHOLD and pol in {"entails", "contradicts"}))
         ):
+            if prevention_overclaim:
+                return 0.0
             return 0.7
         # Nominal/attribution claims often omit explicit verbs (e.g., "X from foods such as Y").
         # Treat source/composition relations as a predicate family when anchors align.
@@ -3697,15 +3806,21 @@ class VerdictGenerator:
             and (obj_overlap >= 0.35 or (anchor_overlap >= 0.25 and pol in {"entails", "contradicts"}))
             and subject_guard_ok
         ):
+            if prevention_overclaim:
+                return 0.0
             return 0.7
         # Robust fallback: use full-sentence predicate families when token-level extraction is noisy.
         if full_bucket_overlap and (obj_overlap >= 0.35 or anchor_overlap >= 0.25) and subject_guard_ok:
+            if prevention_overclaim:
+                return 0.0
             return 0.7
         if (
             self._predicate_semantic_equivalent(cp_full, ep_full)
             and (obj_overlap >= 0.5 or anchor_overlap >= ANCHOR_THRESHOLD)
             and subject_guard_ok
         ):
+            if prevention_overclaim:
+                return 0.0
             return 0.7
         if (
             self._object_semantic_equivalent(claim_text, evidence_text)
@@ -3715,9 +3830,13 @@ class VerdictGenerator:
             )
             and subject_guard_ok
         ):
+            if prevention_overclaim:
+                return 0.0
             return 0.7
 
         if anchor_overlap >= 0.2 and sub_overlap >= 0.5 and obj_overlap >= 0.5 and subject_guard_ok:
+            if prevention_overclaim:
+                return 0.0
             return 0.7
 
         if (
@@ -3726,6 +3845,8 @@ class VerdictGenerator:
             and obj_overlap >= 0.5
             and subject_guard_ok
         ):
+            if prevention_overclaim:
+                return 0.0
             return 0.7
 
         if pol == "contradicts" and anchor_overlap >= ANCHOR_THRESHOLD:
@@ -3974,13 +4095,22 @@ class VerdictGenerator:
                     scope_mismatch_for_negated_claim = claim_neg and scope_alignment < 0.34
                     if scope_mismatch_for_negated_claim:
                         support_gate = False
+                    if support_gate and not self._quantifier_support_allowed(claim, statement):
+                        support_gate = False
+                    if support_gate and not self._dose_scope_support_allowed(claim, statement):
+                        support_gate = False
                     if support_gate:
                         relevance = "SUPPORTS"
                         relevance_score = max(relevance_score, support_strength, 0.62)
                         if scope_alignment < 0.40:
                             relevance_score *= 0.78
                     elif seed_rel == "REFUTES" and contradiction_score >= 0.45:
-                        if predicate_match_score >= 0.4 and intervention_match:
+                        if (
+                            predicate_match_score >= 0.4
+                            and intervention_match
+                            and self._quantifier_refute_allowed(claim, statement)
+                            and self._dose_scope_refute_allowed(claim, statement)
+                        ):
                             relevance = "REFUTES"
                             relevance_score = max(relevance_score, contradiction_score)
                             if scope_alignment < 0.34:
@@ -4168,6 +4298,10 @@ class VerdictGenerator:
                     )
                 )
                 score = (0.55 * rel_score) + (0.25 * anchor_overlap) + (0.20 * predicate_match_score)
+                if strict_support_ok and not self._quantifier_support_allowed(segment, statement):
+                    strict_support_ok = False
+                if strict_support_ok and not self._dose_scope_support_allowed(segment, statement):
+                    strict_support_ok = False
                 if strict_support_ok and score > best_support_score:
                     best_support_score = score
                     best_support_item = {
@@ -4193,6 +4327,10 @@ class VerdictGenerator:
                         "stance_used": rel,
                     }
                 elif rel == "SUPPORTS":
+                    if not self._quantifier_support_allowed(segment, statement):
+                        return
+                    if not self._dose_scope_support_allowed(segment, statement):
+                        return
                     # Keep weak/hedged support for PARTIALLY_VALID fallback.
                     weakness = 1.0 - max(0.0, min(1.0, support_strength))
                     weak_score = (
@@ -4553,6 +4691,13 @@ class VerdictGenerator:
             for seg in unknown_segments
         ):
             return
+        # If strict predicate floor already rejected evidence alignment, do not
+        # force promotion from UNKNOWN via coverage fallback.
+        if all(
+            str(((seg.get("alignment_debug") or {}).get("reason") or "")).lower() == "strict_predicate_floor_not_met"
+            for seg in unknown_segments
+        ):
+            return
 
         best_ev: Dict[str, Any] | None = None
         best_score = -1.0
@@ -4603,6 +4748,8 @@ class VerdictGenerator:
                 continue
             prev_dbg = seg.get("alignment_debug") or {}
             prev_reason = str(prev_dbg.get("reason") or "") if isinstance(prev_dbg, dict) else ""
+            if prev_reason.lower() == "strict_predicate_floor_not_met":
+                continue
             seg["status"] = "PARTIALLY_VALID"
             seg["supporting_fact"] = fallback_fact
             seg["source_url"] = fallback_src
@@ -6138,6 +6285,16 @@ class VerdictGenerator:
             elif neutral_only_map:
                 verdict = Verdict.PARTIALLY_TRUE.value
 
+        # Deterministic trust gate: do not keep hard TRUE when policy/trust says insufficient.
+        policy_sufficient = bool(payload.get("policy_sufficient", False))
+        trust_post = float(payload.get("trust_post", 0.0) or 0.0)
+        coverage_score = float(payload.get("coverage_score", 0.0) or 0.0)
+        if verdict == Verdict.TRUE.value and (not policy_sufficient):
+            if strong_support_signal and trust_post >= 0.45 and coverage_score >= 0.70:
+                verdict = Verdict.PARTIALLY_TRUE.value
+            else:
+                verdict = Verdict.UNVERIFIABLE.value
+
         payload["verdict"] = verdict
 
         best_ev = self._pick_best_binary_evidence(verdict, evidence_map, evidence)
@@ -6186,30 +6343,26 @@ class VerdictGenerator:
         payload["confidence"] = max(0.05, min(0.98, confidence))
 
         rationale = str(payload.get("rationale") or "").strip()
-        low_quality_rationale = (
-            not rationale
-            or "unverifiable" in rationale.lower()
-            or "insufficient" in rationale.lower()
-            or "partially" in rationale.lower()
+        candidate_rationale = self._build_human_rationale(
+            claim=claim,
+            verdict=verdict,
+            claim_breakdown=claim_breakdown,
+            evidence_map=evidence_map,
+            best_stmt=best_stmt,
+            best_src=best_src,
+            original_rationale=rationale,
         )
-        if best_stmt and best_src:
-            stance_word = "supports" if verdict == Verdict.TRUE.value else "contradicts"
-            explicit_rationale = (
-                f"Based on the strongest direct evidence, this claim is assessed as {verdict}. "
-                f"Evidence from {best_src} {stance_word} this conclusion: {best_stmt}"
-            )
-        elif best_stmt:
-            stance_word = "supports" if verdict == Verdict.TRUE.value else "contradicts"
-            explicit_rationale = (
-                f"Based on the strongest direct evidence, this claim is assessed as {verdict}. "
-                f"The evidence {stance_word} this conclusion: {best_stmt}"
-            )
-        else:
-            explicit_rationale = f"Based on the currently available evidence, this claim is assessed as {verdict}."
-        candidate_rationale = explicit_rationale if low_quality_rationale else f"{rationale}"
         fidelity = self._rationale_sentence_fidelity(candidate_rationale, evidence_map, evidence)
-        if fidelity < 0.50:
-            candidate_rationale = explicit_rationale
+        if fidelity < 0.35:
+            candidate_rationale = self._build_human_rationale(
+                claim=claim,
+                verdict=verdict,
+                claim_breakdown=claim_breakdown,
+                evidence_map=evidence_map,
+                best_stmt=best_stmt,
+                best_src=best_src,
+                original_rationale="",
+            )
         payload["rationale"] = candidate_rationale
 
         key_findings = payload.get("key_findings", []) or []
@@ -6242,6 +6395,12 @@ class VerdictGenerator:
                     Verdict.FALSE.value,
                 }
             ) or (original_verdict != verdict)
+            status_counts_final: Dict[str, int] = {}
+            for seg in claim_breakdown:
+                status = str(seg.get("status") or "UNKNOWN").upper()
+                status_counts_final[status] = status_counts_final.get(status, 0) + 1
+            analysis_counts["segment_status_distribution"] = status_counts_final
+            analysis_counts["claim_breakdown_count"] = len(claim_breakdown)
             payload["analysis_counts"] = analysis_counts
 
         # Final safety: if all segments ended UNKNOWN, do not emit synthetic key findings.
@@ -6249,6 +6408,62 @@ class VerdictGenerator:
         if final_breakdown and all(str(seg.get("status") or "UNKNOWN").upper() == "UNKNOWN" for seg in final_breakdown):
             payload["key_findings"] = []
         return payload
+
+    def _build_human_rationale(
+        self,
+        claim: str,
+        verdict: str,
+        claim_breakdown: List[Dict[str, Any]],
+        evidence_map: List[Dict[str, Any]],
+        best_stmt: str,
+        best_src: str,
+        original_rationale: str,
+    ) -> str:
+        rel_counts = {"SUPPORTS": 0, "REFUTES": 0, "NEUTRAL": 0}
+        for ev in evidence_map or []:
+            rel = self._normalize_relevance_label(ev.get("relevance", "NEUTRAL"))
+            rel_counts[rel] = rel_counts.get(rel, 0) + 1
+
+        statuses = [str(seg.get("status") or "UNKNOWN").upper() for seg in (claim_breakdown or [])]
+        has_unknown = any(s == "UNKNOWN" for s in statuses)
+        has_valid = any(s in {"VALID", "PARTIALLY_VALID"} for s in statuses)
+        has_invalid = any(s in {"INVALID", "PARTIALLY_INVALID"} for s in statuses)
+
+        if verdict == Verdict.TRUE.value:
+            lead = "Overall, the available evidence supports this claim."
+        elif verdict == Verdict.FALSE.value:
+            lead = "Overall, the available evidence does not support this claim."
+        elif verdict == Verdict.PARTIALLY_TRUE.value:
+            lead = "The evidence is mixed: some findings align with the claim, while important limitations remain."
+        else:
+            lead = "The current evidence is not strong or consistent enough to verify this claim confidently."
+
+        balance_parts: List[str] = []
+        if rel_counts["SUPPORTS"] > 0:
+            balance_parts.append(f"{rel_counts['SUPPORTS']} supporting")
+        if rel_counts["REFUTES"] > 0:
+            balance_parts.append(f"{rel_counts['REFUTES']} contradicting")
+        if rel_counts["NEUTRAL"] > 0:
+            balance_parts.append(f"{rel_counts['NEUTRAL']} neutral")
+        balance = ""
+        if balance_parts:
+            balance = " Evidence balance: " + ", ".join(balance_parts) + "."
+
+        status_note = ""
+        if has_unknown:
+            status_note = " Some parts remain uncertain."
+        elif has_valid and has_invalid:
+            status_note = " Different sub-parts of the claim are supported to different degrees."
+
+        evidence_note = ""
+        if best_stmt and best_src:
+            evidence_note = f" A key cited evidence point from {best_src} is: {best_stmt}"
+        elif best_stmt:
+            evidence_note = f" A key cited evidence point is: {best_stmt}"
+        elif original_rationale:
+            evidence_note = f" {original_rationale.strip()}"
+
+        return f"{lead}{balance}{status_note}{evidence_note}".strip()
 
     def _unverifiable_result(self, claim: str, reason: str) -> Dict[str, Any]:
         """Return a forced binary fallback result when normal verdict generation fails."""
