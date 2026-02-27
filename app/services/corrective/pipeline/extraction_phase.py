@@ -3,6 +3,8 @@ Extraction Phase: Fact, entity, and relation extraction from scraped content.
 """
 
 import os
+import re
+from hashlib import sha1
 from typing import Any, Dict, List, Optional
 
 from app.core.logger import get_logger, is_debug_enabled, log_value_payload
@@ -14,6 +16,13 @@ from app.services.logging.log_manager import LogManager
 from app.services.pipeline_debug_report import PipelineDebugReporter
 
 logger = get_logger(__name__)
+
+
+def _claim_context_hash(claim_text: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(claim_text or "").strip().lower())
+    if not normalized:
+        return ""
+    return sha1(normalized.encode("utf-8")).hexdigest()[:16]
 
 
 async def scrape_pages(
@@ -108,13 +117,27 @@ async def extract_all(
         Tuple of (extracted_facts, all_entities, extracted_triples)
     """
     # 3) Fact extraction
-    extracted_facts = await fact_extractor.extract(
-        scraped_pages,
-        predicate_target=predicate_target,
-        claim_text=claim_text,
-        claim_entities=claim_entities or [],
-        must_have_entities=must_have_entities or [],
-    )
+    try:
+        extracted_facts = await fact_extractor.extract(
+            scraped_pages,
+            predicate_target=predicate_target,
+            claim_text=claim_text,
+            claim_entities=claim_entities or [],
+            must_have_entities=must_have_entities or [],
+        )
+    except TypeError as exc:
+        # Backward compatibility for tests/mocks that still expose the legacy extractor signature.
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        try:
+            extracted_facts = await fact_extractor.extract(
+                scraped_pages,
+                predicate_target=predicate_target,
+            )
+        except TypeError as exc2:
+            if "unexpected keyword argument" not in str(exc2):
+                raise
+            extracted_facts = await fact_extractor.extract(scraped_pages)
     if debug_reporter:
         await debug_reporter.log_step(
             step_name="LLM-identified facts",
@@ -140,11 +163,38 @@ async def extract_all(
     if not extracted_facts:
         return [], [], []
 
+    # Stamp per-fact claim context so downstream ingest/retrieval can scope evidence to this claim.
+    claim_hash = _claim_context_hash(claim_text)
+    claim_ctx_entities: List[str] = []
+    for ent in (must_have_entities or []) + (claim_entities or []):
+        low = str(ent or "").strip().lower()
+        if low and low not in claim_ctx_entities:
+            claim_ctx_entities.append(low)
+    claim_ctx_entities = claim_ctx_entities[:20]
+    for fact in extracted_facts:
+        if claim_hash and not str(fact.get("claim_context_hash") or "").strip():
+            fact["claim_context_hash"] = claim_hash
+        if claim_ctx_entities and not fact.get("claim_context_entities"):
+            fact["claim_context_entities"] = list(claim_ctx_entities)
+        if claim_ctx_entities and not fact.get("claim_entities_ctx"):
+            fact["claim_entities_ctx"] = list(claim_ctx_entities)
+
     # 4) Entity annotation
     extracted_facts = await entity_extractor.annotate_entities(extracted_facts)
     all_entities = list({e for f in extracted_facts for e in (f.get("entities") or [])})
     # 5) Relation extraction
-    triples = await relation_extractor.extract_relations(extracted_facts, all_entities)
+    try:
+        triples = await relation_extractor.extract_relations(
+            extracted_facts,
+            all_entities,
+            claim_text=claim_text,
+            claim_entities=claim_entities or [],
+            must_have_entities=must_have_entities or [],
+        )
+    except TypeError as exc:
+        if "unexpected keyword argument" not in str(exc):
+            raise
+        triples = await relation_extractor.extract_relations(extracted_facts, all_entities)
     if debug_reporter:
         await debug_reporter.log_step(
             step_name="Knowledge graph tuples identified",

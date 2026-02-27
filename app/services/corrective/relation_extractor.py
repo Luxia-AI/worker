@@ -2,6 +2,7 @@ import json
 import os
 import re
 import uuid
+from hashlib import sha1
 from typing import Any, Dict, List, Optional
 
 from app.core.logger import get_logger, log_value_payload
@@ -19,6 +20,9 @@ Requirements:
 - Subject/object must be entity strings
 - Relation should be concise (e.g., "causes", "reduces risk of", "is treatment for")
 - Confidence: float 0-1 indicating support strength
+- Keep only triples directly relevant to the claim context and anchors.
+- Prefer intervention/outcome relations that help verify/refute the claim.
+- Drop triples that are medically true but unrelated to the claim focus.
 
 IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
 Return ONLY valid JSON:
@@ -26,6 +30,7 @@ Return ONLY valid JSON:
 "confidence": 0.9}}]}}]}}
 
 ENTITIES PROVIDED: {entities}
+CLAIM CONTEXT: {claim_context}
 
 FACTS:
 """
@@ -53,6 +58,112 @@ class RelationExtractor:
 
     def __init__(self) -> None:
         self.llm_service = HybridLLMService()
+
+    @staticmethod
+    def _tokenize(text: str) -> set[str]:
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+        }
+        return {w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (text or "").lower()) if w not in stop}
+
+    @staticmethod
+    def _predicate_family_tokens(text: str) -> set[str]:
+        low = (text or "").lower()
+        families: set[str] = set()
+        if re.search(r"\b(reduc|lower|decreas|alleviat|improv|help|benefit|reliev)\w*\b", low):
+            families.add("improve_reduce")
+        if re.search(r"\b(increas|worsen|exacerbat|aggravat|trigger|cause)\w*\b", low):
+            families.add("increase_cause")
+        if re.search(r"\b(treat|cure|prevent|protect|work|effective|effic)\w*\b", low):
+            families.add("treat_prevent")
+        if re.search(r"\b(associat|link|correlat|relat)\w*\b", low):
+            families.add("associate")
+        return families
+
+    @classmethod
+    def _build_claim_context(
+        cls,
+        claim_text: str = "",
+        claim_entities: Optional[List[str]] = None,
+        must_have_entities: Optional[List[str]] = None,
+    ) -> str:
+        claim = str(claim_text or "").strip()
+        claim_entities = [str(e).strip() for e in (claim_entities or []) if str(e).strip()]
+        must_have_entities = [str(e).strip() for e in (must_have_entities or []) if str(e).strip()]
+        if not claim and not claim_entities and not must_have_entities:
+            return "none"
+        return (
+            f"claim={claim}; "
+            f"claim_entities={claim_entities[:10] if claim_entities else []}; "
+            f"must_have_entities={must_have_entities[:10] if must_have_entities else []}"
+        )
+
+    def _is_claim_aligned_triple(
+        self,
+        triple: Dict[str, Any],
+        fact_statement: str,
+        claim_text: str = "",
+        claim_entities: Optional[List[str]] = None,
+        must_have_entities: Optional[List[str]] = None,
+    ) -> bool:
+        if not claim_text and not claim_entities and not must_have_entities:
+            return True
+
+        triple_tokens = self._tokenize(
+            " ".join(
+                [
+                    str(triple.get("subject") or ""),
+                    str(triple.get("relation") or ""),
+                    str(triple.get("object") or ""),
+                    str(fact_statement or ""),
+                ]
+            )
+        )
+        if not triple_tokens:
+            return False
+
+        claim_tokens = self._tokenize(claim_text)
+        claim_entity_tokens: set[str] = set()
+        for ent in claim_entities or []:
+            claim_entity_tokens |= self._tokenize(ent)
+        must_have_tokens: set[str] = set()
+        for ent in must_have_entities or []:
+            must_have_tokens |= self._tokenize(ent)
+
+        if must_have_tokens and len(triple_tokens & must_have_tokens) == 0:
+            return False
+        if not must_have_tokens and claim_entity_tokens and len(triple_tokens & claim_entity_tokens) == 0:
+            return False
+        if claim_tokens and len(triple_tokens & claim_tokens) == 0:
+            return False
+
+        claim_pred = self._predicate_family_tokens(claim_text)
+        triple_pred = self._predicate_family_tokens(f"{triple.get('relation', '')} {fact_statement or ''}".strip())
+        if claim_pred and triple_pred and not (claim_pred & triple_pred):
+            lexical_overlap = len(triple_tokens & claim_tokens)
+            if lexical_overlap < 2:
+                return False
+        return True
 
     @staticmethod
     def _normalize_relation(relation: str) -> str:
@@ -244,7 +355,14 @@ class RelationExtractor:
         logger.warning("[RelationExtractor] All retries exhausted, returning None")
         return None
 
-    async def extract_relations(self, facts: List[Dict[str, Any]], entities: List[str]) -> List[Dict[str, Any]]:
+    async def extract_relations(
+        self,
+        facts: List[Dict[str, Any]],
+        entities: List[str],
+        claim_text: str = "",
+        claim_entities: Optional[List[str]] = None,
+        must_have_entities: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Extract triples for ALL facts in ONE batched LLM call.
 
@@ -263,7 +381,18 @@ class RelationExtractor:
         # Build batch prompt with all facts
         facts_text = "\n".join(f"[{i}] {fact.get('statement', '')}" for i, fact in enumerate(facts))
         entities_str = ", ".join(entities[:50])  # Limit entities to avoid token overflow
-        prompt = BATCH_TRIPLE_PROMPT.format(entities=entities_str) + facts_text
+        claim_context = self._build_claim_context(
+            claim_text=claim_text,
+            claim_entities=claim_entities,
+            must_have_entities=must_have_entities,
+        )
+        prompt = (
+            BATCH_TRIPLE_PROMPT.format(
+                entities=entities_str,
+                claim_context=claim_context,
+            )
+            + facts_text
+        )
 
         required_format = (
             '{"results": [{"index": 0, "triples": '
@@ -305,8 +434,14 @@ class RelationExtractor:
                 "same_entity": 0,
                 "low_conf": 0,
                 "negation_guard_drop": 0,
+                "claim_mismatch": 0,
                 "malformed_triple": 0,
             }
+
+            claim_hash = ""
+            claim_norm = re.sub(r"\s+", " ", str(claim_text or "").strip().lower())
+            if claim_norm:
+                claim_hash = sha1(claim_norm.encode("utf-8")).hexdigest()[:16]
 
             for item in results_list:
                 idx = item.get("index", -1)
@@ -361,7 +496,22 @@ class RelationExtractor:
                             "source_url": src,
                             "fact_id": fact.get("fact_id"),
                             "source_statement": fact.get("statement", ""),
+                            "claim_context_hash": str(fact.get("claim_context_hash") or claim_hash or ""),
+                            "claim_context_entities": list(
+                                fact.get("claim_context_entities")
+                                or fact.get("claim_entities_ctx")
+                                or (claim_entities or [])
+                            )[:20],
                         }
+                        if not self._is_claim_aligned_triple(
+                            triple,
+                            fact_statement=fact.get("statement", ""),
+                            claim_text=claim_text,
+                            claim_entities=claim_entities,
+                            must_have_entities=must_have_entities,
+                        ):
+                            rejected_by_reason["claim_mismatch"] += 1
+                            continue
                         all_triples.append(triple)
                     except Exception as e:
                         logger.warning(f"[RelationExtractor] Skipping malformed triple: {e}")

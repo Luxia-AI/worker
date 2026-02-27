@@ -19,6 +19,12 @@ Keep only truth-grounded statements explicitly asserted in the section.
 Exclude speculative/hedged language (may, might, could, possible, suggests, appears),
 opinion text, claim-about-claim text, and generic background filler.
 
+Claim alignment rules (strict):
+- Keep statements directly useful for verifying the claim context.
+- Prefer statements containing claim intervention/outcome entities or close lexical equivalents.
+- Drop off-topic biomedical facts even if true in isolation.
+- Keep explicit support and explicit contradiction statements when claim-relevant.
+
 IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
 Return ONLY valid JSON with this exact structure:
 {{"results": [{{"index": 0, "facts": [{{"statement": "...", "confidence": 0.85}}]}}, {{"index": 1, "facts": [...]}}]}}
@@ -296,15 +302,50 @@ class FactExtractor:
         return fallback
 
     @staticmethod
-    def _build_fact_prompt(content: str, predicate_target: Optional[Dict[str, str]] = None) -> str:
+    def _build_claim_context_block(
+        claim_text: str = "",
+        claim_entities: Optional[List[str]] = None,
+        must_have_entities: Optional[List[str]] = None,
+    ) -> str:
+        claim = str(claim_text or "").strip()
+        claim_entities = [str(e).strip() for e in (claim_entities or []) if str(e).strip()]
+        must_have_entities = [str(e).strip() for e in (must_have_entities or []) if str(e).strip()]
+        if not claim and not claim_entities and not must_have_entities:
+            return ""
+        return (
+            "\n\nCLAIM CONTEXT (must guide extraction):\n"
+            f"- claim: {claim}\n"
+            f"- claim_entities: {', '.join(claim_entities[:10]) if claim_entities else '[]'}\n"
+            f"- must_have_entities: {', '.join(must_have_entities[:10]) if must_have_entities else '[]'}\n"
+            "- Keep only statements that help verify or refute this claim.\n"
+            "- Include contradictory evidence if it is claim-relevant.\n"
+        )
+
+    @classmethod
+    def _build_fact_prompt(
+        cls,
+        content: str,
+        predicate_target: Optional[Dict[str, str]] = None,
+        claim_text: str = "",
+        claim_entities: Optional[List[str]] = None,
+        must_have_entities: Optional[List[str]] = None,
+    ) -> str:
+        claim_block = cls._build_claim_context_block(
+            claim_text=claim_text,
+            claim_entities=claim_entities,
+            must_have_entities=must_have_entities,
+        )
         if predicate_target:
-            return FACT_EXTRACTION_PREDICATE_FORCING_PROMPT.format(
-                subject=str(predicate_target.get("subject", "") or ""),
-                predicate=str(predicate_target.get("predicate", "") or ""),
-                object=str(predicate_target.get("object", "") or ""),
-                content=content,
+            return (
+                FACT_EXTRACTION_PREDICATE_FORCING_PROMPT.format(
+                    subject=str(predicate_target.get("subject", "") or ""),
+                    predicate=str(predicate_target.get("predicate", "") or ""),
+                    object=str(predicate_target.get("object", "") or ""),
+                    content=content,
+                )
+                + claim_block
             )
-        return FACT_EXTRACTION_PROMPT.format(content=content)
+        return FACT_EXTRACTION_PROMPT.format(content=content) + claim_block
 
     async def _parse_llm_response(
         self, result: Any, original_prompt: str, required_format: str, max_retries: int = 1
@@ -401,9 +442,15 @@ class FactExtractor:
                 sections.append(f"[{section_index}] {chunk}")
 
         batch_content = "\n\n".join(sections)
+        claim_context_block = self._build_claim_context_block(
+            claim_text=claim_text,
+            claim_entities=claim_entities,
+            must_have_entities=must_have_entities,
+        )
         prompt = (
             f"{BATCH_FACT_PROMPT}{batch_content}\n\n"
             f"TARGET_FACTS_PER_SECTION: up to {target_facts_per_page} high-quality atomic facts."
+            f"{claim_context_block}"
         )
 
         required_format = '{"results": [{"index": 0, "facts": [{"statement": "...", "confidence": 0.85}]}]}'
@@ -435,7 +482,13 @@ class FactExtractor:
 
             if parsed is None:
                 logger.warning("[FactExtractor] Could not parse LLM response after retries, using fallback")
-                return await self._extract_per_page_fallback(valid_pages, predicate_target=predicate_target)
+                return await self._extract_per_page_fallback(
+                    valid_pages,
+                    predicate_target=predicate_target,
+                    claim_text=claim_text,
+                    claim_entities=claim_entities,
+                    must_have_entities=must_have_entities,
+                )
 
             facts: List[Dict[str, Any]] = []
             results_list = parsed.get("results", [])
@@ -516,7 +569,13 @@ class FactExtractor:
         for page in pages:
             content = page.get("content", "")
             content_chunk = truncate_content(content, max_length=2000)
-            prompt = self._build_fact_prompt(content_chunk, predicate_target=predicate_target)
+            prompt = self._build_fact_prompt(
+                content_chunk,
+                predicate_target=predicate_target,
+                claim_text=claim_text,
+                claim_entities=claim_entities,
+                must_have_entities=must_have_entities,
+            )
 
             try:
                 result = await self.llm_service.ainvoke(

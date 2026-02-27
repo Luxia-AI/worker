@@ -124,6 +124,15 @@ class KGIngest:
                     # Extract optional fields
                     confidence = float(triple.get("confidence", 0.0))
                     source_url = triple.get("source_url")
+                    claim_context_hash = str(triple.get("claim_context_hash") or "").strip()
+                    claim_context_entities = (
+                        triple.get("claim_context_entities") or triple.get("claim_entities_ctx") or []
+                    )
+                    if isinstance(claim_context_entities, str):
+                        claim_context_entities = [claim_context_entities]
+                    claim_context_entities = [str(e).strip().lower() for e in claim_context_entities if str(e).strip()][
+                        :20
+                    ]
 
                     # Ingest the triple
                     try:
@@ -138,6 +147,8 @@ class KGIngest:
                                 rel_predicate,
                                 confidence,
                                 source_url,
+                                claim_context_hash,
+                                claim_context_entities,
                             ),
                             timeout=NEO4J_QUERY_TIMEOUT,
                         )
@@ -180,8 +191,11 @@ class KGIngest:
         rel_predicate: str,
         confidence: float,
         source_url: str | None,
+        claim_context_hash: str = "",
+        claim_context_entities: List[str] | None = None,
     ) -> None:
         """Ingest a single triple with proper KG structure."""
+        claim_context_entities = claim_context_entities or []
 
         # Cypher query for proper KG structure
         cypher = """
@@ -199,9 +213,22 @@ class KGIngest:
         ON CREATE SET
             rel.predicate = $rel_predicate,
             rel.confidence = $confidence,
+            rel.claim_context_hash = CASE WHEN $claim_context_hash <> '' THEN $claim_context_hash ELSE NULL END,
+            rel.claim_context_entities = CASE
+                WHEN size($claim_context_entities) > 0 THEN $claim_context_entities
+                ELSE NULL
+            END,
             rel.updated_at = datetime()
         ON MATCH SET
             rel.confidence = CASE WHEN rel.confidence < $confidence THEN $confidence ELSE rel.confidence END,
+            rel.claim_context_hash = CASE
+                WHEN $claim_context_hash <> '' THEN $claim_context_hash
+                ELSE rel.claim_context_hash
+            END,
+            rel.claim_context_entities = CASE
+                WHEN size($claim_context_entities) > 0 THEN $claim_context_entities
+                ELSE rel.claim_context_entities
+            END,
             rel.updated_at = datetime()
 
         // Create relationships (idempotent)
@@ -217,6 +244,8 @@ class KGIngest:
             "rel_rid": rel_rid,
             "rel_predicate": rel_predicate,
             "confidence": confidence,
+            "claim_context_hash": claim_context_hash,
+            "claim_context_entities": claim_context_entities,
         }
 
         await session.run(cypher, **params)

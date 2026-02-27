@@ -1351,6 +1351,26 @@ class CorrectivePipeline:
             "causes",
             "reduce",
             "improve",
+            "prevent",
+            "prevents",
+            "prevented",
+            "preventing",
+            "treat",
+            "treats",
+            "treated",
+            "treating",
+            "cure",
+            "cures",
+            "cured",
+            "curing",
+            "boost",
+            "boosts",
+            "boosted",
+            "boosting",
+            "stop",
+            "stops",
+            "stopped",
+            "stopping",
         }
         if low in generic or low in verbs:
             return False
@@ -1387,6 +1407,26 @@ class CorrectivePipeline:
             "used",
             "use",
             "using",
+            "prevent",
+            "prevents",
+            "prevented",
+            "preventing",
+            "treat",
+            "treats",
+            "treated",
+            "treating",
+            "cure",
+            "cures",
+            "cured",
+            "curing",
+            "boost",
+            "boosts",
+            "boosted",
+            "boosting",
+            "stop",
+            "stops",
+            "stopped",
+            "stopping",
         }
         cleaned = [t for t in tokens if t not in noisy]
         if not cleaned:
@@ -1498,28 +1538,91 @@ class CorrectivePipeline:
             "average",
             "per",
             "times",
+            "not",
+            "no",
+            "never",
+            "do",
+            "does",
+            "did",
+            "this",
+            "that",
+            "these",
+            "those",
+            "it",
+            "its",
+            "itself",
+            "through",
+            "scientifically",
+            "supported",
+            "support",
+            "supports",
         }
 
         def _fallback_entities(text: str) -> List[str]:
+            blocked_tokens = {
+                "not",
+                "no",
+                "never",
+                "scientifically",
+                "supported",
+                "support",
+                "supports",
+                "proven",
+                "prove",
+                "proves",
+            }
+            leading_verb_tokens = {
+                "cause",
+                "causes",
+                "prevent",
+                "prevents",
+                "treat",
+                "treats",
+                "cure",
+                "cures",
+                "boost",
+                "boosts",
+                "help",
+                "helps",
+                "support",
+                "supports",
+            }
+
+            def _valid_candidate(raw: str) -> str:
+                candidate = self._normalize_entity_phrase(raw)
+                if not candidate or not self._is_high_salience_entity(candidate):
+                    return ""
+                toks = [t for t in self._entity_tokenize(candidate) if t]
+                if not toks:
+                    return ""
+                if any(t in blocked_tokens for t in toks):
+                    return ""
+                if len(toks) > 1 and toks[0] in leading_verb_tokens:
+                    return ""
+                return candidate
+
             phrases = re.findall(
                 r"\b([A-Za-z][a-z]+(?:\s+[A-Za-z][a-z]+){0,2})\b",
                 text or "",
             )
             preferred: List[str] = []
+
+            # Prefer clean atomic tokens first to avoid synthetic bigrams crowding out real entities.
+            unigram_tokens = [t for t in self._entity_tokenize(text) if t not in stop]
+            for t in unigram_tokens:
+                normalized = _valid_candidate(t)
+                if normalized and normalized not in preferred:
+                    preferred.append(normalized)
+
             for phrase in phrases:
                 low = phrase.strip().lower()
                 toks = [t for t in self._entity_tokenize(low) if t not in stop]
-                if not toks:
+                if len(toks) < 2:
                     continue
-                candidate = self._normalize_entity_phrase(" ".join(toks))
-                if self._is_high_salience_entity(candidate) and candidate not in preferred:
+                candidate = _valid_candidate(" ".join(toks))
+                if candidate and candidate not in preferred:
                     preferred.append(candidate)
-            unigram_tokens = [t for t in self._entity_tokenize(text) if t not in stop]
-            for t in unigram_tokens:
-                normalized = self._normalize_entity_phrase(t)
-                if self._is_high_salience_entity(normalized) and normalized not in preferred:
-                    preferred.append(normalized)
-            return preferred[:8]
+            return preferred[:10]
 
         llm_entities: List[str] = []
         try:

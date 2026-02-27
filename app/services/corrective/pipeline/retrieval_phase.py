@@ -4,6 +4,7 @@ Retrieval Phase: Retrieve semantic and KG candidates.
 
 import math
 import re
+from hashlib import sha1
 from typing import Any, Dict, List, Optional
 
 from app.core.logger import get_logger, is_debug_enabled, log_value_payload
@@ -44,6 +45,31 @@ def _tokenize(text: str) -> set[str]:
     return {w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (text or "").lower()) if w not in stop}
 
 
+def _claim_context_hash(claim_text: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(claim_text or "").strip().lower())
+    if not normalized:
+        return ""
+    return sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+
+def _semantic_candidate_anchor_overlap(candidate: Dict[str, Any], anchors: List[str], claim_tokens: set[str]) -> bool:
+    statement = str(candidate.get("statement") or "")
+    entities = " ".join(str(e) for e in (candidate.get("entities") or []))
+    ctx_entities = " ".join(str(e) for e in (candidate.get("claim_context_entities") or []))
+    cand_tokens = _tokenize(" ".join([statement, entities, ctx_entities]))
+    if not cand_tokens:
+        return False
+
+    anchor_tokens: set[str] = set()
+    for anchor in anchors or []:
+        anchor_tokens |= _tokenize(anchor)
+    if anchor_tokens and (cand_tokens & anchor_tokens):
+        return True
+    if claim_tokens and (cand_tokens & claim_tokens):
+        return True
+    return False
+
+
 def _kg_candidate_anchor_overlap(candidate: Dict[str, Any], anchors: List[str], claim_tokens: set[str]) -> bool:
     subject = str(candidate.get("subject") or "")
     object_ = str(candidate.get("object") or "")
@@ -76,6 +102,7 @@ async def retrieve_candidates(
     query_text: str = "",
     claim_anchors: Optional[List[str]] = None,
     include_metrics: bool = False,
+    claim_context_hash: str = "",
 ) -> (
     tuple[List[Dict[str, Any]], List[Dict[str, Any]]]
     | tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, int]]
@@ -101,6 +128,9 @@ async def retrieve_candidates(
     bm25_ids: Dict[str, float] = {}
     query_embeddings: List[List[float]] = []
     normalized_queries: List[str] = []
+    anchors = [str(a).strip() for a in (claim_anchors or all_entities or []) if str(a).strip()]
+    claim_tokens = _tokenize(query_text)
+    effective_claim_context_hash = str(claim_context_hash or "").strip().lower() or _claim_context_hash(query_text)
 
     if not topics:
         logger.warning(
@@ -113,7 +143,14 @@ async def retrieve_candidates(
             continue
         normalized_queries.append(q_embed)
         try:
-            sem_res = await vdb_retriever.search(q_embed, top_k=top_k, topics=topics or None)
+            sem_res = await vdb_retriever.search(
+                q_embed,
+                top_k=top_k,
+                topics=topics or None,
+                claim_text=query_text,
+                claim_anchors=anchors,
+                claim_context_hash=effective_claim_context_hash,
+            )
             semantic_candidates.extend(sem_res or [])
         except Exception as e:
             logger.warning(f"[RetrievalPhase:{round_id}] VDB retrieval failed for query='{q_embed}': {e}")
@@ -187,6 +224,29 @@ async def retrieve_candidates(
         except Exception as e:
             logger.warning(f"[RetrievalPhase:{round_id}] BM25 re-rank failed: {e}")
 
+    if anchors and semantic_candidates:
+        filtered_sem: List[Dict[str, Any]] = []
+        sem_dropped_by_anchor = 0
+        for c in semantic_candidates:
+            claim_ctx_match = bool(c.get("claim_context_match"))
+            overlap_ok = _semantic_candidate_anchor_overlap(c, anchors, claim_tokens)
+            if claim_ctx_match or overlap_ok:
+                filtered_sem.append(c)
+                continue
+            score = float(c.get("score") or 0.0)
+            # Keep very strong semantic matches as conservative fallback.
+            if score >= 0.72:
+                filtered_sem.append(c)
+                continue
+            sem_dropped_by_anchor += 1
+        if sem_dropped_by_anchor > 0:
+            logger.info(
+                "[RetrievalPhase:%s] Dropped %d semantic candidates failing claim-anchor overlap prefilter",
+                round_id,
+                sem_dropped_by_anchor,
+            )
+        semantic_candidates = filtered_sem
+
     # Deduplicate semantic candidates
     dedup_sem = dedup_candidates_by_score(
         semantic_candidates,
@@ -229,12 +289,16 @@ async def retrieve_candidates(
     # KG retrieval
     kg_candidates = []
     try:
-        kg_candidates = await kg_retriever.retrieve(all_entities, top_k=top_k, query_text=query_text)
+        kg_candidates = await kg_retriever.retrieve(
+            all_entities,
+            top_k=top_k,
+            query_text=query_text,
+            claim_anchors=anchors,
+            claim_context_hash=effective_claim_context_hash,
+        )
     except Exception as e:
         logger.warning(f"[RetrievalPhase:{round_id}] KG retrieval failed: {e}")
 
-    anchors = [str(a).strip() for a in (claim_anchors or all_entities or []) if str(a).strip()]
-    claim_tokens = _tokenize(query_text)
     if anchors and kg_candidates:
         filtered_kg: List[Dict[str, Any]] = []
         for c in kg_candidates:

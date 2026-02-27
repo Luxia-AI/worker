@@ -91,6 +91,25 @@ def _contains_must_have_entity(candidate: Dict[str, Any], must_have_aliases: Lis
     return False
 
 
+def _alias_overlap_score(candidate: Dict[str, Any], must_have_aliases: List[str]) -> float:
+    """Soft overlap score used when strict alias matching fails for all top items."""
+    if not must_have_aliases:
+        return 0.0
+    tokens = _tokenize(str(candidate.get("statement") or ""))
+    if not tokens:
+        return 0.0
+    best = 0.0
+    for alias in must_have_aliases:
+        alias_tokens = _tokenize(str(alias or ""))
+        if not alias_tokens:
+            continue
+        overlap = len(tokens & alias_tokens)
+        ratio = overlap / max(1, len(alias_tokens))
+        if ratio > best:
+            best = ratio
+    return best
+
+
 async def rank_candidates(
     semantic_candidates: List[Dict[str, Any]],
     kg_candidates: List[Dict[str, Any]],
@@ -190,12 +209,22 @@ async def rank_candidates(
             without_core = [r for r in top_ranked if r not in with_core]
             top_ranked = (with_core + without_core)[:top_k]
         else:
-            logger.info(
-                "[RankingPhase:%s] Hard gate: top evidence missing core claim entity aliases=%s",
+            logger.warning(
+                "[RankingPhase:%s] Soft gate fallback: top evidence missing strict core aliases=%s; "
+                "keeping best overlap candidates instead of emptying ranking",
                 round_id,
                 must_have_aliases,
             )
-            top_ranked = []
+            scored = [
+                (
+                    _alias_overlap_score(r, must_have_aliases),
+                    float(r.get("final_score", 0.0) or 0.0),
+                    r,
+                )
+                for r in top_ranked
+            ]
+            scored.sort(key=lambda x: (-x[0], -x[1]))
+            top_ranked = [item[2] for item in scored[:top_k]]
 
     # Phase 2: Enrich with trust grades
     graded_results = TrustRanker.enrich_ranked_results(top_ranked)

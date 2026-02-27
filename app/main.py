@@ -53,17 +53,12 @@ class VerifyRequest(BaseModel):
 def _mock_verdict_for_claim(claim: str) -> tuple[str, float, float, str]:
     claim_l = claim.lower()
     if any(k in claim_l for k in ("hoax", "fake", "myth")):
-        return ("MISLEADING", 0.86, 22.0, "Claim contains patterns commonly associated with misinformation framing.")
+        return ("FALSE", 0.86, 22.0, "Claim contains patterns commonly associated with misinformation framing.")
     if any(k in claim_l for k in ("significantly", "guaranteed", "always", "never", "detoxifies")):
-        return (
-            "UNVERIFIABLE",
-            0.64,
-            48.0,
-            "Claim makes strong causal assertions without attached evidence in this flow.",
-        )
+        return ("FALSE", 0.64, 38.0, "Strong causal claim fallback: defaulting to conservative false until supported.")
     if any(k in claim_l for k in ("improves", "supports", "is linked to", "can reduce")):
-        return ("PARTIALLY_SUPPORTED", 0.71, 63.0, "Claim appears plausible but requires stronger source validation.")
-    return ("UNVERIFIABLE", 0.58, 50.0, "Insufficient evidence context for deterministic verification.")
+        return ("TRUE", 0.71, 63.0, "Claim appears directionally supported in fallback mode.")
+    return ("FALSE", 0.58, 40.0, "Fallback mode: conservative binary classification.")
 
 
 async def _get_pipeline() -> Any:
@@ -117,7 +112,7 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "claim": payload.claim,
         "pipeline_status": status,
         "result_status": status,
-        "verdict": verdict_result.get("verdict", "UNVERIFIABLE"),
+        "verdict": verdict_result.get("verdict", "FALSE"),
         "verdict_confidence": verdict_result.get("confidence", 0.0),
         "truthfulness_percent": verdict_result.get("truthfulness_percent", 0.0),
         "verdict_rationale": verdict_result.get("rationale", ""),

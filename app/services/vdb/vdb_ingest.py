@@ -145,6 +145,10 @@ class VDBIngest:
 
         vectors = []
         for fact, emb in zip(trusted_facts, embeddings):
+            claim_ctx_entities = fact.get("claim_context_entities") or fact.get("claim_entities_ctx") or []
+            if isinstance(claim_ctx_entities, str):
+                claim_ctx_entities = [claim_ctx_entities]
+            claim_ctx_entities = [str(e).strip().lower() for e in claim_ctx_entities if str(e).strip()][:20]
             metadata = {
                 "statement": fact["statement"],
                 "entities": fact.get("entities", []),
@@ -156,6 +160,8 @@ class VDBIngest:
                 "doc_type": fact.get("doc_type"),
                 "fact_type": fact.get("fact_type"),
                 "count_value": fact.get("count_value"),
+                "claim_context_hash": str(fact.get("claim_context_hash") or "").strip() or None,
+                "claim_context_entities": claim_ctx_entities or None,
             }
             # Pinecone metadata cannot include null values
             metadata = {k: v for k, v in metadata.items() if v is not None}

@@ -1,4 +1,5 @@
 import re
+from hashlib import sha1
 from typing import Any, Dict, List
 
 from app.constants.config import PIPELINE_MIN_RANK_CANDIDATES, VDB_BACKFILL_MIN_SCORE, VDB_MIN_SCORE
@@ -35,6 +36,40 @@ def normalize_query_for_embedding(text: str) -> str:
     return cleaned
 
 
+def _tokenize(text: str) -> set[str]:
+    stop = {
+        "the",
+        "a",
+        "an",
+        "and",
+        "or",
+        "but",
+        "to",
+        "for",
+        "of",
+        "in",
+        "on",
+        "with",
+        "by",
+        "at",
+        "is",
+        "are",
+        "was",
+        "were",
+        "be",
+        "been",
+        "being",
+    }
+    return {w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (text or "").lower()) if w not in stop}
+
+
+def _claim_context_hash(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
+    if not normalized:
+        return ""
+    return sha1(normalized.encode("utf-8")).hexdigest()[:16]
+
+
 class VDBRetrieval:
     """
     Semantic retrieval from Pinecone vector database.
@@ -64,6 +99,9 @@ class VDBRetrieval:
         top_k: int = 5,
         topics: List[str] | None = None,
         min_score: float | None = None,
+        claim_text: str = "",
+        claim_anchors: List[str] | None = None,
+        claim_context_hash: str = "",
     ) -> List[Dict[str, Any]]:
         """
         Search vector DB for semantically similar facts.
@@ -86,6 +124,11 @@ class VDBRetrieval:
         normalized_query = normalize_query_for_embedding(query)
         if not normalized_query:
             return []
+        normalized_claim_hash = str(claim_context_hash or "").strip().lower() or _claim_context_hash(claim_text)
+        anchor_tokens: set[str] = set()
+        for anchor in claim_anchors or []:
+            anchor_tokens |= _tokenize(anchor)
+        claim_tokens = _tokenize(claim_text)
 
         try:
             embedding = await embed_async([normalized_query])
@@ -142,6 +185,7 @@ class VDBRetrieval:
         below_threshold: List[Dict[str, Any]] = []
         dropped = 0
         dropped_low_signal = 0
+        dropped_claim_mismatch = 0
         low_signal_phrases = (
             "data element definitions",
             "registration or results information",
@@ -157,31 +201,48 @@ class VDBRetrieval:
             else:
                 metadata = m.get("metadata", {}) if isinstance(m, dict) else {}
                 score = float((m.get("score", 0.0) if isinstance(m, dict) else 0.0) or 0.0)
-            if score < effective_min_score:
-                dropped += 1
-                # Keep a lightweight backfill pool to avoid starvation.
-                if score >= VDB_BACKFILL_MIN_SCORE:
-                    below_threshold.append(
-                        {
-                            "score": score,
-                            "statement": metadata.get("statement", ""),
-                            "entities": metadata.get("entities", []) or [],
-                            "source_url": metadata.get("source_url") or metadata.get("source", ""),
-                            "published_at": metadata.get("published_at"),
-                            "credibility": metadata.get("credibility"),
-                            "source": metadata.get("source"),
-                            "domain": metadata.get("domain"),
-                            "topic": metadata.get("topic"),
-                            "doc_type": metadata.get("doc_type"),
-                            "fact_type": metadata.get("fact_type"),
-                            "count_value": metadata.get("count_value"),
-                        }
-                    )
-                continue
+
+            statement = str(metadata.get("statement", "") or "")
+            entities = metadata.get("entities", []) or []
+            claim_ctx_entities = metadata.get("claim_context_entities") or metadata.get("claim_entities_ctx") or []
+            if isinstance(claim_ctx_entities, str):
+                claim_ctx_entities = [claim_ctx_entities]
+            claim_ctx_entities = [str(e).strip().lower() for e in claim_ctx_entities if str(e).strip()][:20]
+            stored_claim_hash = str(metadata.get("claim_context_hash") or "").strip().lower()
+            candidate_tokens = _tokenize(
+                " ".join(
+                    [
+                        statement,
+                        " ".join(str(e) for e in entities),
+                        " ".join(claim_ctx_entities),
+                    ]
+                )
+            )
+            anchor_overlap_count = len(candidate_tokens & anchor_tokens) if anchor_tokens else 0
+            claim_overlap_count = len(candidate_tokens & claim_tokens) if claim_tokens else 0
+            claim_context_match = bool(
+                normalized_claim_hash and stored_claim_hash and stored_claim_hash == normalized_claim_hash
+            )
+            claim_alignment_boost = 0.0
+            if claim_context_match:
+                claim_alignment_boost += 0.12
+            if anchor_overlap_count > 0:
+                claim_alignment_boost += min(0.10, 0.02 * anchor_overlap_count)
+            if claim_overlap_count > 0:
+                claim_alignment_boost += min(0.06, 0.01 * claim_overlap_count)
+            aligned_score = min(1.0, score + claim_alignment_boost)
+
+            if anchor_tokens or claim_tokens or normalized_claim_hash:
+                has_alignment = claim_context_match or anchor_overlap_count > 0 or claim_overlap_count > 0
+                if not has_alignment and score < max(effective_min_score + 0.10, 0.45):
+                    dropped_claim_mismatch += 1
+                    continue
+
             result = {
-                "score": score,
-                "statement": metadata.get("statement", ""),
-                "entities": metadata.get("entities", []) or [],
+                "score": aligned_score,
+                "semantic_score_raw": score,
+                "statement": statement,
+                "entities": entities,
                 "source_url": metadata.get("source_url") or metadata.get("source", ""),
                 "published_at": metadata.get("published_at"),
                 "credibility": metadata.get("credibility"),
@@ -191,7 +252,19 @@ class VDBRetrieval:
                 "doc_type": metadata.get("doc_type"),
                 "fact_type": metadata.get("fact_type"),
                 "count_value": metadata.get("count_value"),
+                "claim_context_hash": stored_claim_hash,
+                "claim_context_match": claim_context_match,
+                "claim_context_entities": claim_ctx_entities,
+                "anchor_overlap_count": anchor_overlap_count,
+                "claim_overlap_count": claim_overlap_count,
+                "claim_alignment_score": round(claim_alignment_boost, 4),
             }
+            if aligned_score < effective_min_score:
+                dropped += 1
+                # Keep a lightweight backfill pool to avoid starvation.
+                if aligned_score >= VDB_BACKFILL_MIN_SCORE:
+                    below_threshold.append(result)
+                continue
             if result["statement"]:  # Only include non-empty statements
                 if any(p in result["statement"].lower() for p in low_signal_phrases):
                     dropped_low_signal += 1
@@ -222,13 +295,14 @@ class VDBRetrieval:
         )
         logger.info(
             "[VDBRetrieval][Filter] query='%s' pre=%d above_min=%d post=%d "
-            "dropped_min=%d dropped_low_signal=%d min=%.2f",
+            "dropped_min=%d dropped_low_signal=%d dropped_claim_mismatch=%d min=%.2f",
             normalized_query[:80],
             pre_filter_count,
             max(0, pre_filter_count - dropped),
             len(results),
             dropped,
             dropped_low_signal,
+            dropped_claim_mismatch,
             effective_min_score,
         )
         return results
@@ -273,6 +347,10 @@ class VDBRetrieval:
                 "doc_type": metadata.get("doc_type"),
                 "fact_type": metadata.get("fact_type"),
                 "count_value": metadata.get("count_value"),
+                "claim_context_hash": metadata.get("claim_context_hash"),
+                "claim_context_entities": metadata.get("claim_context_entities")
+                or metadata.get("claim_entities_ctx")
+                or [],
             }
             if include_values:
                 result["values"] = values
