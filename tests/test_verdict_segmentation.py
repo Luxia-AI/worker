@@ -246,3 +246,83 @@ def test_normalize_evidence_map_neutralizes_reporting_statement():
     assert normalized
     assert normalized[0]["relevance"] == "NEUTRAL"
     assert normalized[0]["relevance_score"] < 0.5
+
+
+def test_attach_exact_claim_segment_preserves_original_split_text():
+    vg = _vg()
+    claim = "Poor sleep is a significant risk factor for weight gain and obesity"
+    segments = vg._split_claim_into_segments(claim)
+    assert len(segments) >= 2
+
+    breakdown = [
+        {"claim_segment": segments[0], "status": "UNKNOWN"},
+        {"claim_segment": "obesity", "status": "UNKNOWN"},
+    ]
+    out = vg._attach_exact_claim_segments(claim, breakdown)
+    assert all(str(item.get("exact_claim_segment") or "").strip() for item in out)
+    assert out[0]["exact_claim_segment"] == segments[0]
+    assert out[1]["exact_claim_segment"] == segments[1]
+
+
+def test_parse_verdict_result_includes_exact_claim_segment_field():
+    vg = _vg()
+    claim = "Zinc is a necessary mineral that contributes to normal fertility and reproduction"
+    llm_result = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.3,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN"}],
+    }
+    out = vg._parse_verdict_result(llm_result, claim, evidence=[])
+    assert out["claim_breakdown"]
+    assert "exact_claim_segment" in out["claim_breakdown"][0]
+    assert str(out["claim_breakdown"][0]["exact_claim_segment"]).strip()
+
+
+def test_parse_verdict_result_includes_direct_evidence_and_plain_key_findings():
+    vg = _vg()
+    claim = "Moderate coffee consumption does not cause dehydration."
+    evidence = [
+        {
+            "statement": "A low to moderate dose of caffeine does not induce a diuretic effect.",
+            "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC3886980",
+            "final_score": 0.78,
+            "credibility": 0.9,
+        }
+    ]
+    llm_result = {
+        "verdict": "PARTIALLY_TRUE",
+        "confidence": 0.6,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID"}],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": evidence[0]["statement"],
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.78,
+                "source_url": evidence[0]["source_url"],
+            }
+        ],
+    }
+    out = vg._parse_verdict_result(llm_result, claim, evidence=evidence)
+    assert "direct_evidence" in out
+    assert isinstance(out["direct_evidence"], list)
+    assert isinstance(out.get("key_findings"), list)
+    assert "Final verdict:" not in str(out.get("rationale") or "")
+
+
+def test_build_direct_evidence_list_returns_exact_statements():
+    entries = VerdictGenerator._build_direct_evidence_list(
+        claim_breakdown=[
+            {
+                "status": "VALID",
+                "supporting_fact": "A low to moderate dose of caffeine does not induce a diuretic effect.",
+                "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC3886980",
+            }
+        ],
+        evidence_map=[],
+    )
+    assert entries
+    assert entries[0]["statement"] == "A low to moderate dose of caffeine does not induce a diuretic effect."
+    assert entries[0]["source_url"] == "https://pmc.ncbi.nlm.nih.gov/articles/PMC3886980"

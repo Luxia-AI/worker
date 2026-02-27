@@ -137,3 +137,69 @@ def test_for_pattern_claim_extracts_support_predicate_and_matches_evidence():
         "Vitamin D is necessary for normal bone growth in children.",
     )
     assert score >= 0.7
+
+
+def test_not_all_quantifier_not_refuted_by_subset_evidence():
+    vg = _vg()
+    claim = "Not all fats are harmful"
+    evidence = [
+        {
+            "statement": "Trans fats are harmful to health.",
+            "source_url": "https://www.bmj.com/content/351/bmj.h3978/rr-8",
+            "final_score": 0.82,
+            "credibility": 0.95,
+        }
+    ]
+    normalized = vg._normalize_evidence_map(
+        claim,
+        [{"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "REFUTES", "relevance_score": 0.82}],
+        evidence,
+    )
+    assert normalized
+    assert normalized[0]["relevance"] != "REFUTES"
+
+    llm_result = {
+        "verdict": "FALSE",
+        "confidence": 0.8,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "INVALID"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "REFUTES", "relevance_score": 0.82}
+        ],
+    }
+    out = vg._parse_verdict_result(llm_result, claim, evidence)
+    assert out["verdict"] != "FALSE"
+    assert out["claim_breakdown"][0]["status"] != "INVALID"
+
+
+def test_moderate_claim_not_refuted_by_overload_statement():
+    vg = _vg()
+    claim = "Moderate coffee consumption does not cause dehydration."
+    evidence = [
+        {
+            "statement": "Caffeine overload is the risk for dehydration, not coffee itself.",
+            "source_url": "https://health.clevelandclinic.org/coffee-dehydration",
+            "final_score": 0.46,
+            "credibility": 0.7,
+        }
+    ]
+    normalized = vg._normalize_evidence_map(
+        claim,
+        [{"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "REFUTES", "relevance_score": 0.46}],
+        evidence,
+    )
+    assert normalized
+    assert normalized[0]["relevance"] != "REFUTES"
+
+    llm_result = {
+        "verdict": "FALSE",
+        "confidence": 0.75,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "INVALID"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.46}
+        ],
+    }
+    out = vg._parse_verdict_result(llm_result, claim, evidence)
+    assert out["verdict"] != "FALSE"
+    assert out["claim_breakdown"][0]["status"] != "INVALID"

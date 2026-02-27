@@ -1265,6 +1265,10 @@ class VerdictGenerator:
             if therapeutic_efficacy_claim and polarity_text and not is_efficacy_relevant(polarity_text):
                 polarity_text = ""
             polarity = self._segment_polarity(seg_text, polarity_text, stance=stance)
+            quantifier_refute_allowed = self._quantifier_refute_allowed(seg_text, polarity_text)
+            dose_scope_refute_allowed = self._dose_scope_refute_allowed(seg_text, polarity_text)
+            contradiction_eligibility = quantifier_refute_allowed and dose_scope_refute_allowed
+            polarity_predicate_match = float(self.compute_predicate_match(seg_text, polarity_text) or 0.0)
             anchor_overlap = self._segment_anchor_overlap(seg_text, fact or "")
             try:
                 best_semantic = float(
@@ -1283,11 +1287,18 @@ class VerdictGenerator:
 
             if status in {"VALID", "PARTIALLY_VALID"} and fact and fact_neg and not seg_neg:
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
-            if status in {"VALID", "PARTIALLY_VALID"} and polarity == "contradicts":
+            if (
+                status in {"VALID", "PARTIALLY_VALID"}
+                and polarity == "contradicts"
+                and contradiction_eligibility
+                and polarity_predicate_match >= 0.4
+            ):
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
             if (
                 status in {"VALID", "PARTIALLY_VALID"}
                 and high_semantic_negation_mismatch
+                and contradiction_eligibility
+                and polarity_predicate_match >= 0.4
                 and (polarity == "contradicts" or self._is_explicit_refutation_statement(polarity_text))
             ):
                 seg["status"] = "INVALID" if status == "VALID" else "PARTIALLY_INVALID"
@@ -1335,14 +1346,22 @@ class VerdictGenerator:
                 if not fact:
                     seg["supporting_fact"] = polarity_text
                     fact = polarity_text
-                if high_semantic_negation_mismatch and (
-                    polarity == "contradicts" or self._is_explicit_refutation_statement(polarity_text)
+                if (
+                    high_semantic_negation_mismatch
+                    and (polarity == "contradicts" or self._is_explicit_refutation_statement(polarity_text))
+                    and contradiction_eligibility
+                    and polarity_predicate_match >= 0.4
                 ):
                     seg["status"] = "INVALID"
                     seg["supporting_fact"] = fact
                     seg["source_url"] = src
                     seg["evidence_used_ids"] = [best_idx] if best_idx >= 0 else []
-                elif polarity == "contradicts" and best_semantic >= 0.75:
+                elif (
+                    polarity == "contradicts"
+                    and best_semantic >= 0.75
+                    and contradiction_eligibility
+                    and polarity_predicate_match >= 0.4
+                ):
                     seg["status"] = "PARTIALLY_INVALID"
                     seg["supporting_fact"] = fact
                     seg["source_url"] = src
@@ -1373,9 +1392,13 @@ class VerdictGenerator:
             final_status = (seg.get("status") or "UNKNOWN").upper()
             if final_status in {"INVALID", "PARTIALLY_INVALID"}:
                 contradiction_signal = (
-                    polarity == "contradicts"
-                    or high_semantic_negation_mismatch
-                    or self._is_explicit_refutation_statement(polarity_text or "")
+                    contradiction_eligibility
+                    and polarity_predicate_match >= 0.4
+                    and (
+                        polarity == "contradicts"
+                        or high_semantic_negation_mismatch
+                        or self._is_explicit_refutation_statement(polarity_text or "")
+                    )
                 )
                 if not contradiction_signal:
                     seg["status"] = "UNKNOWN"
@@ -2155,6 +2178,7 @@ class VerdictGenerator:
             )
 
         key_findings = self._build_evidence_grounded_key_findings(claim_breakdown, evidence_map)
+        direct_evidence = self._build_direct_evidence_list(claim_breakdown, evidence_map)
 
         verdict_payload = {
             "verdict": verdict_str,
@@ -2167,6 +2191,7 @@ class VerdictGenerator:
             "claim_breakdown": claim_breakdown,
             "evidence_map": evidence_map,
             "key_findings": key_findings,
+            "direct_evidence": direct_evidence,
             "claim": claim,
             "evidence_count": len(evidence),
             "required_segments_count": reconciled["required_segments_count"],
@@ -3507,6 +3532,57 @@ class VerdictGenerator:
             return "SUPPORTS"
         return "NEUTRAL"
 
+    @staticmethod
+    def _has_not_all_quantifier(text: str) -> bool:
+        low = (text or "").lower()
+        return bool(re.search(r"\bnot\s+all\b", low))
+
+    @staticmethod
+    def _has_universal_quantifier(text: str) -> bool:
+        low = (text or "").lower()
+        return bool(
+            re.search(
+                r"\b(all|every|each|always|entirely|completely|universally|all\s+types?|all\s+forms?)\b",
+                low,
+            )
+        )
+
+    def _quantifier_refute_allowed(self, claim_text: str, statement: str) -> bool:
+        # For "not all X are Y" claims, subset-level statements like
+        # "trans fats are harmful" must not be treated as full contradiction.
+        if self._has_not_all_quantifier(claim_text):
+            return self._has_universal_quantifier(statement)
+        return True
+
+    @staticmethod
+    def _dose_scope_refute_allowed(claim_text: str, statement: str) -> bool:
+        claim = (claim_text or "").lower()
+        stmt = (statement or "").lower()
+        claim_moderate = bool(
+            re.search(
+                r"\b(low|moderate|normal|usual|recommended)\b|\b(?:1|2|3|4)\s*(?:cups?|mg|milligrams?)\b",
+                claim,
+            )
+        )
+        stmt_high_or_excess = bool(
+            re.search(
+                (
+                    r"\b(high|higher|excess|excessive|overload|overconsumption|heavy|very high|large amounts?)\b|"
+                    r"\btoo much\b|\bthroughout the day\b"
+                ),
+                stmt,
+            )
+        )
+        stmt_moderate = bool(
+            re.search(
+                r"\b(low|moderate|normal|usual|recommended)\b|\b(?:1|2|3|4)\s*(?:cups?|mg|milligrams?)\b",
+                stmt,
+            )
+        )
+        if claim_moderate and stmt_high_or_excess and not stmt_moderate:
+            return False
+        return True
+
     def compute_predicate_match(self, claim_text: str, evidence_text: str) -> float:
         claim_t = self._extract_canonical_predicate_triplet(claim_text)
         ev_t = self._extract_canonical_predicate_triplet(evidence_text)
@@ -3839,6 +3915,12 @@ class VerdictGenerator:
                     or numeric_rel == "CONTRADICTS"
                     or dna_rel == "CONTRADICTS"
                 )
+                # Quantifier guard: "not all X are Y" cannot be refuted by
+                # subset evidence like "trans fats are harmful".
+                if refute_by_rule and not self._quantifier_refute_allowed(claim, statement):
+                    refute_by_rule = False
+                if refute_by_rule and not self._dose_scope_refute_allowed(claim, statement):
+                    refute_by_rule = False
                 if refute_by_rule:
                     if intervention_match:
                         relevance = "REFUTES"
@@ -4066,6 +4148,8 @@ class VerdictGenerator:
                     bool(em.get("intervention_match", False))
                     and predicate_match_score >= 0.4
                     and float(em.get("credibility", 0.0) or 0.0) >= 0.8
+                    and self._quantifier_refute_allowed(segment, statement)
+                    and self._dose_scope_refute_allowed(segment, statement)
                     and (
                         contradiction_score >= CONTRADICTION_THRESHOLD
                         or self._segment_polarity(segment, statement, stance="neutral") == "contradicts"
@@ -4586,6 +4670,81 @@ class VerdictGenerator:
             else:
                 matched_statuses.append("UNKNOWN")
         return matched_statuses
+
+    def _attach_exact_claim_segments(self, claim: str, claim_breakdown: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        required_segments = self._split_claim_into_segments(claim)
+        if not required_segments:
+            cleaned = re.sub(r"\s+", " ", (claim or "")).strip(" ,.")
+            required_segments = [cleaned] if cleaned else []
+        if not claim_breakdown:
+            return claim_breakdown
+
+        stop = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+        }
+
+        def _tokens(text: str) -> set[str]:
+            return {w for w in re.findall(r"\b[\w']+\b", (text or "").lower()) if w and w not in stop and len(w) > 2}
+
+        required_pack = [
+            {"segment": seg, "tokens": _tokens(seg), "used": False}
+            for seg in required_segments
+            if str(seg or "").strip()
+        ]
+
+        for item in claim_breakdown:
+            existing_exact = str(item.get("exact_claim_segment") or "").strip()
+            if existing_exact:
+                item["exact_claim_segment"] = existing_exact
+                continue
+
+            seg = self._normalize_segment_text(str(item.get("claim_segment") or ""))
+            seg_tokens = _tokens(seg)
+            best_idx = -1
+            best_overlap = 0.0
+            for idx, req in enumerate(required_pack):
+                if req["used"]:
+                    continue
+                req_tokens = req["tokens"]
+                if not req_tokens and not seg_tokens:
+                    overlap = 1.0
+                else:
+                    overlap = len(seg_tokens & req_tokens) / max(1, len(req_tokens))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+                    best_idx = idx
+
+            if best_idx >= 0 and best_overlap >= 0.30:
+                required_pack[best_idx]["used"] = True
+                item["exact_claim_segment"] = str(required_pack[best_idx]["segment"])
+            elif required_pack:
+                fallback_idx = next((i for i, req in enumerate(required_pack) if not req["used"]), 0)
+                if 0 <= fallback_idx < len(required_pack):
+                    required_pack[fallback_idx]["used"] = True
+                    item["exact_claim_segment"] = str(required_pack[fallback_idx]["segment"])
+            else:
+                item["exact_claim_segment"] = seg or str(item.get("claim_segment") or "").strip()
+        return claim_breakdown
 
     def _build_decision_trace_id(self, claim: str, evidence: List[Dict[str, Any]]) -> str:
         statement_len_sum = sum(len(str(e.get("statement") or e.get("text") or "")) for e in (evidence or []))
@@ -5119,15 +5278,11 @@ class VerdictGenerator:
             return t
 
         if verdict == Verdict.UNVERIFIABLE.value:
-            return (
-                "Available admissible evidence is mixed or insufficiently decisive for this claim, "
-                "so the result is UNVERIFIABLE."
-            )
+            return "The available evidence is still mixed or not decisive enough to make a firm call on this claim."
         if unresolved > 0 or unknown_count > 0:
             return (
-                f"Evidence supports {valid_count}/{total} segment(s), "
-                f"while {unknown_count} segment(s) remain unresolved. "
-                f"Verdict is {verdict} until segment-level evidence is complete."
+                f"So far, evidence supports {valid_count}/{total} segment(s), "
+                f"while {unknown_count} segment(s) remain unresolved."
             )
         if invalid_count > 0 and valid_count > 0:
             return (
@@ -5135,14 +5290,14 @@ class VerdictGenerator:
                 f"{invalid_count}/{total} are contradicted."
             )
         if invalid_count == total:
-            return "Evidence contradicts all required claim segments."
+            return "Current evidence consistently points against this claim."
         if valid_count == total and verdict == Verdict.TRUE.value:
             return _normalize_for_verdict(
-                original or "Evidence supports all required claim segments.",
+                original or "Current evidence consistently supports this claim.",
                 verdict,
             )
         return _normalize_for_verdict(
-            original or "Verdict is based on segment-level evidence evaluation.",
+            original or "This assessment is based on segment-level evidence evaluation.",
             verdict,
         )
 
@@ -5152,8 +5307,7 @@ class VerdictGenerator:
         evidence_map: List[Dict[str, Any]],
     ) -> List[str]:
         """
-        Build key findings from aligned segment evidence only.
-        Prevents unsupported LLM key-findings from leaking into final output.
+        Build key findings from exact aligned evidence statements only.
         """
         findings: List[str] = []
         seen: set[str] = set()
@@ -5166,10 +5320,7 @@ class VerdictGenerator:
             fact = str(seg.get("supporting_fact") or "").strip()
             if not segment or not fact:
                 continue
-            if status in {"INVALID", "PARTIALLY_INVALID"}:
-                text = f"Contradicted: {segment}. Evidence: {fact}"
-            else:
-                text = f"{segment}. Evidence: {fact}"
+            text = fact
             key = re.sub(r"\s+", " ", text).strip().lower()
             if key and key not in seen:
                 findings.append(text)
@@ -5185,7 +5336,7 @@ class VerdictGenerator:
             stmt = str(em.get("statement") or "").strip()
             if not stmt:
                 continue
-            text = f"Evidence ({rel.lower()}): {stmt}"
+            text = stmt
             key = re.sub(r"\s+", " ", text).strip().lower()
             if key and key not in seen:
                 findings.append(text)
@@ -5194,6 +5345,57 @@ class VerdictGenerator:
                 break
 
         return findings
+
+    @staticmethod
+    def _build_direct_evidence_list(
+        claim_breakdown: List[Dict[str, Any]],
+        evidence_map: List[Dict[str, Any]],
+        limit: int = 5,
+    ) -> List[Dict[str, str]]:
+        out: List[Dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+
+        for seg in claim_breakdown or []:
+            fact = str(seg.get("supporting_fact") or "").strip()
+            src = str(seg.get("source_url") or "").strip()
+            status = str(seg.get("status") or "UNKNOWN").upper()
+            if not fact:
+                continue
+            item = {
+                "statement": fact,
+                "source_url": src,
+                "segment_status": status,
+            }
+            key = (item["statement"].lower(), item["source_url"].lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+            if len(out) >= limit:
+                return out
+
+        for em in evidence_map or []:
+            rel = str(em.get("relevance") or "").upper()
+            if rel not in {"SUPPORTS", "REFUTES"}:
+                continue
+            stmt = str(em.get("statement") or "").strip()
+            src = str(em.get("source_url") or "").strip()
+            if not stmt:
+                continue
+            item = {
+                "statement": stmt,
+                "source_url": src,
+                "segment_status": rel,
+            }
+            key = (item["statement"].lower(), item["source_url"].lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+            if len(out) >= limit:
+                break
+
+        return out
 
     def _build_deterministic_claim_breakdown(self, claim: str, evidence: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
@@ -5323,6 +5525,7 @@ class VerdictGenerator:
             out.append(
                 {
                     "claim_segment": seg,
+                    "exact_claim_segment": seg,
                     "status": status,
                     "supporting_fact": (best.get("statement") if best and status != "UNKNOWN" else "") or "",
                     "source_url": (best.get("source_url") if best and status != "UNKNOWN" else "") or "",
@@ -5874,6 +6077,7 @@ class VerdictGenerator:
             for seg in claim_breakdown:
                 if "evidence_used_ids" not in seg or seg.get("evidence_used_ids") is None:
                     seg["evidence_used_ids"] = []
+        claim_breakdown = self._attach_exact_claim_segments(claim, claim_breakdown)
         payload["claim_breakdown"] = claim_breakdown
 
         if verdict == Verdict.TRUE.value:
@@ -5908,35 +6112,41 @@ class VerdictGenerator:
         if best_stmt and best_src:
             stance_word = "supports" if verdict == Verdict.TRUE.value else "contradicts"
             explicit_rationale = (
-                f"Final verdict: {verdict}. Direct evidence from {best_src} {stance_word} the claim: {best_stmt}"
+                f"Based on the strongest direct evidence, this claim is assessed as {verdict}. "
+                f"Evidence from {best_src} {stance_word} this conclusion: {best_stmt}"
             )
         elif best_stmt:
             stance_word = "supports" if verdict == Verdict.TRUE.value else "contradicts"
-            explicit_rationale = f"Final verdict: {verdict}. Direct evidence {stance_word} the claim: {best_stmt}"
-        else:
             explicit_rationale = (
-                f"Final verdict: {verdict}. Determined from strongest available evidence "
-                "signals after exhaustive retrieval."
+                f"Based on the strongest direct evidence, this claim is assessed as {verdict}. "
+                f"The evidence {stance_word} this conclusion: {best_stmt}"
             )
-        candidate_rationale = explicit_rationale if low_quality_rationale else f"Final verdict: {verdict}. {rationale}"
+        else:
+            explicit_rationale = f"Based on the currently available evidence, this claim is assessed as {verdict}."
+        candidate_rationale = explicit_rationale if low_quality_rationale else f"{rationale}"
         fidelity = self._rationale_sentence_fidelity(candidate_rationale, evidence_map, evidence)
         if fidelity < 0.50:
             candidate_rationale = explicit_rationale
         payload["rationale"] = candidate_rationale
 
         key_findings = payload.get("key_findings", []) or []
+        direct_evidence = self._build_direct_evidence_list(claim_breakdown, evidence_map)
         all_unknown = bool(claim_breakdown) and all(
             str(seg.get("status") or "UNKNOWN").upper() == "UNKNOWN" for seg in claim_breakdown
         )
         if all_unknown:
             key_findings = []
         elif not key_findings:
-            key_findings = self._build_evidence_grounded_key_findings(claim_breakdown, evidence_map)
+            key_findings = [
+                str(item.get("statement") or "").strip() for item in direct_evidence if item.get("statement")
+            ]
+            key_findings = [k for k in key_findings if k][:3]
         if not all_unknown and (not key_findings) and best_stmt:
             key_findings = [best_stmt]
         if not all_unknown and (not key_findings):
-            key_findings = [f"Binary decision finalized as {verdict} based on highest-signal evidence."]
+            key_findings = []
         payload["key_findings"] = key_findings
+        payload["direct_evidence"] = direct_evidence
         payload["evidence_count"] = max(int(payload.get("evidence_count", 0) or 0), len(evidence_map), len(evidence))
 
         analysis_counts = payload.get("analysis_counts")
