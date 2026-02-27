@@ -427,6 +427,10 @@ class VerdictGenerator:
         claim_tokens = self._meaningful_tokens(claim)
         if not claim_tokens:
             return None
+        strict_predicate_threshold = max(
+            float(PREDICATE_MATCH_THRESHOLD),
+            float(os.getenv("SEGMENT_STRICT_PREDICATE_FLOOR", "0.35")),
+        )
         best: Optional[Dict[str, Any]] = None
         best_score = -1.0
         for ev in evidence[:12]:
@@ -448,6 +452,10 @@ class VerdictGenerator:
             stmt_tokens = self._meaningful_tokens(stmt)
             overlap = len(claim_tokens & stmt_tokens)
             if overlap < 3:
+                continue
+            if float(self.compute_predicate_match(claim, stmt) or 0.0) < strict_predicate_threshold:
+                continue
+            if float(self._segment_anchor_overlap(claim, stmt) or 0.0) < max(0.25, ANCHOR_THRESHOLD - 0.05):
                 continue
             score = (0.70 * sem) + (0.30 * (overlap / max(1, len(claim_tokens))))
             if score > best_score:
@@ -4025,6 +4033,10 @@ class VerdictGenerator:
 
         evidence_by_id: Dict[int, Dict[str, Any]] = {idx: ev for idx, ev in enumerate(evidence)}
         support_strength_threshold = float(os.getenv("SEGMENT_SUPPORT_STRENGTH_THRESHOLD", "0.30"))
+        strict_predicate_threshold = max(
+            float(PREDICATE_MATCH_THRESHOLD),
+            float(os.getenv("SEGMENT_STRICT_PREDICATE_FLOOR", "0.35")),
+        )
 
         for seg in claim_breakdown:
             segment = (seg.get("claim_segment") or "").strip()
@@ -4120,14 +4132,14 @@ class VerdictGenerator:
                 content_overlap = len(self._content_tokens(segment) & self._content_tokens(statement))
                 strong_neutral_support = (
                     rel == "NEUTRAL"
-                    and predicate_match_score >= PREDICATE_MATCH_THRESHOLD
+                    and predicate_match_score >= strict_predicate_threshold
                     and anchor_overlap >= max(0.20, ANCHOR_THRESHOLD - 0.10)
                     and (support_strength >= support_strength_threshold or rel_score >= 0.55)
                     and polarity != "contradicts"
                 )
                 strict_support_ok = (
                     (rel == "SUPPORTS" or strong_neutral_support)
-                    and predicate_match_score >= PREDICATE_MATCH_THRESHOLD
+                    and predicate_match_score >= strict_predicate_threshold
                     and (
                         anchor_overlap >= max(0.20, ANCHOR_THRESHOLD - 0.10)
                         or (predicate_match_score >= 0.7 and support_strength >= 0.55 and rel_score >= 0.45)
@@ -4254,6 +4266,22 @@ class VerdictGenerator:
                     )
                 )
                 pred_match = float(chosen.get("predicate_match_score", 0.0) or 0.0)
+                segment_requires_predicate_guard = bool(
+                    re.search(
+                        (
+                            r"\b(is|are|was|were|be|being|"
+                            r"cause|causes|caused|causing|reduce|reduces|reduced|reducing|"
+                            r"prevent|prevents|prevented|preventing|support|supports|supported|supporting|"
+                            r"contribute|contributes|contributed|contributing|"
+                            r"help|helps|helped|helping|treat|treats|treated|treating|"
+                            r"cure|cures|cured|curing|improve|improves|improved|improving|"
+                            r"worsen|worsens|worsened|worsening|increase|increases|increased|increasing|"
+                            r"decrease|decreases|decreased|decreasing|"
+                            r"detoxif(?:y|ies|ied|ying))\b"
+                        ),
+                        segment.lower(),
+                    )
+                )
                 hedge_support_language = bool(
                     re.search(
                         (
@@ -4268,11 +4296,35 @@ class VerdictGenerator:
                 elif explicit_refute_present:
                     seg["status"] = "INVALID"
                 elif best_support_item is not None:
+                    if segment_requires_predicate_guard and pred_match < strict_predicate_threshold:
+                        seg["status"] = "UNKNOWN"
+                        seg["supporting_fact"] = ""
+                        seg["source_url"] = ""
+                        seg["evidence_used_ids"] = []
+                        seg["alignment_debug"] = {
+                            "reason": "strict_predicate_floor_not_met",
+                            "predicate_match_score": round(float(pred_match), 3),
+                            "predicate_min_required": round(float(strict_predicate_threshold), 3),
+                            "canonical_predicate": str(seg_triplet.get("canonical_predicate") or ""),
+                        }
+                        continue
                     if seg_neg != stmt_neg and pred_match >= 0.45:
                         seg["status"] = "INVALID"
                     else:
                         seg["status"] = "PARTIALLY_VALID" if hedge_support_language else "VALID"
                 else:
+                    if segment_requires_predicate_guard and pred_match < strict_predicate_threshold:
+                        seg["status"] = "UNKNOWN"
+                        seg["supporting_fact"] = ""
+                        seg["source_url"] = ""
+                        seg["evidence_used_ids"] = []
+                        seg["alignment_debug"] = {
+                            "reason": "strict_predicate_floor_not_met",
+                            "predicate_match_score": round(float(pred_match), 3),
+                            "predicate_min_required": round(float(strict_predicate_threshold), 3),
+                            "canonical_predicate": str(seg_triplet.get("canonical_predicate") or ""),
+                        }
+                        continue
                     seg["status"] = "PARTIALLY_VALID"
                 if statement:
                     seg["supporting_fact"] = statement

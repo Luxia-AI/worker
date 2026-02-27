@@ -793,3 +793,27 @@ def test_negated_claim_not_validated_by_positive_support_fact():
     out = vg._parse_verdict_result(llm, claim, evidence)
     assert out["verdict"] != "TRUE"
     assert out["claim_breakdown"][0]["status"] in {"INVALID", "PARTIALLY_INVALID", "UNKNOWN"}
+
+
+def test_liver_detox_claim_not_validated_by_generic_water_fact():
+    vg = _vg()
+    claim = "Drinking lemon water detoxifies the liver"
+    evidence = [
+        {
+            "statement": "Drinking water also keeps your teeth and mouth healthy.",
+            "source_url": "https://www.healthdirect.gov.au/drinking-water-and-your-health",
+            "final_score": 0.42,
+            "credibility": 0.7,
+        }
+    ]
+    llm = {
+        "verdict": "PARTIALLY_TRUE",
+        "confidence": 0.75,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.42}
+        ],
+    }
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    assert out["claim_breakdown"][0]["status"] == "UNKNOWN"
