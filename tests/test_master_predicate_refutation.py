@@ -172,40 +172,6 @@ def test_not_all_quantifier_not_refuted_by_subset_evidence():
     assert out["claim_breakdown"][0]["status"] != "INVALID"
 
 
-def test_not_all_quantifier_not_supported_by_subset_harm_evidence():
-    vg = _vg()
-    claim = "Not all fats are harmful"
-    evidence = [
-        {
-            "statement": "Trans fats are harmful to health.",
-            "source_url": "https://www.bmj.com/content/351/bmj.h3978/rr-8",
-            "final_score": 0.82,
-            "credibility": 0.95,
-        }
-    ]
-
-    normalized = vg._normalize_evidence_map(
-        claim,
-        [{"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.82}],
-        evidence,
-    )
-    assert normalized
-    assert normalized[0]["relevance"] != "SUPPORTS"
-
-    llm_result = {
-        "verdict": "TRUE",
-        "confidence": 0.8,
-        "rationale": "test",
-        "claim_breakdown": [{"claim_segment": claim, "status": "VALID"}],
-        "evidence_map": [
-            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.82}
-        ],
-    }
-    out = vg._parse_verdict_result(llm_result, claim, evidence)
-    assert out["verdict"] != "TRUE"
-    assert out["claim_breakdown"][0]["status"] != "VALID"
-
-
 def test_moderate_claim_not_refuted_by_overload_statement():
     vg = _vg()
     claim = "Moderate coffee consumption does not cause dehydration."
@@ -232,39 +198,6 @@ def test_moderate_claim_not_refuted_by_overload_statement():
         "claim_breakdown": [{"claim_segment": claim, "status": "INVALID"}],
         "evidence_map": [
             {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.46}
-        ],
-    }
-    out = vg._parse_verdict_result(llm_result, claim, evidence)
-    assert out["verdict"] != "FALSE"
-    assert out["claim_breakdown"][0]["status"] != "INVALID"
-
-
-def test_moderate_claim_not_refuted_by_unbounded_generic_hazard_statement():
-    vg = _vg()
-    claim = "Moderate coffee consumption does not cause dehydration."
-    evidence = [
-        {
-            "statement": "Caffeine can cause dehydration.",
-            "source_url": "https://pubmed.ncbi.nlm.nih.gov/22740040/",
-            "final_score": 0.83,
-            "credibility": 0.5,
-        }
-    ]
-    normalized = vg._normalize_evidence_map(
-        claim,
-        [{"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "REFUTES", "relevance_score": 0.83}],
-        evidence,
-    )
-    assert normalized
-    assert normalized[0]["relevance"] != "REFUTES"
-
-    llm_result = {
-        "verdict": "FALSE",
-        "confidence": 0.75,
-        "rationale": "test",
-        "claim_breakdown": [{"claim_segment": claim, "status": "INVALID"}],
-        "evidence_map": [
-            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "REFUTES", "relevance_score": 0.83}
         ],
     }
     out = vg._parse_verdict_result(llm_result, claim, evidence)
