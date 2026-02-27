@@ -21,3 +21,28 @@ def test_non_listed_domain_fails() -> None:
 def test_case_insensitive_and_bare_host() -> None:
     assert is_trusted_domain("HTTPS://WWW.CDC.GOV/clean-hands")
     assert is_trusted_domain("PUBMED.NCBI.NLM.NIH.GOV")
+
+
+def test_expanded_trusted_health_policy_domains_are_present() -> None:
+    required = {
+        "statnews.com",
+        "healthaffairs.org",
+        "kff.org",
+        "cochranelibrary.com",
+        "sciencedirect.com",
+        "jamanetwork.com",
+        "nejm.org",
+        "clevelandclinic.org",
+        "hopkinsmedicine.org",
+        "mayoclinic.org",
+        "canada.ca",
+        "ema.europa.eu",
+        "nice.org.uk",
+        "nhs.uk",
+        "clinicaltrials.gov",
+        "pubmed.ncbi.nlm.nih.gov",
+        "pmc.ncbi.nlm.nih.gov",
+        "who.int",
+    }
+    missing = sorted(d for d in required if d not in TRUSTED_ROOT_DOMAINS)
+    assert not missing, f"Missing trusted roots: {missing}"

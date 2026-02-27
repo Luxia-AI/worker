@@ -122,7 +122,18 @@ def test_calcium_build_claim_maps_to_support_not_neutral():
     assert float(normalized[0].get("predicate_match_score", 0.0) or 0.0) >= 0.7
 
 
-def test_predicate_refute_hints_skip_non_action_noun_phrase_segments():
+def test_predicate_refute_hints_skip_for_pattern_noun_phrase_claim():
     vg = _vg()
     q = vg._predicate_refute_query_hints("Vitamin D for bone growth in children")
     assert q == []
+
+
+def test_for_pattern_claim_extracts_support_predicate_and_matches_evidence():
+    vg = _vg()
+    triplet = vg._extract_canonical_predicate_triplet("Vitamin D for bone growth in children")
+    assert triplet["canonical_predicate"] == "support"
+    score = vg.compute_predicate_match(
+        "Vitamin D for bone growth in children",
+        "Vitamin D is necessary for normal bone growth in children.",
+    )
+    assert score >= 0.7

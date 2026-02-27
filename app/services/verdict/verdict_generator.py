@@ -1924,6 +1924,14 @@ class VerdictGenerator:
             confidence = min(float(confidence), UNVERIFIABLE_CONFIDENCE_CAP)
             for seg in claim_breakdown or []:
                 status_u = str(seg.get("status") or "UNKNOWN").upper()
+                keep_supported_segment = (
+                    status_u in {"VALID", "PARTIALLY_VALID"}
+                    and support_status_count > 0
+                    and invalid_status_count == 0
+                    and map_contradict_signal < CONTRADICTION_THRESHOLD
+                )
+                if keep_supported_segment:
+                    continue
                 if status_u not in {"INVALID", "PARTIALLY_INVALID"}:
                     seg["status"] = "UNKNOWN"
                     seg["supporting_fact"] = ""
@@ -1948,6 +1956,13 @@ class VerdictGenerator:
         ):
             verdict_str = Verdict.PARTIALLY_TRUE.value
             truth_score_percent = max(55.0, min(75.0, float(truth_score_percent or 0.0)))
+        if verdict_str == Verdict.UNVERIFIABLE.value:
+            current_statuses = [str((seg or {}).get("status") or "UNKNOWN").upper() for seg in (claim_breakdown or [])]
+            has_support_now = any(s in {"VALID", "PARTIALLY_VALID"} for s in current_statuses)
+            has_invalid_now = any(s in {"INVALID", "PARTIALLY_INVALID"} for s in current_statuses)
+            if has_support_now and not has_invalid_now and map_contradict_signal < CONTRADICTION_THRESHOLD:
+                verdict_str = Verdict.PARTIALLY_TRUE.value
+                truth_score_percent = max(55.0, min(75.0, float(truth_score_percent or 0.0)))
         if verdict_str == Verdict.UNVERIFIABLE.value and numeric_truth_override is None:
             truth_score_percent = max(35.0, min(65.0, float(truth_score_percent or 0.0)))
         if self._has_absolute_quantifier(claim) and verdict_str == Verdict.TRUE.value:
@@ -3039,6 +3054,7 @@ class VerdictGenerator:
     def _segment_object_tokens(segment: str) -> set[str]:
         text = (segment or "").lower()
         patterns = (
+            r"^(?P<subject>.+?)\s+\b(?:for|to)\b\s+(?P<object>.+)$",
             r"\b(?:as\s+part\s+of|part\s+of)\s+(?P<object>.+)$",
             r"\b(?:support|supports|supported|help|helps|boost|boosts)\s+(?P<object>.+)$",
             (
@@ -3113,16 +3129,20 @@ class VerdictGenerator:
     @staticmethod
     def _segment_subject_tokens(segment: str) -> set[str]:
         text = (segment or "").lower()
-        match = re.search(
-            r"^(?P<subject>.+?)\b(?:increase|increases|increased|cause|causes|caused|"
-            r"reduce|reduces|reduced|prevent|prevents|prevented|contain|contains|work|works|"
-            r"contribut(?:e|es|ed|ing)|help|helps|support|supports|needed|required|"
-            r"is|are|was|were|has|have)\b",
-            text,
-        )
-        if not match:
-            return set()
-        subject_text = match.group("subject")
+        phrase_match = re.search(r"^(?P<subject>.+?)\s+\b(?:for|to)\b\s+(?P<object>.+)$", text)
+        if phrase_match:
+            subject_text = str(phrase_match.group("subject") or "")
+        else:
+            match = re.search(
+                r"^(?P<subject>.+?)\b(?:increase|increases|increased|cause|causes|caused|"
+                r"reduce|reduces|reduced|prevent|prevents|prevented|contain|contains|work|works|"
+                r"contribut(?:e|es|ed|ing)|help|helps|support|supports|needed|required|"
+                r"is|are|was|were|has|have)\b",
+                text,
+            )
+            if not match:
+                return set()
+            subject_text = match.group("subject")
         stop = {
             "to",
             "the",
@@ -3234,6 +3254,30 @@ class VerdictGenerator:
 
     def _extract_canonical_predicate_triplet(self, text: str) -> Dict[str, str]:
         low = (text or "").strip().lower()
+        has_explicit_relation_verb = bool(
+            re.search(
+                (
+                    r"\b(is|are|was|were|be|been|being|do|does|did|can|could|may|might|must|should|would|will|"
+                    r"support(?:s|ed|ing)?|help(?:s|ed|ing)?|contribut(?:e|es|ed|ing)|"
+                    r"prevent(?:s|ed|ing)?|reduce(?:s|d|ing)?|increase(?:s|d|ing)?|"
+                    r"improve(?:s|d|ing)?|cause(?:s|d|ing)?|require(?:s|d|ing)?|need(?:s|ed|ing)?)\b"
+                ),
+                low,
+                flags=re.IGNORECASE,
+            )
+        )
+        phrase_match = re.match(r"^\s*(?P<subj>.+?)\s+\b(?:for|to)\b\s+(?P<obj>.+?)\s*$", low, flags=re.IGNORECASE)
+        if phrase_match and not has_explicit_relation_verb:
+            subj = re.sub(r"\s+", " ", phrase_match.group("subj")).strip(" ,.")
+            obj = re.sub(r"\s+", " ", phrase_match.group("obj")).strip(" ,.")
+            if subj and obj:
+                return {
+                    "subject_span": subj,
+                    "predicate_span": "for",
+                    "object_span": obj,
+                    "canonical_predicate": "support",
+                }
+
         tokens = re.findall(r"\b[a-z][a-z0-9_-]*\b", low)
         if len(tokens) < 3:
             return {"subject_span": "", "predicate_span": "", "object_span": "", "canonical_predicate": ""}
@@ -3319,6 +3363,10 @@ class VerdictGenerator:
             "contain",
             "manage",
             "contribut",
+            "necessary",
+            "important",
+            "required",
+            "needed",
         }
         pred_idx = -1
         best_score = -1
@@ -3358,7 +3406,10 @@ class VerdictGenerator:
         selected = tokens[pred_idx]
         selected_lemma = self._lemma_token(selected)
         selected_verb_like = (
-            selected_lemma in verb_hints or selected in aux or selected.endswith(("ing", "ed", "es", "e"))
+            selected_lemma in verb_hints
+            or selected in aux
+            or selected in {"necessary", "important", "required", "needed"}
+            or selected.endswith(("ing", "ed", "es", "e"))
         )
         # Prevent noun-heavy spans from being forced into predicate slots.
         if best_score < 2 or (not selected_verb_like):
@@ -3425,6 +3476,10 @@ class VerdictGenerator:
             "link",
             "contribute",
             "contribut",
+            "necessary",
+            "important",
+            "required",
+            "needed",
             "require",
             "need",
             "maintain",
@@ -3750,6 +3805,9 @@ class VerdictGenerator:
             seed_rel = self._normalize_relevance_label(item.get("relevance", "NEUTRAL"))
             intervention_match, intervention_anchors_ok = self._intervention_alignment(claim, statement)
             credibility = float(ev.get("credibility", 0.5) or 0.5)
+            claim_scope = self._scope_profile(claim)
+            stmt_scope = self._scope_profile(statement)
+            scope_alignment = self._scope_alignment_score(claim_scope, stmt_scope)
 
             relevance = "NEUTRAL"
             relevance_score = max(0.0, min(1.0, base_score))
@@ -3771,9 +3829,6 @@ class VerdictGenerator:
                         statement.lower(),
                     )
                 )
-                claim_scope = self._scope_profile(claim)
-                stmt_scope = self._scope_profile(statement)
-                scope_alignment = self._scope_alignment_score(claim_scope, stmt_scope)
                 refute_by_rule = (
                     (
                         contradiction_score >= CONTRADICTION_THRESHOLD
@@ -3921,6 +3976,20 @@ class VerdictGenerator:
                     return
                 if not self._segment_topic_guard_ok(segment, statement):
                     return
+                seg_subject_tokens = {self._lemma_token(t) for t in self._segment_subject_tokens(segment)}
+                stmt_tokens_lem = {self._lemma_token(t) for t in self._statement_tokens(statement)}
+                if seg_subject_tokens:
+                    subject_overlap = len(seg_subject_tokens & stmt_tokens_lem) / max(1, len(seg_subject_tokens))
+                    seg_object_tokens_local = {self._lemma_token(t) for t in self._segment_object_tokens(segment)}
+                    object_overlap_local = (
+                        len(seg_object_tokens_local & stmt_tokens_lem) / max(1, len(seg_object_tokens_local))
+                        if seg_object_tokens_local
+                        else 0.0
+                    )
+                    # Prevent cross-subclaim leakage: evidence for a different intervention/entity
+                    # must not be used to mark this segment INVALID.
+                    if subject_overlap < 0.20 and object_overlap_local < 0.35 and not segment_belief_mode:
+                        return
                 anchor_eval = evaluate_anchor_match(segment, statement)
                 anchor_overlap = max(
                     float(anchor_eval.get("anchor_overlap", 0.0) or 0.0),
@@ -3965,6 +4034,8 @@ class VerdictGenerator:
                     em.get("contradiction_score", self._contradiction_score(segment, statement))
                 )
                 polarity = self._segment_polarity(segment, statement, stance="neutral")
+                segment_has_predicate = bool(str(seg_triplet.get("canonical_predicate") or "").strip())
+                content_overlap = len(self._content_tokens(segment) & self._content_tokens(statement))
                 strong_neutral_support = (
                     rel == "NEUTRAL"
                     and predicate_match_score >= PREDICATE_MATCH_THRESHOLD
@@ -3981,6 +4052,16 @@ class VerdictGenerator:
                     )
                     and (support_strength >= support_strength_threshold or rel_score >= 0.55)
                 )
+                noun_phrase_support_ok = (
+                    (not segment_has_predicate)
+                    and rel in {"SUPPORTS", "NEUTRAL"}
+                    and anchor_overlap >= 0.30
+                    and (content_overlap >= 1 or self._object_semantic_equivalent(segment, statement))
+                    and rel_score >= 0.30
+                    and polarity != "contradicts"
+                )
+                if noun_phrase_support_ok:
+                    strict_support_ok = True
                 refute_ok = rel == "REFUTES" and (
                     bool(em.get("intervention_match", False))
                     and predicate_match_score >= 0.4
@@ -4068,7 +4149,11 @@ class VerdictGenerator:
             if chosen is None and near_miss_support_item is not None:
                 chosen = near_miss_support_item
             if chosen is not None:
-                ev_id = int(chosen.get("evidence_id", -1) or -1)
+                raw_evidence_id = chosen.get("evidence_id", -1)
+                try:
+                    ev_id = int(raw_evidence_id)
+                except Exception:
+                    ev_id = -1
                 ev = evidence_by_id.get(ev_id, {})
                 statement = (chosen.get("statement") or ev.get("statement") or ev.get("text") or "").strip()
                 source_url = (chosen.get("source_url") or ev.get("source_url") or ev.get("source") or "").strip()
@@ -5704,7 +5789,7 @@ class VerdictGenerator:
         payload: Dict[str, Any],
         evidence: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
-        """Force final output into binary TRUE/FALSE with explicit rationale and evidence anchoring."""
+        """Normalize final payload and only force binary verdict when evidence is decisive."""
         payload = dict(payload or {})
         evidence = list(evidence or [])
 
@@ -5730,43 +5815,87 @@ class VerdictGenerator:
 
         original_verdict = str(payload.get("verdict") or "").upper()
         truth = float(payload.get("truthfulness_percent", 0.0) or 0.0)
-        verdict = self._decide_binary_verdict(
-            original_verdict,
-            truth,
-            evidence_map,
-            claim_breakdown,
+        statuses = [str(seg.get("status") or "UNKNOWN").upper() for seg in claim_breakdown]
+        has_unknown_status = any(s == "UNKNOWN" for s in statuses)
+        has_valid_like = any(s in {"VALID", "PARTIALLY_VALID"} for s in statuses)
+        has_invalid_like = any(s in {"INVALID", "PARTIALLY_INVALID"} for s in statuses)
+        mixed_status = has_valid_like and (has_invalid_like or has_unknown_status)
+        strong_support_signal = any(
+            str(item.get("relevance") or "").upper() == "SUPPORTS"
+            and float(item.get("relevance_score", 0.0) or 0.0) >= 0.35
+            for item in (evidence_map or [])
         )
+        strong_refute_signal = any(
+            str(item.get("relevance") or "").upper() == "REFUTES"
+            and float(item.get("relevance_score", 0.0) or 0.0) >= 0.35
+            for item in (evidence_map or [])
+        )
+        single_unknown_with_signal = (
+            len(statuses) == 1 and has_unknown_status and (strong_support_signal or strong_refute_signal)
+        )
+        preserve_multiclass = (
+            original_verdict == Verdict.PARTIALLY_TRUE.value or has_unknown_status or mixed_status
+        ) and not single_unknown_with_signal
+        if preserve_multiclass:
+            verdict = original_verdict or (Verdict.PARTIALLY_TRUE.value if mixed_status else Verdict.UNVERIFIABLE.value)
+            if verdict not in {
+                Verdict.TRUE.value,
+                Verdict.FALSE.value,
+                Verdict.PARTIALLY_TRUE.value,
+                Verdict.UNVERIFIABLE.value,
+            }:
+                verdict = Verdict.PARTIALLY_TRUE.value if mixed_status else Verdict.UNVERIFIABLE.value
+        else:
+            verdict = self._decide_binary_verdict(
+                original_verdict,
+                truth,
+                evidence_map,
+                claim_breakdown,
+            )
         payload["verdict"] = verdict
 
         best_ev = self._pick_best_binary_evidence(verdict, evidence_map, evidence)
         best_stmt = str(best_ev.get("statement") or "").strip()
         best_src = str(best_ev.get("source_url") or "").strip()
 
-        target_status = "VALID" if verdict == Verdict.TRUE.value else "INVALID"
-        for seg in claim_breakdown:
-            status = str(seg.get("status") or "UNKNOWN").upper()
-            if status in {"UNKNOWN", "PARTIALLY_VALID", "PARTIALLY_INVALID"}:
-                seg["status"] = target_status
-            if not str(seg.get("supporting_fact") or "").strip() and best_stmt:
-                seg["supporting_fact"] = best_stmt
-            if not str(seg.get("source_url") or "").strip() and best_src:
-                seg["source_url"] = best_src
-            if not seg.get("evidence_used_ids"):
-                seg["evidence_used_ids"] = [0] if best_stmt else []
+        if verdict in {Verdict.TRUE.value, Verdict.FALSE.value}:
+            target_status = "VALID" if verdict == Verdict.TRUE.value else "INVALID"
+            for seg in claim_breakdown:
+                status = str(seg.get("status") or "UNKNOWN").upper()
+                if status in {"UNKNOWN", "PARTIALLY_VALID", "PARTIALLY_INVALID"}:
+                    seg["status"] = target_status
+                if not str(seg.get("supporting_fact") or "").strip() and best_stmt:
+                    seg["supporting_fact"] = best_stmt
+                if not str(seg.get("source_url") or "").strip() and best_src:
+                    seg["source_url"] = best_src
+                if not seg.get("evidence_used_ids"):
+                    seg["evidence_used_ids"] = [0] if best_stmt else []
+        else:
+            for seg in claim_breakdown:
+                if "evidence_used_ids" not in seg or seg.get("evidence_used_ids") is None:
+                    seg["evidence_used_ids"] = []
         payload["claim_breakdown"] = claim_breakdown
 
         if verdict == Verdict.TRUE.value:
             truth = max(55.0, min(99.0, truth if truth > 0 else 62.0))
-        else:
+        elif verdict == Verdict.FALSE.value:
             truth = min(45.0, max(1.0, truth if truth > 0 else 38.0))
+        elif verdict == Verdict.PARTIALLY_TRUE.value:
+            truth = min(89.0, max(30.0, truth if truth > 0 else 60.0))
+        else:
+            truth = min(49.0, max(1.0, truth if truth > 0 else 25.0))
         payload["truthfulness_percent"] = truth
         payload["truth_score_percent"] = truth
 
         confidence = float(payload.get("confidence", 0.0) or 0.0)
         if verdict == Verdict.TRUE.value:
             confidence = max(confidence, 0.62 if best_stmt else 0.45)
+        elif verdict == Verdict.FALSE.value:
+            confidence = max(confidence, 0.75 if best_stmt else 0.50)
+        elif verdict == Verdict.PARTIALLY_TRUE.value:
+            confidence = max(confidence, 0.50 if best_stmt else 0.35)
         else:
-            confidence = max(confidence, 0.65 if best_stmt else 0.50)
+            confidence = max(confidence, 0.30 if best_stmt else 0.20)
         payload["confidence"] = max(0.05, min(0.98, confidence))
 
         rationale = str(payload.get("rationale") or "").strip()
@@ -5796,11 +5925,16 @@ class VerdictGenerator:
         payload["rationale"] = candidate_rationale
 
         key_findings = payload.get("key_findings", []) or []
-        if not key_findings:
+        all_unknown = bool(claim_breakdown) and all(
+            str(seg.get("status") or "UNKNOWN").upper() == "UNKNOWN" for seg in claim_breakdown
+        )
+        if all_unknown:
+            key_findings = []
+        elif not key_findings:
             key_findings = self._build_evidence_grounded_key_findings(claim_breakdown, evidence_map)
-        if not key_findings and best_stmt:
+        if not all_unknown and (not key_findings) and best_stmt:
             key_findings = [best_stmt]
-        if not key_findings:
+        if not all_unknown and (not key_findings):
             key_findings = [f"Binary decision finalized as {verdict} based on highest-signal evidence."]
         payload["key_findings"] = key_findings
         payload["evidence_count"] = max(int(payload.get("evidence_count", 0) or 0), len(evidence_map), len(evidence))
@@ -5816,6 +5950,11 @@ class VerdictGenerator:
                 }
             ) or (original_verdict != verdict)
             payload["analysis_counts"] = analysis_counts
+
+        # Final safety: if all segments ended UNKNOWN, do not emit synthetic key findings.
+        final_breakdown = payload.get("claim_breakdown") or []
+        if final_breakdown and all(str(seg.get("status") or "UNKNOWN").upper() == "UNKNOWN" for seg in final_breakdown):
+            payload["key_findings"] = []
         return payload
 
     def _unverifiable_result(self, claim: str, reason: str) -> Dict[str, Any]:
@@ -6095,6 +6234,8 @@ class VerdictGenerator:
             ]
             anchor_subject = " ".join(tokens[:2]).strip()
         pred_obj = " ".join(x for x in [predicate, obj] if x).strip()
+        if predicate.lower() in {"for", "to"} and obj:
+            pred_obj = f"support {obj}".strip()
         pred_obj = re.sub(r"^(?:do(?:es)?\s+not|cannot|can't|not)\s+", "", pred_obj, flags=re.IGNORECASE).strip()
         if not pred_obj:
             return []
@@ -6192,7 +6333,7 @@ class VerdictGenerator:
                     predicate_hints = [q for q in self._predicate_refute_query_hints(segment) if q]
                     generated_predicate_queries.extend(predicate_hints)
                 if hinted:
-                    queries = list(dict.fromkeys(predicate_hints + hinted + (queries or [])))
+                    queries = list(dict.fromkeys(hinted + predicate_hints + (queries or [])))
                 elif predicate_hints:
                     queries = list(dict.fromkeys(predicate_hints + (queries or [])))
                 if not queries:

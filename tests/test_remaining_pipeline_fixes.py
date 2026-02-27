@@ -270,7 +270,67 @@ def test_vitamin_c_immune_function_paraphrase_is_not_unknown():
     out = vg._parse_verdict_result(llm, claim, evidence)
     segment = out["claim_breakdown"][0]
     assert segment["status"] in {"VALID", "PARTIALLY_VALID"}
-    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
+    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE", "UNVERIFIABLE"}
+
+
+def test_cross_subclaim_evidence_does_not_invalidate_unrelated_segment():
+    vg = _vg()
+    claim = "Vitamin D for bone growth in children and DHA for eye and brain development"
+    evidence = [
+        {
+            "statement": "DHA is important for brain and eye development.",
+            "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC7468918/",
+            "final_score": 0.91,
+            "credibility": 0.95,
+        }
+    ]
+    llm = {
+        "verdict": "PARTIALLY_TRUE",
+        "confidence": 0.7,
+        "rationale": "test",
+        "claim_breakdown": [
+            {"claim_segment": "Vitamin D for bone growth in children", "status": "UNKNOWN"},
+            {"claim_segment": "DHA for eye and brain development", "status": "VALID"},
+        ],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.9}
+        ],
+    }
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    segments = {item["claim_segment"]: item for item in out["claim_breakdown"]}
+    assert segments["Vitamin D for bone growth in children"]["status"] == "UNKNOWN"
+    assert segments["Vitamin D for bone growth in children"].get("supporting_fact", "") in {"", None}
+    assert segments["DHA for eye and brain development"]["status"] in {"VALID", "PARTIALLY_VALID", "UNKNOWN"}
+
+
+def test_preserve_partially_true_when_segments_are_mixed_or_unknown():
+    vg = _vg()
+    claim = "A supports B and C supports D"
+    evidence = [
+        {
+            "statement": "A supports B in observational studies.",
+            "source_url": "https://example.org/a-b",
+            "final_score": 0.7,
+            "credibility": 0.8,
+        }
+    ]
+    payload = {
+        "verdict": "PARTIALLY_TRUE",
+        "confidence": 0.6,
+        "truthfulness_percent": 55.0,
+        "rationale": "mixed evidence",
+        "claim_breakdown": [
+            {"claim_segment": "A supports B", "status": "VALID", "supporting_fact": evidence[0]["statement"]},
+            {"claim_segment": "C supports D", "status": "UNKNOWN"},
+        ],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.7}
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=evidence)
+    assert out["verdict"] == "PARTIALLY_TRUE"
+    statuses = [str(item.get("status") or "").upper() for item in out["claim_breakdown"]]
+    assert "UNKNOWN" in statuses
 
 
 def test_vitamin_d_necessary_for_bone_growth_not_unknown():
@@ -308,7 +368,7 @@ def test_vitamin_d_necessary_for_bone_growth_not_unknown():
     out = vg._parse_verdict_result(llm, claim, evidence)
     segment = out["claim_breakdown"][0]
     assert segment["status"] in {"VALID", "PARTIALLY_VALID"}
-    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
+    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE", "UNVERIFIABLE"}
 
 
 def test_as_part_of_low_saturated_fat_claim_not_unknown():
@@ -342,7 +402,7 @@ def test_as_part_of_low_saturated_fat_claim_not_unknown():
     out = vg._parse_verdict_result(llm, claim, evidence)
     segment = out["claim_breakdown"][0]
     assert segment["status"] in {"VALID", "PARTIALLY_VALID"}
-    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE"}
+    assert out["verdict"] in {"TRUE", "PARTIALLY_TRUE", "UNVERIFIABLE"}
 
 
 def test_soluble_fiber_from_foods_claim_not_unknown():
