@@ -179,6 +179,35 @@ Return ONLY valid JSON (no markdown, no extra text):
 }}"""
 
 
+RATIONALE_GENERATION_PROMPT = """You are an expert scientific fact-checking writer.
+Write a short, human-readable verification rationale.
+
+Input claim:
+{claim}
+
+Final verdict:
+{verdict}
+
+Claim breakdown (segment status + cited fact):
+{claim_breakdown_text}
+
+Relevant evidence only (supporting/contradicting):
+{relevant_evidence_text}
+
+Instructions:
+- Write 2-4 sentences that are easy to understand at a glance.
+- Start with a direct verdict statement about the claim.
+- Mention the main supporting and/or contradicting evidence balance.
+- Keep language precise and non-hyped. Do not use boilerplate phrasing.
+- Do not invent evidence. Use only the provided inputs.
+- If evidence is mixed or limited, state that clearly.
+
+Return ONLY valid JSON:
+{{
+  "rationale": "..."
+}}"""
+
+
 class VerdictGenerator:
     """
     RAG-based verdict generator using LLM with augmented facts.
@@ -962,12 +991,24 @@ class VerdictGenerator:
                 final_evidence=top_evidence,
                 verdict_result=verdict_result,
             )
-            return self._enforce_binary_verdict_payload(claim, verdict_result, evidence=top_evidence)
+            final_payload = self._enforce_binary_verdict_payload(claim, verdict_result, evidence=top_evidence)
+            llm_rationale = await self._generate_llm_rationale(claim, final_payload)
+            if llm_rationale:
+                final_payload["rationale"] = llm_rationale
+            return final_payload
 
         except Exception as e:
             logger.error(f"[VerdictGenerator] LLM call failed: {e}")
             fallback = self._unverifiable_result(claim, f"Verdict generation failed: {str(e)}")
-            return self._enforce_binary_verdict_payload(claim, fallback, evidence=top_evidence if top_evidence else [])
+            final_payload = self._enforce_binary_verdict_payload(
+                claim,
+                fallback,
+                evidence=top_evidence if top_evidence else [],
+            )
+            llm_rationale = await self._generate_llm_rationale(claim, final_payload)
+            if llm_rationale:
+                final_payload["rationale"] = llm_rationale
+            return final_payload
 
     def _format_evidence_for_prompt(self, evidence: List[Dict[str, Any]]) -> str:
         """Format evidence list into readable text for the LLM prompt."""
@@ -990,6 +1031,90 @@ class VerdictGenerator:
             )
 
         return "\n\n".join(lines)
+
+    @staticmethod
+    def _format_claim_breakdown_for_rationale_prompt(claim_breakdown: List[Dict[str, Any]]) -> str:
+        lines: List[str] = []
+        for idx, seg in enumerate(claim_breakdown or []):
+            seg_text = str(seg.get("exact_claim_segment") or seg.get("claim_segment") or "").strip()
+            status = str(seg.get("status") or "UNKNOWN").strip().upper()
+            fact = str(seg.get("supporting_fact") or "").strip()
+            src = str(seg.get("source_url") or "").strip()
+            if not seg_text:
+                continue
+            line = f"[{idx}] Segment: {seg_text}\n    Status: {status}"
+            if fact:
+                line += f"\n    Fact: {fact}"
+            if src:
+                line += f"\n    Source: {src}"
+            lines.append(line)
+        return "\n\n".join(lines) if lines else "No segment breakdown available."
+
+    def _format_relevant_evidence_for_rationale_prompt(self, payload: Dict[str, Any], max_items: int = 8) -> str:
+        evidence_map = list(payload.get("evidence_map") or [])
+        relevant = []
+        for ev in evidence_map:
+            rel = self._normalize_relevance_label(ev.get("relevance", "NEUTRAL"))
+            if rel in {"SUPPORTS", "REFUTES"}:
+                relevant.append(ev)
+        if not relevant:
+            # Fallback: include strongest neutral evidence if no explicit support/refute survived.
+            relevant = sorted(
+                evidence_map,
+                key=lambda x: float(x.get("relevance_score", 0.0) or 0.0),
+                reverse=True,
+            )[: max(1, min(3, len(evidence_map)))]
+
+        relevant = sorted(
+            relevant,
+            key=lambda x: float(x.get("relevance_score", 0.0) or 0.0),
+            reverse=True,
+        )[:max_items]
+
+        lines: List[str] = []
+        for i, ev in enumerate(relevant):
+            stmt = str(ev.get("statement") or "").strip()
+            src = str(ev.get("source_url") or "").strip()
+            rel = self._normalize_relevance_label(ev.get("relevance", "NEUTRAL"))
+            score = float(ev.get("relevance_score", 0.0) or 0.0)
+            if not stmt:
+                continue
+            lines.append(
+                f"[{i}] Relevance: {rel} (score={score:.3f})\n"
+                f"    Statement: {stmt}\n"
+                f"    Source: {src or 'Unknown'}"
+            )
+        return "\n\n".join(lines) if lines else "No relevant evidence available."
+
+    async def _generate_llm_rationale(self, claim: str, payload: Dict[str, Any]) -> str:
+        """Generate the final rationale with Llama from finalized verdict state."""
+        try:
+            claim_breakdown_text = self._format_claim_breakdown_for_rationale_prompt(
+                payload.get("claim_breakdown") or []
+            )
+            relevant_evidence_text = self._format_relevant_evidence_for_rationale_prompt(payload)
+            prompt = RATIONALE_GENERATION_PROMPT.format(
+                claim=claim,
+                verdict=str(payload.get("verdict") or "UNVERIFIABLE"),
+                claim_breakdown_text=claim_breakdown_text,
+                relevant_evidence_text=relevant_evidence_text,
+            )
+            result = await self.llm_service.ainvoke(
+                prompt,
+                response_format="json",
+                priority=LLMPriority.HIGH,
+                temperature=LLM_TEMPERATURE_VERDICT,
+                call_tag="verdict_generation",
+            )
+            rationale = ""
+            if isinstance(result, dict):
+                rationale = str(result.get("rationale") or "").strip()
+            if not rationale:
+                return str(payload.get("rationale") or "").strip()
+            return rationale
+        except Exception as e:
+            logger.warning("[VerdictGenerator] LLM rationale generation failed, using fallback rationale: %s", e)
+            return str(payload.get("rationale") or "").strip()
 
     def _parse_verdict_result(
         self,
@@ -3156,6 +3281,12 @@ class VerdictGenerator:
             "have",
             "has",
             "had",
+            "certain",
+            "types",
+            "type",
+            "some",
+            "significant",
+            "new",
         }
         return {t for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", object_text) if t not in stop}
 
@@ -3244,6 +3375,10 @@ class VerdictGenerator:
             "preventive": (
                 r"\b(prevent|prevents|prevention|reduce|reduces|reduced|decrease|decreases|decreased|"
                 r"lower|lowers|lowered|protect|protects)\b"
+            ),
+            "risk_factor": (
+                r"\b(risk\s+factor|risk\s+factors|associated\s+with|association\s+with|"
+                r"linked\s+to|predispos(?:e|es|ed|ing)|contributor\s+to)\b"
             ),
             "therapeutic": (
                 r"\b(treat|treats|treatment|cure|cures|help|helps|promote|promotes|improve|improves|"
@@ -3641,6 +3776,21 @@ class VerdictGenerator:
         full_claim_buckets = self._predicate_bucket_tokens(claim_text)
         full_ev_buckets = self._predicate_bucket_tokens(evidence_text)
         full_bucket_overlap = bool(full_claim_buckets and full_ev_buckets and (full_claim_buckets & full_ev_buckets))
+        claim_low = (claim_text or "").lower()
+        evidence_low = (evidence_text or "").lower()
+        claim_preventive = bool(
+            re.search(r"\b(prevent|prevents|prevented|preventing|protection|protects?)\b", claim_low)
+        )
+        evidence_risk_reduction_only = bool(
+            re.search(
+                (
+                    r"\b(reduce|reduces|reduced|reducing|decrease|decreases|decreased|"
+                    r"lower|lowers|lowered)\b.{0,24}\b(risk|odds|chance|likelihood|incidence)\b"
+                ),
+                evidence_low,
+            )
+            and not re.search(r"\b(prevent|prevents|prevented|preventing|protect|protects)\b", evidence_low)
+        )
         claim_sub = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", claim_t.get("subject_span", "")))
         ev_sub = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", ev_t.get("subject_span", "")))
         sub_overlap = (len(claim_sub & ev_sub) / max(1, len(claim_sub))) if claim_sub else 0.0
@@ -3668,6 +3818,8 @@ class VerdictGenerator:
             and subject_guard_ok
             and (obj_overlap >= 0.35 or (anchor_overlap >= ANCHOR_THRESHOLD and pol in {"entails", "contradicts"}))
         ):
+            if claim_preventive and evidence_risk_reduction_only:
+                return 0.0
             return 0.7
         # Nominal/attribution claims often omit explicit verbs (e.g., "X from foods such as Y").
         # Treat source/composition relations as a predicate family when anchors align.
@@ -3697,9 +3849,13 @@ class VerdictGenerator:
             and (obj_overlap >= 0.35 or (anchor_overlap >= 0.25 and pol in {"entails", "contradicts"}))
             and subject_guard_ok
         ):
+            if claim_preventive and evidence_risk_reduction_only:
+                return 0.0
             return 0.7
         # Robust fallback: use full-sentence predicate families when token-level extraction is noisy.
         if full_bucket_overlap and (obj_overlap >= 0.35 or anchor_overlap >= 0.25) and subject_guard_ok:
+            if claim_preventive and evidence_risk_reduction_only:
+                return 0.0
             return 0.7
         if (
             self._predicate_semantic_equivalent(cp_full, ep_full)
@@ -6186,30 +6342,26 @@ class VerdictGenerator:
         payload["confidence"] = max(0.05, min(0.98, confidence))
 
         rationale = str(payload.get("rationale") or "").strip()
-        low_quality_rationale = (
-            not rationale
-            or "unverifiable" in rationale.lower()
-            or "insufficient" in rationale.lower()
-            or "partially" in rationale.lower()
+        candidate_rationale = self._build_human_rationale(
+            claim=claim,
+            verdict=verdict,
+            claim_breakdown=claim_breakdown,
+            evidence_map=evidence_map,
+            best_stmt=best_stmt,
+            best_src=best_src,
+            original_rationale=rationale,
         )
-        if best_stmt and best_src:
-            stance_word = "supports" if verdict == Verdict.TRUE.value else "contradicts"
-            explicit_rationale = (
-                f"Based on the strongest direct evidence, this claim is assessed as {verdict}. "
-                f"Evidence from {best_src} {stance_word} this conclusion: {best_stmt}"
-            )
-        elif best_stmt:
-            stance_word = "supports" if verdict == Verdict.TRUE.value else "contradicts"
-            explicit_rationale = (
-                f"Based on the strongest direct evidence, this claim is assessed as {verdict}. "
-                f"The evidence {stance_word} this conclusion: {best_stmt}"
-            )
-        else:
-            explicit_rationale = f"Based on the currently available evidence, this claim is assessed as {verdict}."
-        candidate_rationale = explicit_rationale if low_quality_rationale else f"{rationale}"
         fidelity = self._rationale_sentence_fidelity(candidate_rationale, evidence_map, evidence)
-        if fidelity < 0.50:
-            candidate_rationale = explicit_rationale
+        if fidelity < 0.35:
+            candidate_rationale = self._build_human_rationale(
+                claim=claim,
+                verdict=verdict,
+                claim_breakdown=claim_breakdown,
+                evidence_map=evidence_map,
+                best_stmt=best_stmt,
+                best_src=best_src,
+                original_rationale="",
+            )
         payload["rationale"] = candidate_rationale
 
         key_findings = payload.get("key_findings", []) or []
@@ -6249,6 +6401,58 @@ class VerdictGenerator:
         if final_breakdown and all(str(seg.get("status") or "UNKNOWN").upper() == "UNKNOWN" for seg in final_breakdown):
             payload["key_findings"] = []
         return payload
+
+    def _build_human_rationale(
+        self,
+        claim: str,
+        verdict: str,
+        claim_breakdown: List[Dict[str, Any]],
+        evidence_map: List[Dict[str, Any]],
+        best_stmt: str,
+        best_src: str,
+        original_rationale: str,
+    ) -> str:
+        rel_counts = {"SUPPORTS": 0, "REFUTES": 0, "NEUTRAL": 0}
+        for ev in evidence_map or []:
+            rel = self._normalize_relevance_label(ev.get("relevance", "NEUTRAL"))
+            rel_counts[rel] = rel_counts.get(rel, 0) + 1
+
+        statuses = [str(seg.get("status") or "UNKNOWN").upper() for seg in (claim_breakdown or [])]
+        has_unknown = any(s == "UNKNOWN" for s in statuses)
+        has_mixed = any(s in {"VALID", "PARTIALLY_VALID"} for s in statuses) and any(
+            s in {"INVALID", "PARTIALLY_INVALID"} for s in statuses
+        )
+
+        if verdict == Verdict.TRUE.value:
+            lead = f'According to the available evidence, the claim "{claim}" is supported.'
+        elif verdict == Verdict.FALSE.value:
+            lead = f'According to the available evidence, the claim "{claim}" is not supported.'
+        elif verdict == Verdict.PARTIALLY_TRUE.value:
+            lead = f'At a glance, evidence for "{claim}" is mixed.'
+        else:
+            lead = f'At a glance, evidence is not strong enough to verify "{claim}" with confidence.'
+
+        balance = (
+            f" Evidence summary: {rel_counts.get('SUPPORTS', 0)} supporting, "
+            f"{rel_counts.get('REFUTES', 0)} contradicting, "
+            f"{rel_counts.get('NEUTRAL', 0)} neutral."
+        )
+
+        nuance = ""
+        if has_unknown:
+            nuance = " Some parts remain uncertain."
+        elif has_mixed:
+            nuance = " Different parts of the claim have different support levels."
+
+        key_line = ""
+        if best_stmt and best_src:
+            key_line = f" Key evidence: {best_stmt} (source: {best_src})."
+        elif best_stmt:
+            key_line = f" Key evidence: {best_stmt}."
+        elif original_rationale:
+            key_line = f" {original_rationale.strip()}"
+
+        return f"{lead}{balance}{nuance}{key_line}".strip()
 
     def _unverifiable_result(self, claim: str, reason: str) -> Dict[str, Any]:
         """Return a forced binary fallback result when normal verdict generation fails."""

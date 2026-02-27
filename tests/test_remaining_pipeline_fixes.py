@@ -1,3 +1,5 @@
+import asyncio
+
 from app.services.ranking.hybrid_ranker import hybrid_rank
 from app.services.verdict.verdict_generator import VerdictGenerator
 
@@ -845,3 +847,113 @@ def test_liver_detox_claim_not_validated_by_generic_water_fact():
     }
     out = vg._parse_verdict_result(llm, claim, evidence)
     assert out["claim_breakdown"][0]["status"] == "UNKNOWN"
+
+
+def test_llm_rationale_generation_uses_claim_breakdown_and_relevant_evidence():
+    vg = _vg()
+
+    captured = {"prompt": ""}
+
+    class _FakeLLM:
+        async def ainvoke(self, prompt, response_format="json", priority=None, temperature=0.0, call_tag=""):
+            captured["prompt"] = prompt
+            return {"rationale": "According to the cited studies, the claim is supported with some limits."}
+
+    vg.llm_service = _FakeLLM()
+    payload = {
+        "verdict": "PARTIALLY_TRUE",
+        "rationale": "fallback rationale",
+        "claim_breakdown": [
+            {
+                "claim_segment": "Poor sleep is a significant risk factor for obesity",
+                "status": "PARTIALLY_VALID",
+                "supporting_fact": "Short sleep duration is a new risk factor for obesity.",
+                "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC3632337",
+            }
+        ],
+        "evidence_map": [
+            {
+                "statement": "Short sleep duration is a new risk factor for obesity.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.62,
+                "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC3632337",
+            },
+            {
+                "statement": "Background context statement.",
+                "relevance": "NEUTRAL",
+                "relevance_score": 0.10,
+                "source_url": "https://example.org/context",
+            },
+        ],
+    }
+
+    rationale = asyncio.run(vg._generate_llm_rationale("Poor sleep and obesity risk", payload))
+    assert "supported" in rationale.lower()
+    assert "claim breakdown" in captured["prompt"].lower()
+    assert "relevant evidence only" in captured["prompt"].lower()
+    assert "background context statement" not in captured["prompt"].lower()
+
+
+def test_rationale_is_humanized_and_not_old_template():
+    vg = _vg()
+    claim = "Diets rich in fruits and vegetables may reduce the risk of certain cancers"
+    payload = {
+        "verdict": "PARTIALLY_TRUE",
+        "confidence": 0.7,
+        "truthfulness_percent": 58.0,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "PARTIALLY_VALID"}],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Fruit and vegetable intake is associated with lower risk for some cancers.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.67,
+            }
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(
+        claim,
+        payload,
+        evidence=[
+            {
+                "statement": "Fruit and vegetable intake is associated with lower risk for some cancers.",
+                "source_url": "https://pubmed.ncbi.nlm.nih.gov/10089116/",
+            }
+        ],
+    )
+    r = str(out.get("rationale") or "")
+    assert "Based on the strongest direct evidence" not in r
+    assert "at a glance" in r.lower() or "according to the available evidence" in r.lower()
+    assert "evidence summary" in r.lower()
+
+
+def test_rationale_includes_key_evidence_reference_when_available():
+    vg = _vg()
+    claim = "Moderate coffee consumption does not cause dehydration"
+    payload = {
+        "verdict": "FALSE",
+        "confidence": 0.75,
+        "truthfulness_percent": 20.0,
+        "rationale": "",
+        "claim_breakdown": [{"claim_segment": claim, "status": "INVALID"}],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Caffeine can cause dehydration.",
+                "relevance": "REFUTES",
+                "relevance_score": 0.83,
+                "source_url": "https://pubmed.ncbi.nlm.nih.gov/22740040/",
+            }
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(
+        claim,
+        payload,
+        evidence=[
+            {"statement": "Caffeine can cause dehydration.", "source_url": "https://pubmed.ncbi.nlm.nih.gov/22740040/"}
+        ],
+    )
+    r = str(out.get("rationale") or "")
+    assert "key evidence" in r.lower()
+    assert "pubmed.ncbi.nlm.nih.gov" in r.lower()
