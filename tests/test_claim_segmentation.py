@@ -87,3 +87,13 @@ def test_aux_clause_inherits_subject_after_and_split():
 
     assert len(segments) == 2
     assert segments[1].lower().startswith("laughter has been shown to help lower blood sugar")
+
+
+def test_compound_for_claim_preserves_subject_context_in_each_segment():
+    claim = "Vitamin D for bone growth in children and DHA for eye and brain development"
+    segments = split_claim_into_segments(claim)
+
+    low = [s.lower() for s in segments]
+    assert any("vitamin d" in s and "bone growth" in s for s in low)
+    assert any("dha" in s and ("eye" in s or "brain development" in s) for s in low)
+    assert not any(s.strip() == "brain development" for s in low)

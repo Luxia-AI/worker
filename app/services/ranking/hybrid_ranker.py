@@ -40,6 +40,84 @@ UNCERTAINTY_PHRASES = (
 )
 
 
+def _infer_claim_type(query_text: str) -> str:
+    low = (query_text or "").lower()
+    if re.search(r"\b(treat|treatment|cure|prevent|effective|efficacy|works?)\b", low):
+        return "therapeutic"
+    if re.search(r"\b(cause|causes|linked|association|risk|increase|decrease)\b", low):
+        return "causal"
+    if re.search(r"\b(mechanism|pathway|gene|protein|receptor|cellular)\b", low):
+        return "mechanistic"
+    return "general"
+
+
+def _claim_type_weight_overrides(claim_type: str) -> Dict[str, float]:
+    if claim_type == "therapeutic":
+        return {
+            "w_semantic": 0.35,
+            "w_kg": 0.08,
+            "w_entity": 0.20,
+            "w_claim_overlap": 0.18,
+            "w_recency": 0.08,
+            "w_credibility": 0.08,
+            "w_source_quality": 0.03,
+        }
+    if claim_type == "causal":
+        return {
+            "w_semantic": 0.28,
+            "w_kg": 0.16,
+            "w_entity": 0.19,
+            "w_claim_overlap": 0.18,
+            "w_recency": 0.06,
+            "w_credibility": 0.09,
+            "w_source_quality": 0.04,
+        }
+    if claim_type == "mechanistic":
+        return {
+            "w_semantic": 0.27,
+            "w_kg": 0.20,
+            "w_entity": 0.19,
+            "w_claim_overlap": 0.16,
+            "w_recency": 0.05,
+            "w_credibility": 0.09,
+            "w_source_quality": 0.04,
+        }
+    return {
+        "w_semantic": RANKING_WEIGHTS["w_semantic"],
+        "w_kg": RANKING_WEIGHTS["w_kg"],
+        "w_entity": RANKING_WEIGHTS["w_entity"],
+        "w_claim_overlap": RANKING_WEIGHTS["w_claim_overlap"],
+        "w_recency": RANKING_WEIGHTS["w_recency"],
+        "w_credibility": RANKING_WEIGHTS["w_credibility"],
+        "w_source_quality": 0.03,
+    }
+
+
+def _source_quality_score(meta: Dict[str, Any]) -> float:
+    source_url = str(meta.get("source_url") or meta.get("source") or "").lower()
+    doc_type = str(meta.get("doc_type") or "").lower()
+    statement = str(meta.get("statement") or "").lower()
+    score = 0.5
+    if doc_type in {"guideline"}:
+        score = 0.95
+    elif doc_type in {"journal"}:
+        if any(k in statement for k in ("systematic review", "meta-analysis", "randomized")):
+            score = 0.93
+        else:
+            score = 0.88
+    elif doc_type in {"report"}:
+        score = 0.80
+    elif doc_type in {"web", "encyclopedia"}:
+        score = 0.60
+    elif doc_type in {"news"}:
+        score = 0.45
+    if "cochrane" in source_url:
+        score = max(score, 0.95)
+    if "pubmed.ncbi.nlm.nih.gov" in source_url or "pmc.ncbi.nlm.nih.gov" in source_url:
+        score = max(score, 0.88)
+    return max(0.0, min(1.0, score))
+
+
 def _is_claim_mention_statement(text: str) -> bool:
     if not text:
         return False
@@ -431,13 +509,16 @@ def hybrid_rank(
     query_entities = query_entities or []
     query_text = query_text or ""
     weights = weights or {}
+    claim_type = _infer_claim_type(query_text)
+    claim_weight_defaults = _claim_type_weight_overrides(claim_type)
     # weights defaults
-    w_sem = float(weights.get("w_semantic", RANKING_WEIGHTS["w_semantic"]))
-    w_kg = float(weights.get("w_kg", RANKING_WEIGHTS["w_kg"]))
-    w_entity = float(weights.get("w_entity", RANKING_WEIGHTS["w_entity"]))
-    w_claim_overlap = float(weights.get("w_claim_overlap", RANKING_WEIGHTS["w_claim_overlap"]))
-    w_recency = float(weights.get("w_recency", RANKING_WEIGHTS["w_recency"]))
-    w_cred = float(weights.get("w_credibility", RANKING_WEIGHTS["w_credibility"]))
+    w_sem = float(weights.get("w_semantic", claim_weight_defaults["w_semantic"]))
+    w_kg = float(weights.get("w_kg", claim_weight_defaults["w_kg"]))
+    w_entity = float(weights.get("w_entity", claim_weight_defaults["w_entity"]))
+    w_claim_overlap = float(weights.get("w_claim_overlap", claim_weight_defaults["w_claim_overlap"]))
+    w_recency = float(weights.get("w_recency", claim_weight_defaults["w_recency"]))
+    w_cred = float(weights.get("w_credibility", claim_weight_defaults["w_credibility"]))
+    w_source_quality = float(weights.get("w_source_quality", claim_weight_defaults["w_source_quality"]))
 
     # Build unified candidate list keyed by (statement, source_url) to merge duplicates
     candidates_map: Dict[Tuple[str, Optional[str]], Dict[str, Any]] = {}
@@ -523,6 +604,7 @@ def hybrid_rank(
         ent_s = _entity_overlap_score(query_entities, item.get("entities", []))
         recency_s = _recency_boost(item.get("published_at"), now=now)
         cred_s = _safe_float(item.get("credibility"), 0.5)
+        source_quality_s = _source_quality_score(item)
         stmt_l = item["statement"].lower()
         if any(p in stmt_l for p in LOW_SIGNAL_PHRASES):
             continue
@@ -550,6 +632,7 @@ def hybrid_rank(
             + (w_claim_overlap * claim_overlap)
             + (w_recency * recency_s)
             + (w_cred * cred_s)
+            + (w_source_quality * source_quality_s)
         )
         neg_anchor_weight = float(os.getenv("NEGATION_ANCHOR_BOOST_WEIGHT", "0.07"))
         if negation_anchor_overlap > 0.0:
@@ -617,6 +700,8 @@ def hybrid_rank(
             "kg_score_raw": kg_raw,
             "entity_overlap": ent_s,
             "claim_overlap": claim_overlap,
+            "source_quality": source_quality_s,
+            "claim_type_hint": claim_type,
             "anchors_matched": int(anchor_eval.get("matched_groups", 0)),
             "anchors_required": int(anchor_eval.get("required_groups", 0)),
             "anchor_match_score": anchor_match_score,

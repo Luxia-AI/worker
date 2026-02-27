@@ -48,6 +48,23 @@ def test_filter_trusted_urls_reports_rejection_counts(trusted_search):
     assert metrics["final_trusted_count"] == 1
 
 
+def test_sanitize_query_fixes_negation_grammar(trusted_search):
+    cleaned = trusted_search._sanitize_query("vitamin c do not support immune health")
+    assert cleaned == "vitamin c does not support immune health"
+
+
+def test_claim_logic_tracks_include_support_and_refute(trusted_search):
+    tracks = trusted_search._build_claim_logic_query_tracks(
+        "vitamin c",
+        "support",
+        "immune health",
+        "Vitamin C does not support immune health",
+    )
+    joined = " | ".join(tracks).lower()
+    assert "vitamin c support immune health" in joined
+    assert "does not" in joined or "no evidence" in joined
+
+
 @pytest.mark.asyncio
 async def test_google_query_cleanup_strips_confidence_negatives(monkeypatch, trusted_search):
     trusted_search.google_available = True

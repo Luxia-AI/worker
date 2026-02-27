@@ -76,6 +76,8 @@ Requirements:
 - Subject/object must be entity strings from provided list
 - Relation should be concise (e.g., "causes", "reduces risk of", "is treatment for")
 - Confidence: float 0-1 indicating support strength
+- For negated statements, encode negation in relation label (e.g., "does_not_cause", "not_associated_with")
+- Do not infer relations not explicitly stated in the sentence
 - If no triples found: {{"triples": []}}
 
 Example:
@@ -91,38 +93,34 @@ Entities: {entities}"""
 # QUERY REFORMULATION PROMPTS
 # ============================================================================
 
-QUERY_REFORMULATION_PROMPT = """You are a search query optimizer for claim verification (medical/health).
-Your job: generate EXACTLY 3–4 web search queries that help verify THIS specific claim.
+QUERY_REFORMULATION_PROMPT = """You are a medical claim verification query planner.
+Generate exactly 4 search queries in two logical tracks:
+- Track A (support-check): queries that could support the claim.
+- Track B (refute-check): queries that could refute the claim.
 
-ABSOLUTE RULES (must follow):
-1) Claim-anchored: Every query MUST include at least 1–2 key terms copied verbatim from the claim \
-   (entity names, condition, drug, mechanism, population, outcome, numbers).
-2) Subclaim coverage: Queries should collectively cover EACH subclaim if subclaims are provided.
-3) Numbers are mandatory when present: If a subclaim contains a number, include it verbatim in at least one query.
-4) No topic drift: Do NOT introduce new entities/topics not present in the claim \
-   (e.g., vitamins, nutrients, collagen, selenium) unless explicitly mentioned in the claim.
-5) Query length: 3–7 words each, short and specific.
-6) Evidence-oriented: Prefer terms that retrieve authoritative sources \
-   (guideline, systematic review, RCT, cohort, meta-analysis, CDC/WHO/NIH).
-7) Coverage: Queries should collectively cover:
-   - definition/claim core (what is asserted)
-   - mechanism or causality (if asserted)
-   - effect/outcome magnitude or safety (if asserted)
-8) Output MUST be ONLY valid JSON.
+Hard constraints:
+1) Keep subject, predicate, and object aligned to the claim text. Do not add new entities.
+2) Preserve negation logic exactly (e.g., "does not", "cannot"). No malformed grammar.
+3) Include at least one high-evidence formulation:
+   - systematic review OR meta-analysis OR randomized trial OR guideline.
+4) If claim includes numbers/dose/population, include them verbatim in at least one query.
+5) Keep each query concise (4-10 words) and evidence-oriented.
+6) No promotional language, no broad/vague phrases.
+7) Output valid JSON only. No markdown. No prose.
 
-FORMAT EXAMPLES (structure only — DO NOT reuse these words):
-Example claim: "<CLAIM_TEXT>"
-Good query shapes:
-- "<KEY_TERM_1> <KEY_TERM_2> systematic review"
-- "<KEY_TERM_1> <OUTCOME_TERM> randomized trial"
-- "<KEY_TERM_1> mechanism evidence"
-Bad query shapes:
-- "benefits of <KEY_TERM_1>" (too vague/promotional)
-- "<unrelated nutrient> mechanism" (introduces new topic)
+Expected JSON schema:
+{"queries":["q1","q2","q3","q4"]}
 
-Return ONLY valid JSON:
-{"queries": ["...", "...", "..."]}"""
+Few-shot guidance:
+- Claim: "Vitamin C does not support immune health"
+  Good refute-check query: "vitamin c supports immune health systematic review"
+  Good support-check query: "no evidence vitamin c supports immunity trial"
+- Claim: "X reduces blood pressure"
+  Good support-check query: "x reduces blood pressure randomized trial"
+  Good refute-check query: "x does not reduce blood pressure meta-analysis"
 
+Return ONLY:
+{"queries":["...","...","...","..."]}"""
 REINFORCEMENT_QUERY_PROMPT = """You are a search-query optimization model for claim verification.
 Generate 8–12 highly effective web search queries for authoritative evidence.
 

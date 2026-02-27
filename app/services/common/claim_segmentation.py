@@ -334,15 +334,29 @@ def _split_on_conjunctives(text: str) -> List[str]:
         if len(parts) <= 1:
             continue
 
+        # For noun-phrase style enumerations with multiple top-level conjunctions,
+        # keep the trailing coordinated phrase intact to preserve subject context.
+        if conj.strip() == "and" and len(parts) > 2 and all(not _looks_independent_clause(p) for p in parts):
+            tail = f" {conj.strip()} ".join(parts[1:])
+            return [_clean(parts[0], keep_conj_prefix=False), _clean(tail, keep_conj_prefix=False)]
+
         # Shared-predicate expansion for "X causes A or B" style claims.
         if conj.strip() in {"and", "or"} and len(parts) == 2:
             left = parts[0]
             right = _clean(parts[1], keep_conj_prefix=False)
+            left_has_clause = _looks_independent_clause(left)
+            right_has_clause = _looks_independent_clause(right)
+            left_has_for_to = bool(re.search(r"\b(?:for|to)\b", left, flags=re.IGNORECASE))
+            right_has_for_to = bool(re.search(r"\b(?:for|to)\b", right, flags=re.IGNORECASE))
+            # If both sides are noun-phrase style fragments (no clause verb), preserve both
+            # sides as-is and avoid inheriting prefixes that can corrupt subject context.
+            if (not left_has_clause) and (not right_has_clause) and left_has_for_to and right_has_for_to:
+                return [left, right]
             # Avoid bad splits for coordinated noun phrases under one predicate:
             # "needed for growth and development ..."
             if (
                 conj.strip() == "and"
-                and not _looks_independent_clause(right)
+                and not right_has_clause
                 and re.search(r"\b(needed for|required for|important for|growth)\b", left, flags=re.IGNORECASE)
                 and re.search(r"\b(development|growth|maturation|bone)\b", right, flags=re.IGNORECASE)
             ):
@@ -357,15 +371,20 @@ def _split_on_conjunctives(text: str) -> List[str]:
             ):
                 return [_clean(text, keep_conj_prefix=False)]
             # Handle "X ... to/for A and B" by inheriting the governing preposition.
-            if right and not _looks_independent_clause(right):
+            if right and not right_has_clause:
                 prep = re.match(
                     r"^(?P<prefix>.+?\b(?:to|for|against|in|with|into|from|on)\b)\s+(?P<obj>.+)$",
                     left,
                     flags=re.IGNORECASE,
                 )
-                if prep and len(right.split()) <= 8:
+                # Do not inherit prefix when the right side already appears to carry its
+                # own subject phrase (e.g., "DHA for eye and brain development").
+                right_has_own_subject_phrase = bool(
+                    re.match(r"^[a-z][a-z0-9_-]*\s+(?:for|to|with|in|on|of)\b", right, flags=re.IGNORECASE)
+                )
+                if prep and len(right.split()) <= 8 and not right_has_own_subject_phrase:
                     return [left, _clean(f"{prep.group('prefix')} {right}", keep_conj_prefix=False)]
-            if right and not _looks_independent_clause(right):
+            if right and not right_has_clause:
                 subject_pred = _extract_subject_predicate(left)
                 if subject_pred:
                     return [left, _clean(f"{subject_pred} {right}", keep_conj_prefix=False)]
@@ -505,6 +524,14 @@ def split_claim_into_segments(claim: str, min_segment_chars: int = 10) -> List[s
             i += 1
             continue
         if not _has_predicate_tokens(current) and i + 1 < len(raw_segments):
+            nxt = _clean(raw_segments[i + 1], keep_conj_prefix=False)
+            current_has_for_to = bool(re.search(r"\b(?:for|to)\b", current, flags=re.IGNORECASE))
+            next_has_for_to = bool(re.search(r"\b(?:for|to)\b", nxt, flags=re.IGNORECASE))
+            # Keep parallel noun-phrase segments separate (e.g., "X for A" and "Y for B").
+            if current_has_for_to and next_has_for_to:
+                normalized_segments.append(current)
+                i += 1
+                continue
             merged = _clean(f"{current} {raw_segments[i + 1]}", keep_conj_prefix=False)
             if merged:
                 normalized_segments.append(merged)

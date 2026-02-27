@@ -699,6 +699,7 @@ class VerdictGenerator:
                 - key_findings: List of key findings
         """
         self._last_predicate_queries_generated = []
+        attempted_web_urls: set[str] = set()
         if self.confidence_mode:
             top_k = max(top_k, int(os.getenv("CONFIDENCE_VERDICT_TOP_K", "10")))
         if not ranked_evidence:
@@ -714,6 +715,7 @@ class VerdictGenerator:
                 max_queries_per_segment=2 if used_web_search else 3,
                 max_urls_per_query=2 if used_web_search else 3,
                 enable_predicate_refute_queries=True,
+                attempted_urls=attempted_web_urls,
             )
             if not web_boost:
                 # Aggressive fallback pass for hard claims.
@@ -722,6 +724,7 @@ class VerdictGenerator:
                     max_queries_per_segment=4,
                     max_urls_per_query=4,
                     enable_predicate_refute_queries=True,
+                    attempted_urls=attempted_web_urls,
                 )
             if not web_boost:
                 fallback = self._unverifiable_result(
@@ -786,6 +789,7 @@ class VerdictGenerator:
                     max_queries_per_segment=2 if used_web_search else 3,
                     max_urls_per_query=2 if used_web_search else 3,
                     enable_predicate_refute_queries=True,
+                    attempted_urls=attempted_web_urls,
                 )
                 if not web_boost:
                     logger.warning("[VerdictGenerator] Web boost returned no facts.")
@@ -806,6 +810,7 @@ class VerdictGenerator:
                 max_queries_per_segment=4,
                 max_urls_per_query=4,
                 enable_predicate_refute_queries=True,
+                attempted_urls=attempted_web_urls,
             )
             if emergency_web:
                 pre_evidence = self._merge_evidence(pre_evidence, emergency_web)
@@ -897,6 +902,7 @@ class VerdictGenerator:
                             max_queries_per_segment=1 if used_web_search else 2,
                             max_urls_per_query=1 if used_web_search else 3,
                             enable_predicate_refute_queries=need_predicate_refute,
+                            attempted_urls=attempted_web_urls,
                         )
                         candidate_boost = web_evidence
                         if web_evidence:
@@ -2011,6 +2017,9 @@ class VerdictGenerator:
                 "coverage": float(coverage_score or 0.0),
                 "agreement": float(agreement_ratio or 0.0),
                 "diversity": float(diversity_score or 0.0),
+                "contradict_signal": float(map_contradict_signal or 0.0),
+                "admissible_ratio": float(admissible_ratio or 0.0),
+                "evidence_quality": max(0.0, min(1.0, float(evidence_quality_percent or 0.0) / 100.0)),
             },
         )
         unverifiable_cap_applied = False
@@ -2892,6 +2901,57 @@ class VerdictGenerator:
         mismatch = (claim_food and ev_med and len(shared_food_specific) == 0) or (claim_med and ev_food and not ev_med)
         return (not mismatch), True
 
+    @staticmethod
+    def _scope_profile(text: str) -> Dict[str, set[str]]:
+        low = (text or "").lower()
+        population = set(
+            re.findall(
+                r"\b(healthy|adults?|children|child|elderly|smokers?|pregnan(?:t|cy)|athletes?|patients?)\b",
+                low,
+            )
+        )
+        intervention = set(
+            re.findall(
+                r"\b(supplement(?:ation)?|diet|dietary|oral|intravenous|iv|dose|dosage|placebo|treatment)\b",
+                low,
+            )
+        )
+        outcome = set(
+            re.findall(
+                r"\b(immunity|immune|infection|incidence|duration|severity|hospitalization|mortality)\b",
+                low,
+            )
+        )
+        context = set(
+            re.findall(
+                r"\b(randomized|trial|meta-analysis|systematic review|guideline|observational|cohort)\b",
+                low,
+            )
+        )
+        return {
+            "population": population,
+            "intervention": intervention,
+            "outcome": outcome,
+            "context": context,
+        }
+
+    @staticmethod
+    def _scope_alignment_score(claim_scope: Dict[str, set[str]], stmt_scope: Dict[str, set[str]]) -> float:
+        weights = {"population": 0.35, "intervention": 0.35, "outcome": 0.20, "context": 0.10}
+        total = 0.0
+        used = 0.0
+        for key, w in weights.items():
+            claim_terms = claim_scope.get(key) or set()
+            stmt_terms = stmt_scope.get(key) or set()
+            if not claim_terms:
+                continue
+            used += w
+            overlap = len(claim_terms & stmt_terms) / max(1, len(claim_terms))
+            total += w * overlap
+        if used <= 0.0:
+            return 1.0
+        return max(0.0, min(1.0, total / used))
+
     def _segment_topic_guard_ok(self, segment: str, statement: str) -> bool:
         seg_concepts = self._concept_hits(segment)
         stmt_concepts = self._concept_hits(statement)
@@ -3295,6 +3355,20 @@ class VerdictGenerator:
         if pred_idx < 0:
             pred_idx = 1
 
+        selected = tokens[pred_idx]
+        selected_lemma = self._lemma_token(selected)
+        selected_verb_like = (
+            selected_lemma in verb_hints or selected in aux or selected.endswith(("ing", "ed", "es", "e"))
+        )
+        # Prevent noun-heavy spans from being forced into predicate slots.
+        if best_score < 2 or (not selected_verb_like):
+            return {
+                "subject_span": "",
+                "predicate_span": "",
+                "object_span": "",
+                "canonical_predicate": "",
+            }
+
         subject_tokens = [t for t in tokens[:pred_idx] if t not in stop and t not in aux and t not in {"no", "not"}]
         predicate_tokens = [tokens[pred_idx]]
         if tokens[pred_idx] in aux and pred_idx + 1 < len(tokens):
@@ -3323,6 +3397,51 @@ class VerdictGenerator:
             "object_span": " ".join(object_tokens).strip(),
             "canonical_predicate": canonical or self._lemma_token(predicate_span),
         }
+
+    @staticmethod
+    def _is_actionable_predicate(predicate: str) -> bool:
+        pred = str(predicate or "").strip().lower()
+        if not pred:
+            return False
+        roots = {
+            "be",
+            "cause",
+            "change",
+            "chang",
+            "prevent",
+            "reduce",
+            "increase",
+            "decrease",
+            "improve",
+            "worsen",
+            "support",
+            "help",
+            "treat",
+            "cure",
+            "protect",
+            "lead",
+            "result",
+            "associate",
+            "link",
+            "contribute",
+            "contribut",
+            "require",
+            "need",
+            "maintain",
+            "build",
+            "promote",
+            "regulate",
+            "boost",
+            "contain",
+            "work",
+            "affect",
+            "inhibit",
+            "stimulate",
+        }
+        for tok in re.findall(r"\b[a-z][a-z0-9_-]*\b", pred):
+            if VerdictGenerator._lemma_token(tok) in roots:
+                return True
+        return False
 
     @staticmethod
     def _normalize_relevance_label(relevance: str) -> str:
@@ -3652,23 +3771,9 @@ class VerdictGenerator:
                         statement.lower(),
                     )
                 )
-                scope_vocab = {
-                    "healthy",
-                    "adults",
-                    "adult",
-                    "children",
-                    "child",
-                    "elderly",
-                    "smokers",
-                    "smoker",
-                    "supplementation",
-                    "supplement",
-                    "supplements",
-                    "oral",
-                    "intravenous",
-                }
-                claim_scope_terms = {t for t in self._statement_tokens(claim) if t in scope_vocab}
-                stmt_scope_terms = {t for t in self._statement_tokens(statement) if t in scope_vocab}
+                claim_scope = self._scope_profile(claim)
+                stmt_scope = self._scope_profile(statement)
+                scope_alignment = self._scope_alignment_score(claim_scope, stmt_scope)
                 refute_by_rule = (
                     (
                         contradiction_score >= CONTRADICTION_THRESHOLD
@@ -3683,6 +3788,8 @@ class VerdictGenerator:
                     if intervention_match:
                         relevance = "REFUTES"
                         relevance_score = max(relevance_score, contradiction_score, 0.65)
+                        if scope_alignment < 0.34:
+                            relevance_score *= 0.72
                         refute_eligible = predicate_match_score >= 0.4 and intervention_match and credibility >= 0.8
                     else:
                         relevance = "NEUTRAL"
@@ -3719,18 +3826,20 @@ class VerdictGenerator:
                     if bone_strength_proxy_support and support_strength >= 0.30:
                         support_gate = True
                     # Prevent broad negated claims from being "supported" only by narrow population/scope evidence.
-                    scope_mismatch_for_negated_claim = (
-                        claim_neg and bool(stmt_scope_terms) and not bool(claim_scope_terms & stmt_scope_terms)
-                    )
+                    scope_mismatch_for_negated_claim = claim_neg and scope_alignment < 0.34
                     if scope_mismatch_for_negated_claim:
                         support_gate = False
                     if support_gate:
                         relevance = "SUPPORTS"
                         relevance_score = max(relevance_score, support_strength, 0.62)
+                        if scope_alignment < 0.40:
+                            relevance_score *= 0.78
                     elif seed_rel == "REFUTES" and contradiction_score >= 0.45:
                         if predicate_match_score >= 0.4 and intervention_match:
                             relevance = "REFUTES"
                             relevance_score = max(relevance_score, contradiction_score)
+                            if scope_alignment < 0.34:
+                                relevance_score *= 0.72
                             refute_eligible = predicate_match_score >= 0.4 and intervention_match and credibility >= 0.8
                         else:
                             relevance = "NEUTRAL"
@@ -3760,6 +3869,10 @@ class VerdictGenerator:
                     "intervention_anchors_ok": bool(intervention_anchors_ok),
                     "refute_eligible": bool(refute_eligible),
                     "blocked_content": bool(blocked_content),
+                    "scope_alignment": round(float(scope_alignment), 4),
+                    "scope_population": sorted(claim_scope.get("population") or []),
+                    "scope_intervention": sorted(claim_scope.get("intervention") or []),
+                    "scope_outcome": sorted(claim_scope.get("outcome") or []),
                 }
             )
         return normalized
@@ -5554,6 +5667,37 @@ class VerdictGenerator:
             return Verdict.TRUE.value
         return Verdict.TRUE.value if float(truthfulness_percent or 0.0) >= 55.0 else Verdict.FALSE.value
 
+    def _rationale_sentence_fidelity(
+        self,
+        rationale: str,
+        evidence_map: List[Dict[str, Any]],
+        evidence: List[Dict[str, Any]],
+    ) -> float:
+        sentences = [s.strip() for s in re.split(r"[.!?]+", str(rationale or "")) if s.strip()]
+        if not sentences:
+            return 0.0
+        evidence_statements = [
+            str(x.get("statement") or x.get("text") or "").strip().lower() for x in (evidence_map or evidence or [])
+        ]
+        evidence_statements = [s for s in evidence_statements if s]
+        if not evidence_statements:
+            return 0.0
+
+        matched = 0
+        for sent in sentences:
+            sent_tokens = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", sent.lower()))
+            if not sent_tokens:
+                continue
+            for stmt in evidence_statements:
+                stmt_tokens = set(re.findall(r"\b[a-z][a-z0-9_-]+\b", stmt))
+                if not stmt_tokens:
+                    continue
+                overlap = len(sent_tokens & stmt_tokens) / max(1, len(sent_tokens))
+                if overlap >= 0.35:
+                    matched += 1
+                    break
+        return matched / max(1, len(sentences))
+
     def _enforce_binary_verdict_payload(
         self,
         claim: str,
@@ -5645,7 +5789,11 @@ class VerdictGenerator:
                 f"Final verdict: {verdict}. Determined from strongest available evidence "
                 "signals after exhaustive retrieval."
             )
-        payload["rationale"] = explicit_rationale if low_quality_rationale else f"Final verdict: {verdict}. {rationale}"
+        candidate_rationale = explicit_rationale if low_quality_rationale else f"Final verdict: {verdict}. {rationale}"
+        fidelity = self._rationale_sentence_fidelity(candidate_rationale, evidence_map, evidence)
+        if fidelity < 0.50:
+            candidate_rationale = explicit_rationale
+        payload["rationale"] = candidate_rationale
 
         key_findings = payload.get("key_findings", []) or []
         if not key_findings:
@@ -5882,7 +6030,7 @@ class VerdictGenerator:
         subject = str(triplet.get("subject_span") or "").strip()
         predicate = str(triplet.get("predicate_span") or "").strip()
         obj = str(triplet.get("object_span") or "").strip()
-        if not predicate:
+        if not predicate or not self._is_actionable_predicate(predicate):
             return [f"{seg} evidence", f"{seg} guideline"]
 
         core = " ".join(x for x in [subject, predicate, obj] if x).strip()
@@ -5910,7 +6058,7 @@ class VerdictGenerator:
         subject = str(triplet.get("subject_span") or "").strip()
         predicate = str(triplet.get("predicate_span") or "").strip()
         obj = str(triplet.get("object_span") or "").strip()
-        if not predicate:
+        if not predicate or not self._is_actionable_predicate(predicate):
             return []
         anchor_subject = subject or seg.split()[0]
         anchor_subject = re.sub(
@@ -5969,18 +6117,31 @@ class VerdictGenerator:
             deduped.append(h_clean)
         return deduped
 
+    @staticmethod
+    def _canonicalize_web_url(url: str) -> str:
+        raw = str(url or "").strip()
+        if not raw:
+            return ""
+        normalized = raw.split("#", 1)[0].strip()
+        normalized = re.sub(r"\s+", "", normalized)
+        if normalized.endswith("/"):
+            normalized = normalized[:-1]
+        return normalized
+
     async def _fetch_web_evidence_for_unknown_segments(
         self,
         unknown_segments: List[str],
         max_queries_per_segment: int = 2,
         max_urls_per_query: int = 3,
         enable_predicate_refute_queries: bool = False,
+        attempted_urls: Optional[set[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Fetch web evidence for UNKNOWN claim segments."""
         all_web_evidence = []
         generated_predicate_queries: List[str] = []
         authoritative_scraped_pages: List[Dict[str, Any]] = []
         predicate_target: Dict[str, str] = {}
+        attempted = attempted_urls if attempted_urls is not None else set()
 
         def _is_authoritative_url(url: str) -> bool:
             src = str(url or "").lower()
@@ -6003,6 +6164,7 @@ class VerdictGenerator:
         for segment in unknown_segments:
             try:
                 logger.debug(f"[VerdictGenerator] Searching web for UNKNOWN segment: '{segment[:50]}...'")
+                query_seen: set[str] = set()
                 triplet = self._extract_canonical_predicate_triplet(segment)
                 segment_entities = [
                     str(triplet.get("subject_span") or "").strip(),
@@ -6040,6 +6202,10 @@ class VerdictGenerator:
                 force_query_count = 2 if (enable_predicate_refute_queries and predicate_hints) else 0
                 effective_query_count = max(int(max_queries_per_segment), force_query_count)
                 for query in queries[:effective_query_count]:
+                    query_key = re.sub(r"\s+", " ", str(query or "").strip().lower())
+                    if query_key in query_seen:
+                        continue
+                    query_seen.add(query_key)
                     logger.debug(f"[VerdictGenerator] Using search query: '{query}'")
 
                     # Perform the search
@@ -6053,20 +6219,30 @@ class VerdictGenerator:
                         url = result.get("url", "")
                         if not url:
                             continue
+                        url_norm = self._canonicalize_web_url(url)
+                        if not url_norm:
+                            continue
+                        if url_norm in attempted:
+                            logger.debug(
+                                "[VerdictGenerator] Skipping already attempted web URL in this verdict round: %s",
+                                url_norm,
+                            )
+                            continue
+                        attempted.add(url_norm)
 
                         try:
-                            logger.debug(f"[VerdictGenerator] Scraping and extracting facts from: {url}")
+                            logger.debug(f"[VerdictGenerator] Scraping and extracting facts from: {url_norm}")
 
                             # Scrape the URL to get content
                             import aiohttp
 
                             async with aiohttp.ClientSession() as session:
-                                scraped_page = await self.scraper.scrape_one(session, url)
+                                scraped_page = await self.scraper.scrape_one(session, url_norm)
 
                             if not scraped_page.get("content"):
-                                logger.warning(f"[VerdictGenerator] No content scraped from {url}")
+                                logger.warning(f"[VerdictGenerator] No content scraped from {url_norm}")
                                 continue
-                            if _is_authoritative_url(url):
+                            if _is_authoritative_url(url_norm):
                                 authoritative_scraped_pages.append(scraped_page)
 
                             # Extract facts from the scraped content
@@ -6083,7 +6259,7 @@ class VerdictGenerator:
                                 score = self._quick_web_score(segment, stmt, conf)
                                 evidence_item = {
                                     "statement": stmt,
-                                    "source_url": url,
+                                    "source_url": url_norm,
                                     "final_score": score,
                                     "extraction_confidence": conf,
                                     "credibility": 0.7,  # Default credibility for web-extracted facts
@@ -6093,7 +6269,7 @@ class VerdictGenerator:
                                 all_web_evidence.append(evidence_item)
 
                         except Exception as e:
-                            logger.warning(f"[VerdictGenerator] Failed to extract facts from {url}: {e}")
+                            logger.warning(f"[VerdictGenerator] Failed to extract facts from {url_norm}: {e}")
                             continue
             except Exception as e:
                 logger.warning(f"[VerdictGenerator] Failed to fetch web evidence for segment '{segment[:30]}...': {e}")
@@ -6143,12 +6319,25 @@ class VerdictGenerator:
                         }
                     )
 
+        deduped: List[Dict[str, Any]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for item in all_web_evidence:
+            stmt = str(item.get("statement") or "").strip()
+            src = self._canonicalize_web_url(str(item.get("source_url") or ""))
+            if not stmt:
+                continue
+            pair = (stmt.lower(), src.lower())
+            if pair in seen_pairs:
+                continue
+            seen_pairs.add(pair)
+            item["source_url"] = src
+            deduped.append(item)
         logger.debug(
-            f"[VerdictGenerator] Retrieved {len(all_web_evidence)} web evidence items "
-            f"for {len(unknown_segments)} UNKNOWN segments"
+            f"[VerdictGenerator] Retrieved {len(deduped)} web evidence items "
+            f"(raw={len(all_web_evidence)}) for {len(unknown_segments)} UNKNOWN segments"
         )
         self._last_predicate_queries_generated = list(dict.fromkeys(generated_predicate_queries))
-        return all_web_evidence
+        return deduped
 
 
 def _self_test_unverifiable_lock_and_rationale() -> None:

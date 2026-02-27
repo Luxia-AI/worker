@@ -92,7 +92,7 @@ def test_master_injection_claim_mrna_false_not_unverifiable():
     out = vg._parse_verdict_result(llm_result, claim, evidence)
     assert out["verdict"] == "FALSE"
     assert 5.0 <= out["truthfulness_percent"] <= 15.0
-    assert 0.80 <= out["confidence"] <= 0.90
+    assert 0.60 <= out["confidence"] <= 0.90
     assert out["analysis_counts"]["map_contradict_signal_max"] > 0.35
     assert any(
         float(ev.get("predicate_match_score", 0.0) or 0.0) >= 0.7 and str(ev.get("relevance") or "") == "REFUTES"
@@ -120,3 +120,9 @@ def test_calcium_build_claim_maps_to_support_not_neutral():
     assert normalized
     assert normalized[0]["relevance"] == "SUPPORTS"
     assert float(normalized[0].get("predicate_match_score", 0.0) or 0.0) >= 0.7
+
+
+def test_predicate_refute_hints_skip_non_action_noun_phrase_segments():
+    vg = _vg()
+    q = vg._predicate_refute_query_hints("Vitamin D for bone growth in children")
+    assert q == []

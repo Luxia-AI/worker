@@ -85,6 +85,51 @@ def _claim_context_hash(claim_text: str) -> str:
     return sha1(normalized.encode("utf-8")).hexdigest()[:16]
 
 
+def _canonicalize_relation_label(relation: str) -> str:
+    rel = re.sub(r"\s+", " ", str(relation or "").replace("_", " ").strip().lower())
+    if not rel:
+        return ""
+    mapping = [
+        (r"\b(support|supports|supports the|contributes to)\b", "supports"),
+        (r"\b(associated with|association with|linked to|correlates with)\b", "associated_with"),
+        (r"\b(causes?|caused by|results? in|leads? to|induces?)\b", "causes"),
+        (r"\b(reduces?|decreases?|lowers?)\b", "reduces"),
+        (r"\b(increases?|raises?)\b", "increases"),
+        (r"\b(prevents?|protects?)\b", "prevents"),
+    ]
+    for pattern, normalized in mapping:
+        if re.search(pattern, rel):
+            return normalized
+    return rel
+
+
+def _relation_type(relation_canonical: str) -> str:
+    if relation_canonical in {"causes", "reduces", "increases", "prevents", "supports"}:
+        return "causal_or_effect"
+    if relation_canonical in {"associated_with"}:
+        return "associative"
+    return "other"
+
+
+def _role_alignment_score(subject: str, object_: str, anchors: List[str]) -> float:
+    if not anchors:
+        return 1.0
+    subject_tokens = _tokenize(subject)
+    object_tokens = _tokenize(object_)
+    if not subject_tokens and not object_tokens:
+        return 0.0
+    anchor_sets = [_tokenize(a) for a in anchors if str(a or "").strip()]
+    anchor_sets = [s for s in anchor_sets if s]
+    if not anchor_sets:
+        return 1.0
+    subj_best = 0.0
+    obj_best = 0.0
+    for aset in anchor_sets:
+        subj_best = max(subj_best, len(subject_tokens & aset) / max(1, len(aset)))
+        obj_best = max(obj_best, len(object_tokens & aset) / max(1, len(aset)))
+    return max(0.0, min(1.0, (0.60 * subj_best) + (0.40 * obj_best)))
+
+
 class KGRetrieval:
     """
     Advanced KG retrieval with:
@@ -311,6 +356,8 @@ class KGRetrieval:
             credibility = self._infer_credibility(src)
 
             rel_norm = (rel or "").replace("_", " ").strip()
+            rel_canonical = _canonicalize_relation_label(rel_norm)
+            rel_type = _relation_type(rel_canonical)
             statement = f"{subj} {rel_norm} {obj}".strip()
             claim_entities = row_claim_entities if isinstance(row_claim_entities, list) else []
             claim_entities = [str(e).strip().lower() for e in claim_entities if str(e).strip()][:20]
@@ -342,6 +389,9 @@ class KGRetrieval:
                 # Reject obvious drift in low-signal relations.
                 if hop > 1 or path_score < 0.65:
                     continue
+            role_alignment = _role_alignment_score(subj, obj, anchors)
+            if anchor_tokens and not claim_context_match and role_alignment < 0.34 and (hop > 1 or path_score < 0.75):
+                continue
 
             if claim_context_match:
                 path_score = min(1.0, path_score + 0.20)
@@ -351,6 +401,7 @@ class KGRetrieval:
                 path_score = min(1.0, path_score + min(0.08, 0.02 * query_specific_overlap))
             elif not query_specific_keywords and query_overlap > 0:
                 path_score = min(1.0, path_score + min(0.05, 0.01 * query_overlap))
+            path_score = min(1.0, path_score + (0.05 * role_alignment))
 
             result = {
                 "statement": statement,
@@ -365,10 +416,13 @@ class KGRetrieval:
                 # Additional structured fields for transparency
                 "subject": subj,
                 "relation": rel,
+                "relation_canonical": rel_canonical,
+                "relation_type": rel_type,
                 "object": obj,
                 "confidence": float(confidence or 0.0),  # raw relation confidence
                 "hop_distance": hop,
                 "path_quality_score": path_score,
+                "role_alignment_score": role_alignment,
                 "claim_context_hash": row_claim_hash_norm,
                 "claim_context_match": claim_context_match,
                 "claim_context_entities": claim_entities,

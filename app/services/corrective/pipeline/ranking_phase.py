@@ -2,6 +2,8 @@
 Ranking Phase: Hybrid ranking of semantic and KG candidates with trust-based grading.
 """
 
+import math
+import os
 import re
 from typing import Any, Dict, List, Optional
 
@@ -13,6 +15,7 @@ from app.services.ranking.trust_ranker import DummyStanceClassifier, TrustRanker
 from app.services.retrieval.evidence_gate import filter_candidates_for_count_claim
 
 logger = get_logger(__name__)
+_CROSS_ENCODER = None
 
 
 def _tokenize(text: str) -> set[str]:
@@ -126,6 +129,72 @@ def _alias_overlap_score(candidate: Dict[str, Any], must_have_aliases: List[str]
     return best
 
 
+def _entity_type_mismatch(candidate: Dict[str, Any], claim_text: str, claim_entities: List[str]) -> bool:
+    """
+    Lightweight guard for common entity-family drift (e.g., Vitamin A evidence for Vitamin C claims).
+    """
+    statement = str(candidate.get("statement") or "").lower()
+    if not statement:
+        return False
+    claim_context = " ".join([claim_text] + (claim_entities or [])).lower()
+    claim_vitamins = set(re.findall(r"\bvitamin\s+([a-z0-9]+)\b", claim_context))
+    stmt_vitamins = set(re.findall(r"\bvitamin\s+([a-z0-9]+)\b", statement))
+    if claim_vitamins and stmt_vitamins and not (claim_vitamins & stmt_vitamins):
+        return True
+    return False
+
+
+def _load_cross_encoder():
+    global _CROSS_ENCODER
+    if _CROSS_ENCODER is not None:
+        return _CROSS_ENCODER
+    model_name = os.getenv("RANKING_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-6-v2").strip()
+    try:
+        from sentence_transformers import CrossEncoder
+
+        _CROSS_ENCODER = CrossEncoder(model_name)
+        logger.info("[RankingPhase] Cross-encoder reranker loaded: %s", model_name)
+    except Exception as exc:
+        logger.warning("[RankingPhase] Cross-encoder unavailable (%s); skipping rerank.", exc)
+        _CROSS_ENCODER = False
+    return _CROSS_ENCODER
+
+
+def _apply_cross_encoder_rerank(query_text: str, ranked: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not ranked or not query_text:
+        return ranked
+    enabled = os.getenv("ENABLE_CROSS_ENCODER_RERANK", "false").strip().lower() in {"1", "true", "yes", "on"}
+    if not enabled:
+        return ranked
+    rerank_top_n = max(5, int(os.getenv("RANKING_CROSS_ENCODER_TOP_N", "30")))
+    model = _load_cross_encoder()
+    if not model:
+        return ranked
+    head = ranked[: min(len(ranked), rerank_top_n)]
+    tail = ranked[min(len(ranked), rerank_top_n) :]
+    pairs = [(query_text, str(item.get("statement") or "")) for item in head]
+    try:
+        scores = model.predict(pairs)
+    except Exception as exc:
+        logger.warning("[RankingPhase] Cross-encoder scoring failed: %s", exc)
+        return ranked
+    for item, ce in zip(head, scores):
+        ce_score = float(ce)
+        if ce_score > 1.0 or ce_score < 0.0:
+            # Map raw logits to [0,1]
+            ce_score = 1.0 / (1.0 + math.exp(-ce_score))
+        item["cross_encoder_score"] = max(0.0, min(1.0, ce_score))
+        item["final_score"] = (0.75 * float(item.get("final_score", 0.0) or 0.0)) + (0.25 * item["cross_encoder_score"])
+    head.sort(
+        key=lambda r: (
+            -float(r.get("final_score", 0.0) or 0.0),
+            -float(r.get("cross_encoder_score", 0.0) or 0.0),
+            str(r.get("statement", "")),
+        )
+    )
+    return head + tail
+
+
 async def rank_candidates(
     semantic_candidates: List[Dict[str, Any]],
     kg_candidates: List[Dict[str, Any]],
@@ -181,6 +250,21 @@ async def rank_candidates(
         query_entities=query_entities,
         query_text=query_text,
     )
+    filtered_ranked: List[Dict[str, Any]] = []
+    dropped_entity_mismatch = 0
+    for item in ranked:
+        if _entity_type_mismatch(item, query_text, query_entities):
+            dropped_entity_mismatch += 1
+            continue
+        filtered_ranked.append(item)
+    if dropped_entity_mismatch > 0:
+        logger.info(
+            "[RankingPhase:%s] Dropped %d candidates due to entity-family mismatch.",
+            round_id,
+            dropped_entity_mismatch,
+        )
+    ranked = filtered_ranked
+    ranked = _apply_cross_encoder_rerank(query_text, ranked)
     filtered_for_trust: List[Dict[str, Any]] = []
     for item in ranked:
         topic_aligned = _topic_aligned_candidate(item, query_text, query_entities)

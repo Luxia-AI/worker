@@ -497,6 +497,37 @@ class TrustedSearch:
         q = re.sub(r"\b(?:do|does)\s+not\s+cannot\b", "does not", q, flags=re.IGNORECASE)
         q = re.sub(r"\bcannot\s+(?:do|does)\s+not\b", "cannot", q, flags=re.IGNORECASE)
         q = re.sub(r"\bnot\s+not\b", "not", q, flags=re.IGNORECASE)
+        q = self._normalize_negation_grammar(q)
+        q = re.sub(r"\s+", " ", q).strip()
+        return q
+
+    @staticmethod
+    def _normalize_negation_grammar(query: str) -> str:
+        q = str(query or "")
+        if not q:
+            return ""
+        pronoun_plural = {"i", "you", "we", "they", "people", "adults", "children", "supplements"}
+
+        def _fix_subject_do_not(match: re.Match[str]) -> str:
+            subject = str(match.group("subject") or "").strip()
+            rest = str(match.group("rest") or "").strip()
+            if not subject:
+                return match.group(0)
+            last = subject.split()[-1].lower()
+            if last in pronoun_plural or last.endswith("s"):
+                return f"{subject} do not {rest}".strip()
+            return f"{subject} does not {rest}".strip()
+
+        q = re.sub(
+            r"^(?P<subject>[a-z][a-z0-9\-\s]{0,60}?)\s+do\s+not\s+(?P<rest>[a-z].+)$",
+            _fix_subject_do_not,
+            q,
+            flags=re.IGNORECASE,
+        )
+        q = re.sub(r"\bdoes\s+not\s+does\s+not\b", "does not", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bdo\s+not\s+do\s+not\b", "do not", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bdoes\s+not\s+cannot\b", "does not", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bdo\s+not\s+cannot\b", "do not", q, flags=re.IGNORECASE)
         q = re.sub(r"\s+", " ", q).strip()
         return q
 
@@ -652,6 +683,17 @@ class TrustedSearch:
             "yogurt",
             "supplement",
             "supplements",
+            "vitamin",
+            "vitamins",
+            "mineral",
+            "minerals",
+            "dha",
+            "epa",
+            "omega",
+            "drug",
+            "drugs",
+            "medication",
+            "therapy",
         }
         outcome_cues = {
             "digestion",
@@ -667,6 +709,16 @@ class TrustedSearch:
             "pain",
             "level",
             "levels",
+            "growth",
+            "development",
+            "brain",
+            "eye",
+            "bone",
+            "immune",
+            "immunity",
+            "infection",
+            "cognition",
+            "memory",
         }
 
         anchors = [a.strip() for a in (entity_obj.anchors or entity_obj.topic or []) if str(a).strip()]
@@ -710,6 +762,16 @@ class TrustedSearch:
             if recovered:
                 b_term = recovered
 
+        if not a_term:
+            # Generic pattern guard: recover intervention phrase from "<subject> for/to <outcome>" claims.
+            pattern = re.search(r"^(?P<lhs>.+?)\b(?:for|to)\b\s+(?P<rhs>.+)$", claim, flags=re.IGNORECASE)
+            if pattern:
+                lhs = re.sub(r"\s+", " ", pattern.group("lhs")).strip()
+                rhs = re.sub(r"\s+", " ", pattern.group("rhs")).strip()
+                if lhs and len(lhs.split()) <= 5:
+                    a_term = lhs
+                if rhs and (not b_term):
+                    b_term = " ".join(self._tokenize_words(rhs)[:6]).strip() or b_term
         if not a_term:
             token_fallback = [
                 t
@@ -772,8 +834,10 @@ class TrustedSearch:
         concise_direct = self._build_direct_query(claim_clean, entities=entity_obj.anchors)
         if not concise_direct:
             concise_direct = f"{a_term} {action_term} {b_variants[0]}".strip()
+        logic_track = self._build_claim_logic_query_tracks(a_term, action_term, b_variants[0], claim_clean)
         queries: List[str] = [
             concise_direct,
+            *logic_track,
             f"{a_term} {action_term} {b_variants[0]}",
             f"{a_term} {b_variants[0]} evidence",
             f"{a_term} {b_variants[0]} systematic review meta-analysis",
@@ -827,6 +891,53 @@ class TrustedSearch:
 
         cleaned = [self._sanitize_query(q) for q in queries if q]
         return dedupe_list([q for q in cleaned if q])[: max(1, max_queries)]
+
+    @staticmethod
+    def _claim_is_negated(text: str) -> bool:
+        low = (text or "").lower()
+        return bool(
+            re.search(
+                r"\b(?:no|not|never|cannot|can't|does not|do not|without|ineffective|fails?)\b",
+                low,
+            )
+        )
+
+    def _build_claim_logic_query_tracks(self, subject: str, action: str, obj: str, claim: str) -> List[str]:
+        """
+        Build complementary support/refute tracks for the same claim frame.
+        This keeps query generation logically balanced and prevents one-sided retrieval drift.
+        """
+        subj = self._sanitize_query(subject)
+        pred = self._sanitize_query(action)
+        target = self._sanitize_query(obj)
+        if not subj or not pred or not target:
+            return []
+        core = self._sanitize_query(f"{subj} {pred} {target}")
+        if not core:
+            return []
+
+        support_track = [
+            core,
+            f"{core} systematic review",
+            f"{core} randomized trial",
+        ]
+        refute_track = [
+            f"no evidence {subj} {pred} {target}",
+            f"{subj} does not {pred} {target}",
+            f"{subj} cannot {pred} {target}",
+        ]
+
+        if self._claim_is_negated(claim):
+            # For negated claims, force a positive counter-track too.
+            support_track.extend(
+                [
+                    f"{subj} {pred} {target} evidence",
+                    f"{subj} {pred} {target} guideline",
+                ]
+            )
+
+        merged = [self._sanitize_query(q) for q in (support_track + refute_track) if q]
+        return dedupe_list([q for q in merged if q])[:8]
 
     @staticmethod
     def _is_numeric_comparison_claim(text: str) -> bool:
