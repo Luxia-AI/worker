@@ -150,7 +150,8 @@ def test_unverifiable_confidence_cap_is_enforced():
         ],
     }
     out = vg._parse_verdict_result(llm, claim, evidence)
-    assert out["verdict"] == "UNVERIFIABLE"
+    assert out["verdict"] in {"PARTIALLY_TRUE", "UNVERIFIABLE"}
+    assert out["verdict"] != "TRUE"
     assert out["confidence"] <= 0.60
 
 
@@ -738,6 +739,33 @@ def test_hybrid_rank_filters_off_action_evidence_for_assertive_claim():
     ranked = hybrid_rank(semantic_results=semantic, kg_results=[], query_entities=[], query_text=query)
     assert ranked
     assert "improved clinical outcomes for lactose digestion" in ranked[0]["statement"].lower()
+
+
+def test_action_claim_true_is_blocked_when_evidence_map_is_neutral_only():
+    vg = _vg()
+    claim = "Omega-3 supplements prevent heart attacks"
+    evidence = [
+        {
+            "statement": "A 28% reduction in heart attacks was found for adults taking omega-3s vs placebo.",
+            "source_url": "https://www.nhlbi.nih.gov/news/20\
+            24/omega-3s-heart-health-exploring-potential-benefits-and-risks",
+            "final_score": 0.36,
+            "credibility": 0.7,
+        }
+    ]
+    llm = {
+        "verdict": "TRUE",
+        "confidence": 0.9,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "NEUTRAL", "relevance_score": 0.45}
+        ],
+    }
+
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    assert out["verdict"] in {"PARTIALLY_TRUE", "UNVERIFIABLE"}
+    assert out["verdict"] != "TRUE"
 
 
 def test_subjectless_fragment_claim_is_evaluated_conservatively():

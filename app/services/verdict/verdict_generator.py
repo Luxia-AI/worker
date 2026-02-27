@@ -6085,6 +6085,29 @@ class VerdictGenerator:
             and float(item.get("relevance_score", 0.0) or 0.0) >= 0.35
             for item in (evidence_map or [])
         )
+        rel_labels = [
+            self._normalize_relevance_for_binary(str(item.get("relevance") or "")) for item in (evidence_map or [])
+        ]
+        neutral_only_map = bool(rel_labels) and all(lbl == "NEUTRAL" for lbl in rel_labels)
+        high_impact_action_claim = bool(
+            re.search(
+                (
+                    r"\b("
+                    r"prevent|prevents|prevented|preventing|"
+                    r"reduce|reduces|reduced|reducing|"
+                    r"cure|cures|cured|curing|"
+                    r"treat|treats|treated|treating|"
+                    r"detoxif(?:y|ies|ied|ying)|"
+                    r"improve|improves|improved|improving|"
+                    r"lower|lowers|lowered|lowering|"
+                    r"increase|increases|increased|increasing|"
+                    r"decrease|decreases|decreased|decreasing|"
+                    r"cause|causes|caused|causing"
+                    r")\b"
+                ),
+                str(claim or "").lower(),
+            )
+        )
         single_unknown_with_signal = (
             len(statuses) == 1 and has_unknown_status and (strong_support_signal or strong_refute_signal)
         )
@@ -6107,6 +6130,14 @@ class VerdictGenerator:
                 evidence_map,
                 claim_breakdown,
             )
+
+        # Guard: do not emit TRUE from neutral-only evidence on action claims.
+        if verdict == Verdict.TRUE.value and not strong_support_signal:
+            if neutral_only_map and high_impact_action_claim:
+                verdict = Verdict.UNVERIFIABLE.value
+            elif neutral_only_map:
+                verdict = Verdict.PARTIALLY_TRUE.value
+
         payload["verdict"] = verdict
 
         best_ev = self._pick_best_binary_evidence(verdict, evidence_map, evidence)
