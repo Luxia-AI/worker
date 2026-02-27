@@ -63,6 +63,42 @@ def _tokenize(text: str) -> set[str]:
     return {w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (text or "").lower()) if w not in stop}
 
 
+def _phrase_present(candidate_tokens: set[str], phrase: str) -> bool:
+    phrase_tokens = _tokenize(phrase)
+    if not phrase_tokens:
+        return False
+    overlap = len(candidate_tokens & phrase_tokens)
+    if len(phrase_tokens) == 1:
+        return overlap >= 1
+    return overlap >= max(1, len(phrase_tokens) - 1)
+
+
+def _strong_anchor_match(candidate_tokens: set[str], anchors: List[str]) -> bool:
+    generic_singletons = {
+        "health",
+        "healthy",
+        "immune",
+        "immunity",
+        "vitamin",
+        "supplement",
+        "supplements",
+        "disease",
+        "condition",
+    }
+    for anchor in anchors or []:
+        a = str(anchor or "").strip().lower()
+        if not a:
+            continue
+        toks = _tokenize(a)
+        if not toks:
+            continue
+        if len(toks) == 1 and next(iter(toks), "") in generic_singletons:
+            continue
+        if _phrase_present(candidate_tokens, a):
+            return True
+    return False
+
+
 def _claim_context_hash(text: str) -> str:
     normalized = re.sub(r"\s+", " ", str(text or "").strip().lower())
     if not normalized:
@@ -125,10 +161,56 @@ class VDBRetrieval:
         if not normalized_query:
             return []
         normalized_claim_hash = str(claim_context_hash or "").strip().lower() or _claim_context_hash(claim_text)
+        generic_anchor_tokens = {
+            "health",
+            "healthy",
+            "immune",
+            "immunity",
+            "vitamin",
+            "supplement",
+            "supplements",
+            "disease",
+            "condition",
+        }
+        claim_anchor_list = [str(a).strip().lower() for a in (claim_anchors or []) if str(a).strip()]
+        usable_claim_anchors: List[str] = []
+        claim_anchor_token_sets = [(a, _tokenize(a)) for a in claim_anchor_list]
+        for anchor, toks in claim_anchor_token_sets:
+            if not toks:
+                continue
+            if len(toks) == 1:
+                tok = next(iter(toks), "")
+                has_more_specific = any(
+                    other != anchor and toks < other_toks for other, other_toks in claim_anchor_token_sets
+                )
+                if tok in generic_anchor_tokens and (len(claim_anchor_token_sets) > 1 or has_more_specific):
+                    continue
+                if has_more_specific:
+                    continue
+            if anchor not in usable_claim_anchors:
+                usable_claim_anchors.append(anchor)
+        if not usable_claim_anchors:
+            usable_claim_anchors = claim_anchor_list
         anchor_tokens: set[str] = set()
-        for anchor in claim_anchors or []:
+        for anchor in usable_claim_anchors:
             anchor_tokens |= _tokenize(anchor)
         claim_tokens = _tokenize(claim_text)
+        generic_claim_tokens = {
+            "health",
+            "healthy",
+            "immune",
+            "immunity",
+            "vitamin",
+            "supplement",
+            "supplements",
+            "support",
+            "function",
+            "benefit",
+            "benefits",
+            "effect",
+            "effects",
+        }
+        claim_specific_tokens = {t for t in claim_tokens if t not in generic_claim_tokens}
 
         try:
             embedding = await embed_async([normalized_query])
@@ -220,6 +302,8 @@ class VDBRetrieval:
             )
             anchor_overlap_count = len(candidate_tokens & anchor_tokens) if anchor_tokens else 0
             claim_overlap_count = len(candidate_tokens & claim_tokens) if claim_tokens else 0
+            claim_specific_overlap_count = len(candidate_tokens & claim_specific_tokens) if claim_specific_tokens else 0
+            strong_anchor = _strong_anchor_match(candidate_tokens, usable_claim_anchors)
             claim_context_match = bool(
                 normalized_claim_hash and stored_claim_hash and stored_claim_hash == normalized_claim_hash
             )
@@ -233,7 +317,13 @@ class VDBRetrieval:
             aligned_score = min(1.0, score + claim_alignment_boost)
 
             if anchor_tokens or claim_tokens or normalized_claim_hash:
-                has_alignment = claim_context_match or anchor_overlap_count > 0 or claim_overlap_count > 0
+                has_alignment = (
+                    claim_context_match
+                    or strong_anchor
+                    or claim_specific_overlap_count > 0
+                    or anchor_overlap_count >= 2
+                    or (not claim_specific_tokens and claim_overlap_count >= 2)
+                )
                 if not has_alignment and score < max(effective_min_score + 0.10, 0.45):
                     dropped_claim_mismatch += 1
                     continue

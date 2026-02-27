@@ -28,6 +28,10 @@ IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
 Return ONLY valid JSON:
 {{"results": [{{"index": 0, "triples": [{{"subject": "...", "relation": "...", "object": "...",
 "confidence": 0.9}}]}}]}}
+Index integrity:
+- Triples under each "index" must come only from that fact index.
+- Do not attach triples from one fact to another index.
+- If a fact has no claim-relevant triples, return that index with an empty triples list.
 
 ENTITIES PROVIDED: {entities}
 CLAIM CONTEXT: {claim_context}
@@ -58,6 +62,21 @@ class RelationExtractor:
 
     def __init__(self) -> None:
         self.llm_service = HybridLLMService()
+        self._generic_anchor_tokens = {
+            "health",
+            "healthy",
+            "disease",
+            "diseases",
+            "condition",
+            "conditions",
+            "symptom",
+            "symptoms",
+            "vitamin",
+            "supplement",
+            "supplements",
+            "immune",
+            "immunity",
+        }
 
     @staticmethod
     def _tokenize(text: str) -> set[str]:
@@ -118,6 +137,41 @@ class RelationExtractor:
             f"must_have_entities={must_have_entities[:10] if must_have_entities else []}"
         )
 
+    @classmethod
+    def _phrase_tokens(cls, phrase: str) -> set[str]:
+        return cls._tokenize(phrase)
+
+    @classmethod
+    def _phrase_present(cls, candidate_tokens: set[str], phrase: str) -> bool:
+        phrase_toks = cls._phrase_tokens(phrase)
+        if not phrase_toks:
+            return False
+        overlap = len(candidate_tokens & phrase_toks)
+        if len(phrase_toks) == 1:
+            return overlap >= 1
+        # Keep phrase matching strict enough to prevent partial generic drift.
+        return overlap >= max(1, len(phrase_toks) - 1)
+
+    def _has_strong_anchor_alignment(
+        self,
+        candidate_tokens: set[str],
+        anchors: Optional[List[str]],
+    ) -> bool:
+        if not anchors:
+            return False
+        for anchor in anchors:
+            text = str(anchor or "").strip()
+            if not text:
+                continue
+            phrase_toks = self._phrase_tokens(text)
+            if not phrase_toks:
+                continue
+            if len(phrase_toks) == 1 and next(iter(phrase_toks), "") in self._generic_anchor_tokens:
+                continue
+            if self._phrase_present(candidate_tokens, text):
+                return True
+        return False
+
     def _is_claim_aligned_triple(
         self,
         triple: Dict[str, Any],
@@ -150,9 +204,17 @@ class RelationExtractor:
         for ent in must_have_entities or []:
             must_have_tokens |= self._tokenize(ent)
 
-        if must_have_tokens and len(triple_tokens & must_have_tokens) == 0:
+        strong_must_have = self._has_strong_anchor_alignment(triple_tokens, must_have_entities)
+        strong_claim_entity = self._has_strong_anchor_alignment(triple_tokens, claim_entities)
+
+        if must_have_tokens and not strong_must_have and len(triple_tokens & must_have_tokens) == 0:
             return False
-        if not must_have_tokens and claim_entity_tokens and len(triple_tokens & claim_entity_tokens) == 0:
+        if (
+            not must_have_tokens
+            and claim_entity_tokens
+            and not strong_claim_entity
+            and len(triple_tokens & claim_entity_tokens) == 0
+        ):
             return False
         if claim_tokens and len(triple_tokens & claim_tokens) == 0:
             return False
@@ -164,6 +226,56 @@ class RelationExtractor:
             if lexical_overlap < 2:
                 return False
         return True
+
+    def _triple_fact_alignment_score(self, triple: Dict[str, Any], statement: str) -> float:
+        stmt_tokens = self._tokenize(statement)
+        if not stmt_tokens:
+            return 0.0
+        subj = str(triple.get("subject") or "")
+        rel = str(triple.get("relation") or "")
+        obj = str(triple.get("object") or "")
+        ent_tokens = self._tokenize(" ".join([subj, obj]))
+        rel_tokens = self._tokenize(rel)
+        if not ent_tokens and not rel_tokens:
+            return 0.0
+
+        ent_overlap = (len(ent_tokens & stmt_tokens) / max(1, len(ent_tokens))) if ent_tokens else 0.0
+        rel_overlap = (len(rel_tokens & stmt_tokens) / max(1, len(rel_tokens))) if rel_tokens else 0.0
+        phrase_bonus = 0.0
+        if subj and self._phrase_present(stmt_tokens, subj):
+            phrase_bonus += 0.12
+        if obj and self._phrase_present(stmt_tokens, obj):
+            phrase_bonus += 0.12
+        return max(0.0, min(1.0, (0.75 * ent_overlap) + (0.25 * rel_overlap) + phrase_bonus))
+
+    def _resolve_fact_index(self, idx: int, raw_triple: Dict[str, Any], facts: List[Dict[str, Any]]) -> int:
+        if not facts:
+            return -1
+        try:
+            idx_int = int(idx)
+        except Exception:
+            idx_int = -1
+
+        def _score(i: int) -> float:
+            stmt = str(facts[i].get("statement", "") or "")
+            return self._triple_fact_alignment_score(raw_triple, stmt)
+
+        # Prefer provided index when it is valid and aligned.
+        if 0 <= idx_int < len(facts):
+            if _score(idx_int) >= 0.35:
+                return idx_int
+
+        # Otherwise remap to best aligned fact.
+        best_idx = -1
+        best_score = 0.0
+        for i in range(len(facts)):
+            s = _score(i)
+            if s > best_score:
+                best_score = s
+                best_idx = i
+        if best_idx >= 0 and best_score >= 0.45:
+            return best_idx
+        return -1
 
     @staticmethod
     def _normalize_relation(relation: str) -> str:
@@ -249,7 +361,7 @@ class RelationExtractor:
             return negated
         return None
 
-    def _try_parse_result(self, result: Any) -> Optional[Dict[str, Any]]:
+    def _try_parse_result(self, result: Any, allow_single_index_fallback: bool = True) -> Optional[Dict[str, Any]]:
         """Try to parse LLM result into expected format. No retries, just parsing."""
         # Reject None, empty dict, or error indicators
         if result is None or result == {} or (isinstance(result, dict) and "_llm_error" in result):
@@ -262,7 +374,7 @@ class RelationExtractor:
         # If dict but missing results key, try to extract
         if isinstance(result, dict):
             # Maybe LLM returned {"triples": [...]} for single fact
-            if "triples" in result:
+            if allow_single_index_fallback and "triples" in result:
                 return {"results": [{"index": 0, "triples": result["triples"]}]}
             logger.warning(f"[RelationExtractor] Dict missing 'results' key: {list(result.keys())}")
             return None
@@ -274,7 +386,7 @@ class RelationExtractor:
                 if isinstance(parsed, dict):
                     if "results" in parsed:
                         return parsed
-                    if "triples" in parsed:
+                    if allow_single_index_fallback and "triples" in parsed:
                         return {"results": [{"index": 0, "triples": parsed["triples"]}]}
             except json.JSONDecodeError as e:
                 preview = result[:800].replace("\n", "\\n")
@@ -294,7 +406,7 @@ class RelationExtractor:
                             if "results" in parsed:
                                 logger.warning("[RelationExtractor] JSON repaired successfully")
                                 return parsed
-                            if "triples" in parsed:
+                            if allow_single_index_fallback and "triples" in parsed:
                                 logger.warning("[RelationExtractor] JSON repaired successfully (triples root)")
                                 return {"results": [{"index": 0, "triples": parsed["triples"]}]}
                     except json.JSONDecodeError as repair_err:
@@ -324,11 +436,16 @@ class RelationExtractor:
         return text
 
     async def _parse_llm_response(
-        self, result: Any, original_prompt: str, required_format: str, max_retries: int = 1
+        self,
+        result: Any,
+        original_prompt: str,
+        required_format: str,
+        max_retries: int = 1,
+        allow_single_index_fallback: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """Parse LLM response with limited retries. NO RECURSION - uses iterative loop."""
         # First attempt: try to parse the original result
-        parsed = self._try_parse_result(result)
+        parsed = self._try_parse_result(result, allow_single_index_fallback=allow_single_index_fallback)
         if parsed is not None:
             return parsed
 
@@ -345,7 +462,7 @@ class RelationExtractor:
                     priority=LLMPriority.LOW,
                     call_tag="relation_extraction",
                 )
-                parsed = self._try_parse_result(retry_result)
+                parsed = self._try_parse_result(retry_result, allow_single_index_fallback=allow_single_index_fallback)
                 if parsed is not None:
                     logger.info(f"[RelationExtractor] Retry {attempt + 1} succeeded")
                     return parsed
@@ -415,7 +532,12 @@ class RelationExtractor:
                 logger.debug("[RelationExtractor] LLM raw output preview=%s", preview)
 
             # Parse with retry logic
-            parsed = await self._parse_llm_response(result, prompt, required_format)
+            parsed = await self._parse_llm_response(
+                result,
+                prompt,
+                required_format,
+                allow_single_index_fallback=(len(facts) == 1),
+            )
 
             if parsed is None:
                 logger.warning("[RelationExtractor] Could not parse LLM response after retries")
@@ -448,12 +570,10 @@ class RelationExtractor:
                 raw_triples = item.get("triples", [])
                 raw_triples_count += len(raw_triples or [])
 
-                if idx < 0 or idx >= len(facts):
+                # Validate each triple-level index separately below; this block only guards obvious malformed rows.
+                if not isinstance(raw_triples, list):
                     rejected_by_reason["invalid_index"] += len(raw_triples or [])
                     continue
-
-                fact = facts[idx]
-                src = fact.get("source_url") or fact.get("source") or None
 
                 for rt in raw_triples:
                     try:
@@ -461,6 +581,12 @@ class RelationExtractor:
                             rejected_by_reason["non_dict_triple"] += 1
                             continue
                         parsed_triples_count += 1
+                        resolved_idx = self._resolve_fact_index(idx, rt, facts)
+                        if resolved_idx < 0 or resolved_idx >= len(facts):
+                            rejected_by_reason["invalid_index"] += 1
+                            continue
+                        fact = facts[resolved_idx]
+                        src = fact.get("source_url") or fact.get("source") or None
                         subj = (rt.get("subject") or "").strip()
                         rel = (rt.get("relation") or "").strip()
                         obj = (rt.get("object") or "").strip()

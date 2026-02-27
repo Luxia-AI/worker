@@ -28,6 +28,10 @@ Claim alignment rules (strict):
 IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
 Return ONLY valid JSON with this exact structure:
 {{"results": [{{"index": 0, "facts": [{{"statement": "...", "confidence": 0.85}}]}}, {{"index": 1, "facts": [...]}}]}}
+Index integrity:
+- Facts under each "index" must come only from that section index.
+- Do not move or merge facts across section indices.
+- If a section has no claim-relevant facts, return that section with an empty facts list.
 
 SECTIONS:
 """
@@ -52,8 +56,23 @@ class FactExtractor:
 
     def __init__(self) -> None:
         self.llm_service = HybridLLMService()
+        self._generic_anchor_tokens = {
+            "health",
+            "healthy",
+            "disease",
+            "diseases",
+            "condition",
+            "conditions",
+            "symptom",
+            "symptoms",
+            "vitamin",
+            "supplement",
+            "supplements",
+            "immune",
+            "immunity",
+        }
 
-    def _try_parse_result(self, result: Any) -> Optional[Dict[str, Any]]:
+    def _try_parse_result(self, result: Any, allow_single_index_fallback: bool = True) -> Optional[Dict[str, Any]]:
         """Try to parse LLM result into expected format. No retries, just parsing."""
         # Reject None, empty dict, or error indicators
         if result is None or result == {} or (isinstance(result, dict) and "_llm_error" in result):
@@ -66,7 +85,7 @@ class FactExtractor:
         # If dict but missing results key, try to extract
         if isinstance(result, dict):
             # Maybe LLM returned {"facts": [...]} for single page
-            if "facts" in result:
+            if allow_single_index_fallback and "facts" in result:
                 return {"results": [{"index": 0, "facts": result["facts"]}]}
             logger.warning(f"[FactExtractor] Dict missing 'results' key: {list(result.keys())}")
             return None
@@ -78,7 +97,7 @@ class FactExtractor:
                 if isinstance(parsed, dict):
                     if "results" in parsed:
                         return parsed
-                    if "facts" in parsed:
+                    if allow_single_index_fallback and "facts" in parsed:
                         return {"results": [{"index": 0, "facts": parsed["facts"]}]}
             except json.JSONDecodeError:
                 pass
@@ -198,6 +217,36 @@ class FactExtractor:
                 kept.append(fact)
         return kept
 
+    @classmethod
+    def _phrase_tokens(cls, phrase: str) -> set[str]:
+        return cls._tokenize(phrase)
+
+    @classmethod
+    def _phrase_present(cls, statement_tokens: set[str], phrase: str) -> bool:
+        phrase_toks = cls._phrase_tokens(phrase)
+        if not phrase_toks:
+            return False
+        overlap = len(statement_tokens & phrase_toks)
+        if len(phrase_toks) == 1:
+            return overlap >= 1
+        return overlap >= max(1, len(phrase_toks) - 1)
+
+    def _has_strong_anchor_alignment(self, statement_tokens: set[str], anchors: Optional[List[str]]) -> bool:
+        if not anchors:
+            return False
+        for anchor in anchors:
+            text = str(anchor or "").strip()
+            if not text:
+                continue
+            phrase_toks = self._phrase_tokens(text)
+            if not phrase_toks:
+                continue
+            if len(phrase_toks) == 1 and next(iter(phrase_toks), "") in self._generic_anchor_tokens:
+                continue
+            if self._phrase_present(statement_tokens, text):
+                return True
+        return False
+
     @staticmethod
     def _tokenize(text: str) -> set[str]:
         stop = {
@@ -264,12 +313,14 @@ class FactExtractor:
 
             has_must_have = bool(must_have_tokens and (stmt_tokens & must_have_tokens))
             has_claim_entity = bool(claim_entity_tokens and (stmt_tokens & claim_entity_tokens))
+            strong_must_have = self._has_strong_anchor_alignment(stmt_tokens, must_have_entities)
+            strong_claim_entity = self._has_strong_anchor_alignment(stmt_tokens, claim_entities)
 
             # Primary-entity gate: must-have if available, otherwise any claim entity.
             if must_have_tokens:
-                if not has_must_have:
+                if not strong_must_have and not has_must_have:
                     continue
-            elif claim_entity_tokens and not has_claim_entity:
+            elif claim_entity_tokens and not strong_claim_entity and not has_claim_entity:
                 continue
 
             if claim_tokens and len(stmt_tokens & claim_tokens) == 0:
@@ -348,11 +399,16 @@ class FactExtractor:
         return FACT_EXTRACTION_PROMPT.format(content=content) + claim_block
 
     async def _parse_llm_response(
-        self, result: Any, original_prompt: str, required_format: str, max_retries: int = 1
+        self,
+        result: Any,
+        original_prompt: str,
+        required_format: str,
+        max_retries: int = 1,
+        allow_single_index_fallback: bool = True,
     ) -> Optional[Dict[str, Any]]:
         """Parse LLM response with limited retries. NO RECURSION - uses iterative loop."""
         # First attempt: try to parse the original result
-        parsed = self._try_parse_result(result)
+        parsed = self._try_parse_result(result, allow_single_index_fallback=allow_single_index_fallback)
         if parsed is not None:
             return parsed
 
@@ -369,7 +425,7 @@ class FactExtractor:
                     priority=LLMPriority.LOW,
                     call_tag="fact_extraction",
                 )
-                parsed = self._try_parse_result(retry_result)
+                parsed = self._try_parse_result(retry_result, allow_single_index_fallback=allow_single_index_fallback)
                 if parsed is not None:
                     logger.info(f"[FactExtractor] Retry {attempt + 1} succeeded")
                     return parsed
@@ -465,7 +521,12 @@ class FactExtractor:
             )
 
             # Parse with retry logic
-            parsed = await self._parse_llm_response(result, prompt, required_format)
+            parsed = await self._parse_llm_response(
+                result,
+                prompt,
+                required_format,
+                allow_single_index_fallback=(len(section_to_page_idx) == 1),
+            )
 
             if parsed is None and confidence_mode:
                 logger.warning(
@@ -478,7 +539,12 @@ class FactExtractor:
                     call_tag="fact_extraction",
                     allow_quota_override=True,
                 )
-                parsed = await self._parse_llm_response(retry_result, prompt, required_format)
+                parsed = await self._parse_llm_response(
+                    retry_result,
+                    prompt,
+                    required_format,
+                    allow_single_index_fallback=(len(section_to_page_idx) == 1),
+                )
 
             if parsed is None:
                 logger.warning("[FactExtractor] Could not parse LLM response after retries, using fallback")

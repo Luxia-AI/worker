@@ -492,6 +492,12 @@ class TrustedSearch:
         # Keep query compact and avoid over-constraining.
         tokens = q.split()
         q = " ".join(tokens[:18]).strip()
+        # Collapse duplicated/stacked negation artifacts from generated templates.
+        q = re.sub(r"\b(do|does)\s+not\s+(?:do|does)\s+not\b", r"\1 not", q, flags=re.IGNORECASE)
+        q = re.sub(r"\b(?:do|does)\s+not\s+cannot\b", "does not", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bcannot\s+(?:do|does)\s+not\b", "cannot", q, flags=re.IGNORECASE)
+        q = re.sub(r"\bnot\s+not\b", "not", q, flags=re.IGNORECASE)
+        q = re.sub(r"\s+", " ", q).strip()
         return q
 
     @staticmethod

@@ -2980,6 +2980,7 @@ class VerdictGenerator:
         text = (segment or "").lower()
         patterns = (
             r"\b(?:as\s+part\s+of|part\s+of)\s+(?P<object>.+)$",
+            r"\b(?:support|supports|supported|help|helps|boost|boosts)\s+(?P<object>.+)$",
             (
                 r"\b(?:contribut(?:e|es|ed|ing)|help|helps|support|supports|needed|required)\s+"
                 r"(?:to|for)\s+(?P<object>.+)$"
@@ -3090,6 +3091,15 @@ class VerdictGenerator:
             "as",
             "part",
             "from",
+            "no",
+            "not",
+            "do",
+            "does",
+            "did",
+            "is",
+            "are",
+            "was",
+            "were",
         }
         return {t for t in re.findall(r"\b[a-z][a-z0-9_-]+\b", subject_text) if t not in stop}
 
@@ -3188,6 +3198,7 @@ class VerdictGenerator:
             "would",
             "will",
             "not",
+            "no",
         }
         prepositions = {"to", "in", "on", "of", "for", "with", "into", "from", "as"}
         stop = {
@@ -3284,7 +3295,7 @@ class VerdictGenerator:
         if pred_idx < 0:
             pred_idx = 1
 
-        subject_tokens = [t for t in tokens[:pred_idx] if t not in stop]
+        subject_tokens = [t for t in tokens[:pred_idx] if t not in stop and t not in aux and t not in {"no", "not"}]
         predicate_tokens = [tokens[pred_idx]]
         if tokens[pred_idx] in aux and pred_idx + 1 < len(tokens):
             predicate_tokens.append(tokens[pred_idx + 1])
@@ -3641,6 +3652,23 @@ class VerdictGenerator:
                         statement.lower(),
                     )
                 )
+                scope_vocab = {
+                    "healthy",
+                    "adults",
+                    "adult",
+                    "children",
+                    "child",
+                    "elderly",
+                    "smokers",
+                    "smoker",
+                    "supplementation",
+                    "supplement",
+                    "supplements",
+                    "oral",
+                    "intravenous",
+                }
+                claim_scope_terms = {t for t in self._statement_tokens(claim) if t in scope_vocab}
+                stmt_scope_terms = {t for t in self._statement_tokens(statement) if t in scope_vocab}
                 refute_by_rule = (
                     (
                         contradiction_score >= CONTRADICTION_THRESHOLD
@@ -3690,6 +3718,12 @@ class VerdictGenerator:
                         support_gate = support_gate or (anchor_score >= ANCHOR_THRESHOLD)
                     if bone_strength_proxy_support and support_strength >= 0.30:
                         support_gate = True
+                    # Prevent broad negated claims from being "supported" only by narrow population/scope evidence.
+                    scope_mismatch_for_negated_claim = (
+                        claim_neg and bool(stmt_scope_terms) and not bool(claim_scope_terms & stmt_scope_terms)
+                    )
+                    if scope_mismatch_for_negated_claim:
+                        support_gate = False
                     if support_gate:
                         relevance = "SUPPORTS"
                         relevance_score = max(relevance_score, support_strength, 0.62)
@@ -5879,7 +5913,43 @@ class VerdictGenerator:
         if not predicate:
             return []
         anchor_subject = subject or seg.split()[0]
+        anchor_subject = re.sub(
+            r"\b(?:do|does|did|is|are|was|were|can|could|may|might|must|should|would|will|no|not)\b",
+            " ",
+            anchor_subject,
+            flags=re.IGNORECASE,
+        )
+        anchor_subject = re.sub(r"\s+", " ", anchor_subject).strip()
+        if not anchor_subject:
+            tokens = [
+                t
+                for t in re.findall(r"\b[a-zA-Z][a-zA-Z0-9_-]*\b", seg)
+                if t.lower()
+                not in {
+                    "do",
+                    "does",
+                    "did",
+                    "is",
+                    "are",
+                    "was",
+                    "were",
+                    "can",
+                    "could",
+                    "may",
+                    "might",
+                    "must",
+                    "should",
+                    "would",
+                    "will",
+                    "no",
+                    "not",
+                }
+            ]
+            anchor_subject = " ".join(tokens[:2]).strip()
         pred_obj = " ".join(x for x in [predicate, obj] if x).strip()
+        pred_obj = re.sub(r"^(?:do(?:es)?\s+not|cannot|can't|not)\s+", "", pred_obj, flags=re.IGNORECASE).strip()
+        if not pred_obj:
+            return []
         hints = [
             f"{anchor_subject} do not {pred_obj}".strip(),
             f"{anchor_subject} cannot {pred_obj}".strip(),
@@ -5889,7 +5959,15 @@ class VerdictGenerator:
             f"{anchor_subject} does not {pred_obj}".strip(),
             f"does {anchor_subject} {pred_obj}".strip(),
         ]
-        return [h for h in hints if h]
+        deduped: List[str] = []
+        for h in hints:
+            h_clean = re.sub(r"\s+", " ", h).strip()
+            if not h_clean:
+                continue
+            if h_clean.lower() in {x.lower() for x in deduped}:
+                continue
+            deduped.append(h_clean)
+        return deduped
 
     async def _fetch_web_evidence_for_unknown_segments(
         self,
@@ -5926,6 +6004,11 @@ class VerdictGenerator:
             try:
                 logger.debug(f"[VerdictGenerator] Searching web for UNKNOWN segment: '{segment[:50]}...'")
                 triplet = self._extract_canonical_predicate_triplet(segment)
+                segment_entities = [
+                    str(triplet.get("subject_span") or "").strip(),
+                    str(triplet.get("object_span") or "").strip(),
+                ]
+                segment_entities = [e for e in segment_entities if e]
                 if not predicate_target and triplet.get("canonical_predicate"):
                     predicate_target = {
                         "subject": str(triplet.get("subject_span") or ""),
@@ -5987,7 +6070,12 @@ class VerdictGenerator:
                                 authoritative_scraped_pages.append(scraped_page)
 
                             # Extract facts from the scraped content
-                            facts = await self.fact_extractor.extract([scraped_page])
+                            facts = await self.fact_extractor.extract(
+                                [scraped_page],
+                                claim_text=segment,
+                                claim_entities=segment_entities,
+                                must_have_entities=segment_entities[:1],
+                            )
 
                             for fact in facts:
                                 stmt = fact.get("statement", "") or ""
@@ -6030,6 +6118,12 @@ class VerdictGenerator:
                 forced_facts = await self.fact_extractor.extract(
                     authoritative_scraped_pages[: max(1, min(4, len(authoritative_scraped_pages)))],
                     predicate_target=predicate_target,
+                    claim_text=" ".join(unknown_segments),
+                    claim_entities=[
+                        str(predicate_target.get("subject") or "").strip(),
+                        str(predicate_target.get("object") or "").strip(),
+                    ],
+                    must_have_entities=[str(predicate_target.get("subject") or "").strip()],
                 )
                 for fact in forced_facts:
                     stmt = str(fact.get("statement") or "")

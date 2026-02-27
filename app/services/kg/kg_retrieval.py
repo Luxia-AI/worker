@@ -42,6 +42,42 @@ def _tokenize(text: str) -> set[str]:
     return {w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (text or "").lower()) if w not in stop}
 
 
+def _phrase_present(candidate_tokens: set[str], phrase: str) -> bool:
+    phrase_tokens = _tokenize(phrase)
+    if not phrase_tokens:
+        return False
+    overlap = len(candidate_tokens & phrase_tokens)
+    if len(phrase_tokens) == 1:
+        return overlap >= 1
+    return overlap >= max(1, len(phrase_tokens) - 1)
+
+
+def _strong_anchor_match(candidate_tokens: set[str], anchors: List[str]) -> bool:
+    generic_singletons = {
+        "health",
+        "healthy",
+        "immune",
+        "immunity",
+        "vitamin",
+        "supplement",
+        "supplements",
+        "disease",
+        "condition",
+    }
+    for anchor in anchors or []:
+        a = str(anchor or "").strip().lower()
+        if not a:
+            continue
+        toks = _tokenize(a)
+        if not toks:
+            continue
+        if len(toks) == 1 and next(iter(toks), "") in generic_singletons:
+            continue
+        if _phrase_present(candidate_tokens, a):
+            return True
+    return False
+
+
 def _claim_context_hash(claim_text: str) -> str:
     normalized = re.sub(r"\s+", " ", str(claim_text or "").strip().lower())
     if not normalized:
@@ -125,6 +161,38 @@ class KGRetrieval:
         claim_context_hash: str = "",
     ) -> List[Dict[str, Any]]:
         """Internal method that performs the actual retrieval."""
+        generic_singletons = {
+            "health",
+            "healthy",
+            "immune",
+            "immunity",
+            "vitamin",
+            "supplement",
+            "supplements",
+            "disease",
+            "condition",
+        }
+        normalized_entities: List[str] = []
+        for e in entities or []:
+            clean = str(e or "").strip().lower()
+            if clean and clean not in normalized_entities:
+                normalized_entities.append(clean)
+        token_sets = [(e, _tokenize(e)) for e in normalized_entities]
+        retrieval_entities: List[str] = []
+        for ent, toks in token_sets:
+            if not toks:
+                continue
+            if len(toks) == 1:
+                tok = next(iter(toks), "")
+                has_more_specific = any(other_ent != ent and toks < other_toks for other_ent, other_toks in token_sets)
+                if tok in generic_singletons and (len(token_sets) > 1 or has_more_specific):
+                    continue
+                if has_more_specific:
+                    continue
+            retrieval_entities.append(ent)
+        if not retrieval_entities:
+            retrieval_entities = normalized_entities[:]
+
         cypher = """
         UNWIND $ents AS e
 
@@ -192,7 +260,7 @@ class KGRetrieval:
             async with self.client.session() as session:
                 res = await session.run(
                     cypher,
-                    ents=entities,
+                    ents=retrieval_entities,
                     limit=top_k * 2,
                     claim_context_hash=str(claim_context_hash or "").strip().lower(),
                 )
@@ -204,7 +272,23 @@ class KGRetrieval:
         results = []
         seen = set()
         query_keywords = _tokenize(query_text)
-        anchors = [str(a).strip().lower() for a in (claim_anchors or entities or []) if str(a).strip()]
+        generic_claim_tokens = {
+            "health",
+            "healthy",
+            "immune",
+            "immunity",
+            "vitamin",
+            "supplement",
+            "supplements",
+            "support",
+            "function",
+            "benefit",
+            "benefits",
+            "effect",
+            "effects",
+        }
+        query_specific_keywords = {t for t in query_keywords if t not in generic_claim_tokens}
+        anchors = [str(a).strip().lower() for a in (claim_anchors or retrieval_entities or []) if str(a).strip()]
         anchor_tokens: set[str] = set()
         for anchor in anchors:
             anchor_tokens |= _tokenize(anchor)
@@ -239,13 +323,22 @@ class KGRetrieval:
                 )
             )
             query_overlap = len(statement_tokens & query_keywords) if query_keywords else 0
+            query_specific_overlap = len(statement_tokens & query_specific_keywords) if query_specific_keywords else 0
             anchor_overlap = len(statement_tokens & anchor_tokens) if anchor_tokens else 0
+            strong_anchor = _strong_anchor_match(statement_tokens, anchors)
             row_claim_hash_norm = str(row_claim_hash or "").strip().lower()
             claim_context_match = bool(
                 normalized_claim_hash and row_claim_hash_norm and row_claim_hash_norm == normalized_claim_hash
             )
 
-            if anchor_tokens and not claim_context_match and anchor_overlap == 0 and query_overlap == 0:
+            if (
+                anchor_tokens
+                and not claim_context_match
+                and not strong_anchor
+                and anchor_overlap == 0
+                and query_specific_overlap == 0
+                and (not query_specific_keywords and query_overlap == 0)
+            ):
                 # Reject obvious drift in low-signal relations.
                 if hop > 1 or path_score < 0.65:
                     continue
@@ -254,8 +347,10 @@ class KGRetrieval:
                 path_score = min(1.0, path_score + 0.20)
             if anchor_overlap > 0:
                 path_score = min(1.0, path_score + min(0.15, 0.03 * anchor_overlap))
-            if query_overlap > 0:
-                path_score = min(1.0, path_score + min(0.08, 0.02 * query_overlap))
+            if query_specific_overlap > 0:
+                path_score = min(1.0, path_score + min(0.08, 0.02 * query_specific_overlap))
+            elif not query_specific_keywords and query_overlap > 0:
+                path_score = min(1.0, path_score + min(0.05, 0.01 * query_overlap))
 
             result = {
                 "statement": statement,
@@ -286,7 +381,7 @@ class KGRetrieval:
         # This ensures identical queries return identical ordering even when scores are equal
         sorted_results = sorted(results, key=lambda x: (-x["score"], x["statement"]))[:top_k]
         logger.info(
-            f"[KGRetrieval] Retrieved {len(sorted_results)} relations from {len(entities)} entities "
+            f"[KGRetrieval] Retrieved {len(sorted_results)} relations from {len(retrieval_entities)} entities "
             f"(raw matches: {len(results)})"
         )
         return sorted_results

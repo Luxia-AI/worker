@@ -12,12 +12,19 @@ from app.core.logger import get_logger
 logger = get_logger(__name__)
 
 _model = None
+_embedding_batch_size = int(os.getenv("EMBEDDING_BATCH_SIZE", "32") or 32)
+_embedding_device = os.getenv("EMBEDDING_DEVICE", "").strip() or None
 
 # Fallback model if primary fails (smaller, more reliable)
 EMBEDDING_MODEL_FALLBACK = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Set deterministic mode for reproducible embeddings
 torch.set_num_threads(1)  # Single thread for consistent results
+if hasattr(torch, "set_num_interop_threads"):
+    try:
+        torch.set_num_interop_threads(1)
+    except Exception:
+        pass
 if hasattr(torch, "use_deterministic_algorithms"):
     try:
         torch.use_deterministic_algorithms(True, warn_only=True)
@@ -50,18 +57,17 @@ def get_embedding_model() -> SentenceTransformer:
 
         try:
             logger.info(f"Loading embedding model: {model_name}")
-            _model = SentenceTransformer(model_name, token=hf_token)
+            _model = SentenceTransformer(model_name, token=hf_token, device=_embedding_device)
             logger.info("Embedding model loaded successfully")
         except Exception as e:
             logger.warning(f"Failed to load {model_name}: {e}")
             logger.info(f"Falling back to {EMBEDDING_MODEL_FALLBACK}")
             try:
-                _model = SentenceTransformer(EMBEDDING_MODEL_FALLBACK, token=hf_token)
+                _model = SentenceTransformer(EMBEDDING_MODEL_FALLBACK, token=hf_token, device=_embedding_device)
                 logger.info(f"Fallback embedding model loaded: {EMBEDDING_MODEL_FALLBACK}")
             except Exception as e2:
                 logger.error(f"Failed to load fallback model: {e2}")
                 raise RuntimeError(f"Could not load any embedding model: {e}, {e2}")
-    return _model
     return _model
 
 
@@ -75,8 +81,13 @@ async def embed_async(sentences: List[str]) -> List[List[float]]:
     model = get_embedding_model()
 
     def _encode() -> List[List[float]]:
-        embeddings = model.encode(sentences, convert_to_tensor=True)
-        # Convert tensors to lists of floats
+        embeddings = model.encode(
+            sentences,
+            convert_to_numpy=True,
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            batch_size=max(1, _embedding_batch_size),
+        )
         return [embedding.tolist() for embedding in embeddings]
 
     return await loop.run_in_executor(None, _encode)

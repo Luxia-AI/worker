@@ -79,14 +79,30 @@ def _contains_must_have_entity(candidate: Dict[str, Any], must_have_aliases: Lis
     tokens = _tokenize(str(candidate.get("statement") or ""))
     if not tokens:
         return False
+    generic_singletons = {
+        "health",
+        "healthy",
+        "immune",
+        "immunity",
+        "vitamin",
+        "supplement",
+        "supplements",
+        "disease",
+        "condition",
+    }
     for alias in must_have_aliases:
         alias_tokens = _tokenize(str(alias or ""))
         if not alias_tokens:
             continue
         overlap = len(tokens & alias_tokens)
-        if len(alias_tokens) == 1 and overlap >= 1:
-            return True
-        if len(alias_tokens) > 1 and overlap >= max(1, len(alias_tokens) - 1):
+        if len(alias_tokens) == 1:
+            term = next(iter(alias_tokens), "")
+            if term in generic_singletons:
+                continue
+            if overlap >= 1:
+                return True
+        # Require full phrase coverage for multi-token core aliases (prevents vitamin-A drift for "vitamin c").
+        if len(alias_tokens) > 1 and overlap >= len(alias_tokens):
             return True
     return False
 

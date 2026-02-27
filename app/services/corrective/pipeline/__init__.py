@@ -1155,9 +1155,9 @@ class CorrectivePipeline:
 
         # Determine final status
         final_status = "completed"
-        if not all_facts and search_api_calls > 0:
+        if not all_facts and search_api_calls > 0 and not top_ranked:
             final_status = "no_facts_extracted"
-        elif search_api_calls == 0:
+        elif search_api_calls == 0 and not top_ranked:
             final_status = "no_search_results"
 
         # ====================================================================
@@ -1229,11 +1229,47 @@ class CorrectivePipeline:
         )
         await debug_reporter.close()
 
+        output_facts = list(all_facts or [])
+        if not output_facts and top_ranked:
+            # Keep downstream consumers from receiving an empty fact list when
+            # we still have admissible ranked evidence.
+            output_facts = [
+                {
+                    "statement": str(item.get("statement") or ""),
+                    "source_url": str(item.get("source_url") or ""),
+                    "source": str(item.get("source") or ""),
+                    "confidence": float(item.get("final_score", 0.0) or 0.0),
+                }
+                for item in top_ranked
+                if str(item.get("statement") or "").strip()
+            ]
+        output_triples = list(all_triples or [])
+        if not output_triples and top_ranked:
+            for item in top_ranked:
+                entities = [str(e).strip() for e in (item.get("entities") or []) if str(e).strip()]
+                subject = str(item.get("subject") or (entities[0] if entities else "")).strip()
+                object_ = str(item.get("object") or (entities[1] if len(entities) > 1 else "")).strip()
+                relation = str(item.get("relation") or "related_to").strip()
+                if not subject or not object_:
+                    continue
+                output_triples.append(
+                    {
+                        "id": str(uuid.uuid4()),
+                        "subject": subject,
+                        "relation": relation,
+                        "object": object_,
+                        "confidence": float(item.get("final_score", 0.0) or 0.0),
+                        "source_url": str(item.get("source_url") or ""),
+                    }
+                )
+                if len(output_triples) >= 3:
+                    break
+
         return {
             "round_id": round_id,
             "status": final_status,
-            "facts": all_facts,
-            "triples": all_triples,
+            "facts": output_facts,
+            "triples": output_triples,
             "queries": queries_executed,
             "queries_total": len(queries),
             "semantic_candidates_count": len(dedup_sem),
@@ -1458,6 +1494,20 @@ class CorrectivePipeline:
             "substance",
             "substances",
         }
+        weak_singletons = {
+            "adult",
+            "adults",
+            "human",
+            "body",
+            "located",
+            "more",
+            "than",
+            "half",
+            "most",
+            "many",
+            "some",
+        }
+        candidate_token_sets = [(c, set(self._entity_tokenize(c))) for c in candidates if c]
         for e in candidates:
             text = str(e).strip()
             toks = self._entity_tokenize(text)
@@ -1474,6 +1524,18 @@ class CorrectivePipeline:
                 score += 1
             else:
                 score -= 1
+            # Prefer specific entities over generic heads (e.g., "vitamin c" over "vitamin").
+            toks_set = set(toks)
+            if len(toks_set) == 1:
+                tok = next(iter(toks_set), "")
+                if tok in weak_singletons:
+                    score -= 4
+                has_more_specific_variant = any(
+                    other_text != text and toks_set and toks_set < other_toks
+                    for other_text, other_toks in candidate_token_sets
+                )
+                if has_more_specific_variant:
+                    score -= 3
             if set(toks) <= broad_nouns:
                 score -= 3
             scored.append((score, len(text), text))

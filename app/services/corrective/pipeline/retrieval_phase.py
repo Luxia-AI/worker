@@ -45,6 +45,75 @@ def _tokenize(text: str) -> set[str]:
     return {w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (text or "").lower()) if w not in stop}
 
 
+def _phrase_present(candidate_tokens: set[str], phrase: str) -> bool:
+    phrase_tokens = _tokenize(phrase)
+    if not phrase_tokens:
+        return False
+    overlap = len(candidate_tokens & phrase_tokens)
+    if len(phrase_tokens) == 1:
+        return overlap >= 1
+    return overlap >= max(1, len(phrase_tokens) - 1)
+
+
+def _strong_anchor_match(candidate_tokens: set[str], anchors: List[str]) -> bool:
+    generic_singletons = {
+        "health",
+        "healthy",
+        "immune",
+        "immunity",
+        "vitamin",
+        "supplement",
+        "supplements",
+        "disease",
+        "condition",
+    }
+    for anchor in anchors or []:
+        a = str(anchor or "").strip().lower()
+        if not a:
+            continue
+        toks = _tokenize(a)
+        if not toks:
+            continue
+        if len(toks) == 1 and next(iter(toks), "") in generic_singletons:
+            continue
+        if _phrase_present(candidate_tokens, a):
+            return True
+    return False
+
+
+def _normalize_retrieval_anchors(anchors: List[str]) -> List[str]:
+    generic_singletons = {
+        "health",
+        "healthy",
+        "immune",
+        "immunity",
+        "vitamin",
+        "supplement",
+        "supplements",
+        "disease",
+        "condition",
+    }
+    normalized: List[str] = []
+    for anchor in anchors or []:
+        clean = str(anchor or "").strip().lower()
+        if clean and clean not in normalized:
+            normalized.append(clean)
+    token_sets = [(a, _tokenize(a)) for a in normalized]
+    filtered: List[str] = []
+    for anchor, toks in token_sets:
+        if not toks:
+            continue
+        if len(toks) == 1:
+            tok = next(iter(toks), "")
+            has_more_specific = any(other != anchor and toks < other_toks for other, other_toks in token_sets)
+            if tok in generic_singletons and (len(token_sets) > 1 or has_more_specific):
+                continue
+            if has_more_specific:
+                continue
+        filtered.append(anchor)
+    return filtered or normalized
+
+
 def _claim_context_hash(claim_text: str) -> str:
     normalized = re.sub(r"\s+", " ", str(claim_text or "").strip().lower())
     if not normalized:
@@ -60,12 +129,27 @@ def _semantic_candidate_anchor_overlap(candidate: Dict[str, Any], anchors: List[
     if not cand_tokens:
         return False
 
-    anchor_tokens: set[str] = set()
-    for anchor in anchors or []:
-        anchor_tokens |= _tokenize(anchor)
-    if anchor_tokens and (cand_tokens & anchor_tokens):
+    if _strong_anchor_match(cand_tokens, anchors):
         return True
-    if claim_tokens and (cand_tokens & claim_tokens):
+    generic_claim_tokens = {
+        "health",
+        "healthy",
+        "immune",
+        "immunity",
+        "vitamin",
+        "supplement",
+        "supplements",
+        "support",
+        "function",
+        "benefit",
+        "benefits",
+        "effect",
+        "effects",
+    }
+    claim_specific_tokens = {t for t in claim_tokens if t not in generic_claim_tokens}
+    if claim_specific_tokens and (cand_tokens & claim_specific_tokens):
+        return True
+    if not claim_specific_tokens and claim_tokens and (cand_tokens & claim_tokens):
         return True
     return False
 
@@ -79,12 +163,27 @@ def _kg_candidate_anchor_overlap(candidate: Dict[str, Any], anchors: List[str], 
     if not cand_tokens:
         return False
 
-    anchor_tokens: set[str] = set()
-    for anchor in anchors or []:
-        anchor_tokens |= _tokenize(anchor)
-    if anchor_tokens and (cand_tokens & anchor_tokens):
+    if _strong_anchor_match(cand_tokens, anchors):
         return True
-    if claim_tokens and (cand_tokens & claim_tokens):
+    generic_claim_tokens = {
+        "health",
+        "healthy",
+        "immune",
+        "immunity",
+        "vitamin",
+        "supplement",
+        "supplements",
+        "support",
+        "function",
+        "benefit",
+        "benefits",
+        "effect",
+        "effects",
+    }
+    claim_specific_tokens = {t for t in claim_tokens if t not in generic_claim_tokens}
+    if claim_specific_tokens and (cand_tokens & claim_specific_tokens):
+        return True
+    if not claim_specific_tokens and claim_tokens and (cand_tokens & claim_tokens):
         return True
     return False
 
@@ -129,6 +228,7 @@ async def retrieve_candidates(
     query_embeddings: List[List[float]] = []
     normalized_queries: List[str] = []
     anchors = [str(a).strip() for a in (claim_anchors or all_entities or []) if str(a).strip()]
+    anchors = _normalize_retrieval_anchors(anchors)
     claim_tokens = _tokenize(query_text)
     effective_claim_context_hash = str(claim_context_hash or "").strip().lower() or _claim_context_hash(query_text)
 
