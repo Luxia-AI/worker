@@ -1,9 +1,11 @@
 import asyncio
+import contextlib
 import logging
 import os
 from datetime import datetime, timezone
 from typing import Any
 
+import httpx
 from fastapi import FastAPI
 from prometheus_client import Counter
 from pydantic import BaseModel, Field
@@ -23,6 +25,12 @@ rag_jobs_failed_total = Counter(
 )
 
 logger = logging.getLogger(__name__)
+SOCKETHUB_BASE_URL = os.getenv("SOCKETHUB_URL", "").strip().rstrip("/")
+SOCKETHUB_STAGE_CALLBACK_URL = os.getenv(
+    "SOCKETHUB_STAGE_CALLBACK_URL",
+    (f"{SOCKETHUB_BASE_URL}/internal/dispatch-stage" if SOCKETHUB_BASE_URL else ""),
+).strip()
+SOCKETHUB_RESULT_CALLBACK_TOKEN = os.getenv("SOCKETHUB_RESULT_CALLBACK_TOKEN", "").strip()
 
 app = FastAPI(title="Luxia Worker", version=SERVICE_VERSION)
 install_metrics(app, service_name=SERVICE_NAME, version=SERVICE_VERSION, env=SERVICE_ENV)
@@ -201,6 +209,55 @@ def _format_fallback_response(payload: VerifyRequest, error_message: str) -> dic
     }
 
 
+def _stage_payload_dict(stage_payload: Any) -> dict[str, Any]:
+    if isinstance(stage_payload, dict):
+        return stage_payload
+    return {"value": str(stage_payload)}
+
+
+async def _emit_stage_callback(
+    payload: VerifyRequest,
+    stage: str,
+    stage_payload: dict[str, Any],
+) -> None:
+    if not SOCKETHUB_STAGE_CALLBACK_URL:
+        return
+
+    body = {
+        "event_type": "stage",
+        "job_id": payload.job_id,
+        "room_id": payload.room_id,
+        "client_id": payload.client_id,
+        "client_claim_id": payload.client_claim_id,
+        "claim": payload.claim,
+        "stage": stage,
+        "stage_payload": stage_payload,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "source": SERVICE_NAME,
+    }
+    headers: dict[str, str] = {}
+    if SOCKETHUB_RESULT_CALLBACK_TOKEN:
+        headers["x-dispatcher-token"] = SOCKETHUB_RESULT_CALLBACK_TOKEN
+
+    try:
+        timeout = httpx.Timeout(connect=5.0, read=10.0, write=10.0, pool=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                SOCKETHUB_STAGE_CALLBACK_URL,
+                json=body,
+                headers=headers,
+            )
+            response.raise_for_status()
+    except Exception as exc:
+        logger.warning(
+            "[Worker] Stage callback failed job_id=%s stage=%s room_id=%s error=%s",
+            payload.job_id,
+            stage,
+            str(payload.room_id or ""),
+            exc,
+        )
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok", "service": SERVICE_NAME}
@@ -214,6 +271,18 @@ async def worker_test() -> dict[str, object]:
 
 @app.post("/worker/verify")
 async def worker_verify(payload: VerifyRequest) -> dict[str, object]:
+    stage_events: list[dict[str, Any]] = []
+
+    async def stage_callback(stage: str, callback_payload: Any) -> None:
+        stage_payload = _stage_payload_dict(callback_payload)
+        event = {
+            "stage": stage,
+            "payload": stage_payload,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        stage_events.append(event)
+        await _emit_stage_callback(payload, stage=stage, stage_payload=stage_payload)
+
     try:
         pipeline = await _get_pipeline()
         result = await pipeline.run(
@@ -221,14 +290,25 @@ async def worker_verify(payload: VerifyRequest) -> dict[str, object]:
             domain=payload.domain,
             round_id=payload.job_id,
             top_k=payload.top_k,
+            stage_callback=stage_callback,
         )
         response = _format_completed_response(payload, result)
+        if stage_events:
+            response["stage_events"] = stage_events
         rag_jobs_completed_total.inc()
         return response
     except Exception as exc:
         rag_jobs_failed_total.inc()
+        with contextlib.suppress(Exception):
+            await _emit_stage_callback(
+                payload,
+                stage="error",
+                stage_payload={"error": str(exc)},
+            )
         # Preserve API availability if the full pipeline fails at runtime.
         fallback = _format_fallback_response(payload, str(exc))
+        if stage_events:
+            fallback["stage_events"] = stage_events
         rag_jobs_completed_total.inc()
         return fallback
 
