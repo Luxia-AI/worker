@@ -849,6 +849,130 @@ def test_liver_detox_claim_not_validated_by_generic_water_fact():
     assert out["claim_breakdown"][0]["status"] == "UNKNOWN"
 
 
+def test_mixed_valid_and_invalid_segments_do_not_end_unverifiable():
+    vg = _vg()
+    claim = "Vitamin D supplements prevent respiratory infections. Vitamin C does not support immune health."
+    payload = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.6,
+        "truthfulness_percent": 49.0,
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": "Vitamin D supplements prevent respiratory infections",
+                "status": "VALID",
+                "supporting_fact": "Meta-analysis found a protective effect.",
+                "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC7709175",
+            },
+            {
+                "claim_segment": "Vitamin C does not support immune health",
+                "status": "INVALID",
+                "supporting_fact": "Vitamin C supports immune health.",
+                "source_url": "https://health.clevelandclinic.org/vitamin-c",
+            },
+        ],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Meta-analysis found a protective effect.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.52,
+            },
+            {
+                "evidence_id": 1,
+                "statement": "Vitamin C supports immune health.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.82,
+            },
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "PARTIALLY_TRUE"
+
+
+def test_effective_top_k_scales_with_subclaims():
+    vg = _vg()
+    simple = vg._effective_top_k_for_claim("Vitamin C supports immune health.", 5)
+    multi = vg._effective_top_k_for_claim(
+        "Vitamin D supplements prevent respiratory infections. Vitamin C does not support immune health.",
+        5,
+    )
+    assert multi >= simple
+    assert multi >= 7
+
+
+def test_select_balanced_top_evidence_reserves_minimum_per_segment_when_available():
+    vg = _vg()
+    claim = "Vitamin D prevents respiratory infections. Vitamin C supports immune health."
+    evidence = []
+    for i in range(8):
+        evidence.append(
+            {
+                "statement": f"Vitamin D supplementation prevents respiratory infections in study {i}.",
+                "source_url": f"https://example.org/d/{i}",
+                "final_score": 0.9 - (i * 0.02),
+                "credibility": 0.9,
+            }
+        )
+    for i in range(8):
+        evidence.append(
+            {
+                "statement": f"Vitamin C supports immune health in trial {i}.",
+                "source_url": f"https://example.org/c/{i}",
+                "final_score": 0.88 - (i * 0.02),
+                "credibility": 0.9,
+            }
+        )
+
+    selected = vg._select_balanced_top_evidence(claim, evidence, top_k=10)
+    d_count = sum(1 for ev in selected if "vitamin d" in ev["statement"].lower())
+    c_count = sum(1 for ev in selected if "vitamin c" in ev["statement"].lower())
+    assert d_count >= 5
+    assert c_count >= 5
+
+
+def test_select_balanced_top_evidence_prefers_segment_specific_assignment():
+    vg = _vg()
+    claim = "Vitamin D prevents respiratory infections. Vitamin C supports immune health."
+    evidence = [
+        {
+            "statement": "Vitamin D supplementation prevents respiratory infections in randomized trials.",
+            "source_url": "https://example.org/d/1",
+            "final_score": 0.92,
+            "credibility": 0.9,
+        },
+        {
+            "statement": "Vitamin D reduces acute respiratory infection incidence in adults.",
+            "source_url": "https://example.org/d/2",
+            "final_score": 0.90,
+            "credibility": 0.9,
+        },
+        {
+            "statement": "Vitamin C supports immune health by maintaining immune system function.",
+            "source_url": "https://example.org/c/1",
+            "final_score": 0.91,
+            "credibility": 0.9,
+        },
+        {
+            "statement": "Vitamin C contributes to normal immune function.",
+            "source_url": "https://example.org/c/2",
+            "final_score": 0.89,
+            "credibility": 0.9,
+        },
+        {
+            "statement": "General healthy diet guidance without specific vitamin outcome.",
+            "source_url": "https://example.org/bg/1",
+            "final_score": 0.88,
+            "credibility": 0.9,
+        },
+    ]
+
+    selected = vg._select_balanced_top_evidence(claim, evidence, top_k=4)
+    selected_text = " || ".join(ev["statement"].lower() for ev in selected)
+    assert "vitamin d" in selected_text
+    assert "vitamin c" in selected_text
+
+
 def test_llm_rationale_generation_uses_claim_breakdown_and_relevant_evidence():
     vg = _vg()
 

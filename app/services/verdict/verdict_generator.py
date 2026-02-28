@@ -739,6 +739,7 @@ class VerdictGenerator:
         attempted_web_urls: set[str] = set()
         if self.confidence_mode:
             top_k = max(top_k, int(os.getenv("CONFIDENCE_VERDICT_TOP_K", "10")))
+        effective_top_k = self._effective_top_k_for_claim(claim, top_k)
         if not ranked_evidence:
             logger.warning(
                 "[VerdictGenerator] No ranked VDB/KG evidence; forcing targeted web evidence recovery "
@@ -802,7 +803,7 @@ class VerdictGenerator:
             logger.debug(f"[VerdictGenerator] Using {len(ranked_evidence)} ranked evidence (segment retrieval skipped)")
 
         # Step 2) PRE-VERDICT web-boost loop driven by *sufficiency*
-        pre_evidence = enriched_evidence[: min(len(enriched_evidence), max(top_k, 12), 20)]
+        pre_evidence = enriched_evidence[: min(len(enriched_evidence), max(effective_top_k, 12), 20)]
         if not cache_sufficient:
             pre_verdict_rounds = max(1, int(self.MAX_WEB_ROUNDS_PRE_VERDICT))
             if used_web_search:
@@ -836,7 +837,7 @@ class VerdictGenerator:
                 merged_with_web.sort(key=self._deterministic_evidence_sort_key)
                 pre_evidence = merged_with_web[: min(len(merged_with_web), 18)]
         pre_evidence.sort(key=self._deterministic_evidence_sort_key)
-        top_evidence = self._select_balanced_top_evidence(claim, pre_evidence, top_k=min(top_k, 20))
+        top_evidence = self._select_balanced_top_evidence(claim, pre_evidence, top_k=min(effective_top_k, 20))
         if not top_evidence:
             logger.warning(
                 "[VerdictGenerator] Top evidence still empty before verdict; running emergency evidence recovery."
@@ -851,7 +852,7 @@ class VerdictGenerator:
             )
             if emergency_web:
                 pre_evidence = self._merge_evidence(pre_evidence, emergency_web)
-                top_evidence = self._select_balanced_top_evidence(claim, pre_evidence, top_k=min(top_k, 20))
+                top_evidence = self._select_balanced_top_evidence(claim, pre_evidence, top_k=min(effective_top_k, 20))
                 logger.debug(
                     "[VerdictGenerator] Emergency recovery added %d evidence items (top=%d)",
                     len(emergency_web),
@@ -955,7 +956,9 @@ class VerdictGenerator:
                         break
 
                     enriched_evidence = self._merge_evidence(top_evidence, candidate_boost)
-                    top_evidence = self._select_balanced_top_evidence(claim, enriched_evidence, top_k=min(top_k, 20))
+                    top_evidence = self._select_balanced_top_evidence(
+                        claim, enriched_evidence, top_k=min(effective_top_k, 20)
+                    )
                     enriched_evidence_text = self._format_evidence_for_prompt(top_evidence)
                     enriched_prompt = VERDICT_GENERATION_PROMPT.format(
                         claim=claim, evidence_text=enriched_evidence_text
@@ -3946,6 +3949,10 @@ class VerdictGenerator:
         candidates = sorted(candidates, key=self._deterministic_evidence_sort_key)
 
         segments = self._split_claim_into_segments(claim)
+        try:
+            min_per_segment = max(1, int(os.getenv("VERDICT_MIN_EVIDENCE_PER_SEGMENT", "5")))
+        except Exception:
+            min_per_segment = 5
         selected: List[Dict[str, Any]] = []
         seen: set[str] = set()
 
@@ -3955,15 +3962,37 @@ class VerdictGenerator:
                 seen.add(key)
                 selected.append(ev)
 
-        # First pass: guarantee per-segment representation when possible.
+        def _segment_match_score(segment: str, statement: str) -> float:
+            if not self._segment_topic_guard_ok(segment, statement):
+                return 0.0
+            anchor_eval = evaluate_anchor_match(segment, statement)
+            if not bool(anchor_eval.get("anchor_ok", False)):
+                return 0.0
+            anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
+            pred_match = float(self.compute_predicate_match(segment, statement) or 0.0)
+            stmt_tokens = {self._lemma_token(t) for t in self._statement_tokens(statement)}
+            seg_obj_tokens = {self._lemma_token(t) for t in self._segment_object_tokens(segment)}
+            obj_overlap = len(seg_obj_tokens & stmt_tokens) / max(1, len(seg_obj_tokens)) if seg_obj_tokens else 0.0
+            return (0.45 * anchor_overlap) + (0.35 * pred_match) + (0.20 * obj_overlap)
+
+        # First pass: build segment-specific ranked candidate pools.
+        segment_ranked: Dict[str, List[Dict[str, Any]]] = {}
         for segment in segments:
-            best_ev: Optional[Dict[str, Any]] = None
-            best_score = -1.0
+            ranked_for_segment: List[tuple[float, Dict[str, Any]]] = []
             for ev in candidates:
                 if str(ev.get("stance", "neutral") or "neutral").lower() == "contradicts":
                     continue
                 stmt = str(ev.get("statement") or ev.get("text") or "")
-                if not self._segment_topic_guard_ok(segment, stmt):
+                # Assign evidence to the best-matching segment first to avoid
+                # one segment hijacking evidence intended for another.
+                best_seg = None
+                best_seg_score = -1.0
+                for seg2 in segments:
+                    s2 = _segment_match_score(seg2, stmt)
+                    if s2 > best_seg_score:
+                        best_seg_score = s2
+                        best_seg = seg2
+                if best_seg != segment:
                     continue
                 anchor_eval = evaluate_anchor_match(segment, stmt)
                 if not bool(anchor_eval.get("anchor_ok", False)):
@@ -3971,15 +4000,36 @@ class VerdictGenerator:
                 score = (0.75 * self._evidence_score(ev)) + (
                     0.25 * float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
                 )
-                if score > best_score:
-                    best_score = score
-                    best_ev = ev
-            if best_ev is not None:
-                _add(best_ev)
-            if len(selected) >= top_k:
-                return selected[:top_k]
+                ranked_for_segment.append((score, ev))
+            ranked_for_segment.sort(key=lambda x: x[0], reverse=True)
+            segment_ranked[segment] = [ev for _, ev in ranked_for_segment]
 
-        # Second pass: fill with strongest non-contradicting evidence.
+        # Second pass: round-robin allocation to guarantee minimum evidence per segment
+        # (when candidates exist), preventing segment starvation.
+        seg_counts: Dict[str, int] = {s: 0 for s in segments}
+        seg_indices: Dict[str, int] = {s: 0 for s in segments}
+        made_progress = True
+        while made_progress and len(selected) < top_k:
+            made_progress = False
+            for segment in segments:
+                if seg_counts.get(segment, 0) >= min_per_segment:
+                    continue
+                pool = segment_ranked.get(segment, [])
+                idx = seg_indices.get(segment, 0)
+                while idx < len(pool):
+                    ev = pool[idx]
+                    idx += 1
+                    before = len(selected)
+                    _add(ev)
+                    if len(selected) > before:
+                        seg_counts[segment] = seg_counts.get(segment, 0) + 1
+                        made_progress = True
+                        break
+                seg_indices[segment] = idx
+                if len(selected) >= top_k:
+                    return selected[:top_k]
+
+        # Third pass: fill with strongest non-contradicting evidence.
         for ev in candidates:
             if str(ev.get("stance", "neutral") or "neutral").lower() == "contradicts":
                 continue
@@ -3995,6 +4045,36 @@ class VerdictGenerator:
                     break
 
         return selected[:top_k]
+
+    def _effective_top_k_for_claim(self, claim: str, base_top_k: int) -> int:
+        """
+        Scale evidence budget with claim complexity.
+        More segments/sub-claims need more evidence capacity to avoid under-coverage.
+        """
+        try:
+            min_top_k = max(3, int(os.getenv("VERDICT_TOP_K_MIN", "5")))
+        except Exception:
+            min_top_k = 5
+        try:
+            max_top_k = max(min_top_k, int(os.getenv("VERDICT_TOP_K_MAX", "50")))
+        except Exception:
+            max_top_k = 50
+        try:
+            extra_per_segment = max(1, int(os.getenv("VERDICT_TOP_K_EXTRA_PER_SEGMENT", "2")))
+        except Exception:
+            extra_per_segment = 2
+        try:
+            min_per_segment = max(1, int(os.getenv("VERDICT_MIN_EVIDENCE_PER_SEGMENT", "5")))
+        except Exception:
+            min_per_segment = 5
+
+        base = max(min_top_k, int(base_top_k or min_top_k))
+        segments = self._split_claim_into_segments(claim) or [claim]
+        seg_count = max(1, len(segments))
+        scaled = base + max(0, seg_count - 1) * extra_per_segment
+        required_for_segments = seg_count * min_per_segment
+        scaled = max(scaled, required_for_segments)
+        return max(min_top_k, min(max_top_k, scaled))
 
     def _normalize_evidence_map(
         self,
@@ -6286,6 +6366,12 @@ class VerdictGenerator:
                 evidence_map,
                 claim_breakdown,
             )
+
+        # Deterministic mixed-segment guard:
+        # if at least one segment is valid-like and another is invalid-like,
+        # the aggregate is partial rather than unverifiable.
+        if has_valid_like and has_invalid_like:
+            verdict = Verdict.PARTIALLY_TRUE.value
 
         # Guard: do not emit TRUE from neutral-only evidence on action claims.
         if verdict == Verdict.TRUE.value and not strong_support_signal:
