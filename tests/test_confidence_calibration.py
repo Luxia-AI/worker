@@ -26,3 +26,13 @@ def test_calibrator_feature_penalty_for_contradiction():
         },
     )
     assert hi > lo
+
+
+def test_calibrator_distribution_prefers_unverifiable_when_sparse():
+    calibrator = ConfidenceCalibrator(None)
+    probs = calibrator.calibrate_distribution(
+        {"true": 0.4, "false": 0.3, "unverifiable": 0.3},
+        features={"coverage": 0.2, "admissible_ratio": 0.3, "contradict_signal": 0.1, "support_signal": 0.1},
+    )
+    assert abs(sum(probs.values()) - 1.0) < 1e-6
+    assert probs["unverifiable"] >= 0.3

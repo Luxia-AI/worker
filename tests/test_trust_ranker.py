@@ -524,6 +524,10 @@ class TestTrustRankingModule:
             assert "trust" in item.score_components
             assert item.score_components["trust"] == item.trust
 
+    def test_neutral_stance_is_centered_not_support_biased(self, module):
+        neutral_score = module.compute_stance_score("neutral")
+        assert neutral_score == 0.0
+
     def test_post_breakdown_in_compute_post_trust(self, module):
         """Test that post_breakdown is included with expected keys."""
         evidence = [

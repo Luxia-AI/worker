@@ -689,6 +689,36 @@ def hybrid_rank(
         else:
             predicate_match_score = min(1.0, max(claim_overlap, anchor_match_score))
 
+        object_align = 1.0 if object_relation_overlap > 0 else (0.4 if object_overlap > 0 else 0.0)
+        scope_align = max(0.0, min(1.0, (0.55 * claim_overlap) + (0.45 * anchor_match_score)))
+        support_score = max(
+            0.0,
+            min(
+                1.0,
+                (0.28 * sem_s)
+                + (0.20 * predicate_match_score)
+                + (0.15 * object_align)
+                + (0.12 * source_quality_s)
+                + (0.10 * scope_align)
+                + (0.15 * max(kg_s, min(1.0, kg_raw))),
+            ),
+        )
+        explicit_refute = 1.0 if _has_object_refutation_signal(item["statement"]) else 0.0
+        predicate_conflict = 1.0 if (claim_actions and not action_overlap_ok) else 0.0
+        kg_refute_path = max(kg_s, min(1.0, kg_raw)) if (explicit_refute > 0.0 or predicate_conflict > 0.0) else 0.0
+        contradict_score = max(
+            0.0,
+            min(
+                1.0,
+                (0.38 * max(negation_anchor_overlap, explicit_refute))
+                + (0.22 * predicate_conflict)
+                + (0.18 * max(0.0, 1.0 - predicate_match_score))
+                + (0.22 * kg_refute_path),
+            ),
+        )
+        final_rank_priority = max(support_score, contradict_score)
+        final_score = (0.65 * max(0.0, min(1.0, final_score))) + (0.35 * final_rank_priority)
+
         out = {
             "statement": item["statement"],
             "entities": item.get("entities", []),
@@ -716,6 +746,9 @@ def hybrid_rank(
             "action_overlap_ok": bool(action_overlap_ok),
             "recency": recency_s,
             "credibility": cred_s,
+            "support_score": support_score,
+            "contradict_score": contradict_score,
+            "final_rank_priority": final_rank_priority,
             "final_score": max(0.0, min(final_score, 1.0)),
             "orig": item.get("orig", {}),
         }

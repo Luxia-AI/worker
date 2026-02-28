@@ -329,8 +329,8 @@ class TrustRankingModule:
 
     def compute_stance_score(self, stance: str) -> float:
         """Convert stance string to numerical score."""
-        stance_scores = {"entails": 1.0, "neutral": 0.5, "contradicts": -1.0}
-        return stance_scores.get(stance, 0.5)
+        stance_scores = {"entails": 1.0, "neutral": 0.0, "contradicts": -1.0}
+        return stance_scores.get(stance, 0.0)
 
     def compute_trust_evidence(self, item: EvidenceItem) -> float:
         """
@@ -584,6 +584,58 @@ class TrustRankingModule:
             "trust_post_ci_samples": N,
             "trust_post_ci_level": ci_level,
             "post_breakdown": post_breakdown,
+        }
+
+    def compute_uncertainty_snapshot(self, ranked_evidence: List[EvidenceItem], top_k: int = 10) -> Dict[str, Any]:
+        """
+        Build an uncertainty-aware trust snapshot.
+
+        Returns support/contradict/uncertain channels plus an admissibility estimate.
+        """
+        evidence_items = ranked_evidence[:top_k]
+        if not evidence_items:
+            return {
+                "trust_support": 0.0,
+                "trust_contradict": 0.0,
+                "trust_uncertain": 1.0,
+                "admissibility_rate": 0.0,
+            }
+
+        total_trust = sum(max(0.0, float(getattr(e, "trust", 0.0) or 0.0)) for e in evidence_items)
+        if total_trust <= 0.0:
+            return {
+                "trust_support": 0.0,
+                "trust_contradict": 0.0,
+                "trust_uncertain": 1.0,
+                "admissibility_rate": 0.0,
+            }
+
+        support_mass = 0.0
+        contradict_mass = 0.0
+        neutral_mass = 0.0
+        admissible_count = 0
+        for item in evidence_items:
+            t = max(0.0, float(getattr(item, "trust", 0.0) or 0.0))
+            stance = str(getattr(item, "stance", "neutral") or "neutral").lower()
+            components = getattr(item, "score_components", {}) or {}
+            admissible = bool(components.get("admissible_for_trust", True))
+            if admissible:
+                admissible_count += 1
+            if stance == "entails":
+                support_mass += t
+            elif stance == "contradicts":
+                contradict_mass += t
+            else:
+                neutral_mass += t
+
+        trust_support = support_mass / total_trust
+        trust_contradict = contradict_mass / total_trust
+        trust_uncertain = neutral_mass / total_trust
+        return {
+            "trust_support": max(0.0, min(1.0, trust_support)),
+            "trust_contradict": max(0.0, min(1.0, trust_contradict)),
+            "trust_uncertain": max(0.0, min(1.0, trust_uncertain)),
+            "admissibility_rate": max(0.0, min(1.0, admissible_count / max(1, len(evidence_items)))),
         }
 
     def decide(self, evidence_list: List[EvidenceItem], threshold: float = 0.75) -> str:

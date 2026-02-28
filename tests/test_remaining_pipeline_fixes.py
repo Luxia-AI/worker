@@ -914,6 +914,53 @@ def test_policy_insufficient_never_emits_binary_verdict():
     assert out["verdict"] in {"PARTIALLY_TRUE", "UNVERIFIABLE"}
     assert out["verdict"] not in {"TRUE", "FALSE"}
     assert bool(out.get("trust_gate_binary_lock_applied")) is True
+    assert out.get("display_verdict") in {"MOSTLY_FALSE", "MIXED_OR_UNCLEAR", "MOSTLY_TRUE"}
+
+
+def test_trust_threshold_failure_locks_binary_even_if_policy_field_is_true():
+    vg = _vg()
+    claim = "Vitamin D prevents respiratory infections"
+    payload = {
+        "verdict": "TRUE",
+        "confidence": 0.82,
+        "truthfulness_percent": 86.0,
+        "policy_sufficient": True,
+        "trust_threshold_met": False,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID", "evidence_used_ids": [0]}],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Vitamin D reduced respiratory infection risk in meta-analysis.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.82,
+                "source_url": "https://example.org/d",
+            }
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] in {"PARTIALLY_TRUE", "UNVERIFIABLE"}
+    assert out["verdict"] not in {"TRUE", "FALSE"}
+    assert out.get("display_verdict") in {"MOSTLY_FALSE", "MIXED_OR_UNCLEAR", "MOSTLY_TRUE"}
+
+
+def test_trust_failed_display_band_is_conservative_three_band_only():
+    vg = _vg()
+    claim = "Vitamin D prevents respiratory infections"
+    payload = {
+        "verdict": "PARTIALLY_TRUE",
+        "confidence": 0.6,
+        "truthfulness_percent": 92.0,
+        "policy_sufficient": False,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "PARTIALLY_VALID"}],
+        "evidence_map": [],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out.get("verdict_band") == "MOSTLY_TRUE"
+    assert out.get("display_verdict") == "MOSTLY_TRUE"
+    assert float(out.get("truthfulness_percent", 0.0) or 0.0) <= 74.0
+    assert float(out.get("confidence", 0.0) or 0.0) <= 0.68
 
 
 def test_segment_valid_status_is_not_linked_to_refute_evidence_after_normalization():

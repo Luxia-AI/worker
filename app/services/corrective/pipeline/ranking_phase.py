@@ -282,7 +282,7 @@ async def rank_candidates(
         item["stance"] = stance
         if stance == "contradicts":
             raw_score = float(item.get("final_score", 0.0) or 0.0)
-            penalized = max(0.0, raw_score * 0.60)
+            penalized = max(0.0, raw_score * 0.90)
             item["raw_final_score"] = raw_score
             item["final_score"] = penalized
             item["contradiction_penalty"] = round(raw_score - penalized, 4)
@@ -297,11 +297,32 @@ async def rank_candidates(
         )
     )
 
-    # Keep contradiction evidence out of supporting top-k unless no non-contradicting
-    # candidates exist (degraded mode).
+    # Keep a contradiction quota so verdict generation receives explicit polarity evidence.
     non_contradicting = [r for r in ranked if (r.get("stance") or "neutral") != "contradicts"]
     contradicting = [r for r in ranked if (r.get("stance") or "neutral") == "contradicts"]
-    top_ranked = non_contradicting[:top_k] if non_contradicting else contradicting[:top_k]
+    contradiction_quota = 0
+    if contradicting:
+        try:
+            contradiction_quota = max(1, int(os.getenv("RANKING_MIN_CONTRADICTION_QUOTA", "1")))
+        except Exception:
+            contradiction_quota = 1
+    contradiction_quota = min(contradiction_quota, top_k)
+    top_ranked: List[Dict[str, Any]]
+    if non_contradicting:
+        primary = non_contradicting[: max(0, top_k - contradiction_quota)]
+        top_ranked = primary + contradicting[:contradiction_quota]
+        if len(top_ranked) < top_k:
+            top_ranked += non_contradicting[len(primary) : len(primary) + (top_k - len(top_ranked))]
+    else:
+        top_ranked = contradicting[:top_k]
+    top_ranked.sort(
+        key=lambda r: (
+            -float(r.get("final_score", 0.0) or 0.0),
+            -float(r.get("support_score", 0.0) or 0.0),
+            -float(r.get("sem_score", 0.0) or 0.0),
+            str(r.get("statement", "")),
+        )
+    )
     must_have_aliases = [x for x in (must_have_entities or []) if str(x).strip()]
     if must_have_aliases and top_ranked:
         with_core = [r for r in top_ranked if _contains_must_have_entity(r, must_have_aliases)]
@@ -331,6 +352,11 @@ async def rank_candidates(
     kg_in_top = sum(1 for r in graded_results if float(r.get("kg_score", 0.0) or 0.0) > 0.0)
     kg_in_ranked = sum(1 for r in ranked if float(r.get("kg_score", 0.0) or 0.0) > 0.0)
     sem_in_top = sum(1 for r in graded_results if float(r.get("sem_score", 0.0) or 0.0) > 0.0)
+    contradiction_strength = max((float(r.get("contradict_score", 0.0) or 0.0) for r in ranked), default=0.0)
+    support_strength = max((float(r.get("support_score", 0.0) or 0.0) for r in ranked), default=0.0)
+    kg_mass = sum(float(r.get("kg_score", 0.0) or 0.0) for r in graded_results[:5])
+    vdb_mass = sum(float(r.get("sem_score", 0.0) or 0.0) for r in graded_results[:5])
+    kg_utilization_ratio = (kg_mass / (kg_mass + vdb_mass)) if (kg_mass + vdb_mass) > 0 else 0.0
 
     top_score = float(top_ranked[0]["final_score"]) if top_ranked else 0.0
     avg_score = sum(float(r.get("final_score", 0.0) or 0.0) for r in ranked) / len(ranked) if ranked else 0.0
@@ -341,6 +367,8 @@ async def rank_candidates(
             "semantic": round(float(r.get("sem_score", 0.0) or 0.0), 4),
             "kg": round(float(r.get("kg_score", 0.0) or 0.0), 4),
             "final": round(float(r.get("final_score", 0.0) or 0.0), 4),
+            "support": round(float(r.get("support_score", 0.0) or 0.0), 4),
+            "contradict": round(float(r.get("contradict_score", 0.0) or 0.0), 4),
             "stance": r.get("stance", "neutral"),
             "credibility": round(float(r.get("credibility", 0.0) or 0.0), 4),
         }
@@ -362,6 +390,10 @@ async def rank_candidates(
             "kg_in_top": kg_in_top,
             "sem_in_top": sem_in_top,
             "contradicting_in_ranked": contradicting_count,
+            "contradiction_quota": contradiction_quota,
+            "contradiction_strength": round(contradiction_strength, 4),
+            "support_strength": round(support_strength, 4),
+            "kg_utilization_ratio": round(kg_utilization_ratio, 4),
         },
     )
 
@@ -385,6 +417,10 @@ async def rank_candidates(
                 "kg_in_top": kg_in_top,
                 "sem_in_top": sem_in_top,
                 "contradicting_in_ranked": contradicting_count,
+                "contradiction_quota": contradiction_quota,
+                "contradiction_strength": contradiction_strength,
+                "support_strength": support_strength,
+                "kg_utilization_ratio": kg_utilization_ratio,
             },
         )
 

@@ -49,6 +49,7 @@ from app.services.corrective.pipeline.retrieval_phase import retrieve_candidates
 from app.services.corrective.relation_extractor import RelationExtractor
 from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
+from app.services.domain import HealthScopeGate
 from app.services.kg.kg_ingest import KGIngest
 from app.services.kg.kg_retrieval import KGRetrieval
 from app.services.kg.neo4j_client import Neo4jClient
@@ -106,6 +107,7 @@ class CorrectivePipeline:
         self.kg_retriever = KGRetrieval()
         self.lexical_index = LexicalIndex()
         self.topic_classifier = TopicClassifier()
+        self.health_scope_gate = HealthScopeGate()
 
         # Verdict generation (RAG phase)
         self.verdict_generator = VerdictGenerator()
@@ -278,12 +280,39 @@ class CorrectivePipeline:
         return hits
 
     @staticmethod
+    def _estimate_information_gain(
+        adaptive_trust: Dict[str, Any],
+        zero_extraction_rounds: int = 0,
+        low_yield_rounds: int = 0,
+    ) -> float:
+        coverage = float(adaptive_trust.get("coverage", 0.0) or 0.0)
+        diversity = float(adaptive_trust.get("diversity", 0.0) or 0.0)
+        agreement = float(adaptive_trust.get("agreement", 0.0) or 0.0)
+        trust_post = float(adaptive_trust.get("trust_post", 0.0) or 0.0)
+        contradicted = int(adaptive_trust.get("contradicted_subclaims", 0) or 0)
+        signal_gap = abs(0.5 - trust_post) * 2.0  # 0..1; near 0.5 means ambiguous evidence.
+        gain = (
+            (0.34 * (1.0 - coverage))
+            + (0.22 * (1.0 - diversity))
+            + (0.16 * (1.0 - agreement))
+            + (0.20 * signal_gap)
+            + (0.08 * (1.0 if contradicted > 0 else 0.0))
+        )
+        if zero_extraction_rounds >= 2:
+            gain *= 0.70
+        if low_yield_rounds >= 2:
+            gain *= 0.80
+        return max(0.0, min(1.0, gain))
+
+    @staticmethod
     def _should_stop_confidence_mode(
         claim_frame: Dict[str, Any],
         adaptive_trust: Dict[str, Any],
         confidence_target_coverage: float,
         confidence_max_new_trusted_urls: int,
         new_trusted_urls_processed: int,
+        zero_extraction_rounds: int = 0,
+        low_yield_rounds: int = 0,
     ) -> tuple[bool, str]:
         if new_trusted_urls_processed >= confidence_max_new_trusted_urls:
             return True, (
@@ -299,11 +328,16 @@ class CorrectivePipeline:
         trust_post = float(adaptive_trust.get("trust_post", 0.0) or 0.0)
         agreement = float(adaptive_trust.get("agreement", 0.0) or 0.0)
         num_subclaims = int(adaptive_trust.get("num_subclaims", 0) or 0)
+        info_gain = CorrectivePipeline._estimate_information_gain(
+            adaptive_trust,
+            zero_extraction_rounds=zero_extraction_rounds,
+            low_yield_rounds=low_yield_rounds,
+        )
 
         if is_sufficient:
             return True, (
                 f"adaptive_sufficient=True coverage={coverage:.2f} diversity={diversity:.2f} "
-                f"strong_covered={strong_covered}"
+                f"strong_covered={strong_covered} gain={info_gain:.3f}"
             )
 
         # Contradiction-focused early stop for non-therapeutic claims:
@@ -321,7 +355,7 @@ class CorrectivePipeline:
                 "stable contradiction stop "
                 f"(contradicted={contradicted}, agreement={agreement:.2f}, "
                 f"diversity={diversity:.2f}, trust_post={trust_post:.3f}, "
-                f"processed={new_trusted_urls_processed})"
+                f"processed={new_trusted_urls_processed}, gain={info_gain:.3f})"
             )
 
         if claim_frame.get("is_strong_therapeutic", False):
@@ -329,29 +363,52 @@ class CorrectivePipeline:
             if contradicted > 0 and strong_covered >= 1:
                 return True, (
                     f"strong therapeutic contradiction found (contradicted={contradicted}, "
-                    f"strong_covered={strong_covered})"
+                    f"strong_covered={strong_covered}, gain={info_gain:.3f})"
                 )
             if coverage >= confidence_target_coverage and strong_covered >= 1:
                 return True, (
                     f"strong therapeutic coverage target met with strong evidence "
-                    f"(coverage={coverage:.2f}, strong_covered={strong_covered})"
+                    f"(coverage={coverage:.2f}, strong_covered={strong_covered}, gain={info_gain:.3f})"
                 )
             return False, (
                 f"continue: strong therapeutic claim requires strong efficacy evidence "
                 f"(coverage={coverage:.2f}, diversity={diversity:.2f}, strong_covered={strong_covered}, "
-                f"sufficient={is_sufficient})"
+                f"sufficient={is_sufficient}, gain={info_gain:.3f})"
             )
 
-        if coverage >= confidence_target_coverage and diversity >= 0.45 and (trust_post >= 0.55 or strong_covered >= 1):
+        if zero_extraction_rounds >= 2 and info_gain < 0.15:
+            return True, (
+                f"low-yield saturation stop (zero_extraction_rounds={zero_extraction_rounds}, "
+                f"low_yield_rounds={low_yield_rounds}, gain={info_gain:.3f})"
+            )
+
+        if low_yield_rounds >= 3 and new_trusted_urls_processed >= 6 and info_gain < 0.18:
+            return True, (
+                f"expected-gain stop (low_yield_rounds={low_yield_rounds}, processed={new_trusted_urls_processed}, "
+                f"gain={info_gain:.3f})"
+            )
+
+        if (
+            is_sufficient
+            and coverage >= confidence_target_coverage
+            and diversity >= 0.45
+            and (trust_post >= 0.55 or strong_covered >= 1)
+        ):
             return True, (
                 f"coverage target reached with diversity guard "
                 f"(coverage={coverage:.2f} >= {confidence_target_coverage:.2f}, diversity={diversity:.2f}, "
-                f"trust_post={trust_post:.3f}, strong_covered={strong_covered})"
+                f"trust_post={trust_post:.3f}, strong_covered={strong_covered}, gain={info_gain:.3f})"
+            )
+
+        if coverage >= confidence_target_coverage and not is_sufficient:
+            return False, (
+                f"continue: coverage reached but adaptive_sufficient=False "
+                f"(coverage={coverage:.2f}, diversity={diversity:.2f}, gain={info_gain:.3f})"
             )
 
         return False, (
             f"continue: coverage/diversity guard not met "
-            f"(coverage={coverage:.2f}, diversity={diversity:.2f}, sufficient={is_sufficient})"
+            f"(coverage={coverage:.2f}, diversity={diversity:.2f}, sufficient={is_sufficient}, gain={info_gain:.3f})"
         )
 
     def _build_evidence_items(self, claim: str, ranked: List[Dict[str, Any]]) -> List[EvidenceItem]:
@@ -449,6 +506,14 @@ class CorrectivePipeline:
         await debug_reporter.initialize(post_text)
 
         logger.info(f"[CorrectivePipeline:{round_id}] Start for post: {post_text}")
+        normalized_domain = "health"
+        if str(domain or "").strip().lower() not in {"", "health", "biomedical", "medicine"}:
+            logger.warning(
+                "[CorrectivePipeline:%s] Domain '%s' requested; enforcing health-only runtime domain.",
+                round_id,
+                domain,
+            )
+        health_scope = self.health_scope_gate.classify(post_text, declared_domain=domain)
 
         async def _emit_stage(stage: str, payload: Dict[str, Any] | None = None) -> None:
             if not stage_callback:
@@ -458,7 +523,18 @@ class CorrectivePipeline:
             if maybe is not None:
                 await maybe
 
-        await _emit_stage("started", {"claim_preview": post_text[:120], "domain": domain})
+        await _emit_stage(
+            "started",
+            {
+                "claim_preview": post_text[:120],
+                "domain": normalized_domain,
+                "health_scope": {
+                    "in_scope": health_scope.health_in_scope,
+                    "biomedical_confidence": health_scope.biomedical_confidence,
+                    "scope_reason": health_scope.scope_reason,
+                },
+            },
+        )
 
         if self.log_manager:
             await self.log_manager.add_log(
@@ -467,8 +543,132 @@ class CorrectivePipeline:
                 module=__name__,
                 request_id=f"claim-{round_id}",
                 round_id=round_id,
-                context={"domain": domain},
+                context={
+                    "domain": normalized_domain,
+                    "health_scope": {
+                        "in_scope": health_scope.health_in_scope,
+                        "biomedical_confidence": health_scope.biomedical_confidence,
+                        "scope_reason": health_scope.scope_reason,
+                    },
+                },
             )
+
+        if not health_scope.health_in_scope:
+            verdict_result = {
+                "verdict": "UNVERIFIABLE",
+                "display_verdict": "UNVERIFIABLE",
+                "verdict_band": "MIXED_OR_UNCLEAR",
+                "confidence": 0.22,
+                "truthfulness_percent": 35.0,
+                "truth_score_percent": 35.0,
+                "rationale": (
+                    "The input does not provide enough biomedical signal for health-domain evidence adjudication. "
+                    "Returning UNVERIFIABLE conservatively."
+                ),
+                "claim_breakdown": [
+                    {
+                        "claim_segment": post_text,
+                        "status": "UNKNOWN",
+                        "supporting_fact": "",
+                        "source_url": "",
+                        "evidence_used_ids": [],
+                    }
+                ],
+                "evidence_map": [],
+                "key_findings": [],
+                "class_probs": {
+                    "true": 0.20,
+                    "false": 0.20,
+                    "unverifiable": 0.60,
+                },
+                "calibrated_confidence": 0.22,
+                "calibration_meta": {
+                    "mode": "health_scope_gate",
+                    "scope_reason": health_scope.scope_reason,
+                    "biomedical_confidence": health_scope.biomedical_confidence,
+                },
+                "trust_threshold_met": False,
+            }
+            await _emit_stage(
+                "completed",
+                {
+                    "status": "out_of_scope",
+                    "health_scope": {
+                        "in_scope": health_scope.health_in_scope,
+                        "biomedical_confidence": health_scope.biomedical_confidence,
+                        "scope_reason": health_scope.scope_reason,
+                    },
+                },
+            )
+            await debug_reporter.log_step(
+                step_name="Pipeline completed",
+                description="Exited early on health-domain scope gate",
+                input_data={"claim": post_text},
+                output_data={"status": "out_of_scope", "verdict": verdict_result["verdict"]},
+            )
+            await debug_reporter.close()
+            return {
+                "round_id": round_id,
+                "status": "out_of_scope",
+                "facts": [],
+                "triples": [],
+                "queries": [],
+                "queries_total": 0,
+                "semantic_candidates_count": 0,
+                "kg_candidates_count": 0,
+                "ranked": [],
+                "used_web_search": False,
+                "data_source": "DOMAIN_GATE",
+                "search_api_calls": 0,
+                "search_api_calls_saved": 0,
+                "urls_processed": 0,
+                "urls_skipped_already_processed": 0,
+                "initial_top_score": 0.0,
+                "ranking_top_score": 0.0,
+                "ranking_avg_score": 0.0,
+                "trust_post": 0.0,
+                "trust_post_adaptive": 0.0,
+                "trust_post_fixed": 0.0,
+                "trust_grade": "F",
+                "agreement_ratio": 0.0,
+                "coverage": 0.0,
+                "diversity": 0.0,
+                "num_subclaims": 1,
+                "adaptive_is_sufficient": False,
+                "fixed_trust_threshold": self.CONF_THRESHOLD,
+                "fixed_trust_threshold_met": False,
+                "verdict": verdict_result,
+                "debug_counts": {
+                    "kg_raw": 0,
+                    "kg_with_score": 0,
+                    "kg_in_ranked": 0,
+                    "sem_raw": 0,
+                    "sem_filtered": 0,
+                    "sem_in_ranked": 0,
+                },
+                "vdb_signal_count": 0,
+                "kg_signal_count": 0,
+                "vdb_signal_sum_top5": 0.0,
+                "kg_signal_sum_top5": 0.0,
+                "llm": get_groq_job_metadata(),
+                "trust_policy_mode": "adaptive",
+                "trust_metric_name": "adaptive_trust_post",
+                "trust_metric_value": 0.0,
+                "trust_threshold": "adaptive",
+                "trust_threshold_met": False,
+                "domain": normalized_domain,
+                "health_scope": {
+                    "in_scope": health_scope.health_in_scope,
+                    "biomedical_confidence": health_scope.biomedical_confidence,
+                    "scope_reason": health_scope.scope_reason,
+                },
+                "pipeline_diagnostics_v2": {
+                    "stop_reason": "health_scope_gate",
+                    "gain_estimate": 0.0,
+                    "kg_timeout_count": 0,
+                    "zero_extraction_rounds": 0,
+                },
+            }
 
         # ====================================================================
         # PHASE 1: Extract entities from claim (1 LLM call)
@@ -585,6 +785,9 @@ class CorrectivePipeline:
         # Use adaptive trust policy for multi-part claims
         adaptive_trust = self.trust_ranker.compute_adaptive_post_trust(post_text, top_ranked_evidence, internal_top_k)
         initial_fixed_post = self.trust_ranker.compute_post_trust(top_ranked_evidence, internal_top_k)
+        initial_trust_snapshot_v2 = self.trust_ranker.compute_uncertainty_snapshot(top_ranked_evidence, internal_top_k)
+        initial_trust_snapshot_v2["sufficiency_reason"] = str(adaptive_trust.get("gate_reason") or "")
+        initial_trust_snapshot_v2["info_gain"] = 0.0
         initial_fixed_trust_score = float(initial_fixed_post.get("trust_post", 0.0) or 0.0)
         initial_fixed_payload = self._trust_payload_fixed(initial_fixed_trust_score, self.CONF_THRESHOLD)
         is_sufficient = adaptive_trust["is_sufficient"]
@@ -653,6 +856,7 @@ class CorrectivePipeline:
                     "trust_post": adaptive_trust["trust_post"],
                     "trust_post_adaptive": adaptive_trust["trust_post"],
                     "trust_post_fixed": initial_fixed_trust_score,
+                    "trust_snapshot_v2": initial_trust_snapshot_v2,
                     "trust_grade": "adaptive",  # Adaptive grading
                     "agreement_ratio": adaptive_trust["agreement"],
                     "coverage": adaptive_trust["coverage"],
@@ -675,6 +879,18 @@ class CorrectivePipeline:
                         3,
                     ),
                     "llm": get_groq_job_metadata(),
+                    "domain": normalized_domain,
+                    "health_scope": {
+                        "in_scope": health_scope.health_in_scope,
+                        "biomedical_confidence": health_scope.biomedical_confidence,
+                        "scope_reason": health_scope.scope_reason,
+                    },
+                    "pipeline_diagnostics_v2": {
+                        "stop_reason": "cache_sufficient",
+                        "gain_estimate": 0.0,
+                        "kg_timeout_count": 0,
+                        "zero_extraction_rounds": 0,
+                    },
                     **adaptive_payload,
                 }
             logger.info(
@@ -760,6 +976,7 @@ class CorrectivePipeline:
                 "trust_post": adaptive_trust["trust_post"],
                 "trust_post_adaptive": adaptive_trust["trust_post"],
                 "trust_post_fixed": initial_fixed_trust_score,
+                "trust_snapshot_v2": initial_trust_snapshot_v2,
                 "coverage": adaptive_trust["coverage"],
                 "diversity": adaptive_trust["diversity"],
                 "num_subclaims": adaptive_trust["num_subclaims"],
@@ -778,6 +995,18 @@ class CorrectivePipeline:
                     sum(float(e.get("kg_score", 0.0) or 0.0) for e in top_ranked[:5]),
                     3,
                 ),
+                "domain": normalized_domain,
+                "health_scope": {
+                    "in_scope": health_scope.health_in_scope,
+                    "biomedical_confidence": health_scope.biomedical_confidence,
+                    "scope_reason": health_scope.scope_reason,
+                },
+                "pipeline_diagnostics_v2": {
+                    "stop_reason": "no_queries_generated",
+                    "gain_estimate": 0.0,
+                    "kg_timeout_count": 0,
+                    "zero_extraction_rounds": 0,
+                },
                 "llm": get_groq_job_metadata(),
                 **adaptive_payload,
             }
@@ -813,6 +1042,11 @@ class CorrectivePipeline:
         skipped_urls: List[str] = []
         search_api_calls = 0
         queries_executed: List[str] = []
+        zero_extraction_rounds = 0
+        low_yield_rounds = 0
+        kg_timeout_count = 0
+        stop_reason = "query_budget_exhausted"
+        gain_estimate = 0.0
         confidence_target_coverage = float(os.getenv("CONFIDENCE_TARGET_COVERAGE", "0.5"))
         confidence_max_new_trusted_urls = max(
             1,
@@ -842,6 +1076,7 @@ class CorrectivePipeline:
                     f"[CorrectivePipeline:{round_id}] Reached MAX_SEARCH_QUERIES ({self.MAX_SEARCH_QUERIES}), "
                     f"stopping to conserve quota. {len(queries) - query_idx} queries unused."
                 )
+                stop_reason = "max_search_queries_reached"
                 break
 
             logger.info(f"[CorrectivePipeline:{round_id}] === Query {query_idx + 1}/{len(queries)} ===")
@@ -925,6 +1160,7 @@ class CorrectivePipeline:
 
             if not scraped_pages:
                 logger.info(f"[CorrectivePipeline:{round_id}] No content scraped from query {query_idx + 1}")
+                low_yield_rounds += 1
                 continue
 
             # Step 3: Extract facts, entities, relations
@@ -952,7 +1188,14 @@ class CorrectivePipeline:
 
             if not query_facts:
                 logger.info(f"[CorrectivePipeline:{round_id}] No facts extracted from query {query_idx + 1}")
+                zero_extraction_rounds += 1
+                low_yield_rounds += 1
                 continue
+            zero_extraction_rounds = 0
+            if len(query_facts) <= 1:
+                low_yield_rounds += 1
+            else:
+                low_yield_rounds = 0
 
             # Accumulate results
             all_facts.extend(query_facts)
@@ -965,7 +1208,7 @@ class CorrectivePipeline:
             )
 
             # Step 4: Ingest to VDB and KG immediately
-            await ingest_facts_and_triples(
+            ingest_diag = await ingest_facts_and_triples(
                 self.vdb_ingest,
                 self.kg_ingest,
                 query_facts,
@@ -973,12 +1216,14 @@ class CorrectivePipeline:
                 round_id,
                 self.log_manager,
             )
+            kg_timeout_count += int(ingest_diag.get("kg_timeout_count", 0) or 0)
             await _emit_stage(
                 "ingestion_done",
                 {
                     "query_index": query_idx + 1,
                     "facts_ingested": len(query_facts),
                     "triples_ingested": len(query_triples),
+                    "kg_timeout_count": kg_timeout_count,
                 },
             )
 
@@ -1084,6 +1329,7 @@ class CorrectivePipeline:
                         round_id,
                         comparative_monopoly_rounds,
                     )
+                    stop_reason = "comparative_monopoly"
                     break
                 strong_covered_now = int(adaptive_trust.get("strong_covered", 0) or 0)
                 trust_post_now = float(adaptive_trust.get("trust_post", 0.0) or 0.0)
@@ -1102,6 +1348,7 @@ class CorrectivePipeline:
                         strong_covered_now,
                         trust_post_now,
                     )
+                    stop_reason = "comparative_low_signal_saturation"
                     break
 
             # Step 6: Check if adaptive trust sufficient - STOP to save quota!
@@ -1111,15 +1358,23 @@ class CorrectivePipeline:
                     f"[CorrectivePipeline:{round_id}] ADAPTIVE THRESHOLD MET after query {query_idx + 1}! "
                     f"Saved {remaining_queries} search API calls!"
                 )
+                stop_reason = "adaptive_sufficient"
                 break
 
             if confidence_mode:
+                gain_estimate = self._estimate_information_gain(
+                    adaptive_trust,
+                    zero_extraction_rounds=zero_extraction_rounds,
+                    low_yield_rounds=low_yield_rounds,
+                )
                 should_stop, stop_reason = self._should_stop_confidence_mode(
                     claim_frame=claim_frame,
                     adaptive_trust=adaptive_trust,
                     confidence_target_coverage=confidence_target_coverage,
                     confidence_max_new_trusted_urls=confidence_max_new_trusted_urls,
                     new_trusted_urls_processed=new_trusted_urls_processed,
+                    zero_extraction_rounds=zero_extraction_rounds,
+                    low_yield_rounds=low_yield_rounds,
                 )
                 logger.info("[CorrectivePipeline:%s] Confidence mode decision: %s", round_id, stop_reason)
                 if should_stop:
@@ -1183,7 +1438,16 @@ class CorrectivePipeline:
                 float(final_adaptive_trust.get("trust_post", 0.0) or 0.0),
                 bool(final_adaptive_trust.get("is_sufficient", False)),
             )
+        if gain_estimate <= 0.0:
+            gain_estimate = self._estimate_information_gain(
+                final_adaptive_trust,
+                zero_extraction_rounds=zero_extraction_rounds,
+                low_yield_rounds=low_yield_rounds,
+            )
         final_trust_post = self.trust_ranker.compute_post_trust(final_top_ranked_evidence, internal_top_k)
+        trust_snapshot_v2 = self.trust_ranker.compute_uncertainty_snapshot(final_top_ranked_evidence, internal_top_k)
+        trust_snapshot_v2["sufficiency_reason"] = str(final_adaptive_trust.get("gate_reason") or "")
+        trust_snapshot_v2["info_gain"] = round(float(gain_estimate or 0.0), 4)
         final_trust_score = final_trust_post["trust_post"]
         adaptive_payload = self._trust_payload_adaptive(final_adaptive_trust)
         fixed_payload = self._trust_payload_fixed(final_trust_score, self.CONF_THRESHOLD)
@@ -1195,6 +1459,15 @@ class CorrectivePipeline:
             used_web_search=search_api_calls > 0,
             adaptive_metrics=final_adaptive_trust,
             evidence_snapshot_id=final_snapshot_id,
+        )
+        # Final trust harmonization:
+        # force the verdict payload to respect the final adaptive trust gate used by pipeline output.
+        verdict_with_trust = dict(verdict_result or {})
+        verdict_with_trust["trust_threshold_met"] = bool(adaptive_payload.get("trust_threshold_met", False))
+        verdict_result = self.verdict_generator._enforce_binary_verdict_payload(
+            post_text,
+            verdict_with_trust,
+            evidence=top_ranked,
         )
 
         logger.info(
@@ -1215,7 +1488,17 @@ class CorrectivePipeline:
                     "rationale": verdict_result.get("rationale", ""),
                 },
             )
-        await _emit_stage("completed", {"status": final_status, "search_api_calls": search_api_calls})
+        await _emit_stage(
+            "completed",
+            {
+                "status": final_status,
+                "search_api_calls": search_api_calls,
+                "stop_reason": stop_reason,
+                "gain_estimate": round(float(gain_estimate or 0.0), 4),
+                "kg_timeout_count": kg_timeout_count,
+                "zero_extraction_rounds": zero_extraction_rounds,
+            },
+        )
         await debug_reporter.log_step(
             step_name="Pipeline completed",
             description="Final ranked output and verdict summary",
@@ -1291,6 +1574,7 @@ class CorrectivePipeline:
             "trust_post": final_adaptive_trust["trust_post"],
             "trust_post_adaptive": final_adaptive_trust["trust_post"],
             "trust_post_fixed": final_trust_score,
+            "trust_snapshot_v2": trust_snapshot_v2,
             "trust_grade": final_trust_post.get("grade", "D"),
             "agreement_ratio": final_adaptive_trust.get("agreement", final_trust_post.get("agreement_ratio", 0.0)),
             "coverage": final_adaptive_trust.get("coverage", 0.0),
@@ -1312,6 +1596,18 @@ class CorrectivePipeline:
                 3,
             ),
             "llm": get_groq_job_metadata(),
+            "domain": normalized_domain,
+            "health_scope": {
+                "in_scope": health_scope.health_in_scope,
+                "biomedical_confidence": health_scope.biomedical_confidence,
+                "scope_reason": health_scope.scope_reason,
+            },
+            "pipeline_diagnostics_v2": {
+                "stop_reason": stop_reason,
+                "gain_estimate": round(float(gain_estimate or 0.0), 4),
+                "kg_timeout_count": int(kg_timeout_count),
+                "zero_extraction_rounds": int(zero_extraction_rounds),
+            },
             **adaptive_payload,
         }
 

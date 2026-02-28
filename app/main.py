@@ -46,7 +46,7 @@ class VerifyRequest(BaseModel):
     client_id: str | None = None
     client_claim_id: str | None = None
     source: str | None = None
-    domain: str = Field(default="general")
+    domain: str = Field(default="health")
     top_k: int = Field(default=5, ge=1, le=20)
 
 
@@ -59,6 +59,28 @@ def _mock_verdict_for_claim(claim: str) -> tuple[str, float, float, str]:
     if any(k in claim_l for k in ("improves", "supports", "is linked to", "can reduce")):
         return ("TRUE", 0.71, 63.0, "Claim appears directionally supported in fallback mode.")
     return ("FALSE", 0.58, 40.0, "Fallback mode: conservative binary classification.")
+
+
+def _truthfulness_band(score: float) -> str:
+    value = max(0.0, min(100.0, float(score or 0.0)))
+    if value <= 24.0:
+        return "LIKELY_FALSE"
+    if value <= 44.0:
+        return "MOSTLY_FALSE"
+    if value <= 55.0:
+        return "MIXED_OR_UNCLEAR"
+    if value <= 74.0:
+        return "MOSTLY_TRUE"
+    return "LIKELY_TRUE"
+
+
+def _trust_failed_band(score: float) -> str:
+    value = max(0.0, min(100.0, float(score or 0.0)))
+    if value <= 44.0:
+        return "MOSTLY_FALSE"
+    if value <= 55.0:
+        return "MIXED_OR_UNCLEAR"
+    return "MOSTLY_TRUE"
 
 
 async def _get_pipeline() -> Any:
@@ -113,8 +135,14 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "pipeline_status": status,
         "result_status": status,
         "verdict": verdict_result.get("verdict", "FALSE"),
+        "display_verdict": verdict_result.get("display_verdict", verdict_result.get("verdict", "FALSE")),
+        "verdict_band": verdict_result.get("verdict_band"),
         "verdict_confidence": verdict_result.get("confidence", 0.0),
+        "calibrated_confidence": verdict_result.get("calibrated_confidence", verdict_result.get("confidence", 0.0)),
         "truthfulness_percent": verdict_result.get("truthfulness_percent", 0.0),
+        "class_probs": verdict_result.get("class_probs"),
+        "calibration_meta": verdict_result.get("calibration_meta"),
+        "evidence_attribution": verdict_result.get("evidence_attribution"),
         "verdict_rationale": verdict_result.get("rationale", ""),
         "key_findings": verdict_result.get("key_findings", []),
         "claim_breakdown": verdict_result.get("claim_breakdown", []),
@@ -140,6 +168,10 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "num_subclaims": result.get("num_subclaims"),
         "used_web_search": bool(result.get("used_web_search", False)),
         "data_source": result.get("data_source", "cache"),
+        "domain": result.get("domain", "health"),
+        "health_scope": result.get("health_scope"),
+        "pipeline_diagnostics_v2": result.get("pipeline_diagnostics_v2"),
+        "trust_snapshot_v2": result.get("trust_snapshot_v2"),
         "degraded_mode": bool(llm_meta.get("degraded_mode", False)),
         "llm": llm_meta,
         "evidence": [
@@ -161,6 +193,8 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
 
 def _format_fallback_response(payload: VerifyRequest, error_message: str) -> dict[str, Any]:
     verdict, confidence, truthfulness, rationale = _mock_verdict_for_claim(payload.claim)
+    verdict_band = _truthfulness_band(truthfulness)
+    display_verdict = _trust_failed_band(truthfulness)
     return {
         "status": "completed",
         "job_id": payload.job_id,
@@ -171,8 +205,14 @@ def _format_fallback_response(payload: VerifyRequest, error_message: str) -> dic
         "pipeline_status": "fallback",
         "result_status": "fallback",
         "verdict": verdict,
+        "display_verdict": display_verdict,
+        "verdict_band": verdict_band,
         "verdict_confidence": confidence,
+        "calibrated_confidence": confidence,
         "truthfulness_percent": truthfulness,
+        "class_probs": None,
+        "calibration_meta": None,
+        "evidence_attribution": [],
         "verdict_rationale": f"{rationale} (fallback reason: {error_message})",
         "key_findings": ["Fallback mode used due to pipeline error."],
         "claim_breakdown": [],
@@ -199,6 +239,10 @@ def _format_fallback_response(payload: VerifyRequest, error_message: str) -> dic
         "num_subclaims": None,
         "used_web_search": False,
         "data_source": "fallback",
+        "domain": "health",
+        "health_scope": None,
+        "pipeline_diagnostics_v2": None,
+        "trust_snapshot_v2": None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "worker_service": SERVICE_NAME,
     }

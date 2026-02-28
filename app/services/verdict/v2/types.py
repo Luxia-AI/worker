@@ -56,3 +56,38 @@ class VerdictDecision:
     has_support: bool
     has_invalid: bool
     debug: Optional[Dict[str, Any]] = None
+
+
+@dataclass
+class EvidenceScoreV2:
+    support_score: float
+    contradict_score: float
+    nli_entail_prob: float
+    nli_contradict_prob: float
+    admissible: bool
+
+
+@dataclass
+class TrustSnapshotV2:
+    trust_support: float
+    trust_contradict: float
+    trust_uncertain: float
+    sufficiency_reason: str = ""
+    info_gain: float = 0.0
+
+
+@dataclass
+class VerdictPayloadV3:
+    verdict: str
+    class_probs: Dict[str, float]
+    calibrated_confidence: float
+    evidence_attribution: List[Dict[str, Any]] = field(default_factory=list)
+    calibration_meta: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class PipelineDiagnosticsV2:
+    stop_reason: str
+    gain_estimate: float
+    kg_timeout_count: int
+    zero_extraction_rounds: int

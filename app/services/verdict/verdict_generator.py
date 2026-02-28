@@ -2204,8 +2204,58 @@ class VerdictGenerator:
             confidence = max(float(confidence or 0.0), float(os.getenv("FALSE_VERDICT_MIN_CONFIDENCE", "0.55")))
             if explicit_refutes_found and map_contradict_signal >= 0.35:
                 confidence = max(float(confidence or 0.0), 0.80)
+        raw_true_signal = max(
+            0.0,
+            min(
+                1.0,
+                (0.60 * float(map_support_signal or 0.0))
+                + (0.20 * float(coverage_score or 0.0))
+                + (0.20 * float(admissible_ratio or 0.0)),
+            ),
+        )
+        raw_false_signal = max(
+            0.0,
+            min(
+                1.0,
+                (0.65 * float(map_contradict_signal or 0.0))
+                + (0.20 * float(coverage_score or 0.0))
+                + (0.15 * float(admissible_ratio or 0.0)),
+            ),
+        )
+        raw_unv_signal = max(
+            0.0,
+            min(
+                1.0,
+                (0.40 * (1.0 - float(coverage_score or 0.0)))
+                + (0.30 * (1.0 - float(admissible_ratio or 0.0)))
+                + (0.30 * max(0.0, 1.0 - max(raw_true_signal, raw_false_signal))),
+            ),
+        )
+        # Soft verdict prior only; avoid hard forcing.
+        if verdict_str == Verdict.TRUE.value:
+            raw_true_signal *= 1.08
+        elif verdict_str == Verdict.FALSE.value:
+            raw_false_signal *= 1.08
+        elif verdict_str == Verdict.UNVERIFIABLE.value:
+            raw_unv_signal *= 1.10
+        class_probs_raw = {
+            "true": float(raw_true_signal),
+            "false": float(raw_false_signal),
+            "unverifiable": float(raw_unv_signal),
+        }
+        class_probs = calibrator.calibrate_distribution(
+            class_probs_raw,
+            features={
+                "coverage": float(coverage_score or 0.0),
+                "admissible_ratio": float(admissible_ratio or 0.0),
+                "contradict_signal": float(map_contradict_signal or 0.0),
+                "support_signal": float(map_support_signal or 0.0),
+            },
+        )
+        class_max_prob = max(float(v or 0.0) for v in class_probs.values())
+        confidence_seed = (0.55 * float(confidence or 0.0)) + (0.45 * class_max_prob)
         confidence = calibrator.calibrate(
-            float(confidence or 0.0),
+            float(confidence_seed or 0.0),
             features={
                 "coverage": float(coverage_score or 0.0),
                 "agreement": float(agreement_ratio or 0.0),
@@ -2213,6 +2263,8 @@ class VerdictGenerator:
                 "contradict_signal": float(map_contradict_signal or 0.0),
                 "admissible_ratio": float(admissible_ratio or 0.0),
                 "evidence_quality": max(0.0, min(1.0, float(evidence_quality_percent or 0.0) / 100.0)),
+                "class_max_prob": float(class_max_prob or 0.0),
+                "retrieval_depth": max(0.0, min(1.0, float(len(evidence or [])) / 20.0)),
             },
         )
         unverifiable_cap_applied = False
@@ -2363,13 +2415,30 @@ class VerdictGenerator:
 
         key_findings = self._build_evidence_grounded_key_findings(claim_breakdown, evidence_map)
         direct_evidence = self._build_direct_evidence_list(claim_breakdown, evidence_map)
+        evidence_attribution = [
+            {
+                "segment": str(seg.get("claim_segment") or ""),
+                "status": str(seg.get("status") or "UNKNOWN"),
+                "evidence_ids": [int(x) for x in (seg.get("evidence_used_ids") or []) if str(x).isdigit()],
+            }
+            for seg in (claim_breakdown or [])
+        ]
 
         verdict_payload = {
             "verdict": verdict_str,
             "confidence": confidence,
+            "calibrated_confidence": confidence,
             # Backward-compatibility: keep `truthfulness_percent` but now make it a status-driven truth score.
             "truthfulness_percent": truth_score_percent,
             "truth_score_percent": truth_score_percent,
+            "class_probs": class_probs,
+            "evidence_attribution": evidence_attribution,
+            "calibration_meta": {
+                "calibrator_version": calibrator.version,
+                "confidence_seed": round(float(confidence_seed or 0.0), 4),
+                "class_probs_raw": {k: round(float(v or 0.0), 4) for k, v in class_probs_raw.items()},
+                "class_max_prob": round(float(class_max_prob or 0.0), 4),
+            },
             "evidence_quality_percent": float(evidence_quality_percent or 0.0),
             "rationale": rationale,
             "claim_breakdown": claim_breakdown,
@@ -2457,10 +2526,12 @@ class VerdictGenerator:
                 "verdict": verdict_payload["verdict"],
                 "truthfulness_percent": verdict_payload["truthfulness_percent"],
                 "confidence": verdict_payload["confidence"],
+                "calibrated_confidence": verdict_payload.get("calibrated_confidence"),
                 "coverage": coverage_score,
                 "agreement": agreement_ratio,
                 "diversity": diversity_score,
                 "trust_post": adaptive_trust_post,
+                "class_probs": verdict_payload.get("class_probs"),
                 "override_fired": verdict_payload["override_fired"],
                 "override_reason": verdict_payload["override_reason"],
                 "explicit_refutes_found": verdict_payload["explicit_refutes_found"],
@@ -4186,6 +4257,26 @@ class VerdictGenerator:
             claim_scope = self._scope_profile(claim)
             stmt_scope = self._scope_profile(statement)
             scope_alignment = self._scope_alignment_score(claim_scope, stmt_scope)
+            nli_entail_prob = max(
+                0.0,
+                min(
+                    1.0,
+                    (0.45 * support_strength)
+                    + (0.30 * predicate_match_score)
+                    + (0.15 * anchor_score)
+                    + (0.10 * scope_alignment),
+                ),
+            )
+            nli_contradict_prob = max(
+                0.0,
+                min(
+                    1.0,
+                    (0.55 * contradiction_score)
+                    + (0.25 * max(0.0, 1.0 - predicate_match_score))
+                    + (0.20 * (1.0 if self._is_explicit_refutation_statement(statement) else 0.0)),
+                ),
+            )
+            nli_neutral_prob = max(0.0, 1.0 - max(nli_entail_prob, nli_contradict_prob))
 
             relevance = "NEUTRAL"
             relevance_score = max(0.0, min(1.0, base_score))
@@ -4226,20 +4317,19 @@ class VerdictGenerator:
                 if refute_by_rule:
                     if intervention_match:
                         relevance = "REFUTES"
-                        relevance_score = max(relevance_score, contradiction_score, 0.65)
+                        relevance_score = max(relevance_score, contradiction_score, nli_contradict_prob, 0.65)
                         if scope_alignment < 0.34:
                             relevance_score *= 0.72
-                        refute_eligible = predicate_match_score >= 0.4 and intervention_match and credibility >= 0.8
+                        refute_eligible = (
+                            nli_contradict_prob >= 0.45
+                            and intervention_match
+                            and (predicate_match_score >= 0.25 or intervention_anchors_ok)
+                            and credibility >= 0.6
+                        )
                     else:
                         relevance = "NEUTRAL"
                         relevance_score *= 0.55
                 else:
-                    bone_strength_proxy_support = (
-                        bool(re.search(r"\b(build|strong)\b", claim.lower()))
-                        and bool(re.search(r"\bbone(?:s)?\b", claim.lower()))
-                        and bool(re.search(r"\b(bone density|bone mineral density|fracture)\b", statement.lower()))
-                        and bool(re.search(r"\b(increase|increased|reduce|reduced)\b", statement.lower()))
-                    )
                     support_strength_threshold = float(os.getenv("SEGMENT_SUPPORT_STRENGTH_THRESHOLD", "0.30"))
                     support_polarity_ok = polarity_rel == "entails" or (
                         polarity_rel == "neutral"
@@ -4262,8 +4352,6 @@ class VerdictGenerator:
                     # Numeric exact-match can support if predicate and anchor are both present.
                     if numeric_rel == "SUPPORTS" and predicate_match_score >= PREDICATE_MATCH_THRESHOLD:
                         support_gate = support_gate or (anchor_score >= ANCHOR_THRESHOLD)
-                    if bone_strength_proxy_support and support_strength >= 0.30:
-                        support_gate = True
                     # Prevent broad negated claims from being "supported" only by narrow population/scope evidence.
                     scope_mismatch_for_negated_claim = claim_neg and scope_alignment < 0.34
                     if scope_mismatch_for_negated_claim:
@@ -4279,7 +4367,12 @@ class VerdictGenerator:
                             relevance_score = max(relevance_score, contradiction_score)
                             if scope_alignment < 0.34:
                                 relevance_score *= 0.72
-                            refute_eligible = predicate_match_score >= 0.4 and intervention_match and credibility >= 0.8
+                            refute_eligible = (
+                                nli_contradict_prob >= 0.45
+                                and intervention_match
+                                and (predicate_match_score >= 0.25 or intervention_anchors_ok)
+                                and credibility >= 0.6
+                            )
                         else:
                             relevance = "NEUTRAL"
                             relevance_score *= 0.55
@@ -4298,6 +4391,9 @@ class VerdictGenerator:
                     "object_match_ok": bool(object_overlap_ok),
                     "support_strength": max(0.0, min(1.0, support_strength)),
                     "contradiction_score": max(0.0, min(1.0, contradiction_score)),
+                    "nli_entail_prob": round(float(nli_entail_prob), 4),
+                    "nli_contradict_prob": round(float(nli_contradict_prob), 4),
+                    "nli_neutral_prob": round(float(nli_neutral_prob), 4),
                     "canonical_predicate": str(claim_triplet.get("canonical_predicate") or ""),
                     "subject_span": str(claim_triplet.get("subject_span") or ""),
                     "predicate_span": str(claim_triplet.get("predicate_span") or ""),
@@ -4624,6 +4720,22 @@ class VerdictGenerator:
                         }
                         continue
                     seg["status"] = "PARTIALLY_VALID"
+                if (
+                    segment_requires_predicate_guard
+                    and str(seg.get("status") or "").upper() in {"VALID", "PARTIALLY_VALID"}
+                    and pred_match <= 0.05
+                ):
+                    seg["status"] = "UNKNOWN"
+                    seg["supporting_fact"] = ""
+                    seg["source_url"] = ""
+                    seg["evidence_used_ids"] = []
+                    seg["alignment_debug"] = {
+                        "reason": "predicate_alignment_missing",
+                        "predicate_match_score": round(float(pred_match), 3),
+                        "predicate_min_required": 0.05,
+                        "canonical_predicate": str(seg_triplet.get("canonical_predicate") or ""),
+                    }
+                    continue
                 if statement:
                     seg["supporting_fact"] = statement
                 if statement and source_url:
@@ -6497,6 +6609,52 @@ class VerdictGenerator:
         has_valid_like = any(s in {"VALID", "PARTIALLY_VALID"} for s in statuses)
         has_invalid_like = any(s in {"INVALID", "PARTIALLY_INVALID"} for s in statuses)
         mixed_status = has_valid_like and (has_invalid_like or has_unknown_status)
+        # Hallucination control: when evidence_map exists, non-UNKNOWN segments should map to evidence IDs.
+        evidence_idx_by_stmt: Dict[str, int] = {}
+        for em in evidence_map or []:
+            try:
+                ev_idx = int(em.get("evidence_id", -1))
+            except Exception:
+                ev_idx = -1
+            if ev_idx < 0:
+                continue
+            stmt = str(em.get("statement") or "").strip().lower()
+            if stmt and stmt not in evidence_idx_by_stmt:
+                evidence_idx_by_stmt[stmt] = ev_idx
+        for seg in claim_breakdown:
+            status = str(seg.get("status") or "UNKNOWN").upper()
+            ids = list(seg.get("evidence_used_ids") or [])
+            valid_ids = [int(x) for x in ids if str(x).isdigit()]
+            if status != "UNKNOWN" and not valid_ids and evidence_map:
+                fact_text = str(seg.get("supporting_fact") or "").strip().lower()
+                fallback_id = evidence_idx_by_stmt.get(fact_text, -1) if fact_text else -1
+                if fallback_id < 0:
+                    desired = (
+                        {"SUPPORTS", "NEUTRAL"} if status in {"VALID", "PARTIALLY_VALID"} else {"REFUTES", "NEUTRAL"}
+                    )
+                    for em in evidence_map:
+                        rel = self._normalize_relevance_for_binary(str(em.get("relevance") or "NEUTRAL"))
+                        if rel in desired:
+                            try:
+                                fallback_id = int(em.get("evidence_id", -1))
+                            except Exception:
+                                fallback_id = -1
+                            if fallback_id >= 0:
+                                break
+                if fallback_id >= 0:
+                    seg["evidence_used_ids"] = [fallback_id]
+                else:
+                    seg["status"] = "UNKNOWN"
+                    seg["supporting_fact"] = ""
+                    seg["source_url"] = ""
+                    seg["evidence_used_ids"] = []
+            else:
+                seg["evidence_used_ids"] = valid_ids
+        statuses = [str(seg.get("status") or "UNKNOWN").upper() for seg in claim_breakdown]
+        has_unknown_status = any(s == "UNKNOWN" for s in statuses)
+        has_valid_like = any(s in {"VALID", "PARTIALLY_VALID"} for s in statuses)
+        has_invalid_like = any(s in {"INVALID", "PARTIALLY_INVALID"} for s in statuses)
+        mixed_status = has_valid_like and (has_invalid_like or has_unknown_status)
         strong_support_signal = any(
             str(item.get("relevance") or "").upper() == "SUPPORTS"
             and float(item.get("relevance_score", 0.0) or 0.0) >= 0.35
@@ -6510,6 +6668,16 @@ class VerdictGenerator:
         rel_labels = [
             self._normalize_relevance_for_binary(str(item.get("relevance") or "")) for item in (evidence_map or [])
         ]
+        support_mass = sum(
+            float(item.get("relevance_score", 0.0) or 0.0)
+            for item in (evidence_map or [])
+            if self._normalize_relevance_for_binary(str(item.get("relevance") or "")) == "SUPPORTS"
+        )
+        contradict_mass = sum(
+            float(item.get("relevance_score", 0.0) or 0.0)
+            for item in (evidence_map or [])
+            if self._normalize_relevance_for_binary(str(item.get("relevance") or "")) == "REFUTES"
+        )
         neutral_only_map = bool(rel_labels) and all(lbl == "NEUTRAL" for lbl in rel_labels)
         high_impact_action_claim = bool(
             re.search(
@@ -6530,10 +6698,14 @@ class VerdictGenerator:
                 str(claim or "").lower(),
             )
         )
+        fragmentary_claim = self._is_subjectless_predicate_fragment(claim)
         single_unknown_with_signal = (
             len(statuses) == 1 and has_unknown_status and (strong_support_signal or strong_refute_signal)
         )
-        policy_sufficient = bool(payload.get("policy_sufficient", True))
+        policy_sufficient = self._coerce_bool(payload.get("policy_sufficient"), default=True)
+        trust_gate_passed = self._coerce_bool(payload.get("trust_threshold_met"), default=policy_sufficient)
+        payload["policy_sufficient"] = bool(policy_sufficient)
+        payload["trust_threshold_met"] = bool(trust_gate_passed)
         guard_reasons = list(payload.get("verdict_guard_reasons") or [])
         preserve_multiclass = (
             original_verdict == Verdict.PARTIALLY_TRUE.value or has_unknown_status or mixed_status
@@ -6560,6 +6732,20 @@ class VerdictGenerator:
         # the aggregate is partial rather than unverifiable.
         if has_valid_like and has_invalid_like:
             verdict = Verdict.PARTIALLY_TRUE.value
+        elif has_invalid_like and not has_valid_like:
+            verdict = Verdict.FALSE.value
+        elif has_valid_like and not has_invalid_like and not has_unknown_status and not strong_refute_signal:
+            if fragmentary_claim:
+                verdict = Verdict.PARTIALLY_TRUE.value
+            else:
+                verdict = (
+                    Verdict.TRUE.value
+                    if (strong_support_signal and support_mass >= 0.70)
+                    else Verdict.PARTIALLY_TRUE.value
+                )
+
+        if evidence_map and support_mass < 0.30 and contradict_mass < 0.30 and not (has_valid_like or has_invalid_like):
+            verdict = Verdict.UNVERIFIABLE.value
 
         # Guard: do not emit TRUE from neutral-only evidence on action claims.
         if verdict == Verdict.TRUE.value and not strong_support_signal:
@@ -6568,7 +6754,7 @@ class VerdictGenerator:
             elif neutral_only_map:
                 verdict = Verdict.PARTIALLY_TRUE.value
 
-        if not policy_sufficient and verdict in {Verdict.TRUE.value, Verdict.FALSE.value}:
+        if not trust_gate_passed and verdict in {Verdict.TRUE.value, Verdict.FALSE.value}:
             payload["trust_gate_binary_lock_applied"] = True
             guard_reasons.append("trust_gate_binary_lock")
             if verdict == Verdict.TRUE.value and has_valid_like:
@@ -6610,9 +6796,18 @@ class VerdictGenerator:
             truth = min(89.0, max(30.0, truth if truth > 0 else 60.0))
         else:
             truth = min(49.0, max(1.0, truth if truth > 0 else 25.0))
+        if not trust_gate_passed:
+            # Keep trust-failed outcomes conservative even when evidence looks directional.
+            truth = min(74.0, float(truth))
         payload["truthfulness_percent"] = truth
         payload["truth_score_percent"] = truth
         payload["verdict_band"] = self._truthfulness_band(truth)
+        payload["display_verdict"] = self._display_verdict_label(
+            verdict=verdict,
+            truthfulness_percent=truth,
+            trust_gate_passed=trust_gate_passed,
+            analysis_counts=payload.get("analysis_counts"),
+        )
 
         confidence = float(payload.get("confidence", 0.0) or 0.0)
         if verdict == Verdict.TRUE.value:
@@ -6623,7 +6818,30 @@ class VerdictGenerator:
             confidence = max(confidence, 0.50 if best_stmt else 0.35)
         else:
             confidence = max(confidence, 0.30 if best_stmt else 0.20)
+        if not trust_gate_passed:
+            confidence = min(confidence, 0.68)
         payload["confidence"] = max(0.05, min(0.98, confidence))
+        payload["calibrated_confidence"] = payload["confidence"]
+        if not isinstance(payload.get("class_probs"), dict):
+            if verdict == Verdict.TRUE.value:
+                payload["class_probs"] = {"true": 0.72, "false": 0.12, "unverifiable": 0.16}
+            elif verdict == Verdict.FALSE.value:
+                payload["class_probs"] = {"true": 0.10, "false": 0.74, "unverifiable": 0.16}
+            elif verdict == Verdict.PARTIALLY_TRUE.value:
+                payload["class_probs"] = {"true": 0.52, "false": 0.10, "unverifiable": 0.38}
+            else:
+                payload["class_probs"] = {"true": 0.20, "false": 0.20, "unverifiable": 0.60}
+        if not isinstance(payload.get("calibration_meta"), dict):
+            payload["calibration_meta"] = {"calibrator_version": payload.get("calibration_version")}
+        if not isinstance(payload.get("evidence_attribution"), list):
+            payload["evidence_attribution"] = [
+                {
+                    "segment": str(seg.get("claim_segment") or ""),
+                    "status": str(seg.get("status") or "UNKNOWN"),
+                    "evidence_ids": [int(x) for x in (seg.get("evidence_used_ids") or []) if str(x).isdigit()],
+                }
+                for seg in (claim_breakdown or [])
+            ]
 
         rationale = str(payload.get("rationale") or "").strip()
         candidate_rationale = self._build_human_rationale(
@@ -6755,6 +6973,80 @@ class VerdictGenerator:
         if score <= 74.0:
             return "MOSTLY_TRUE"
         return "LIKELY_TRUE"
+
+    @staticmethod
+    def _coerce_bool(value: Any, default: bool) -> bool:
+        """Coerce mixed payload values into a stable boolean."""
+        if value is None:
+            return bool(default)
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @staticmethod
+    def _trust_failed_band(truthfulness_percent: float) -> str:
+        """
+        Conservative trust-failed labels:
+        never expose LIKELY_* or hard TRUE/FALSE while trust gate is unmet.
+        """
+        try:
+            score = float(truthfulness_percent or 0.0)
+        except Exception:
+            score = 0.0
+        score = max(0.0, min(100.0, score))
+        if score <= 44.0:
+            return "MOSTLY_FALSE"
+        if score <= 55.0:
+            return "MIXED_OR_UNCLEAR"
+        return "MOSTLY_TRUE"
+
+    @staticmethod
+    def _has_decisive_signal(analysis_counts: Any) -> bool:
+        if not isinstance(analysis_counts, dict):
+            return False
+        try:
+            support = float(
+                analysis_counts.get(
+                    "map_support_signal_max",
+                    analysis_counts.get("vote_support_max", 0.0),
+                )
+                or 0.0
+            )
+        except Exception:
+            support = 0.0
+        try:
+            contradict = float(
+                analysis_counts.get(
+                    "map_contradict_signal_max",
+                    analysis_counts.get("vote_contradict_max", 0.0),
+                )
+                or 0.0
+            )
+        except Exception:
+            contradict = 0.0
+        return bool((support >= 0.60 and contradict < 0.35) or (contradict >= 0.60 and support < 0.35))
+
+    def _display_verdict_label(
+        self,
+        verdict: str,
+        truthfulness_percent: float,
+        trust_gate_passed: bool,
+        analysis_counts: Any,
+    ) -> str:
+        hard = str(verdict or "").upper()
+        if not trust_gate_passed:
+            return self._trust_failed_band(truthfulness_percent)
+        if hard in {Verdict.TRUE.value, Verdict.FALSE.value}:
+            if self._has_decisive_signal(analysis_counts):
+                return hard
+            return self._truthfulness_band(truthfulness_percent)
+        if hard in {Verdict.PARTIALLY_TRUE.value, Verdict.UNVERIFIABLE.value}:
+            return hard
+        return self._truthfulness_band(truthfulness_percent)
 
     def _unverifiable_result(self, claim: str, reason: str) -> Dict[str, Any]:
         """Return a forced binary fallback result when normal verdict generation fails."""

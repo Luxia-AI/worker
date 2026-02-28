@@ -26,7 +26,7 @@ async def ingest_facts_and_triples(
     triples: List[Dict[str, Any]],
     round_id: str,
     log_manager: Optional[LogManager] = None,
-) -> None:
+) -> Dict[str, Any]:
     """
     Ingest facts to VDB and triples to KG (non-blocking best-effort).
 
@@ -43,6 +43,12 @@ async def ingest_facts_and_triples(
         triples: List of triple dicts to ingest
         round_id: Round identifier for logging
     """
+    diagnostics: Dict[str, Any] = {
+        "vdb_ingest_failed": False,
+        "kg_ingest_failed": False,
+        "kg_timeout_count": 0,
+        "kg_result": {"attempted": 0, "succeeded": 0, "failed": 0},
+    }
     # Enrich facts with validation state before ingestion
     # This signals to VDB ingest which domains are trusted
     if facts:
@@ -77,6 +83,7 @@ async def ingest_facts_and_triples(
                 )
         except Exception as e:
             logger.warning(f"[IngestionPhase:{round_id}] VDB ingest failed: {e}")
+            diagnostics["vdb_ingest_failed"] = True
 
             if log_manager:
                 await log_manager.add_log(
@@ -94,6 +101,9 @@ async def ingest_facts_and_triples(
         try:
             result = await kg_ingest.ingest_triples(triples)
             logger.info(f"[IngestionPhase:{round_id}] KG ingestion result: {result}")
+            diagnostics["kg_result"] = dict(result or {})
+            if int(result.get("attempted", 0) or 0) > 0 and int(result.get("succeeded", 0) or 0) == 0:
+                diagnostics["kg_timeout_count"] = 1
 
             if log_manager:
                 await log_manager.add_log(
@@ -106,6 +116,7 @@ async def ingest_facts_and_triples(
                 )
         except Exception as e:
             logger.warning(f"[IngestionPhase:{round_id}] KG ingest failed: {e}")
+            diagnostics["kg_ingest_failed"] = True
 
             if log_manager:
                 await log_manager.add_log(
@@ -116,3 +127,4 @@ async def ingest_facts_and_triples(
                     round_id=round_id,
                     context={"error": str(e)},
                 )
+    return diagnostics
