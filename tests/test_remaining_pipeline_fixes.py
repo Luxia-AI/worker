@@ -973,6 +973,62 @@ def test_select_balanced_top_evidence_prefers_segment_specific_assignment():
     assert "vitamin c" in selected_text
 
 
+def test_adaptive_fallback_does_not_promote_unknown_on_low_predicate_alignment():
+    vg = _vg()
+    claim_breakdown = [
+        {
+            "claim_segment": "the virus can stay on surfaces long enough to be a source of transmission",
+            "status": "UNKNOWN",
+            "alignment_debug": {"reason": "strict_gate_no_match"},
+        }
+    ]
+    adaptive_metrics = {"coverage": 1.0}
+    evidence = [
+        {
+            "statement": "Transmission can occur via indirect contact with contaminated objects.",
+            "source_url": "https://www.who.int/example",
+            "semantic_score": 0.82,
+            "stance": "neutral",
+        }
+    ]
+    vg._apply_adaptive_coverage_fallback(claim_breakdown, adaptive_metrics, evidence)
+    assert claim_breakdown[0]["status"] == "UNKNOWN"
+
+
+def test_refute_with_moderate_credibility_can_block_true_for_cure_claim():
+    vg = _vg()
+    claim = "camostat mesylate cure coronavirus"
+    evidence = [
+        {
+            "statement": (
+                "Camostat mesylate did not improve clinical outcomes in patients with " "COVID-19, compared to placebo."
+            ),
+            "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11264738",
+            "final_score": 0.81,
+            "credibility": 0.7,
+        },
+        {
+            "statement": "Camostat mesylate has been used in clinical settings to treat pancreatitis.",
+            "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11264738",
+            "final_score": 0.81,
+            "credibility": 0.7,
+        },
+    ]
+    llm = {
+        "verdict": "TRUE",
+        "confidence": 0.8,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID"}],
+        "evidence_map": [
+            {"evidence_id": 0, "statement": evidence[0]["statement"], "relevance": "REFUTES", "relevance_score": 0.81},
+            {"evidence_id": 1, "statement": evidence[1]["statement"], "relevance": "SUPPORTS", "relevance_score": 0.81},
+        ],
+    }
+    out = vg._parse_verdict_result(llm, claim, evidence)
+    assert out["verdict"] != "TRUE"
+    assert out["claim_breakdown"][0]["status"] in {"INVALID", "PARTIALLY_INVALID", "UNKNOWN", "PARTIALLY_VALID"}
+
+
 def test_llm_rationale_generation_uses_claim_breakdown_and_relevant_evidence():
     vg = _vg()
 

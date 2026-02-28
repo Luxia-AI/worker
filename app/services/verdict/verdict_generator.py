@@ -4392,10 +4392,14 @@ class VerdictGenerator:
                 )
                 if noun_phrase_support_ok:
                     strict_support_ok = True
+                try:
+                    min_refute_cred = float(os.getenv("SEGMENT_REFUTE_MIN_CREDIBILITY", "0.70"))
+                except Exception:
+                    min_refute_cred = 0.70
                 refute_ok = rel == "REFUTES" and (
                     bool(em.get("intervention_match", False))
                     and predicate_match_score >= 0.4
-                    and float(em.get("credibility", 0.0) or 0.0) >= 0.8
+                    and float(em.get("credibility", 0.0) or 0.0) >= min_refute_cred
                     and self._quantifier_refute_allowed(segment, statement)
                     and self._dose_scope_refute_allowed(segment, statement)
                     and (
@@ -4789,8 +4793,16 @@ class VerdictGenerator:
             for seg in unknown_segments
         ):
             return
+        # If strict predicate floor already blocked all unknown segments, do not
+        # force promotion via adaptive fallback.
+        if all(
+            str(((seg.get("alignment_debug") or {}).get("reason") or "")).lower() == "strict_predicate_floor_not_met"
+            for seg in unknown_segments
+        ):
+            return
 
         best_ev: Dict[str, Any] | None = None
+        best_seg_text = ""
         best_score = -1.0
         for ev in evidence:
             stance = str(ev.get("stance") or "neutral").lower()
@@ -4803,12 +4815,27 @@ class VerdictGenerator:
                 self._segment_topic_guard_ok(str(seg.get("claim_segment") or ""), statement) for seg in unknown_segments
             ):
                 continue
+            # Require non-trivial segment-level predicate/anchor alignment for fallback.
+            seg_ok = False
+            seg_text_match = ""
+            for seg in unknown_segments:
+                seg_text = str(seg.get("claim_segment") or "")
+                anchor_eval = evaluate_anchor_match(seg_text, statement)
+                anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
+                pred_match = float(self.compute_predicate_match(seg_text, statement) or 0.0)
+                if pred_match >= 0.35 and anchor_overlap >= 0.20:
+                    seg_ok = True
+                    seg_text_match = seg_text
+                    break
+            if not seg_ok:
+                continue
             sem = float(ev.get("semantic_score") or ev.get("sem_score") or ev.get("final_score") or 0.0)
             if sem < 0.55:
                 continue
             if sem > best_score:
                 best_score = sem
                 best_ev = ev
+                best_seg_text = seg_text_match
         if not best_ev:
             # If adaptive metrics are strong but sem-keyed evidence is sparse,
             # still promote with first non-contradicting evidence to avoid UNKNOWN deadlock.
@@ -4824,8 +4851,22 @@ class VerdictGenerator:
                     for seg in unknown_segments
                 ):
                     continue
+                seg_ok = False
+                seg_text_match = ""
+                for seg in unknown_segments:
+                    seg_text = str(seg.get("claim_segment") or "")
+                    anchor_eval = evaluate_anchor_match(seg_text, statement)
+                    anchor_overlap = float(anchor_eval.get("anchor_overlap", 0.0) or 0.0)
+                    pred_match = float(self.compute_predicate_match(seg_text, statement) or 0.0)
+                    if pred_match >= 0.35 and anchor_overlap >= 0.20:
+                        seg_ok = True
+                        seg_text_match = seg_text
+                        break
+                if not seg_ok:
+                    continue
                 best_ev = ev
                 best_score = float(ev.get("final_score") or ev.get("score") or 0.0)
+                best_seg_text = seg_text_match
                 break
             if not best_ev:
                 return
@@ -4837,8 +4878,12 @@ class VerdictGenerator:
         for seg in claim_breakdown:
             if str(seg.get("status") or "UNKNOWN").upper() != "UNKNOWN":
                 continue
+            if best_seg_text and str(seg.get("claim_segment") or "") != best_seg_text:
+                continue
             prev_dbg = seg.get("alignment_debug") or {}
             prev_reason = str(prev_dbg.get("reason") or "") if isinstance(prev_dbg, dict) else ""
+            if prev_reason.lower() == "strict_predicate_floor_not_met":
+                continue
             seg["status"] = "PARTIALLY_VALID"
             seg["supporting_fact"] = fallback_fact
             seg["source_url"] = fallback_src
