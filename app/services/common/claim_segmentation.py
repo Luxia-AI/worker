@@ -370,6 +370,25 @@ def _split_on_conjunctives(text: str) -> List[str]:
                 and len(right.split()) <= 4
             ):
                 return [_clean(text, keep_conj_prefix=False)]
+            # Keep coordinated object continuations unsplit:
+            # "..., bake it into a brownie or other food" should remain one clause.
+            # Splitting here can create malformed fragments like "... way to other food".
+            if (
+                conj.strip() == "or"
+                and not right_has_clause
+                and (
+                    re.match(
+                        r"^(other|another|additional|different|similar|else|any)\b",
+                        right,
+                        flags=re.IGNORECASE,
+                    )
+                    or (
+                        len(right.split()) <= 3
+                        and re.search(r"\b(?:a|an|the)\s+[a-z][a-z-]*\s*$", left, flags=re.IGNORECASE)
+                    )
+                )
+            ):
+                return [_clean(text, keep_conj_prefix=False)]
             # Handle "X ... to/for A and B" by inheriting the governing preposition.
             if right and not right_has_clause:
                 prep = re.match(

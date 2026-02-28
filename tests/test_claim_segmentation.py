@@ -97,3 +97,14 @@ def test_compound_for_claim_preserves_subject_context_in_each_segment():
     assert any("vitamin d" in s and "bone growth" in s for s in low)
     assert any("dha" in s and ("eye" in s or "brain development" in s) for s in low)
     assert not any(s.strip() == "brain development" for s in low)
+
+
+def test_or_object_continuation_does_not_create_malformed_segment():
+    claim = (
+        "Although smoking is the most common way to use marijuana, " "some people bake it into a brownie or other food."
+    )
+    segments = split_claim_into_segments(claim)
+    low = [s.lower() for s in segments]
+
+    assert not any("way to other food" in s for s in low)
+    assert any("brownie or other food" in s for s in low)

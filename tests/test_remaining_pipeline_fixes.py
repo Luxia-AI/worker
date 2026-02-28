@@ -890,6 +890,77 @@ def test_mixed_valid_and_invalid_segments_do_not_end_unverifiable():
     assert out["verdict"] == "PARTIALLY_TRUE"
 
 
+def test_policy_insufficient_never_emits_binary_verdict():
+    vg = _vg()
+    claim = "Vitamin D prevents respiratory infections"
+    payload = {
+        "verdict": "TRUE",
+        "confidence": 0.8,
+        "truthfulness_percent": 88.0,
+        "policy_sufficient": False,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID", "evidence_used_ids": [0]}],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Vitamin D supplementation reduced respiratory infection risk.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.82,
+                "source_url": "https://example.org/d",
+            }
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] in {"PARTIALLY_TRUE", "UNVERIFIABLE"}
+    assert out["verdict"] not in {"TRUE", "FALSE"}
+    assert bool(out.get("trust_gate_binary_lock_applied")) is True
+
+
+def test_segment_valid_status_is_not_linked_to_refute_evidence_after_normalization():
+    vg = _vg()
+    claim = "camostat mesylate cure coronavirus"
+    payload = {
+        "verdict": "PARTIALLY_TRUE",
+        "confidence": 0.65,
+        "truthfulness_percent": 62.0,
+        "policy_sufficient": True,
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": claim,
+                "status": "VALID",
+                "supporting_fact": "Camostat mesylate did not improve clinical outcomes.",
+                "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11264738",
+                "evidence_used_ids": [0],
+            }
+        ],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Camostat mesylate did not improve clinical outcomes in patients with COVID-19.",
+                "relevance": "REFUTES",
+                "relevance_score": 0.81,
+                "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11264738",
+            },
+            {
+                "evidence_id": 1,
+                "statement": "Camostat mesylate has been used clinically to treat pancreatitis.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.80,
+                "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11264738",
+            },
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    seg = out["claim_breakdown"][0]
+    used_ids = [int(x) for x in (seg.get("evidence_used_ids") or []) if str(x).isdigit()]
+    if used_ids:
+        linked = next((e for e in out["evidence_map"] if int(e.get("evidence_id", -1)) == used_ids[0]), None)
+        assert linked is not None
+        if str(seg.get("status") or "").upper() in {"VALID", "PARTIALLY_VALID"}:
+            assert str(linked.get("relevance") or "").upper() != "REFUTES"
+
+
 def test_effective_top_k_scales_with_subclaims():
     vg = _vg()
     simple = vg._effective_top_k_for_claim("Vitamin C supports immune health.", 5)
@@ -1001,7 +1072,7 @@ def test_refute_with_moderate_credibility_can_block_true_for_cure_claim():
     evidence = [
         {
             "statement": (
-                "Camostat mesylate did not improve clinical outcomes in patients with " "COVID-19, compared to placebo."
+                "Camostat mesylate did not improve clinical outcomes in patients " "with COVID-19, compared to placebo."
             ),
             "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC11264738",
             "final_score": 0.81,
@@ -1137,3 +1208,27 @@ def test_rationale_includes_key_evidence_reference_when_available():
     r = str(out.get("rationale") or "")
     assert "key evidence" in r.lower()
     assert "pubmed.ncbi.nlm.nih.gov" in r.lower()
+
+
+def test_truthfulness_band_mapping_boundaries():
+    vg = _vg()
+    assert vg._truthfulness_band(10) == "LIKELY_FALSE"
+    assert vg._truthfulness_band(30) == "MOSTLY_FALSE"
+    assert vg._truthfulness_band(50) == "MIXED_OR_UNCLEAR"
+    assert vg._truthfulness_band(65) == "MOSTLY_TRUE"
+    assert vg._truthfulness_band(90) == "LIKELY_TRUE"
+
+
+def test_enforced_payload_includes_verdict_band():
+    vg = _vg()
+    claim = "Vitamin C does not support immune health"
+    payload = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.55,
+        "truthfulness_percent": 49.0,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN"}],
+        "evidence_map": [],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out.get("verdict_band") == "MIXED_OR_UNCLEAR"
