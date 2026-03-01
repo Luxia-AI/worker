@@ -1984,6 +1984,13 @@ class VerdictGenerator:
             )
         verdict_guard_reasons: List[str] = []
         trust_gate_binary_lock_applied = False
+        decisive_contradiction_unlock = bool(
+            canonical_stance == "contradicts"
+            and (strong_vote_contradiction or float(map_contradict_signal or 0.0) >= 0.60)
+            and float(admissible_ratio or 0.0) >= 0.50
+            and (float(coverage_score or 0.0) >= 0.60 or float(agreement_ratio or 0.0) >= 0.80)
+            and invalid_status_count >= max(1, support_status_count)
+        )
 
         if rationale_stance == "contradicts" and verdict_str == Verdict.TRUE.value:
             verdict_str = Verdict.FALSE.value if vote_contradict >= 0.60 else Verdict.UNVERIFIABLE.value
@@ -1994,7 +2001,11 @@ class VerdictGenerator:
         if policy_insufficient and verdict_str in {Verdict.TRUE.value, Verdict.FALSE.value}:
             trust_gate_binary_lock_applied = True
             verdict_guard_reasons.append("trust_gate_binary_lock")
-            if verdict_str == Verdict.TRUE.value and strong_support_segment_present:
+            if verdict_str == Verdict.FALSE.value and decisive_contradiction_unlock:
+                verdict_guard_reasons.append("trust_gate_binary_lock_bypassed_contradiction")
+                trust_gate_binary_lock_applied = False
+                confidence = max(float(confidence or 0.0), 0.62)
+            elif verdict_str == Verdict.TRUE.value and strong_support_segment_present:
                 verdict_str = Verdict.PARTIALLY_TRUE.value
             else:
                 verdict_str = Verdict.UNVERIFIABLE.value
@@ -2073,7 +2084,7 @@ class VerdictGenerator:
             truth_score_percent = min(float(truth_score_percent or 0.0), 75.0)
             confidence = min(float(confidence), 0.75)
         if strong_vote_contradiction:
-            if policy_insufficient:
+            if policy_insufficient and not decisive_contradiction_unlock:
                 trust_gate_binary_lock_applied = True
                 verdict_guard_reasons.append("trust_gate_binary_lock")
                 verdict_str = Verdict.UNVERIFIABLE.value
@@ -2333,7 +2344,11 @@ class VerdictGenerator:
 
         # Final trust gate lock (after all overrides and consistency transforms):
         # keep outputs trust-governed by prohibiting hard binary verdicts when policy is insufficient.
-        if policy_insufficient and verdict_str in {Verdict.TRUE.value, Verdict.FALSE.value}:
+        if (
+            policy_insufficient
+            and verdict_str in {Verdict.TRUE.value, Verdict.FALSE.value}
+            and not (verdict_str == Verdict.FALSE.value and decisive_contradiction_unlock)
+        ):
             trust_gate_binary_lock_applied = True
             verdict_guard_reasons.append("trust_gate_binary_lock")
             if verdict_str == Verdict.TRUE.value and strong_support_segment_present:

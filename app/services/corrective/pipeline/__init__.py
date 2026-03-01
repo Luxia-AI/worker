@@ -49,7 +49,7 @@ from app.services.corrective.pipeline.retrieval_phase import retrieve_candidates
 from app.services.corrective.relation_extractor import RelationExtractor
 from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
-from app.services.domain import HealthScopeGate, HealthScopeResult
+from app.services.domain import HealthScopeResult
 from app.services.kg.kg_ingest import KGIngest
 from app.services.kg.kg_retrieval import KGRetrieval
 from app.services.kg.neo4j_client import Neo4jClient
@@ -107,7 +107,6 @@ class CorrectivePipeline:
         self.kg_retriever = KGRetrieval()
         self.lexical_index = LexicalIndex()
         self.topic_classifier = TopicClassifier()
-        self.health_scope_gate = HealthScopeGate()
 
         # Verdict generation (RAG phase)
         self.verdict_generator = VerdictGenerator()
@@ -513,22 +512,13 @@ class CorrectivePipeline:
                 round_id,
                 domain,
             )
-        detected_scope = self.health_scope_gate.classify(post_text, declared_domain=domain)
-        if not detected_scope.health_in_scope:
-            logger.info(
-                "[CorrectivePipeline:%s] Health scope gate disabled by policy; proceeding as in-scope "
-                "(detected_conf=%.2f reason=%s)",
-                round_id,
-                float(detected_scope.biomedical_confidence or 0.0),
-                str(detected_scope.scope_reason or ""),
-            )
-            health_scope = HealthScopeResult(
-                health_in_scope=True,
-                biomedical_confidence=max(0.5, float(detected_scope.biomedical_confidence or 0.0)),
-                scope_reason="health_only_mode_gate_disabled",
-            )
-        else:
-            health_scope = detected_scope
+        # Health-only product mode: all incoming claims are treated as in-scope.
+        # Keep explicit metadata for downstream observability and calibration features.
+        health_scope = HealthScopeResult(
+            health_in_scope=True,
+            biomedical_confidence=1.0,
+            scope_reason="health_only_mode_assumed",
+        )
 
         async def _emit_stage(stage: str, payload: Dict[str, Any] | None = None) -> None:
             if not stage_callback:
