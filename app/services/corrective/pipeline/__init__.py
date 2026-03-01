@@ -49,7 +49,7 @@ from app.services.corrective.pipeline.retrieval_phase import retrieve_candidates
 from app.services.corrective.relation_extractor import RelationExtractor
 from app.services.corrective.scraper import Scraper
 from app.services.corrective.trusted_search import TrustedSearch
-from app.services.domain import HealthScopeGate
+from app.services.domain import HealthScopeGate, HealthScopeResult
 from app.services.kg.kg_ingest import KGIngest
 from app.services.kg.kg_retrieval import KGRetrieval
 from app.services.kg.neo4j_client import Neo4jClient
@@ -513,7 +513,22 @@ class CorrectivePipeline:
                 round_id,
                 domain,
             )
-        health_scope = self.health_scope_gate.classify(post_text, declared_domain=domain)
+        detected_scope = self.health_scope_gate.classify(post_text, declared_domain=domain)
+        if not detected_scope.health_in_scope:
+            logger.info(
+                "[CorrectivePipeline:%s] Health scope gate disabled by policy; proceeding as in-scope "
+                "(detected_conf=%.2f reason=%s)",
+                round_id,
+                float(detected_scope.biomedical_confidence or 0.0),
+                str(detected_scope.scope_reason or ""),
+            )
+            health_scope = HealthScopeResult(
+                health_in_scope=True,
+                biomedical_confidence=max(0.5, float(detected_scope.biomedical_confidence or 0.0)),
+                scope_reason="health_only_mode_gate_disabled",
+            )
+        else:
+            health_scope = detected_scope
 
         async def _emit_stage(stage: str, payload: Dict[str, Any] | None = None) -> None:
             if not stage_callback:
@@ -552,123 +567,6 @@ class CorrectivePipeline:
                     },
                 },
             )
-
-        if not health_scope.health_in_scope:
-            verdict_result = {
-                "verdict": "UNVERIFIABLE",
-                "display_verdict": "UNVERIFIABLE",
-                "verdict_band": "MIXED_OR_UNCLEAR",
-                "confidence": 0.22,
-                "truthfulness_percent": 35.0,
-                "truth_score_percent": 35.0,
-                "rationale": (
-                    "The input does not provide enough biomedical signal for health-domain evidence adjudication. "
-                    "Returning UNVERIFIABLE conservatively."
-                ),
-                "claim_breakdown": [
-                    {
-                        "claim_segment": post_text,
-                        "status": "UNKNOWN",
-                        "supporting_fact": "",
-                        "source_url": "",
-                        "evidence_used_ids": [],
-                    }
-                ],
-                "evidence_map": [],
-                "key_findings": [],
-                "class_probs": {
-                    "true": 0.20,
-                    "false": 0.20,
-                    "unverifiable": 0.60,
-                },
-                "calibrated_confidence": 0.22,
-                "calibration_meta": {
-                    "mode": "health_scope_gate",
-                    "scope_reason": health_scope.scope_reason,
-                    "biomedical_confidence": health_scope.biomedical_confidence,
-                },
-                "trust_threshold_met": False,
-            }
-            await _emit_stage(
-                "completed",
-                {
-                    "status": "out_of_scope",
-                    "health_scope": {
-                        "in_scope": health_scope.health_in_scope,
-                        "biomedical_confidence": health_scope.biomedical_confidence,
-                        "scope_reason": health_scope.scope_reason,
-                    },
-                },
-            )
-            await debug_reporter.log_step(
-                step_name="Pipeline completed",
-                description="Exited early on health-domain scope gate",
-                input_data={"claim": post_text},
-                output_data={"status": "out_of_scope", "verdict": verdict_result["verdict"]},
-            )
-            await debug_reporter.close()
-            return {
-                "round_id": round_id,
-                "status": "out_of_scope",
-                "facts": [],
-                "triples": [],
-                "queries": [],
-                "queries_total": 0,
-                "semantic_candidates_count": 0,
-                "kg_candidates_count": 0,
-                "ranked": [],
-                "used_web_search": False,
-                "data_source": "DOMAIN_GATE",
-                "search_api_calls": 0,
-                "search_api_calls_saved": 0,
-                "urls_processed": 0,
-                "urls_skipped_already_processed": 0,
-                "initial_top_score": 0.0,
-                "ranking_top_score": 0.0,
-                "ranking_avg_score": 0.0,
-                "trust_post": 0.0,
-                "trust_post_adaptive": 0.0,
-                "trust_post_fixed": 0.0,
-                "trust_grade": "F",
-                "agreement_ratio": 0.0,
-                "coverage": 0.0,
-                "diversity": 0.0,
-                "num_subclaims": 1,
-                "adaptive_is_sufficient": False,
-                "fixed_trust_threshold": self.CONF_THRESHOLD,
-                "fixed_trust_threshold_met": False,
-                "verdict": verdict_result,
-                "debug_counts": {
-                    "kg_raw": 0,
-                    "kg_with_score": 0,
-                    "kg_in_ranked": 0,
-                    "sem_raw": 0,
-                    "sem_filtered": 0,
-                    "sem_in_ranked": 0,
-                },
-                "vdb_signal_count": 0,
-                "kg_signal_count": 0,
-                "vdb_signal_sum_top5": 0.0,
-                "kg_signal_sum_top5": 0.0,
-                "llm": get_groq_job_metadata(),
-                "trust_policy_mode": "adaptive",
-                "trust_metric_name": "adaptive_trust_post",
-                "trust_metric_value": 0.0,
-                "trust_threshold": "adaptive",
-                "trust_threshold_met": False,
-                "domain": normalized_domain,
-                "health_scope": {
-                    "in_scope": health_scope.health_in_scope,
-                    "biomedical_confidence": health_scope.biomedical_confidence,
-                    "scope_reason": health_scope.scope_reason,
-                },
-                "pipeline_diagnostics_v2": {
-                    "stop_reason": "health_scope_gate",
-                    "gain_estimate": 0.0,
-                    "kg_timeout_count": 0,
-                    "zero_extraction_rounds": 0,
-                },
-            }
 
         # ====================================================================
         # PHASE 1: Extract entities from claim (1 LLM call)
