@@ -65,6 +65,12 @@ class EvidenceScoreV2:
     nli_entail_prob: float
     nli_contradict_prob: float
     admissible: bool
+    evidence_id: int = -1
+    neutral_score: float = 0.0
+    nli_neutral_prob: float = 0.0
+    weight: float = 0.0
+    source_domain: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -72,6 +78,7 @@ class TrustSnapshotV2:
     trust_support: float
     trust_contradict: float
     trust_uncertain: float
+    admissibility_rate: float = 0.0
     sufficiency_reason: str = ""
     info_gain: float = 0.0
 

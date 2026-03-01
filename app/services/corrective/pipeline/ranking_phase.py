@@ -13,9 +13,11 @@ from app.services.ranking.contradiction_scorer import ContradictionScorer
 from app.services.ranking.hybrid_ranker import hybrid_rank
 from app.services.ranking.trust_ranker import DummyStanceClassifier, TrustRanker
 from app.services.retrieval.evidence_gate import filter_candidates_for_count_claim
+from app.services.verdict.v2.entailment import DeterministicEntailmentVerifier
 
 logger = get_logger(__name__)
 _CROSS_ENCODER = None
+_ENTAILMENT_VERIFIER = DeterministicEntailmentVerifier()
 
 
 def _tokenize(text: str) -> set[str]:
@@ -272,20 +274,64 @@ async def rank_candidates(
         item["admissible_for_trust"] = bool(topic_aligned)
         if topic_aligned:
             filtered_for_trust.append(item)
-    if filtered_for_trust:
-        ranked = filtered_for_trust
+    # Keep all ranked items for polarity reasoning; admissible_for_trust controls
+    # trust aggregation without suppressing contradiction evidence.
     stance_classifier = DummyStanceClassifier()
     scorer = ContradictionScorer(semantic_min=0.35)
+    stage1_refute_candidates: List[Dict[str, Any]] = []
     for item in ranked:
         statement = str(item.get("statement") or item.get("text") or "")
         stance = stance_classifier.classify_stance(query_text, statement) if statement else "neutral"
         item["stance"] = stance
+        neg_overlap = float(item.get("negation_anchor_overlap", 0.0) or 0.0)
+        contradiction_seed = float(item.get("contradict_score", 0.0) or 0.0)
+        predicate_match = float(item.get("predicate_match_score", 0.0) or 0.0)
+        stage1_refute_score = max(
+            0.0,
+            min(
+                1.0,
+                (0.42 * contradiction_seed)
+                + (0.30 * neg_overlap)
+                + (0.18 * (1.0 - predicate_match))
+                + (0.10 * (1.0 if stance == "contradicts" else 0.0)),
+            ),
+        )
+        item["stage1_refute_score"] = round(stage1_refute_score, 4)
+        if stage1_refute_score >= 0.30:
+            stage1_refute_candidates.append(item)
         if stance == "contradicts":
             raw_score = float(item.get("final_score", 0.0) or 0.0)
             penalized = max(0.0, raw_score * 0.90)
             item["raw_final_score"] = raw_score
             item["final_score"] = penalized
             item["contradiction_penalty"] = round(raw_score - penalized, 4)
+    stage2_verified = _ENTAILMENT_VERIFIER.verify_refutes(
+        query_text,
+        [
+            {
+                "evidence_id": idx,
+                "statement": str(it.get("statement") or ""),
+                "stage1_refute_score": float(it.get("stage1_refute_score", 0.0) or 0.0),
+            }
+            for idx, it in enumerate(ranked)
+        ],
+        top_n=max(1, int(os.getenv("REFUTE_STAGE2_TOP_N", "5"))),
+    )
+    refute_verified_count_stage2 = 0
+    for idx, item in enumerate(ranked):
+        probs = stage2_verified.get(idx)
+        if not probs:
+            continue
+        entail_p = float(probs.get("entail", 0.0) or 0.0)
+        contra_p = float(probs.get("contradict", 0.0) or 0.0)
+        neutral_p = float(probs.get("neutral", 0.0) or 0.0)
+        item["nli_entail_prob"] = round(entail_p, 4)
+        item["nli_contradict_prob"] = round(contra_p, 4)
+        item["nli_neutral_prob"] = round(neutral_p, 4)
+        if contra_p >= 0.45:
+            item["refute_verified"] = True
+            item["stance"] = "contradicts"
+            refute_verified_count_stage2 += 1
     contradicting_count = scorer.score(ranked).contra_count
 
     ranked.sort(
@@ -394,6 +440,12 @@ async def rank_candidates(
             "contradiction_strength": round(contradiction_strength, 4),
             "support_strength": round(support_strength, 4),
             "kg_utilization_ratio": round(kg_utilization_ratio, 4),
+            "refute_candidate_count_stage1": len(stage1_refute_candidates),
+            "refute_verified_count_stage2": refute_verified_count_stage2,
+            "refutes_admission_rate": round(
+                float(refute_verified_count_stage2 / max(1, len(ranked))),
+                4,
+            ),
         },
     )
 
@@ -421,6 +473,9 @@ async def rank_candidates(
                 "contradiction_strength": contradiction_strength,
                 "support_strength": support_strength,
                 "kg_utilization_ratio": kg_utilization_ratio,
+                "refute_candidate_count_stage1": len(stage1_refute_candidates),
+                "refute_verified_count_stage2": refute_verified_count_stage2,
+                "refutes_admission_rate": float(refute_verified_count_stage2 / max(1, len(ranked))),
             },
         )
 

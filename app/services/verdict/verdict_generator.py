@@ -52,6 +52,7 @@ from app.services.retrieval.metadata_enricher import TopicClassifier
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 from app.services.verdict.policy_override import OverrideSignals, therapeutic_strong_override
 from app.services.verdict.rationale_filter import is_efficacy_relevant
+from app.services.verdict.v2 import build_evidence_scores_v2, compute_verdict_policy_v2
 from app.services.verdict.v2.calibration import ConfidenceCalibrator
 from app.services.verdict.v2.normalizer import is_blocked_content
 from app.services.verdict.v2.reconciler import reconcile_verdict
@@ -2215,69 +2216,110 @@ class VerdictGenerator:
             confidence = max(float(confidence or 0.0), float(os.getenv("FALSE_VERDICT_MIN_CONFIDENCE", "0.55")))
             if explicit_refutes_found and map_contradict_signal >= 0.35:
                 confidence = max(float(confidence or 0.0), 0.80)
-        raw_true_signal = max(
-            0.0,
-            min(
-                1.0,
-                (0.60 * float(map_support_signal or 0.0))
-                + (0.20 * float(coverage_score or 0.0))
-                + (0.20 * float(admissible_ratio or 0.0)),
-            ),
-        )
-        raw_false_signal = max(
-            0.0,
-            min(
-                1.0,
-                (0.65 * float(map_contradict_signal or 0.0))
-                + (0.20 * float(coverage_score or 0.0))
-                + (0.15 * float(admissible_ratio or 0.0)),
-            ),
-        )
-        raw_unv_signal = max(
-            0.0,
-            min(
-                1.0,
-                (0.40 * (1.0 - float(coverage_score or 0.0)))
-                + (0.30 * (1.0 - float(admissible_ratio or 0.0)))
-                + (0.30 * max(0.0, 1.0 - max(raw_true_signal, raw_false_signal))),
-            ),
-        )
-        # Soft verdict prior only; avoid hard forcing.
-        if verdict_str == Verdict.TRUE.value:
-            raw_true_signal *= 1.08
-        elif verdict_str == Verdict.FALSE.value:
-            raw_false_signal *= 1.08
-        elif verdict_str == Verdict.UNVERIFIABLE.value:
-            raw_unv_signal *= 1.10
-        class_probs_raw = {
-            "true": float(raw_true_signal),
-            "false": float(raw_false_signal),
-            "unverifiable": float(raw_unv_signal),
-        }
-        class_probs = calibrator.calibrate_distribution(
-            class_probs_raw,
-            features={
-                "coverage": float(coverage_score or 0.0),
-                "admissible_ratio": float(admissible_ratio or 0.0),
-                "contradict_signal": float(map_contradict_signal or 0.0),
-                "support_signal": float(map_support_signal or 0.0),
-            },
-        )
-        class_max_prob = max(float(v or 0.0) for v in class_probs.values())
-        confidence_seed = (0.55 * float(confidence or 0.0)) + (0.45 * class_max_prob)
-        confidence = calibrator.calibrate(
-            float(confidence_seed or 0.0),
-            features={
-                "coverage": float(coverage_score or 0.0),
-                "agreement": float(agreement_ratio or 0.0),
-                "diversity": float(diversity_score or 0.0),
-                "contradict_signal": float(map_contradict_signal or 0.0),
-                "admissible_ratio": float(admissible_ratio or 0.0),
-                "evidence_quality": max(0.0, min(1.0, float(evidence_quality_percent or 0.0) / 100.0)),
-                "class_max_prob": float(class_max_prob or 0.0),
-                "retrieval_depth": max(0.0, min(1.0, float(len(evidence or [])) / 20.0)),
-            },
-        )
+        v2_policy_output: Dict[str, Any] = {}
+        v2_stance_diag: Dict[str, float] = {}
+        class_probs_raw: Dict[str, float]
+        class_probs: Dict[str, float]
+        class_max_prob: float
+        confidence_seed: float
+        if v2_enabled:
+            try:
+                nli_top_n = max(1, int(os.getenv("REFUTE_STAGE2_TOP_N", "5")))
+            except Exception:
+                nli_top_n = 5
+            try:
+                evidence_scores_v2, v2_stance_diag = build_evidence_scores_v2(
+                    claim=claim,
+                    evidence_map=evidence_map or [],
+                    evidence=evidence or [],
+                    nli_top_n=nli_top_n,
+                )
+                v2_policy_output = compute_verdict_policy_v2(
+                    scores=evidence_scores_v2,
+                    coverage=float(coverage_score or 0.0),
+                    diversity=float(diversity_score or 0.0),
+                    calibrator=calibrator,
+                    calibrator_features={
+                        "agreement": float(agreement_ratio or 0.0),
+                        "retrieval_depth": max(0.0, min(1.0, float(len(evidence or [])) / 20.0)),
+                    },
+                )
+                verdict_str = str(v2_policy_output.get("verdict") or verdict_str)
+                truth_score_percent = float(v2_policy_output.get("truthfulness_percent", truth_score_percent) or 0.0)
+                confidence = float(v2_policy_output.get("calibrated_confidence", confidence) or 0.0)
+                class_probs_raw = dict(v2_policy_output.get("class_probs_raw") or {})
+                class_probs = dict(v2_policy_output.get("class_probs") or {})
+                class_max_prob = max(float(v or 0.0) for v in class_probs.values()) if class_probs else 0.0
+                confidence_seed = float(v2_policy_output.get("calibrated_confidence", confidence) or 0.0)
+            except Exception as policy_exc:
+                logger.warning("[VerdictGenerator][v2] policy compute failed, fallback to v1 scoring: %s", policy_exc)
+                v2_policy_output = {}
+                v2_stance_diag = {}
+                v2_enabled = False
+        if not v2_enabled:
+            raw_true_signal = max(
+                0.0,
+                min(
+                    1.0,
+                    (0.60 * float(map_support_signal or 0.0))
+                    + (0.20 * float(coverage_score or 0.0))
+                    + (0.20 * float(admissible_ratio or 0.0)),
+                ),
+            )
+            raw_false_signal = max(
+                0.0,
+                min(
+                    1.0,
+                    (0.65 * float(map_contradict_signal or 0.0))
+                    + (0.20 * float(coverage_score or 0.0))
+                    + (0.15 * float(admissible_ratio or 0.0)),
+                ),
+            )
+            raw_unv_signal = max(
+                0.0,
+                min(
+                    1.0,
+                    (0.40 * (1.0 - float(coverage_score or 0.0)))
+                    + (0.30 * (1.0 - float(admissible_ratio or 0.0)))
+                    + (0.30 * max(0.0, 1.0 - max(raw_true_signal, raw_false_signal))),
+                ),
+            )
+            # Soft verdict prior only; avoid hard forcing.
+            if verdict_str == Verdict.TRUE.value:
+                raw_true_signal *= 1.08
+            elif verdict_str == Verdict.FALSE.value:
+                raw_false_signal *= 1.08
+            elif verdict_str == Verdict.UNVERIFIABLE.value:
+                raw_unv_signal *= 1.10
+            class_probs_raw = {
+                "true": float(raw_true_signal),
+                "false": float(raw_false_signal),
+                "unverifiable": float(raw_unv_signal),
+            }
+            class_probs = calibrator.calibrate_distribution(
+                class_probs_raw,
+                features={
+                    "coverage": float(coverage_score or 0.0),
+                    "admissible_ratio": float(admissible_ratio or 0.0),
+                    "contradict_signal": float(map_contradict_signal or 0.0),
+                    "support_signal": float(map_support_signal or 0.0),
+                },
+            )
+            class_max_prob = max(float(v or 0.0) for v in class_probs.values())
+            confidence_seed = (0.55 * float(confidence or 0.0)) + (0.45 * class_max_prob)
+            confidence = calibrator.calibrate(
+                float(confidence_seed or 0.0),
+                features={
+                    "coverage": float(coverage_score or 0.0),
+                    "agreement": float(agreement_ratio or 0.0),
+                    "diversity": float(diversity_score or 0.0),
+                    "contradict_signal": float(map_contradict_signal or 0.0),
+                    "admissible_ratio": float(admissible_ratio or 0.0),
+                    "evidence_quality": max(0.0, min(1.0, float(evidence_quality_percent or 0.0) / 100.0)),
+                    "class_max_prob": float(class_max_prob or 0.0),
+                    "retrieval_depth": max(0.0, min(1.0, float(len(evidence or [])) / 20.0)),
+                },
+            )
         unverifiable_cap_applied = False
         if verdict_str == Verdict.UNVERIFIABLE.value and float(confidence or 0.0) > float(UNVERIFIABLE_CONFIDENCE_CAP):
             confidence = float(UNVERIFIABLE_CONFIDENCE_CAP)
@@ -2347,6 +2389,7 @@ class VerdictGenerator:
         if (
             policy_insufficient
             and verdict_str in {Verdict.TRUE.value, Verdict.FALSE.value}
+            and not v2_enabled
             and not (verdict_str == Verdict.FALSE.value and decisive_contradiction_unlock)
         ):
             trust_gate_binary_lock_applied = True
@@ -2358,6 +2401,20 @@ class VerdictGenerator:
                 verdict_str = Verdict.UNVERIFIABLE.value
                 truth_score_percent = min(49.0, float(truth_score_percent or 49.0))
                 confidence = min(float(confidence or 0.0), 0.60)
+
+        # v2 deterministic policy is the final authority for class/score selection.
+        # Keep legacy heuristics active for rationale shaping but do not let them
+        # hard-lock the final class under v2.
+        if v2_enabled and v2_policy_output:
+            verdict_str = str(v2_policy_output.get("verdict") or verdict_str)
+            truth_score_percent = float(v2_policy_output.get("truthfulness_percent", truth_score_percent) or 0.0)
+            confidence = float(v2_policy_output.get("calibrated_confidence", confidence) or 0.0)
+            if verdict_str == Verdict.UNVERIFIABLE.value:
+                confidence = min(float(confidence or 0.0), float(UNVERIFIABLE_CONFIDENCE_CAP))
+            confidence = max(0.05, min(0.98, float(confidence or 0.0)))
+            policy_insufficient = False
+            trust_gate_binary_lock_applied = False
+            verdict_guard_reasons = [r for r in verdict_guard_reasons if r != "trust_gate_binary_lock"]
 
         rel_counts: Dict[str, int] = {}
         for evm in evidence_map or []:
@@ -2453,6 +2510,21 @@ class VerdictGenerator:
                 "confidence_seed": round(float(confidence_seed or 0.0), 4),
                 "class_probs_raw": {k: round(float(v or 0.0), 4) for k, v in class_probs_raw.items()},
                 "class_max_prob": round(float(class_max_prob or 0.0), 4),
+                "v2_policy_active": bool(v2_enabled),
+                "v2_policy": {
+                    "support_mass": round(float(v2_policy_output.get("support_mass", 0.0) or 0.0), 4),
+                    "refute_mass": round(float(v2_policy_output.get("refute_mass", 0.0) or 0.0), 4),
+                    "neutral_mass": round(float(v2_policy_output.get("neutral_mass", 0.0) or 0.0), 4),
+                    "evidence_sufficiency": round(float(v2_policy_output.get("evidence_sufficiency", 0.0) or 0.0), 4),
+                    "agreement_score": round(float(v2_policy_output.get("agreement_score", 0.0) or 0.0), 4),
+                    "retrieval_entropy": round(float(v2_policy_output.get("retrieval_entropy", 0.0) or 0.0), 4),
+                    "admissibility_rate": round(float(v2_policy_output.get("admissibility_rate", 0.0) or 0.0), 4),
+                },
+                "refute_pipeline_stats": {
+                    "refute_candidate_count_stage1": int(v2_stance_diag.get("refute_candidate_count_stage1", 0.0) or 0),
+                    "refute_verified_count_stage2": int(v2_stance_diag.get("refute_verified_count_stage2", 0.0) or 0),
+                    "refutes_admission_rate": round(float(v2_stance_diag.get("refutes_admission_rate", 0.0) or 0.0), 4),
+                },
             },
             "evidence_quality_percent": float(evidence_quality_percent or 0.0),
             "rationale": rationale,
@@ -2495,6 +2567,19 @@ class VerdictGenerator:
             "decision_trace_id": decision_trace_id,
             "calibration_version": calibrator.version,
             "shadow_diff": shadow_diff if v2_shadow else None,
+            "stance_scores": {
+                "support_mass": float(v2_policy_output.get("support_mass", 0.0) or 0.0),
+                "refute_mass": float(v2_policy_output.get("refute_mass", 0.0) or 0.0),
+                "neutral_mass": float(v2_policy_output.get("neutral_mass", 0.0) or 0.0),
+            },
+            "evidence_sufficiency": float(v2_policy_output.get("evidence_sufficiency", 0.0) or 0.0),
+            "agreement_score": float(v2_policy_output.get("agreement_score", agreement_ratio) or agreement_ratio),
+            "retrieval_entropy": float(v2_policy_output.get("retrieval_entropy", 0.0) or 0.0),
+            "refute_pipeline_stats": {
+                "refute_candidate_count_stage1": int(v2_stance_diag.get("refute_candidate_count_stage1", 0.0) or 0),
+                "refute_verified_count_stage2": int(v2_stance_diag.get("refute_verified_count_stage2", 0.0) or 0),
+                "refutes_admission_rate": float(v2_stance_diag.get("refutes_admission_rate", 0.0) or 0.0),
+            },
             "analysis_counts": {
                 "evidence_total_input": len(evidence),
                 "evidence_map_count": len(evidence_map or []),
@@ -2531,6 +2616,14 @@ class VerdictGenerator:
                 "claim_fragmentary": bool(fragmentary_claim),
                 "llm_verdict_raw": llm_verdict,
                 "llm_verdict_changed": bool(llm_verdict != verdict_str),
+                "evidence_sufficiency_v2": round(float(v2_policy_output.get("evidence_sufficiency", 0.0) or 0.0), 4),
+                "agreement_score_v2": round(
+                    float(v2_policy_output.get("agreement_score", agreement_ratio) or agreement_ratio), 4
+                ),
+                "retrieval_entropy_v2": round(float(v2_policy_output.get("retrieval_entropy", 0.0) or 0.0), 4),
+                "refute_candidate_count_stage1": int(v2_stance_diag.get("refute_candidate_count_stage1", 0.0) or 0),
+                "refute_verified_count_stage2": int(v2_stance_diag.get("refute_verified_count_stage2", 0.0) or 0),
+                "refutes_admission_rate": round(float(v2_stance_diag.get("refutes_admission_rate", 0.0) or 0.0), 4),
             },
         }
         verdict_payload = self._enforce_binary_verdict_payload(claim, verdict_payload, evidence=evidence)

@@ -81,6 +81,7 @@ class TrustedSearch:
         "help",
         "effective against",
     ]
+    _EVAL_QUERY_CACHE: Dict[str, List[str]] = {}
 
     @staticmethod
     def _prioritize_trusted_domains(domains: set[str]) -> List[str]:
@@ -2400,6 +2401,24 @@ FAILED ENTITIES:
             List of trusted URLs from this single query
         """
         logger.debug(f"[TrustedSearch] Executing single query: '{query}'")
+        eval_cache_enabled = os.getenv("EVAL_DETERMINISTIC_SEARCH_CACHE", "true").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        cache_key = ""
+        if eval_cache_enabled:
+            key_payload = (
+                f"{str(claim or '').strip().lower()}|"
+                f"{str(claim_type or '').strip().lower()}|"
+                f"{str(query or '').strip().lower()}"
+            )
+            cache_key = hashlib.sha1(key_payload.encode("utf-8")).hexdigest()
+            cached = self._EVAL_QUERY_CACHE.get(cache_key)
+            if cached is not None:
+                logger.debug("[TrustedSearch] Deterministic eval cache hit for query hash=%s", cache_key[:12])
+                return list(cached)
 
         async with aiohttp.ClientSession() as session:
             try:
@@ -2411,6 +2430,9 @@ FAILED ENTITIES:
                     entities=entities,
                 )
                 logger.debug(f"[TrustedSearch] Single query returned {len(urls)} trusted URLs")
+                if eval_cache_enabled and cache_key:
+                    # Store deterministic copy for repeated identical evaluation claims.
+                    self._EVAL_QUERY_CACHE[cache_key] = list(dedupe_list(urls))
                 return urls
             except Exception as e:
                 logger.error(f"[TrustedSearch] Single query failed: {e}")

@@ -2,6 +2,7 @@
 Retrieval Phase: Retrieve semantic and KG candidates.
 """
 
+import asyncio
 import math
 import re
 from hashlib import sha1
@@ -121,6 +122,53 @@ def _claim_context_hash(claim_text: str) -> str:
     return sha1(normalized.encode("utf-8")).hexdigest()[:16]
 
 
+def _kg_fallback_entities(query_text: str, anchors: List[str], entities: List[str]) -> List[str]:
+    """
+    Generic KG fallback expansion:
+    - keep normalized anchors/entities
+    - add noun-phrase chunks from claim text (non domain-specific)
+    """
+    out: List[str] = []
+    seen = set()
+    for source in (anchors or []) + (entities or []):
+        e = str(source or "").strip().lower()
+        if e and e not in seen:
+            seen.add(e)
+            out.append(e)
+    # noun phrase fallback (up to trigrams)
+    tokens = [t for t in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", (query_text or "").lower())]
+    stop = {
+        "the",
+        "and",
+        "or",
+        "with",
+        "without",
+        "from",
+        "into",
+        "that",
+        "this",
+        "those",
+        "these",
+        "may",
+        "might",
+        "could",
+        "should",
+        "would",
+        "health",
+    }
+    clean = [t for t in tokens if t not in stop]
+    for n in (3, 2, 1):
+        for i in range(0, max(0, len(clean) - n + 1)):
+            phrase = " ".join(clean[i : i + n]).strip()
+            if not phrase or phrase in seen:
+                continue
+            seen.add(phrase)
+            out.append(phrase)
+            if len(out) >= 10:
+                return out
+    return out[:10]
+
+
 def _semantic_candidate_anchor_overlap(candidate: Dict[str, Any], anchors: List[str], claim_tokens: set[str]) -> bool:
     statement = str(candidate.get("statement") or "")
     entities = " ".join(str(e) for e in (candidate.get("entities") or []))
@@ -236,6 +284,17 @@ async def retrieve_candidates(
         logger.warning(
             f"[RetrievalPhase:{round_id}] No topics provided; using no-topic fallback for VDB/BM25 retrieval."
         )
+
+    # Run KG retrieval concurrently with semantic retrieval loop.
+    kg_task = asyncio.create_task(
+        kg_retriever.retrieve(
+            all_entities,
+            top_k=top_k,
+            query_text=query_text,
+            claim_anchors=anchors,
+            claim_context_hash=effective_claim_context_hash,
+        )
+    )
 
     for q in queries:
         q_embed = normalize_query_for_embedding(q)
@@ -388,16 +447,31 @@ async def retrieve_candidates(
 
     # KG retrieval
     kg_candidates = []
+    kg_fallback_triggered = False
     try:
-        kg_candidates = await kg_retriever.retrieve(
-            all_entities,
-            top_k=top_k,
-            query_text=query_text,
-            claim_anchors=anchors,
-            claim_context_hash=effective_claim_context_hash,
-        )
+        kg_candidates = await kg_task
     except Exception as e:
         logger.warning(f"[RetrievalPhase:{round_id}] KG retrieval failed: {e}")
+
+    if not kg_candidates:
+        fallback_entities = _kg_fallback_entities(query_text=query_text, anchors=anchors, entities=all_entities)
+        if fallback_entities and fallback_entities != (all_entities or []):
+            kg_fallback_triggered = True
+            logger.info(
+                "[RetrievalPhase:%s] KG fallback triggered with %d expanded entities",
+                round_id,
+                len(fallback_entities),
+            )
+            try:
+                kg_candidates = await kg_retriever.retrieve(
+                    fallback_entities,
+                    top_k=top_k,
+                    query_text=query_text,
+                    claim_anchors=anchors,
+                    claim_context_hash=effective_claim_context_hash,
+                )
+            except Exception as e:
+                logger.warning(f"[RetrievalPhase:{round_id}] KG fallback retrieval failed: {e}")
 
     if anchors and kg_candidates:
         filtered_kg: List[Dict[str, Any]] = []
@@ -475,6 +549,8 @@ async def retrieve_candidates(
             "kg_with_source": kg_with_source,
             "kg_with_positive_score": kg_with_positive_score,
             "kg_max_score": round(kg_max_score, 4),
+            "kg_fallback_triggered": bool(kg_fallback_triggered),
+            "kg_zero_signal": bool(len(kg_candidates) == 0),
         },
         level="debug" if is_debug_enabled() else "info",
     )
@@ -484,6 +560,8 @@ async def retrieve_candidates(
         "sem_filtered": len(dedup_sem),
         "kg_raw": len(kg_candidates),
         "kg_with_score": kg_with_positive_score,
+        "kg_zero_signal": 1 if len(kg_candidates) == 0 else 0,
+        "kg_fallback_triggered": 1 if kg_fallback_triggered else 0,
     }
     if include_metrics:
         return dedup_sem, kg_candidates, metrics

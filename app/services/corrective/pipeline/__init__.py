@@ -610,6 +610,8 @@ class CorrectivePipeline:
         debug_counts = {
             "kg_raw": int(retrieval_metrics.get("kg_raw", len(kg_candidates))),
             "kg_with_score": int(retrieval_metrics.get("kg_with_score", 0)),
+            "kg_zero_signal": bool(int(retrieval_metrics.get("kg_zero_signal", 0) or 0) > 0),
+            "kg_fallback_triggered": bool(int(retrieval_metrics.get("kg_fallback_triggered", 0) or 0) > 0),
             "kg_in_ranked": 0,
             "sem_raw": int(retrieval_metrics.get("sem_raw", 0)),
             "sem_filtered": int(retrieval_metrics.get("sem_filtered", len(dedup_sem))),
@@ -758,6 +760,8 @@ class CorrectivePipeline:
                     "debug_counts": debug_counts,
                     "vdb_signal_count": debug_counts["sem_in_ranked"],
                     "kg_signal_count": debug_counts["kg_in_ranked"],
+                    "kg_zero_signal": bool(debug_counts.get("kg_zero_signal", False)),
+                    "kg_fallback_triggered": bool(debug_counts.get("kg_fallback_triggered", False)),
                     "vdb_signal_sum_top5": round(
                         sum(float(e.get("sem_score", 0.0) or 0.0) for e in top_ranked[:5]),
                         3,
@@ -778,6 +782,8 @@ class CorrectivePipeline:
                         "gain_estimate": 0.0,
                         "kg_timeout_count": 0,
                         "zero_extraction_rounds": 0,
+                        "kg_zero_signal": bool(debug_counts.get("kg_zero_signal", False)),
+                        "kg_fallback_triggered": bool(debug_counts.get("kg_fallback_triggered", False)),
                     },
                     **adaptive_payload,
                 }
@@ -875,6 +881,8 @@ class CorrectivePipeline:
                 "debug_counts": debug_counts,
                 "vdb_signal_count": debug_counts["sem_in_ranked"],
                 "kg_signal_count": debug_counts["kg_in_ranked"],
+                "kg_zero_signal": bool(debug_counts.get("kg_zero_signal", False)),
+                "kg_fallback_triggered": bool(debug_counts.get("kg_fallback_triggered", False)),
                 "vdb_signal_sum_top5": round(
                     sum(float(e.get("sem_score", 0.0) or 0.0) for e in top_ranked[:5]),
                     3,
@@ -894,6 +902,8 @@ class CorrectivePipeline:
                     "gain_estimate": 0.0,
                     "kg_timeout_count": 0,
                     "zero_extraction_rounds": 0,
+                    "kg_zero_signal": bool(debug_counts.get("kg_zero_signal", False)),
+                    "kg_fallback_triggered": bool(debug_counts.get("kg_fallback_triggered", False)),
                 },
                 "llm": get_groq_job_metadata(),
                 **adaptive_payload,
@@ -1134,6 +1144,10 @@ class CorrectivePipeline:
             )
             debug_counts["kg_raw"] = int(retrieval_metrics.get("kg_raw", len(kg_candidates)))
             debug_counts["kg_with_score"] = int(retrieval_metrics.get("kg_with_score", 0))
+            debug_counts["kg_zero_signal"] = bool(int(retrieval_metrics.get("kg_zero_signal", 0) or 0) > 0)
+            debug_counts["kg_fallback_triggered"] = bool(
+                int(retrieval_metrics.get("kg_fallback_triggered", 0) or 0) > 0
+            )
             debug_counts["sem_raw"] = int(retrieval_metrics.get("sem_raw", 0))
             debug_counts["sem_filtered"] = int(retrieval_metrics.get("sem_filtered", len(dedup_sem)))
             await debug_reporter.log_step(
@@ -1475,6 +1489,8 @@ class CorrectivePipeline:
             "debug_counts": debug_counts,
             "vdb_signal_count": debug_counts["sem_in_ranked"],
             "kg_signal_count": debug_counts["kg_in_ranked"],
+            "kg_zero_signal": bool(debug_counts.get("kg_zero_signal", False)),
+            "kg_fallback_triggered": bool(debug_counts.get("kg_fallback_triggered", False)),
             "vdb_signal_sum_top5": round(
                 sum(float(e.get("sem_score", 0.0) or 0.0) for e in top_ranked[:5]),
                 3,
@@ -1495,6 +1511,8 @@ class CorrectivePipeline:
                 "gain_estimate": round(float(gain_estimate or 0.0), 4),
                 "kg_timeout_count": int(kg_timeout_count),
                 "zero_extraction_rounds": int(zero_extraction_rounds),
+                "kg_zero_signal": bool(debug_counts.get("kg_zero_signal", False)),
+                "kg_fallback_triggered": bool(debug_counts.get("kg_fallback_triggered", False)),
             },
             **adaptive_payload,
         }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -133,6 +134,26 @@ class ConfidenceCalibrator:
             p_true = max(0.0, raw_true / total)
             p_false = max(0.0, raw_false / total)
             p_unv = max(0.0, raw_unv / total)
+
+        payload = self._payload or {}
+        # Optional class-conditional temperature scaling from offline artifact.
+        if isinstance(payload, dict):
+            class_temp = payload.get("class_temperature")
+            if isinstance(class_temp, dict):
+                t_true = max(1e-3, float(class_temp.get("true", 1.0) or 1.0))
+                t_false = max(1e-3, float(class_temp.get("false", 1.0) or 1.0))
+                t_unv = max(1e-3, float(class_temp.get("unverifiable", 1.0) or 1.0))
+
+                # Stable logit temperature scaling.
+                def _scaled(prob: float, temp: float) -> float:
+                    p = max(1e-9, min(1.0 - 1e-9, prob))
+                    z = math.log(p / (1.0 - p))
+                    s = z / temp
+                    return 1.0 / (1.0 + math.exp(-max(-30.0, min(30.0, s))))
+
+                p_true = _scaled(p_true, t_true)
+                p_false = _scaled(p_false, t_false)
+                p_unv = _scaled(p_unv, t_unv)
 
         if features:
             coverage = max(0.0, min(1.0, float(features.get("coverage", 0.0) or 0.0)))

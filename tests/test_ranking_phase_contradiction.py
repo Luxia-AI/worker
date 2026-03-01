@@ -30,6 +30,10 @@ async def test_ranking_phase_penalizes_and_deprioritizes_contradicting_evidence(
         return [dict(item) for item in async_ranked]
 
     monkeypatch.setattr("app.services.corrective.pipeline.ranking_phase.hybrid_rank", _fake_hybrid_rank)
+    monkeypatch.setattr(
+        "app.services.corrective.pipeline.ranking_phase._ENTAILMENT_VERIFIER",
+        type("V", (), {"verify_refutes": lambda self, claim, candidates, top_n=5: {}})(),
+    )
 
     ranked = await rank_candidates(
         semantic_candidates=[],
@@ -41,7 +45,8 @@ async def test_ranking_phase_penalizes_and_deprioritizes_contradicting_evidence(
         log_manager=None,
     )
 
-    # Contradicting evidence should be kept out of supporting top-k when
-    # non-contradicting evidence is available.
-    assert len(ranked) == 1
-    assert ranked[0]["stance"] == "entails"
+    # Contradicting evidence should remain admitted but bounded, while
+    # non-contradicting evidence still reaches top-k.
+    assert len(ranked) == 2
+    assert any(item["stance"] == "entails" for item in ranked)
+    assert sum(1 for item in ranked if item["stance"] == "contradicts") <= 1

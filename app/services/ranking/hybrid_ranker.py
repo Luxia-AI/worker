@@ -601,6 +601,7 @@ def hybrid_rank(
     claim_focus_tokens = _claim_focus_tokens(query_text)
     subject_focus_tokens, object_focus_tokens = _relation_focus_tokens(query_text)
     claim_actions = _action_markers(query_text)
+    has_query_context = bool(str(query_text or "").strip())
     belief_claim = _claim_is_belief_or_survey(query_text)
 
     for key, item in candidates_map.items():
