@@ -122,6 +122,10 @@ async def preload_pipeline_on_startup() -> None:
 def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -> dict[str, Any]:
     ranked_evidence = result.get("ranked", []) or []
     verdict_result = result.get("verdict", {}) or {}
+    verdict_evidence = verdict_result.get("evidence", []) if isinstance(verdict_result, dict) else []
+    if not isinstance(verdict_evidence, list):
+        verdict_evidence = []
+    final_evidence = verdict_evidence if verdict_evidence else ranked_evidence
     llm_meta = result.get("llm", {}) or {}
     status = str(result.get("status", "completed") or "completed")
 
@@ -147,7 +151,7 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "key_findings": verdict_result.get("key_findings", []),
         "claim_breakdown": verdict_result.get("claim_breakdown", []),
         "evidence_map": verdict_result.get("evidence_map", []),
-        "evidence_count": len(ranked_evidence),
+        "evidence_count": int(verdict_result.get("evidence_count", len(final_evidence)) or len(final_evidence)),
         "facts_extracted": len(result.get("facts", []) or []),
         "semantic_candidates_count": int(result.get("semantic_candidates_count", 0) or 0),
         "kg_candidates_count": int(result.get("kg_candidates_count", 0) or 0),
@@ -178,13 +182,13 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
             {
                 "statement": e.get("statement", ""),
                 "source_url": e.get("source_url", ""),
-                "score": round(float(e.get("final_score", 0) or 0), 3),
-                "sem_score": round(float(e.get("sem_score", 0.0) or 0.0), 3),
+                "score": round(float(e.get("score", e.get("final_score", 0)) or 0), 3),
+                "sem_score": round(float(e.get("sem_score", e.get("score", 0.0)) or 0.0), 3),
                 "kg_score": round(float(e.get("kg_score", 0.0) or 0.0), 3),
-                "credibility": e.get("credibility"),
+                "credibility": e.get("credibility", 0.5),
                 "grade": e.get("grade", "N/A"),
             }
-            for e in ranked_evidence[:5]
+            for e in final_evidence[:5]
         ],
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "worker_service": SERVICE_NAME,

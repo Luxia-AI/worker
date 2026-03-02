@@ -91,3 +91,26 @@ def test_stance_pipeline_emits_nonzero_refute_admission_stats(monkeypatch):
     assert len(scores) == 2
     assert diag["refute_candidate_count_stage1"] >= 1
     assert diag["refutes_admission_rate"] > 0.0
+
+
+def test_stance_pipeline_support_rows_do_not_inflate_refute_mass(monkeypatch):
+    monkeypatch.setenv("REFUTE_NLI_ENABLED", "false")
+    claim = "Tobacco use is a major cause of preventable death"
+    evidence_map = [
+        {
+            "evidence_id": 0,
+            "statement": "WHO calls tobacco use a leading preventable cause of death.",
+            "relevance": "SUPPORTS",
+            "relevance_score": 0.90,
+            "credibility": 0.8,
+            "scope_alignment": 1.0,
+            "nli_entail_prob": 0.72,
+            "nli_contradict_prob": 0.31,
+            "nli_neutral_prob": 0.28,
+        }
+    ]
+    evidence = [{"statement": evidence_map[0]["statement"], "source_url": "https://who.int/x"}]
+    scores, _ = build_evidence_scores_v2(claim=claim, evidence_map=evidence_map, evidence=evidence, nli_top_n=1)
+    assert len(scores) == 1
+    s = scores[0]
+    assert s.support_score > s.contradict_score

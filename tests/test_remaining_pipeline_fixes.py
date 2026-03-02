@@ -914,7 +914,7 @@ def test_policy_insufficient_never_emits_binary_verdict():
     assert out["verdict"] in {"PARTIALLY_TRUE", "UNVERIFIABLE"}
     assert out["verdict"] not in {"TRUE", "FALSE"}
     assert bool(out.get("trust_gate_binary_lock_applied")) is True
-    assert out.get("display_verdict") in {"MOSTLY_FALSE", "MIXED_OR_UNCLEAR", "MOSTLY_TRUE"}
+    assert out.get("display_verdict") == "PARTIALLY_TRUE"
 
 
 def test_trust_threshold_failure_locks_binary_even_if_policy_field_is_true():
@@ -941,7 +941,43 @@ def test_trust_threshold_failure_locks_binary_even_if_policy_field_is_true():
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out["verdict"] in {"PARTIALLY_TRUE", "UNVERIFIABLE"}
     assert out["verdict"] not in {"TRUE", "FALSE"}
-    assert out.get("display_verdict") in {"MOSTLY_FALSE", "MIXED_OR_UNCLEAR", "MOSTLY_TRUE"}
+    assert out.get("display_verdict") == "PARTIALLY_TRUE"
+
+
+def test_trust_threshold_failure_allows_true_when_decisive_support_is_strong():
+    vg = _vg()
+    claim = "Tobacco use is a major preventable cause of death worldwide"
+    payload = {
+        "verdict": "TRUE",
+        "confidence": 0.61,
+        "truthfulness_percent": 55.0,
+        "policy_sufficient": True,
+        "trust_threshold_met": False,
+        "rationale": "test",
+        "claim_breakdown": [{"claim_segment": claim, "status": "VALID", "evidence_used_ids": [0]}],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "WHO states tobacco use is a leading preventable cause of death worldwide.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.87,
+                "source_url": "https://who.int/tobacco",
+            },
+            {
+                "evidence_id": 1,
+                "statement": "CDC reports tobacco remains a leading preventable cause of death.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.79,
+                "source_url": "https://cdc.gov/tobacco",
+            },
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "TRUE"
+    assert bool(out.get("trust_gate_decisive_override")) is True
+    assert out.get("display_verdict") == "TRUE"
+    assert float(out.get("truthfulness_percent", 0.0) or 0.0) >= 85.0
+    assert float(out.get("confidence", 0.0) or 0.0) >= 0.72
 
 
 def test_trust_failed_display_band_is_conservative_three_band_only():
@@ -958,7 +994,7 @@ def test_trust_failed_display_band_is_conservative_three_band_only():
     }
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out.get("verdict_band") == "MOSTLY_TRUE"
-    assert out.get("display_verdict") == "MOSTLY_TRUE"
+    assert out.get("display_verdict") == "PARTIALLY_TRUE"
     assert float(out.get("truthfulness_percent", 0.0) or 0.0) <= 74.0
     assert float(out.get("confidence", 0.0) or 0.0) <= 0.68
 

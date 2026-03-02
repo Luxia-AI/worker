@@ -6906,13 +6906,39 @@ class VerdictGenerator:
             elif neutral_only_map:
                 verdict = Verdict.PARTIALLY_TRUE.value
 
+        decisive_support_unlock = bool(
+            verdict == Verdict.TRUE.value
+            and has_valid_like
+            and not has_invalid_like
+            and not has_unknown_status
+            and support_mass >= 1.50
+            and contradict_mass <= 0.20
+            and sum(1 for lbl in rel_labels if lbl == "SUPPORTS") >= 2
+        )
+        decisive_refute_unlock = bool(
+            verdict == Verdict.FALSE.value
+            and has_invalid_like
+            and not has_valid_like
+            and not has_unknown_status
+            and contradict_mass >= 1.20
+            and support_mass <= 0.20
+            and sum(1 for lbl in rel_labels if lbl == "REFUTES") >= 2
+        )
+        trust_gate_effective = bool(trust_gate_passed or decisive_support_unlock or decisive_refute_unlock)
+        if trust_gate_effective and not trust_gate_passed:
+            payload["trust_gate_decisive_override"] = True
+            guard_reasons.append("trust_gate_decisive_override")
+
         if not trust_gate_passed and verdict in {Verdict.TRUE.value, Verdict.FALSE.value}:
-            payload["trust_gate_binary_lock_applied"] = True
-            guard_reasons.append("trust_gate_binary_lock")
-            if verdict == Verdict.TRUE.value and has_valid_like:
-                verdict = Verdict.PARTIALLY_TRUE.value
+            if trust_gate_effective:
+                payload["trust_gate_binary_lock_applied"] = False
             else:
-                verdict = Verdict.UNVERIFIABLE.value
+                payload["trust_gate_binary_lock_applied"] = True
+                guard_reasons.append("trust_gate_binary_lock")
+                if verdict == Verdict.TRUE.value and has_valid_like:
+                    verdict = Verdict.PARTIALLY_TRUE.value
+                else:
+                    verdict = Verdict.UNVERIFIABLE.value
         payload["verdict_guard_reasons"] = sorted(set(guard_reasons))
 
         payload["verdict"] = verdict
@@ -6948,7 +6974,11 @@ class VerdictGenerator:
             truth = min(89.0, max(30.0, truth if truth > 0 else 60.0))
         else:
             truth = min(49.0, max(1.0, truth if truth > 0 else 25.0))
-        if not trust_gate_passed:
+        if decisive_support_unlock:
+            truth = max(float(truth), 85.0)
+        elif decisive_refute_unlock:
+            truth = min(float(truth), 15.0)
+        if not trust_gate_passed and not trust_gate_effective:
             # Keep trust-failed outcomes conservative even when evidence looks directional.
             truth = min(74.0, float(truth))
         payload["truthfulness_percent"] = truth
@@ -6957,7 +6987,7 @@ class VerdictGenerator:
         payload["display_verdict"] = self._display_verdict_label(
             verdict=verdict,
             truthfulness_percent=truth,
-            trust_gate_passed=trust_gate_passed,
+            trust_gate_passed=trust_gate_effective,
             analysis_counts=payload.get("analysis_counts"),
         )
 
@@ -6970,7 +7000,9 @@ class VerdictGenerator:
             confidence = max(confidence, 0.50 if best_stmt else 0.35)
         else:
             confidence = max(confidence, 0.30 if best_stmt else 0.20)
-        if not trust_gate_passed:
+        if decisive_support_unlock:
+            confidence = max(confidence, 0.72)
+        if not trust_gate_passed and not trust_gate_effective:
             confidence = min(confidence, 0.68)
         payload["confidence"] = max(0.05, min(0.98, confidence))
         payload["calibrated_confidence"] = payload["confidence"]
@@ -7180,7 +7212,21 @@ class VerdictGenerator:
             )
         except Exception:
             contradict = 0.0
-        return bool((support >= 0.60 and contradict < 0.35) or (contradict >= 0.60 and support < 0.35))
+        support_count = 0
+        contradict_count = 0
+        try:
+            rel = analysis_counts.get("relevance_distribution") or {}
+            if isinstance(rel, dict):
+                support_count = int(rel.get("SUPPORTS", 0) or 0)
+                contradict_count = int(rel.get("REFUTES", 0) or 0)
+        except Exception:
+            support_count = 0
+            contradict_count = 0
+        return bool(
+            (support >= 0.60 and contradict < 0.35)
+            or (contradict >= 0.60 and support < 0.35)
+            or (support >= 0.50 and contradict <= 0.20 and support_count >= 2 and contradict_count == 0)
+        )
 
     def _display_verdict_label(
         self,
@@ -7190,14 +7236,18 @@ class VerdictGenerator:
         analysis_counts: Any,
     ) -> str:
         hard = str(verdict or "").upper()
+        # Preserve multiclass outcomes even when trust gate is not passed.
+        # Trust-failed banding should only coerce hard binary classes.
+        if hard in {Verdict.PARTIALLY_TRUE.value, Verdict.UNVERIFIABLE.value}:
+            return hard
         if not trust_gate_passed:
             return self._trust_failed_band(truthfulness_percent)
         if hard in {Verdict.TRUE.value, Verdict.FALSE.value}:
+            if not isinstance(analysis_counts, dict):
+                return hard
             if self._has_decisive_signal(analysis_counts):
                 return hard
             return self._truthfulness_band(truthfulness_percent)
-        if hard in {Verdict.PARTIALLY_TRUE.value, Verdict.UNVERIFIABLE.value}:
-            return hard
         return self._truthfulness_band(truthfulness_percent)
 
     def _unverifiable_result(self, claim: str, reason: str) -> Dict[str, Any]:

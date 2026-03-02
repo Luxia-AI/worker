@@ -115,6 +115,14 @@ def build_evidence_scores_v2(
             if nli_contra >= 0.45:
                 refute_verified += 1
 
+        # Directional consistency damping:
+        # keep label prior informative when NLI assigns non-trivial opposite mass
+        # on clearly directional evidence.
+        if relevance == "SUPPORTS" and nli_entail >= nli_contra:
+            nli_contra = min(nli_contra, 0.22)
+        elif relevance == "REFUTES" and nli_contra >= nli_entail:
+            nli_entail = min(nli_entail, 0.22)
+
         # Blend label prior and NLI posterior.
         support = _clamp01((0.40 * support_b) + (0.60 * nli_entail))
         refute = _clamp01((0.40 * refute_b) + (0.60 * nli_contra))
