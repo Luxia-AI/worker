@@ -7157,6 +7157,8 @@ class VerdictGenerator:
         p_true = float(class_probs.get("true", 0.0) or 0.0)
         p_false = float(class_probs.get("false", 0.0) or 0.0)
         p_unv = float(class_probs.get("unverifiable", 0.0) or 0.0)
+        support_label_count = sum(1 for lbl in rel_labels if lbl == "SUPPORTS")
+        refute_label_count = sum(1 for lbl in rel_labels if lbl == "REFUTES")
         posterior_unverifiable_dominant = bool(class_probs and p_unv >= 0.55 and p_unv >= (max(p_true, p_false) + 0.05))
         preserve_multiclass = (
             original_verdict == Verdict.PARTIALLY_TRUE.value or has_unknown_status or mixed_status
@@ -7234,9 +7236,32 @@ class VerdictGenerator:
                 )
             )
         )
+        directional_segment_lock = bool(
+            (
+                verdict == Verdict.FALSE.value
+                and has_invalid_like
+                and not has_valid_like
+                and not has_unknown_status
+                and (
+                    refute_label_count >= 1
+                    or segment_refute_confident >= 1
+                    or structural_refute_count >= 1
+                    or contradiction_score_max >= 0.55
+                )
+            )
+            or (
+                verdict == Verdict.TRUE.value
+                and has_valid_like
+                and not has_invalid_like
+                and not has_unknown_status
+                and (support_label_count >= 1 or support_mass >= 0.55 or p_true >= 0.55)
+            )
+        )
         # If posterior strongly favors UNVERIFIABLE, do not promote to truth-leaning class
         # from segment-status heuristics unless there is decisive directional signal.
-        if posterior_unverifiable_dominant and not (decisive_support_unlock or decisive_refute_unlock):
+        if posterior_unverifiable_dominant and not (
+            decisive_support_unlock or decisive_refute_unlock or directional_segment_lock
+        ):
             verdict = Verdict.UNVERIFIABLE.value
             if "posterior_unverifiable_dominant" not in guard_reasons:
                 guard_reasons.append("posterior_unverifiable_dominant")
@@ -7247,15 +7272,11 @@ class VerdictGenerator:
             guard_reasons.append("trust_gate_decisive_override")
 
         if not trust_gate_passed and verdict in {Verdict.TRUE.value, Verdict.FALSE.value}:
-            if trust_gate_effective:
-                payload["trust_gate_binary_lock_applied"] = False
-            else:
-                payload["trust_gate_binary_lock_applied"] = True
-                guard_reasons.append("trust_gate_binary_lock")
-                if verdict == Verdict.TRUE.value and has_valid_like:
-                    verdict = Verdict.PARTIALLY_TRUE.value
-                else:
-                    verdict = Verdict.UNVERIFIABLE.value
+            # Trust is a soft feature: keep mathematically directional verdicts and cap confidence,
+            # instead of coercing label to UNVERIFIABLE.
+            payload["trust_gate_binary_lock_applied"] = False
+            if "trust_gate_soft_feature" not in guard_reasons:
+                guard_reasons.append("trust_gate_soft_feature")
         payload["verdict_guard_reasons"] = sorted(set(guard_reasons))
 
         payload["verdict"] = verdict
@@ -7366,6 +7387,47 @@ class VerdictGenerator:
                         payload["class_probs"] = {"true": 0.20, "false": 0.20, "unverifiable": 0.60}
                     calibration_meta_existing["class_probs_resynced"] = True
                     payload["calibration_meta"] = calibration_meta_existing
+        # Keep posterior distribution consistent with final directional verdict when
+        # segment/status evidence is strong but probabilistic UNVERIFIABLE prior is conservative.
+        probs_now = payload.get("class_probs") if isinstance(payload.get("class_probs"), dict) else {}
+        if probs_now:
+            p_true_now = float(probs_now.get("true", 0.0) or 0.0)
+            p_false_now = float(probs_now.get("false", 0.0) or 0.0)
+            p_unv_now = float(probs_now.get("unverifiable", 0.0) or 0.0)
+            max_cls_now = "true"
+            max_val_now = p_true_now
+            if p_false_now > max_val_now:
+                max_cls_now = "false"
+                max_val_now = p_false_now
+            if p_unv_now > max_val_now:
+                max_cls_now = "unverifiable"
+                max_val_now = p_unv_now
+            if (
+                verdict == Verdict.FALSE.value
+                and directional_segment_lock
+                and max_cls_now != "false"
+                and max_val_now >= 0.55
+            ):
+                payload["class_probs"] = {"true": 0.12, "false": 0.72, "unverifiable": 0.16}
+                meta = payload.get("calibration_meta")
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta["class_probs_resynced"] = True
+                meta["class_probs_resync_reason"] = "directional_false_lock"
+                payload["calibration_meta"] = meta
+            elif (
+                verdict == Verdict.TRUE.value
+                and directional_segment_lock
+                and max_cls_now != "true"
+                and max_val_now >= 0.55
+            ):
+                payload["class_probs"] = {"true": 0.72, "false": 0.12, "unverifiable": 0.16}
+                meta = payload.get("calibration_meta")
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta["class_probs_resynced"] = True
+                meta["class_probs_resync_reason"] = "directional_true_lock"
+                payload["calibration_meta"] = meta
         if not isinstance(payload.get("calibration_meta"), dict):
             payload["calibration_meta"] = {"calibrator_version": payload.get("calibration_version")}
         if not isinstance(payload.get("evidence_attribution"), list):

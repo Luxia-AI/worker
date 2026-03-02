@@ -1647,3 +1647,51 @@ def test_false_verdict_not_locked_when_segment_refutation_is_structurally_confid
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out["verdict"] == "FALSE"
     assert bool(out.get("trust_gate_decisive_override")) is True
+
+
+def test_directional_invalid_segment_overrides_unverifiable_posterior_lock():
+    vg = _vg()
+    claim = "Breast cancer affects only women"
+    payload = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.49,
+        "truthfulness_percent": 36.0,
+        "policy_sufficient": True,
+        "trust_threshold_met": False,
+        "class_probs": {"true": 0.16, "false": 0.07, "unverifiable": 0.77},
+        "calibration_meta": {"v2_policy_active": True},
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": claim,
+                "status": "INVALID",
+                "supporting_fact": "Breast cancer affects men.",
+                "source_url": "https://my.clevelandclinic.org/health/diseases/3986-breast-cancer",
+                "evidence_used_ids": [0],
+            }
+        ],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Breast cancer affects men.",
+                "relevance": "REFUTES",
+                "relevance_score": 0.98,
+                "predicate_match_score": 1.0,
+                "object_match_ok": True,
+                "nli_contradict_prob": 0.66,
+                "contradiction_score": 0.74,
+                "source_url": "https://my.clevelandclinic.org/health/diseases/3986-breast-cancer",
+            },
+            {
+                "evidence_id": 1,
+                "statement": "Breast cancer affects women.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.88,
+                "source_url": "https://pubmed.ncbi.nlm.nih.gov/12928347/",
+            },
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "FALSE"
+    probs = out.get("class_probs") or {}
+    assert float(probs.get("false", 0.0) or 0.0) >= float(probs.get("unverifiable", 0.0) or 0.0)
