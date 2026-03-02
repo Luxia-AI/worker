@@ -241,12 +241,17 @@ class VerdictGenerator:
         self.MAX_WEB_ROUNDS_PRE_VERDICT = int(os.getenv("VERDICT_MAX_WEB_ROUNDS_PRE", "4"))
         self.WEB_SEGMENTS_LIMIT = int(os.getenv("VERDICT_WEB_SEGMENTS_LIMIT", "5"))
         self.MAX_UNKNOWN_ROUNDS_POST_VERDICT = int(os.getenv("VERDICT_MAX_UNKNOWN_ROUNDS_POST", "4"))
-        self.v2_enabled = os.getenv("VERDICT_ENGINE_V2_ENABLED", "false").strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
+        v2_enabled_env = os.getenv("VERDICT_ENGINE_V2_ENABLED")
+        if v2_enabled_env is None:
+            # Default-on for deterministic evidence policy. Can be disabled explicitly.
+            self.v2_enabled = True
+        else:
+            self.v2_enabled = v2_enabled_env.strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
         self.v2_shadow = os.getenv("VERDICT_ENGINE_V2_SHADOW", "true").strip().lower() in {
             "1",
             "true",
@@ -2257,6 +2262,12 @@ class VerdictGenerator:
                 v2_stance_diag = {}
                 v2_enabled = False
         if not v2_enabled:
+            supports_in_map = sum(
+                1 for ev in (evidence_map or []) if str(ev.get("relevance") or "").strip().upper() == "SUPPORTS"
+            )
+            refutes_in_map = sum(
+                1 for ev in (evidence_map or []) if str(ev.get("relevance") or "").strip().upper() == "REFUTES"
+            )
             raw_true_signal = max(
                 0.0,
                 min(
@@ -2275,6 +2286,12 @@ class VerdictGenerator:
                     + (0.15 * float(admissible_ratio or 0.0)),
                 ),
             )
+            # Reduce false posterior inflation when no refuting evidence is admitted.
+            if refutes_in_map == 0 and supports_in_map > 0 and not explicit_refutes_found:
+                raw_false_signal *= 0.55
+                raw_true_signal = min(1.0, raw_true_signal * 1.05)
+            elif explicit_refutes_found and supports_in_map == 0:
+                raw_false_signal = min(1.0, raw_false_signal * 1.10)
             raw_unv_signal = max(
                 0.0,
                 min(
@@ -2487,6 +2504,30 @@ class VerdictGenerator:
 
         key_findings = self._build_evidence_grounded_key_findings(claim_breakdown, evidence_map)
         direct_evidence = self._build_direct_evidence_list(claim_breakdown, evidence_map)
+        evidence_for_payload = list(evidence or [])
+        evidence_backfilled_from_map = False
+        if not evidence_for_payload and evidence_map:
+            # Preserve payload consistency when ranking produced sparse/empty top-k
+            # but validated evidence_map rows exist.
+            evidence_backfilled_from_map = True
+            for item in evidence_map:
+                if not isinstance(item, dict):
+                    continue
+                stmt = str(item.get("statement") or "").strip()
+                if not stmt:
+                    continue
+                evidence_for_payload.append(
+                    {
+                        "statement": stmt,
+                        "source_url": str(item.get("source_url") or ""),
+                        "score": float(item.get("relevance_score", 0.0) or 0.0),
+                        "sem_score": float(item.get("relevance_score", 0.0) or 0.0),
+                        "kg_score": 0.0,
+                        "credibility": float(item.get("credibility", 0.5) or 0.5),
+                    }
+                )
+                if len(evidence_for_payload) >= 12:
+                    break
         evidence_attribution = [
             {
                 "segment": str(seg.get("claim_segment") or ""),
@@ -2530,10 +2571,12 @@ class VerdictGenerator:
             "rationale": rationale,
             "claim_breakdown": claim_breakdown,
             "evidence_map": evidence_map,
+            "evidence": evidence_for_payload,
             "key_findings": key_findings,
             "direct_evidence": direct_evidence,
             "claim": claim,
-            "evidence_count": len(evidence),
+            "evidence_count": len(evidence_for_payload),
+            "evidence_backfilled_from_map": bool(evidence_backfilled_from_map),
             "required_segments_count": reconciled["required_segments_count"],
             "resolved_segments_count": reconciled["resolved_segments_count"],
             "required_segments_resolved": reconciled["required_segments_resolved"],
@@ -2582,6 +2625,7 @@ class VerdictGenerator:
             },
             "analysis_counts": {
                 "evidence_total_input": len(evidence),
+                "evidence_total_payload": len(evidence_for_payload),
                 "evidence_map_count": len(evidence_map or []),
                 "claim_breakdown_count": len(claim_breakdown or []),
                 "admissible_evidence_count": admissible_count,
@@ -2626,7 +2670,7 @@ class VerdictGenerator:
                 "refutes_admission_rate": round(float(v2_stance_diag.get("refutes_admission_rate", 0.0) or 0.0), 4),
             },
         }
-        verdict_payload = self._enforce_binary_verdict_payload(claim, verdict_payload, evidence=evidence)
+        verdict_payload = self._enforce_binary_verdict_payload(claim, verdict_payload, evidence=evidence_for_payload)
         log_value_payload(
             logger,
             "verdict",
