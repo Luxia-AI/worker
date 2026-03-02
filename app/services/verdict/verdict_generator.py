@@ -3013,8 +3013,15 @@ class VerdictGenerator:
         low = text.lower()
         patterns = (
             r"\bdo(?:es)?\s+not\b",
+            r"\bdon['’]?t\b",
+            r"\bdoesn['’]?t\b",
+            r"\bdidn['’]?t\b",
             r"\bcannot\b",
             r"\bno evidence\b",
+            r"\bnot recommended\b",
+            r"\bnot effective\b",
+            r"\bineffective\b",
+            r"\bdo(?:es)?\s+not\s+work\b",
             r"\bdoes\s+not\s+enter\b",
             r"\bdoes\s+not\s+integrate\b",
             r"\bcannot\s+alter\b",
@@ -3274,6 +3281,24 @@ class VerdictGenerator:
             )
         )
         if seg_neg_assoc and stmt_pos_assoc and anchor_overlap >= 0.30:
+            return "contradicts"
+
+        seg_therapeutic_claim = bool(
+            re.search(
+                r"\b(standard treatment|treatment|recommended|effective|efficacious|works?)\b",
+                seg,
+            )
+        )
+        stmt_inefficacy = bool(
+            re.search(
+                (
+                    r"\b(don['’]?t|doesn['’]?t|didn['’]?t|do\s+not|does\s+not|did\s+not|"
+                    r"ineffective|not effective|not recommended)\b"
+                ),
+                stmt,
+            )
+        )
+        if seg_therapeutic_claim and stmt_inefficacy and anchor_overlap >= 0.20:
             return "contradicts"
 
         if stance_l in {"entails", "contradicts"}:
@@ -4608,7 +4633,7 @@ class VerdictGenerator:
                         and predicate_match_score >= 0.4
                         and (claim_neg != stmt_neg)
                     )
-                    or (polarity_rel == "contradicts" and predicate_match_score >= 0.4)
+                    or (polarity_rel == "contradicts" and (predicate_match_score >= 0.25 or anchor_score >= 0.45))
                     or numeric_rel == "CONTRADICTS"
                     or dna_rel == "CONTRADICTS"
                 )
@@ -4657,6 +4682,11 @@ class VerdictGenerator:
                         and not self._is_reporting_statement(statement)
                         and not self._is_claim_mention_statement(statement)
                     )
+                    # Absolute claims ("only/all/every/always") require
+                    # absolute-support evidence; non-absolute evidence should
+                    # not be promoted to SUPPORTS.
+                    if self._has_absolute_quantifier(claim) and not self._has_absolute_quantifier(statement):
+                        support_gate = False
                     # Numeric exact-match can support if predicate and anchor are both present.
                     if numeric_rel == "SUPPORTS" and predicate_match_score >= PREDICATE_MATCH_THRESHOLD:
                         support_gate = support_gate or (anchor_score >= ANCHOR_THRESHOLD)
@@ -7076,6 +7106,24 @@ class VerdictGenerator:
                 and float(item.get("predicate_match_score", 0.0) or 0.0) >= 0.35
             )
         )
+        segment_refute_confident = 0
+        for seg in claim_breakdown or []:
+            st = str(seg.get("status") or "").upper()
+            if st not in {"INVALID", "PARTIALLY_INVALID"}:
+                continue
+            seg_text = str(seg.get("claim_segment") or "").strip()
+            seg_fact = str(seg.get("supporting_fact") or "").strip()
+            if not seg_text or not seg_fact:
+                continue
+            pol = self._segment_polarity(seg_text, seg_fact, stance="neutral")
+            pred = float(self.compute_predicate_match(seg_text, seg_fact) or 0.0)
+            anch = float(self._segment_anchor_overlap(seg_text, seg_fact) or 0.0)
+            contra = float(self._contradiction_score(seg_text, seg_fact) or 0.0)
+            explicit_refute = bool(self._is_explicit_refutation_statement(seg_fact))
+            if (pol == "contradicts" and (pred >= 0.25 or anch >= 0.45 or contra >= 0.45)) or (
+                explicit_refute and anch >= 0.20 and (pred >= 0.15 or contra >= 0.20)
+            ):
+                segment_refute_confident += 1
         neutral_only_map = bool(rel_labels) and all(lbl == "NEUTRAL" for lbl in rel_labels)
         high_impact_action_claim = bool(
             re.search(
@@ -7179,6 +7227,10 @@ class VerdictGenerator:
                 )
                 or (
                     structural_refute_count >= 1 and contradiction_score_max >= 0.62 and nli_contradict_prob_max >= 0.62
+                )
+                or (
+                    segment_refute_confident >= 1
+                    and (contradict_mass >= 0.35 or structural_refute_count >= 1 or p_false >= 0.45)
                 )
             )
         )

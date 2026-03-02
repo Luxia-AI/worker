@@ -1586,3 +1586,64 @@ def test_class_probs_resynced_to_final_verdict_when_v2_not_active():
     probs = out.get("class_probs") or {}
     assert float(probs.get("unverifiable", 0.0) or 0.0) >= 0.60
     assert bool((out.get("calibration_meta") or {}).get("class_probs_resynced", False)) is True
+
+
+def test_absolute_claim_requires_absolute_support_evidence():
+    vg = _vg()
+    claim = "Breast cancer affects only women."
+    statement = "Breast cancer affects women age 50 and older."
+    evidence = [
+        {
+            "statement": statement,
+            "source_url": "https://example.org/bc",
+            "final_score": 0.82,
+            "credibility": 0.95,
+        }
+    ]
+    evidence_map = [
+        {
+            "evidence_id": 0,
+            "statement": statement,
+            "relevance": "SUPPORTS",
+            "relevance_score": 0.82,
+            "source_url": "https://example.org/bc",
+        }
+    ]
+    normalized = vg._normalize_evidence_map(claim, evidence_map, evidence)
+    assert normalized
+    assert str(normalized[0].get("relevance") or "").upper() != "SUPPORTS"
+
+
+def test_false_verdict_not_locked_when_segment_refutation_is_structurally_confident():
+    vg = _vg()
+    claim = "Antibiotics as the standard treatment for common viral colds"
+    payload = {
+        "verdict": "FALSE",
+        "confidence": 0.62,
+        "truthfulness_percent": 32.0,
+        "policy_sufficient": True,
+        "trust_threshold_met": False,
+        "class_probs": {"true": 0.18, "false": 0.52, "unverifiable": 0.30},
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": claim,
+                "status": "INVALID",
+                "supporting_fact": "Because viruses cause colds, antibiotics don't work for colds.",
+                "source_url": "https://my.clevelandclinic.org/health/diseases/12342-common-cold",
+                "evidence_used_ids": [0],
+            }
+        ],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Because viruses cause colds, antibiotics don't work for colds.",
+                "relevance": "NEUTRAL",
+                "relevance_score": 0.34,
+                "source_url": "https://my.clevelandclinic.org/health/diseases/12342-common-cold",
+            }
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "FALSE"
+    assert bool(out.get("trust_gate_decisive_override")) is True
