@@ -40,3 +40,38 @@ def test_cache_does_not_short_circuit_when_coverage_not_full_even_if_llm_breakdo
     }
     verdict_result = {"required_segments_resolved": True}
     assert not CorrectivePipeline._cache_fast_path_allowed(adaptive_trust, verdict_result)
+
+
+def test_cache_does_not_short_circuit_when_unverifiable_probability_dominates():
+    adaptive_trust = {"is_sufficient": True, "trust_post": 0.90}
+    verdict_result = {
+        "verdict": "PARTIALLY_TRUE",
+        "required_segments_resolved": True,
+        "class_probs": {"true": 0.20, "false": 0.21, "unverifiable": 0.59},
+    }
+    assert not CorrectivePipeline._cache_fast_path_allowed(adaptive_trust, verdict_result)
+
+
+def test_cache_does_not_short_circuit_on_behavior_mismatch_support():
+    adaptive_trust = {
+        "is_sufficient": True,
+        "trust_post": 0.90,
+        "coverage": 1.0,
+        "num_subclaims": 1,
+        "strong_covered": 1,
+    }
+    verdict_result = {
+        "verdict": "PARTIALLY_TRUE",
+        "required_segments_resolved": True,
+        "class_probs": {"true": 0.58, "false": 0.25, "unverifiable": 0.17},
+        "claim": "WHO declares that physical activity increases the risk of heart disease in adults",
+        "claim_breakdown": [
+            {
+                "claim_segment": "physical activity increases the risk of heart disease in adults",
+                "status": "VALID",
+                "supporting_fact": "Adults with sleep deprivation are at increased risk of health issues.",
+                "alignment_debug": {"predicate_match_score": 0.82},
+            }
+        ],
+    }
+    assert not CorrectivePipeline._cache_fast_path_allowed(adaptive_trust, verdict_result)

@@ -3292,6 +3292,58 @@ class VerdictGenerator:
         return "neutral"
 
     @staticmethod
+    def _strip_reporting_attribution_prefix(text: str) -> str:
+        """
+        Remove leading attribution/reporting frames so semantic matching focuses
+        on the factual proposition, not "who states/declares".
+        """
+        low = re.sub(r"\s+", " ", str(text or "").strip())
+        if not low:
+            return ""
+        reporting_verbs = (
+            r"(?:says|said|states|stated|declares|declared|reports|reported|"
+            r"announces|announced|notes|noted|warns|warned|indicates|indicated|"
+            r"claims|claimed)"
+        )
+        patterns = (
+            (
+                r"^(?:according to [^,;:.]{2,120}[,:\-]\s*)?(?:[^,;:.]{2,140}\b"
+                + reporting_verbs
+                + r"\b)\s+that\s+(?P<rest>.+)$"
+            ),
+            (
+                r"^(?:according to [^,;:.]{2,120}[,:\-]\s*)?(?:[^,;:.]{2,140}\b"
+                + reporting_verbs
+                + r"\b)\s+(?P<rest>.+)$"
+            ),
+        )
+        for pat in patterns:
+            m = re.match(pat, low, flags=re.IGNORECASE)
+            if not m:
+                continue
+            rest = re.sub(r"\s+", " ", str(m.group("rest") or "").strip(" ,.;:"))
+            if len(rest) >= 12:
+                return rest
+        return low
+
+    @staticmethod
+    def _behavior_anchor_tags(text: str) -> set[str]:
+        low = (text or "").lower()
+        tags: set[str] = set()
+        patterns = {
+            "physical_activity": r"\b(physical activity|exercise|active lifestyle|aerobic|workout|training)\b",
+            "sedentary": r"\b(sedentary|physical inactivity|inactive lifestyle|sitting time)\b",
+            "sleep": r"\b(sleep|sleep deprivation|insomnia|sleep duration|sleep quality)\b",
+            "smoking": r"\b(smoking|smoker|tobacco|nicotine)\b",
+            "alcohol": r"\b(alcohol|drinking|binge drinking)\b",
+            "fasting": r"\b(fasting|time-restricted eating|intermittent fasting)\b",
+        }
+        for tag, pat in patterns.items():
+            if re.search(pat, low):
+                tags.add(tag)
+        return tags
+
+    @staticmethod
     def _intervention_anchor_tokens(text: str) -> set[str]:
         low = (text or "").lower()
         categories = {
@@ -3308,6 +3360,11 @@ class VerdictGenerator:
                 r"\b(drug|drugs|medication|medications|medicine|medicines|pharmaceutical|therapy|"
                 r"antibiotic|insulin|statin|metformin)\b"
             ),
+            "behavior": (
+                r"\b(physical activity|exercise|sedentary|sleep|sleep deprivation|insomnia|"
+                r"smoking|tobacco|alcohol|drinking|binge drinking|"
+                r"time-restricted eating|intermittent fasting)\b"
+            ),
         }
         out: set[str] = set()
         for label, pattern in categories.items():
@@ -3316,10 +3373,12 @@ class VerdictGenerator:
         return out
 
     def _intervention_alignment(self, claim_text: str, evidence_text: str) -> tuple[bool, bool]:
-        claim_anchors = self._intervention_anchor_tokens(claim_text)
-        evidence_anchors = self._intervention_anchor_tokens(evidence_text)
-        claim_low = (claim_text or "").lower()
-        evidence_low = (evidence_text or "").lower()
+        claim_effective = self._strip_reporting_attribution_prefix(claim_text)
+        evidence_effective = self._strip_reporting_attribution_prefix(evidence_text)
+        claim_anchors = self._intervention_anchor_tokens(claim_effective)
+        evidence_anchors = self._intervention_anchor_tokens(evidence_effective)
+        claim_low = (claim_effective or "").lower()
+        evidence_low = (evidence_effective or "").lower()
 
         # If claim has no intervention anchors, do not block refutation eligibility.
         if not claim_anchors:
@@ -3343,8 +3402,10 @@ class VerdictGenerator:
         # Intervention mismatch guard: food/diet evidence cannot refute supplement/drug claims and vice versa.
         claim_food = "food" in claim_anchors
         claim_med = bool({"supplement", "drug"} & claim_anchors)
+        claim_behavior = "behavior" in claim_anchors
         ev_food = "food" in evidence_anchors
         ev_med = bool({"supplement", "drug"} & evidence_anchors)
+        ev_behavior = "behavior" in evidence_anchors
         claim_food_terms = set(
             re.findall(r"\b(fruit|fruits|vegetable|vegetables|whole[-\s]?grain|legume|fiber|fibre|diet)\b", claim_low)
         )
@@ -3355,7 +3416,20 @@ class VerdictGenerator:
             )
         )
         shared_food_specific = {t for t in (claim_food_terms & ev_food_terms) if t not in {"diet"}}
-        mismatch = (claim_food and ev_med and len(shared_food_specific) == 0) or (claim_med and ev_food and not ev_med)
+        claim_behavior_tags = self._behavior_anchor_tags(claim_low)
+        ev_behavior_tags = self._behavior_anchor_tags(evidence_low)
+        behavior_mismatch = False
+        if claim_behavior and ev_behavior:
+            behavior_mismatch = bool(
+                claim_behavior_tags and ev_behavior_tags and not (claim_behavior_tags & ev_behavior_tags)
+            )
+        elif claim_behavior and not ev_behavior:
+            behavior_mismatch = bool(claim_behavior_tags)
+        mismatch = (
+            (claim_food and ev_med and len(shared_food_specific) == 0)
+            or (claim_med and ev_food and not ev_med)
+            or behavior_mismatch
+        )
         return (not mismatch), True
 
     @staticmethod
@@ -3705,7 +3779,7 @@ class VerdictGenerator:
         return overlap >= 0.40
 
     def _extract_canonical_predicate_triplet(self, text: str) -> Dict[str, str]:
-        low = (text or "").strip().lower()
+        low = self._strip_reporting_attribution_prefix(text).strip().lower()
         has_explicit_relation_verb = bool(
             re.search(
                 (
@@ -4011,8 +4085,10 @@ class VerdictGenerator:
         return True
 
     def compute_predicate_match(self, claim_text: str, evidence_text: str) -> float:
-        claim_t = self._extract_canonical_predicate_triplet(claim_text)
-        ev_t = self._extract_canonical_predicate_triplet(evidence_text)
+        claim_effective = self._strip_reporting_attribution_prefix(claim_text)
+        evidence_effective = self._strip_reporting_attribution_prefix(evidence_text)
+        claim_t = self._extract_canonical_predicate_triplet(claim_effective)
+        ev_t = self._extract_canonical_predicate_triplet(evidence_effective)
         cp = str(claim_t.get("canonical_predicate") or "")
         ep = str(ev_t.get("canonical_predicate") or "")
         if not cp:
@@ -4025,11 +4101,11 @@ class VerdictGenerator:
         ep_tokens = [self._lemma_token(t) for t in ep.split() if t]
         overlap = len(set(cp_tokens) & set(ep_tokens)) / max(1, len(set(cp_tokens)))
         lexical_predicate_overlap = overlap > 0.0
-        pol = self._segment_polarity(claim_text, evidence_text, stance="neutral")
-        anchor_overlap = self._segment_anchor_overlap(claim_text, evidence_text)
+        pol = self._segment_polarity(claim_effective, evidence_effective, stance="neutral")
+        anchor_overlap = self._segment_anchor_overlap(claim_effective, evidence_effective)
         claim_subject_tokens = {
             t
-            for t in self._segment_subject_tokens(claim_text)
+            for t in self._segment_subject_tokens(claim_effective)
             if t
             not in {
                 "may",
@@ -4049,7 +4125,7 @@ class VerdictGenerator:
                 "from",
             }
         }
-        evidence_tokens = self._statement_tokens(evidence_text)
+        evidence_tokens = self._statement_tokens(evidence_effective)
         subject_overlap_ratio = (
             len({self._lemma_token(t) for t in claim_subject_tokens} & {self._lemma_token(t) for t in evidence_tokens})
             / max(1, len(claim_subject_tokens))
@@ -4057,11 +4133,11 @@ class VerdictGenerator:
             else 0.0
         )
         subject_guard_ok = (not claim_subject_tokens) or subject_overlap_ratio >= 0.2 or anchor_overlap >= 0.55
-        full_claim_buckets = self._predicate_bucket_tokens(claim_text)
-        full_ev_buckets = self._predicate_bucket_tokens(evidence_text)
+        full_claim_buckets = self._predicate_bucket_tokens(claim_effective)
+        full_ev_buckets = self._predicate_bucket_tokens(evidence_effective)
         full_bucket_overlap = bool(full_claim_buckets and full_ev_buckets and (full_claim_buckets & full_ev_buckets))
-        claim_low = (claim_text or "").lower()
-        evidence_low = (evidence_text or "").lower()
+        claim_low = (claim_effective or "").lower()
+        evidence_low = (evidence_effective or "").lower()
         claim_preventive = bool(
             re.search(r"\b(prevent|prevents|prevented|preventing|protection|protects?)\b", claim_low)
         )
@@ -4148,9 +4224,9 @@ class VerdictGenerator:
         ):
             return 0.7
         if (
-            self._object_semantic_equivalent(claim_text, evidence_text)
+            self._object_semantic_equivalent(claim_effective, evidence_effective)
             and (
-                self._predicate_semantic_equivalent(cp_full + " " + claim_text, ep_full + " " + evidence_text)
+                self._predicate_semantic_equivalent(cp_full + " " + claim_effective, ep_full + " " + evidence_effective)
                 or pol in {"entails", "contradicts"}
             )
             and subject_guard_ok
@@ -4517,6 +4593,7 @@ class VerdictGenerator:
                         predicate_match_score >= PREDICATE_MATCH_THRESHOLD
                         and anchor_score >= max(0.25, ANCHOR_THRESHOLD - 0.05)
                         and object_overlap_ok
+                        and intervention_match
                         and support_polarity_ok
                         and (
                             support_strength >= support_strength_threshold
@@ -4691,6 +4768,9 @@ class VerdictGenerator:
                 rel_score = float(em.get("relevance_score", 0.0) or 0.0)
                 predicate_match_score = float(self.compute_predicate_match(segment, statement) or 0.0)
                 support_strength = float(em.get("support_strength", 0.0) or 0.0)
+                intervention_match_local = bool(em.get("intervention_match", False))
+                segment_intervention_constrained = bool(self._intervention_anchor_tokens(segment))
+                intervention_ok_for_support = intervention_match_local or (not segment_intervention_constrained)
                 contradiction_score = float(
                     em.get("contradiction_score", self._contradiction_score(segment, statement))
                 )
@@ -4701,6 +4781,7 @@ class VerdictGenerator:
                     rel == "NEUTRAL"
                     and predicate_match_score >= strict_predicate_threshold
                     and anchor_overlap >= max(0.20, ANCHOR_THRESHOLD - 0.10)
+                    and intervention_ok_for_support
                     and (support_strength >= support_strength_threshold or rel_score >= 0.55)
                     and polarity != "contradicts"
                 )
@@ -4711,11 +4792,13 @@ class VerdictGenerator:
                         anchor_overlap >= max(0.20, ANCHOR_THRESHOLD - 0.10)
                         or (predicate_match_score >= 0.7 and support_strength >= 0.55 and rel_score >= 0.45)
                     )
+                    and intervention_ok_for_support
                     and (support_strength >= support_strength_threshold or rel_score >= 0.55)
                 )
                 noun_phrase_support_ok = (
                     (not segment_has_predicate)
                     and rel in {"SUPPORTS", "NEUTRAL"}
+                    and intervention_ok_for_support
                     and anchor_overlap >= 0.30
                     and (content_overlap >= 1 or self._object_semantic_equivalent(segment, statement))
                     and rel_score >= 0.30

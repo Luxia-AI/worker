@@ -153,18 +153,68 @@ class CorrectivePipeline:
 
     @staticmethod
     def _cache_fast_path_allowed(adaptive_trust: Dict[str, Any], verdict_result: Dict[str, Any]) -> bool:
+        def _tokens(text: str) -> set[str]:
+            stop = {
+                "the",
+                "a",
+                "an",
+                "and",
+                "or",
+                "but",
+                "to",
+                "for",
+                "of",
+                "in",
+                "on",
+                "with",
+                "by",
+                "at",
+                "is",
+                "are",
+                "was",
+                "were",
+                "be",
+                "been",
+                "being",
+            }
+            return {w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", str(text or "").lower()) if w not in stop}
+
+        def _behavior_tags(text: str) -> set[str]:
+            low = str(text or "").lower()
+            tags: set[str] = set()
+            patterns = {
+                "physical_activity": r"\b(physical activity|exercise|active lifestyle|aerobic|workout|training)\b",
+                "sedentary": r"\b(sedentary|physical inactivity|inactive lifestyle|sitting time)\b",
+                "sleep": r"\b(sleep|sleep deprivation|insomnia|sleep duration|sleep quality)\b",
+                "smoking": r"\b(smoking|smoker|tobacco|nicotine)\b",
+                "alcohol": r"\b(alcohol|drinking|binge drinking)\b",
+                "fasting": r"\b(fasting|time-restricted eating|intermittent fasting)\b",
+            }
+            for tag, pat in patterns.items():
+                if re.search(pat, low):
+                    tags.add(tag)
+            return tags
+
         if not bool(adaptive_trust.get("is_sufficient", False)):
             return False
         verdict = str(verdict_result.get("verdict") or "").upper()
         if verdict == "UNVERIFIABLE":
             return False
+        class_probs = verdict_result.get("class_probs") or {}
+        if isinstance(class_probs, dict):
+            try:
+                unv_prob = float(class_probs.get("unverifiable", class_probs.get("UNVERIFIABLE", 0.0)) or 0.0)
+            except Exception:
+                unv_prob = 0.0
+            if unv_prob >= 0.50:
+                return False
 
         # Deterministic gate from adaptive trust metrics (not LLM phrasing).
         coverage = float(adaptive_trust.get("coverage", 0.0) or 0.0)
         num_subclaims = int(adaptive_trust.get("num_subclaims", 0) or 0)
         strong_covered = int(adaptive_trust.get("strong_covered", 0) or 0)
         if num_subclaims > 0:
-            if strong_covered >= num_subclaims and coverage >= 0.99:
+            if strong_covered >= num_subclaims and coverage >= 0.99 and not verdict_result:
                 return True
             if coverage < 0.99:
                 return False
@@ -200,6 +250,32 @@ class CorrectivePipeline:
             }
             if "no_relevant_evidence" in unresolved_reasons or "insufficient_admissible_evidence" in unresolved_reasons:
                 return False
+            min_pred_match = float(os.getenv("CACHE_FASTPATH_MIN_PREDICATE_MATCH", "0.72") or 0.72)
+            claim_text = str(verdict_result.get("claim") or "")
+            claim_behavior = _behavior_tags(claim_text)
+            for seg in claim_breakdown:
+                status = str(seg.get("status") or "UNKNOWN").upper()
+                if status not in {"VALID", "PARTIALLY_VALID"}:
+                    continue
+                align_dbg = seg.get("alignment_debug") or {}
+                try:
+                    pred_match = float(align_dbg.get("predicate_match_score", 0.0) or 0.0)
+                except Exception:
+                    pred_match = 0.0
+                if pred_match < min_pred_match:
+                    return False
+                seg_text = str(seg.get("claim_segment") or "")
+                fact_text = str(seg.get("supporting_fact") or "")
+                seg_tokens = _tokens(seg_text)
+                fact_tokens = _tokens(fact_text)
+                if seg_tokens and fact_tokens:
+                    lexical_coverage = len(seg_tokens & fact_tokens) / max(1, len(seg_tokens))
+                    if lexical_coverage < 0.30:
+                        return False
+                if claim_behavior:
+                    fact_behavior = _behavior_tags(fact_text)
+                    if fact_behavior and not (claim_behavior & fact_behavior):
+                        return False
 
         if "required_segments_resolved" in verdict_result:
             return bool(verdict_result.get("required_segments_resolved", False))

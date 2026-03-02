@@ -1409,3 +1409,30 @@ def test_segment_valid_is_forced_invalid_when_supporting_fact_semantically_refut
     out = vg._enforce_segment_evidence_polarity_consistency(claim_breakdown, evidence_map)
     assert out[0]["status"] == "INVALID"
     assert str(evidence_map[0].get("relevance") or "").upper() == "REFUTES"
+
+
+def test_behavior_mismatch_is_not_admitted_as_support():
+    vg = _vg()
+    claim = "WHO declares that physical activity increases the risk of heart disease in adults"
+    statement = "Adults and the elderly who sleep less than 7 h are at increased risk of health issues."
+    evidence = [
+        {
+            "statement": statement,
+            "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC12116485/",
+            "final_score": 0.68,
+            "credibility": 0.95,
+            "anchor_match_score": 0.4,
+        }
+    ]
+    evidence_map = [
+        {
+            "evidence_id": 0,
+            "statement": statement,
+            "relevance": "SUPPORTS",
+            "relevance_score": 0.68,
+            "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC12116485/",
+        }
+    ]
+    normalized = vg._normalize_evidence_map(claim, evidence_map, evidence)
+    assert normalized
+    assert normalized[0]["relevance"] != "SUPPORTS"
