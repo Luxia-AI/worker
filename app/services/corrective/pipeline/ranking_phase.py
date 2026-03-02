@@ -146,6 +146,78 @@ def _entity_type_mismatch(candidate: Dict[str, Any], claim_text: str, claim_enti
     return False
 
 
+def _has_negation(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:no|not|never|without|cannot|can't|does not|do not|did not|doesn't|don't|didn't)\b",
+            str(text or "").lower(),
+        )
+    )
+
+
+def _statement_signature(statement: str) -> str:
+    neg_tokens = {"no", "not", "never", "without", "cannot", "can't", "doesn't", "don't", "didn't"}
+    toks = [t for t in _tokenize(statement) if t not in neg_tokens]
+    return " ".join(sorted(set(toks)))
+
+
+def _collapse_source_polarity_conflicts(candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Remove contradictory near-duplicates from the same source URL.
+    This guards against legacy polluted facts where one source appears in both polarities.
+    """
+    if not candidates:
+        return candidates
+
+    by_key: Dict[tuple[str, str], Dict[str, Any]] = {}
+    for item in candidates:
+        src = str(item.get("source_url") or "").strip().lower()
+        if not src:
+            src = "__no_source__"
+        sig = _statement_signature(str(item.get("statement") or ""))
+        if not sig:
+            sig = str(item.get("statement") or "").strip().lower()
+        key = (src, sig)
+        current = by_key.get(key)
+        if current is None:
+            by_key[key] = item
+            continue
+
+        cur_neg = _has_negation(str(current.get("statement") or ""))
+        new_neg = _has_negation(str(item.get("statement") or ""))
+        if cur_neg == new_neg:
+            cur_score = float(current.get("final_score", 0.0) or 0.0)
+            new_score = float(item.get("final_score", 0.0) or 0.0)
+            if new_score > cur_score:
+                by_key[key] = item
+            continue
+
+        cur_support = float(current.get("support_score", 0.0) or 0.0)
+        cur_contradict = float(current.get("contradict_score", 0.0) or 0.0)
+        cur_info = (
+            (0.45 * float(current.get("final_score", 0.0) or 0.0))
+            + (0.20 * float(current.get("anchor_match_score", 0.0) or 0.0))
+            + (0.20 * abs(cur_support - cur_contradict))
+            + (0.15 * float(current.get("credibility", 0.0) or 0.0))
+        )
+        new_support = float(item.get("support_score", 0.0) or 0.0)
+        new_contradict = float(item.get("contradict_score", 0.0) or 0.0)
+        new_info = (
+            (0.45 * float(item.get("final_score", 0.0) or 0.0))
+            + (0.20 * float(item.get("anchor_match_score", 0.0) or 0.0))
+            + (0.20 * abs(new_support - new_contradict))
+            + (0.15 * float(item.get("credibility", 0.0) or 0.0))
+        )
+        if abs(new_info - cur_info) <= 0.03:
+            # Prefer explicit negation in tie scenarios to avoid positive-polarity hallucinated paraphrases.
+            if new_neg and not cur_neg:
+                by_key[key] = item
+        elif new_info > cur_info:
+            by_key[key] = item
+
+    return list(by_key.values())
+
+
 def _load_cross_encoder():
     global _CROSS_ENCODER
     if _CROSS_ENCODER is not None:
@@ -305,17 +377,36 @@ async def rank_candidates(
             item["raw_final_score"] = raw_score
             item["final_score"] = penalized
             item["contradiction_penalty"] = round(raw_score - penalized, 4)
-    stage2_verified = _ENTAILMENT_VERIFIER.verify_refutes(
-        query_text,
-        [
-            {
-                "evidence_id": idx,
-                "statement": str(it.get("statement") or ""),
-                "stage1_refute_score": float(it.get("stage1_refute_score", 0.0) or 0.0),
-            }
-            for idx, it in enumerate(ranked)
-        ],
-        top_n=max(1, int(os.getenv("REFUTE_STAGE2_TOP_N", "5"))),
+        sem_signal = float(item.get("sem_score", 0.0) or 0.0)
+        kg_signal = float(item.get("kg_score", 0.0) or 0.0)
+        claim_overlap = float(item.get("claim_overlap", 0.0) or 0.0)
+        kg_dominance_penalty = float(os.getenv("RANKING_KG_DOMINANCE_PENALTY", "0.18"))
+        if sem_signal <= 0.02 and kg_signal >= 0.80 and claim_overlap < 0.20 and stance != "contradicts":
+            raw_score = float(item.get("final_score", 0.0) or 0.0)
+            damped = max(0.0, raw_score * (1.0 - max(0.0, min(0.60, kg_dominance_penalty))))
+            item["raw_final_score"] = raw_score
+            item["final_score"] = damped
+            item["kg_dominance_penalty"] = round(raw_score - damped, 4)
+
+    ranked = _collapse_source_polarity_conflicts(ranked)
+
+    stage2_input: List[Dict[str, Any]] = [
+        {
+            "evidence_id": idx,
+            "statement": str(it.get("statement") or ""),
+            "stage1_refute_score": float(it.get("stage1_refute_score", 0.0) or 0.0),
+        }
+        for idx, it in enumerate(ranked)
+        if float(it.get("stage1_refute_score", 0.0) or 0.0) >= 0.30
+    ]
+    stage2_verified = (
+        _ENTAILMENT_VERIFIER.verify_refutes(
+            query_text,
+            stage2_input,
+            top_n=max(1, int(os.getenv("REFUTE_STAGE2_TOP_N", "5"))),
+        )
+        if stage2_input
+        else {}
     )
     refute_verified_count_stage2 = 0
     for idx, item in enumerate(ranked):
