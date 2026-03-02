@@ -1355,3 +1355,57 @@ def test_enforced_payload_includes_verdict_band():
     }
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out.get("verdict_band") == "MIXED_OR_UNCLEAR"
+
+
+def test_contradiction_first_override_marks_neutral_polarity_conflict_as_refute():
+    vg = _vg()
+    claim = "FDA has approved all dietary supplements for effectiveness before they are sold."
+    statement = "Dietary supplements do not require FDA approval before they are marketed."
+    evidence = [
+        {
+            "statement": statement,
+            "source_url": "https://ods.od.nih.gov/factsheets/WYNTK-Consumer",
+            "final_score": 0.62,
+            "credibility": 0.95,
+            "anchor_match_score": 0.72,
+        }
+    ]
+    evidence_map = [
+        {
+            "evidence_id": 0,
+            "statement": statement,
+            "relevance": "NEUTRAL",
+            "relevance_score": 0.62,
+            "source_url": "https://ods.od.nih.gov/factsheets/WYNTK-Consumer",
+        }
+    ]
+    normalized = vg._normalize_evidence_map(claim, evidence_map, evidence)
+    assert normalized
+    assert normalized[0]["relevance"] == "REFUTES"
+    assert float(normalized[0].get("relevance_score", 0.0) or 0.0) >= 0.60
+
+
+def test_segment_valid_is_forced_invalid_when_supporting_fact_semantically_refutes():
+    vg = _vg()
+    seg_text = "FDA has approved all dietary supplements for effectiveness before they are sold."
+    evidence_map = [
+        {
+            "evidence_id": 0,
+            "statement": "Dietary supplements do not require FDA approval before they are marketed.",
+            "relevance": "SUPPORTS",
+            "relevance_score": 0.63,
+            "source_url": "https://ods.od.nih.gov/factsheets/WYNTK-Consumer",
+        }
+    ]
+    claim_breakdown = [
+        {
+            "claim_segment": seg_text,
+            "status": "VALID",
+            "supporting_fact": "Dietary supplements do not require FDA approval before they are marketed.",
+            "source_url": "https://ods.od.nih.gov/factsheets/WYNTK-Consumer",
+            "evidence_used_ids": [0],
+        }
+    ]
+    out = vg._enforce_segment_evidence_polarity_consistency(claim_breakdown, evidence_map)
+    assert out[0]["status"] == "INVALID"
+    assert str(evidence_map[0].get("relevance") or "").upper() == "REFUTES"

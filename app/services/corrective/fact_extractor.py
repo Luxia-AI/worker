@@ -7,7 +7,7 @@ from app.constants.llm_prompts import FACT_EXTRACTION_PREDICATE_FORCING_PROMPT, 
 from app.core.config import settings
 from app.core.logger import get_logger, log_value_payload
 from app.services.common.dedup import generate_fact_id
-from app.services.common.text_cleaner import clean_statement, truncate_content
+from app.services.common.text_cleaner import clean_statement, extract_sentences, truncate_content
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 
 logger = get_logger(__name__)
@@ -71,6 +71,141 @@ class FactExtractor:
             "immune",
             "immunity",
         }
+        self._grounding_stop_tokens = {
+            "the",
+            "a",
+            "an",
+            "and",
+            "or",
+            "but",
+            "to",
+            "for",
+            "of",
+            "in",
+            "on",
+            "with",
+            "by",
+            "at",
+            "is",
+            "are",
+            "was",
+            "were",
+            "be",
+            "been",
+            "being",
+            "that",
+            "this",
+            "these",
+            "those",
+            "as",
+            "from",
+            "it",
+            "its",
+            "their",
+            "there",
+            "can",
+            "may",
+            "might",
+            "could",
+            "should",
+            "would",
+            "will",
+            "shall",
+            "have",
+            "has",
+            "had",
+            "do",
+            "does",
+            "did",
+            "than",
+            "then",
+            "also",
+            "such",
+        }
+
+    @staticmethod
+    def _has_negation_marker(text: str) -> bool:
+        low = str(text or "").lower()
+        if not low:
+            return False
+        return bool(
+            re.search(
+                (
+                    r"\b(?:no|not|never|none|without|cannot|can't|does not|do not|did not|"
+                    r"is not|are not|was not|were not|doesn't|don't|didn't|isn't|aren't|"
+                    r"wasn't|weren't|lack|lacks|lacking)\b"
+                ),
+                low,
+            )
+        )
+
+    def _grounding_tokens(self, text: str) -> set[str]:
+        return {
+            tok
+            for tok in re.findall(r"\b[a-z][a-z0-9_-]{2,}\b", (text or "").lower())
+            if tok not in self._grounding_stop_tokens
+        }
+
+    def _best_source_sentence(self, statement: str, source_text: str) -> tuple[str, float]:
+        if not statement or not source_text:
+            return "", 0.0
+        stmt_ordered_tokens = [
+            tok
+            for tok in re.findall(r"\b[a-z][a-z0-9_-]{2,}\b", statement.lower())
+            if tok not in self._grounding_stop_tokens
+        ]
+        stmt_tokens = self._grounding_tokens(statement)
+        if not stmt_tokens:
+            return "", 0.0
+        first_anchor = stmt_ordered_tokens[0] if stmt_ordered_tokens else ""
+        second_anchor = stmt_ordered_tokens[1] if len(stmt_ordered_tokens) > 1 else ""
+        sentences = [clean_statement(s) for s in extract_sentences(source_text) if str(s or "").strip()]
+        if not sentences:
+            sentences = [
+                clean_statement(s) for s in re.split(r"(?<=[.!?])\s+", source_text) if len(str(s or "").strip()) >= 12
+            ]
+        best_sentence = ""
+        best_score = 0.0
+        for sent in sentences[:250]:
+            sent_tokens = self._grounding_tokens(sent)
+            if not sent_tokens:
+                continue
+            overlap = len(stmt_tokens & sent_tokens)
+            if overlap == 0:
+                continue
+            stmt_cover = overlap / max(1, len(stmt_tokens))
+            sent_cover = overlap / max(1, len(sent_tokens))
+            score = (0.75 * stmt_cover) + (0.25 * sent_cover)
+            if first_anchor and first_anchor in sent_tokens:
+                score += 0.20
+            if second_anchor and second_anchor in sent_tokens:
+                score += 0.10
+            if score > best_score:
+                best_score = score
+                best_sentence = sent
+        return best_sentence, best_score
+
+    def _ground_statement_to_source(self, statement: str, source_text: str) -> str:
+        """
+        Keep extracted facts anchored to source wording.
+        If extracted polarity conflicts with closest source sentence, preserve source polarity.
+        """
+        cleaned = clean_statement(statement)
+        if not cleaned:
+            return ""
+        best_sentence, best_score = self._best_source_sentence(cleaned, source_text)
+        if not best_sentence or best_score < 0.40:
+            return cleaned
+
+        stmt_neg = self._has_negation_marker(cleaned)
+        sent_neg = self._has_negation_marker(best_sentence)
+        if stmt_neg != sent_neg and best_score >= 0.55:
+            return best_sentence
+
+        # Very high lexical alignment indicates paraphrase drift risk. Use source sentence directly.
+        if best_score >= 0.88:
+            return best_sentence
+        return cleaned
 
     def _try_parse_result(self, result: Any, allow_single_index_fallback: bool = True) -> Optional[Dict[str, Any]]:
         """Try to parse LLM result into expected format. No retries, just parsing."""
@@ -571,7 +706,10 @@ class FactExtractor:
                 for fact in extracted:
                     if not isinstance(fact, dict):
                         continue
-                    fact["statement"] = clean_statement(fact.get("statement", ""))
+                    fact["statement"] = self._ground_statement_to_source(
+                        fact.get("statement", ""),
+                        page.get("content", ""),
+                    )
                     fact["source_url"] = page.get("url", "")
                     fact["source"] = page.get("source", "")
                     fact["published_at"] = page.get("published_at", "")
@@ -656,7 +794,10 @@ class FactExtractor:
                 for fact in extracted:
                     if not isinstance(fact, dict):
                         continue
-                    fact["statement"] = clean_statement(fact.get("statement", ""))
+                    fact["statement"] = self._ground_statement_to_source(
+                        fact.get("statement", ""),
+                        page.get("content", ""),
+                    )
                     fact["source_url"] = page.get("url", "")
                     fact["source"] = page.get("source", "")
                     fact["published_at"] = page.get("published_at", "")

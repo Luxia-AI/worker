@@ -4443,15 +4443,37 @@ class VerdictGenerator:
                 # Refutation can be decided by direct contradiction, independent of support gates.
                 numeric_rel = self._numeric_relation_relevance(claim, statement)
                 dna_rel = self._dna_integration_relevance(claim, statement)
-                claim_neg = bool(re.search(r"\b(no|not|never|cannot|can't|does not|do not|without)\b", claim.lower()))
+                claim_neg = bool(
+                    re.search(
+                        r"\b(no|not|never|cannot|can't|does not|do not|did not|without|doesn't|don't|didn't)\b",
+                        claim.lower(),
+                    )
+                )
                 stmt_neg = bool(
                     re.search(
-                        r"\b(no|not|never|cannot|can't|does not|do not|without|doesn't|don't)\b",
+                        r"\b(no|not|never|cannot|can't|does not|do not|did not|without|doesn't|don't|didn't)\b",
                         statement.lower(),
                     )
                 )
+                polarity_conflict = claim_neg != stmt_neg
+                contradiction_alignment = (
+                    predicate_match_score >= 0.25
+                    or anchor_score >= 0.45
+                    or (intervention_match and anchor_score >= 0.30)
+                )
+                refute_by_polarity_override = (
+                    polarity_conflict
+                    and contradiction_alignment
+                    and (
+                        contradiction_score >= max(0.45, CONTRADICTION_THRESHOLD - 0.10)
+                        or nli_contradict_prob >= 0.55
+                        or polarity_rel == "contradicts"
+                        or self._is_explicit_refutation_statement(statement)
+                    )
+                )
                 refute_by_rule = (
-                    (
+                    refute_by_polarity_override
+                    or (
                         contradiction_score >= CONTRADICTION_THRESHOLD
                         and predicate_match_score >= 0.4
                         and (claim_neg != stmt_neg)
@@ -4467,14 +4489,17 @@ class VerdictGenerator:
                 if refute_by_rule and not self._dose_scope_refute_allowed(claim, statement):
                     refute_by_rule = False
                 if refute_by_rule:
-                    if intervention_match:
+                    contradiction_alignment_ok = intervention_match or (
+                        refute_by_polarity_override and intervention_anchors_ok
+                    )
+                    if contradiction_alignment_ok:
                         relevance = "REFUTES"
                         relevance_score = max(relevance_score, contradiction_score, nli_contradict_prob, 0.65)
                         if scope_alignment < 0.34:
                             relevance_score *= 0.72
                         refute_eligible = (
                             nli_contradict_prob >= 0.45
-                            and intervention_match
+                            and (intervention_match or intervention_anchors_ok)
                             and (predicate_match_score >= 0.25 or intervention_anchors_ok)
                             and credibility >= 0.6
                         )
@@ -6680,6 +6705,37 @@ class VerdictGenerator:
                         best_id = -1
             return best_id, best_ev
 
+        def _has_negation(text: str) -> bool:
+            return bool(
+                re.search(
+                    (
+                        r"\b(?:no|not|never|without|cannot|can't|does not|do not|did not|"
+                        r"doesn't|don't|didn't|is not|are not|was not|were not|isn't|aren't|"
+                        r"wasn't|weren't)\b"
+                    ),
+                    str(text or "").lower(),
+                )
+            )
+
+        def _semantically_refutes(seg_text: str, fact_text: str) -> bool:
+            seg = str(seg_text or "").strip()
+            fact = str(fact_text or "").strip()
+            if not seg or not fact:
+                return False
+            polarity = self._segment_polarity(seg, fact, stance="neutral")
+            predicate_match = float(self.compute_predicate_match(seg, fact) or 0.0)
+            contradiction_score = float(self._contradiction_score(seg, fact) or 0.0)
+            anchor_overlap = float(self._segment_anchor_overlap(seg, fact) or 0.0)
+            neg_mismatch = _has_negation(seg) != _has_negation(fact)
+            explicit_refute = self._is_explicit_refutation_statement(fact)
+            if polarity == "contradicts" and (predicate_match >= 0.30 or anchor_overlap >= 0.45):
+                return True
+            if explicit_refute and (predicate_match >= 0.25 or anchor_overlap >= 0.35):
+                return True
+            if neg_mismatch and contradiction_score >= 0.45 and (predicate_match >= 0.25 or anchor_overlap >= 0.45):
+                return True
+            return False
+
         for seg in claim_breakdown:
             status = str(seg.get("status") or "UNKNOWN").upper()
             if status == "UNKNOWN":
@@ -6699,6 +6755,20 @@ class VerdictGenerator:
                 continue
 
             linked_rel = self._normalize_relevance_label(linked_ev.get("relevance", "NEUTRAL"))
+            seg_fact = str(seg.get("supporting_fact") or linked_ev.get("statement") or "").strip()
+            if status in {"VALID", "PARTIALLY_VALID"} and _semantically_refutes(seg_text, seg_fact):
+                seg["status"] = "INVALID"
+                if seg_fact:
+                    seg["supporting_fact"] = seg_fact
+                seg["source_url"] = str(seg.get("source_url") or linked_ev.get("source_url") or "").strip()
+                if linked_rel != "REFUTES":
+                    linked_ev["relevance"] = "REFUTES"
+                    linked_ev["relevance_score"] = max(
+                        float(linked_ev.get("relevance_score", 0.0) or 0.0),
+                        0.70,
+                    )
+                continue
+
             if status in {"VALID", "PARTIALLY_VALID"} and linked_rel == "REFUTES":
                 rep_id, rep_ev = _pick_replacement(seg_text, {"SUPPORTS", "NEUTRAL"})
                 if rep_ev is None:
