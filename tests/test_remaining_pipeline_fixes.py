@@ -980,6 +980,46 @@ def test_trust_threshold_failure_allows_true_when_decisive_support_is_strong():
     assert float(out.get("confidence", 0.0) or 0.0) >= 0.72
 
 
+def test_trust_threshold_failure_allows_false_on_strong_structural_refutation():
+    vg = _vg()
+    claim = "FDA has approved all dietary supplements for effectiveness before they are sold."
+    payload = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.61,
+        "truthfulness_percent": 34.0,
+        "policy_sufficient": True,
+        "trust_threshold_met": False,
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": claim,
+                "status": "INVALID",
+                "supporting_fact": "Supplements do not require FDA approval before they can be sold or marketed.",
+                "source_url": "https://ods.od.nih.gov/factsheets/WYNTK-Consumer",
+                "evidence_used_ids": [0],
+            }
+        ],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Supplements do not require FDA approval before they can be sold or marketed.",
+                "relevance": "NEUTRAL",
+                "relevance_score": 0.4455,
+                "contradiction_score": 0.665,
+                "nli_contradict_prob": 0.7158,
+                "object_match_ok": True,
+                "predicate_match_score": 0.4,
+                "source_url": "https://ods.od.nih.gov/factsheets/WYNTK-Consumer",
+            }
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "FALSE"
+    assert bool(out.get("trust_gate_decisive_override")) is True
+    assert out.get("display_verdict") == "FALSE"
+    assert "contradicting" in str(out.get("rationale") or "").lower()
+
+
 def test_trust_failed_display_band_is_conservative_three_band_only():
     vg = _vg()
     claim = "Vitamin D prevents respiratory infections"

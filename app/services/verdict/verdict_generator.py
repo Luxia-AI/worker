@@ -6830,6 +6830,22 @@ class VerdictGenerator:
             for item in (evidence_map or [])
             if self._normalize_relevance_for_binary(str(item.get("relevance") or "")) == "REFUTES"
         )
+        contradiction_score_max = max(
+            [float(item.get("contradiction_score", 0.0) or 0.0) for item in (evidence_map or [])] or [0.0]
+        )
+        nli_contradict_prob_max = max(
+            [float(item.get("nli_contradict_prob", 0.0) or 0.0) for item in (evidence_map or [])] or [0.0]
+        )
+        structural_refute_count = sum(
+            1
+            for item in (evidence_map or [])
+            if (
+                float(item.get("contradiction_score", 0.0) or 0.0) >= 0.62
+                and float(item.get("nli_contradict_prob", 0.0) or 0.0) >= 0.62
+                and bool(item.get("object_match_ok", False))
+                and float(item.get("predicate_match_score", 0.0) or 0.0) >= 0.35
+            )
+        )
         neutral_only_map = bool(rel_labels) and all(lbl == "NEUTRAL" for lbl in rel_labels)
         high_impact_action_claim = bool(
             re.search(
@@ -6920,9 +6936,16 @@ class VerdictGenerator:
             and has_invalid_like
             and not has_valid_like
             and not has_unknown_status
-            and contradict_mass >= 1.20
-            and support_mass <= 0.20
-            and sum(1 for lbl in rel_labels if lbl == "REFUTES") >= 2
+            and (
+                (
+                    contradict_mass >= 1.20
+                    and support_mass <= 0.20
+                    and sum(1 for lbl in rel_labels if lbl == "REFUTES") >= 2
+                )
+                or (
+                    structural_refute_count >= 1 and contradiction_score_max >= 0.62 and nli_contradict_prob_max >= 0.62
+                )
+            )
         )
         trust_gate_effective = bool(trust_gate_passed or decisive_support_unlock or decisive_refute_unlock)
         if trust_gate_effective and not trust_gate_passed:
@@ -7108,6 +7131,10 @@ class VerdictGenerator:
         has_mixed = any(s in {"VALID", "PARTIALLY_VALID"} for s in statuses) and any(
             s in {"INVALID", "PARTIALLY_INVALID"} for s in statuses
         )
+        invalid_like_count = sum(1 for s in statuses if s in {"INVALID", "PARTIALLY_INVALID"})
+        valid_like_count = sum(1 for s in statuses if s in {"VALID", "PARTIALLY_VALID"})
+        if rel_counts.get("REFUTES", 0) == 0 and invalid_like_count > 0 and valid_like_count == 0:
+            rel_counts["REFUTES"] = max(rel_counts.get("REFUTES", 0), invalid_like_count)
 
         if verdict == Verdict.TRUE.value:
             lead = f'According to the available evidence, the claim "{claim}" is supported.'
