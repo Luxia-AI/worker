@@ -3233,6 +3233,49 @@ class VerdictGenerator:
                 )
             return "contradicts"
 
+        anchor_overlap = self._segment_anchor_overlap(segment, statement)
+        # Quantifier/exclusivity conflict:
+        # absolute claims should be contradicted by exception-bearing evidence
+        # on the same topic.
+        seg_abs = bool(
+            re.search(
+                r"\b(only|always|all|every|none|never|no association|no link|no relationship|no effect)\b",
+                seg,
+            )
+        )
+        stmt_exception = bool(
+            re.search(
+                r"\b(some|many|most|often|sometimes|can|may|might|not all|in some|subset|rarely)\b",
+                stmt,
+            )
+        )
+        seg_only_women = bool(re.search(r"\bonly\s+women\b|\bwomen\s+only\b", seg))
+        seg_only_men = bool(re.search(r"\bonly\s+men\b|\bmen\s+only\b", seg))
+        stmt_mentions_men = bool(re.search(r"\b(men|male)\b", stmt))
+        stmt_mentions_women = bool(re.search(r"\b(women|female)\b", stmt))
+        if seg_only_women and stmt_mentions_men and anchor_overlap >= 0.25:
+            return "contradicts"
+        if seg_only_men and stmt_mentions_women and anchor_overlap >= 0.25:
+            return "contradicts"
+        if seg_abs and stmt_exception and anchor_overlap >= 0.35:
+            return "contradicts"
+
+        # Negated-association claims vs positive risk/association evidence.
+        seg_neg_assoc = bool(
+            re.search(
+                r"\b(no|not)\s+(association|associated|link|linked|relationship|effect|risk)\b",
+                seg,
+            )
+        )
+        stmt_pos_assoc = bool(
+            re.search(
+                r"\b(risk\s+factor|associated\s+with|association\s+with|linked\s+to|increas(?:e|es|ed|ing)\s+risk)\b",
+                stmt,
+            )
+        )
+        if seg_neg_assoc and stmt_pos_assoc and anchor_overlap >= 0.30:
+            return "contradicts"
+
         if stance_l in {"entails", "contradicts"}:
             if _POLARITY_DEBUG:
                 logger.debug(
@@ -3257,7 +3300,7 @@ class VerdictGenerator:
             (
                 r"\b(?:cause|causes|caused|causing|contribut(?:e|es|ed|ing)\s+to|"
                 r"link(?:ed)?\s+to|associate(?:d)?\s+with|lead(?:s|ing)?\s+to|"
-                r"result(?:s|ed|ing)?\s+in)\b"
+                r"result(?:s|ed|ing)?\s+in|risk\s+factor(?:s)?(?:\s+for)?)\b"
             ),
             flags=re.IGNORECASE,
         )
@@ -3716,7 +3759,14 @@ class VerdictGenerator:
             return ""
         if t.endswith("ies") and len(t) > 4:
             return t[:-3] + "y"
-        for suf in ("ing", "ed", "es", "s"):
+        # Preserve trailing "e" for common 3rd-person verb forms
+        # (e.g., reduces -> reduce, causes -> cause).
+        if t.endswith("es") and len(t) > 4:
+            base = t[:-2]
+            if base and base[-1] in {"c", "g", "s", "v", "z"}:
+                return base + "e"
+            return base
+        for suf in ("ing", "ed", "s"):
             if t.endswith(suf) and len(t) > len(suf) + 2:
                 return t[: -len(suf)]
         return t
@@ -3885,6 +3935,10 @@ class VerdictGenerator:
             "result",
             "associate",
             "link",
+            "affect",
+            "lower",
+            "protect",
+            "control",
             "work",
             "contain",
             "manage",
@@ -4091,8 +4145,6 @@ class VerdictGenerator:
         ev_t = self._extract_canonical_predicate_triplet(evidence_effective)
         cp = str(claim_t.get("canonical_predicate") or "")
         ep = str(ev_t.get("canonical_predicate") or "")
-        if not cp:
-            return 0.0
         if cp and ep and cp == ep:
             return 1.0
 
@@ -4136,6 +4188,8 @@ class VerdictGenerator:
         full_claim_buckets = self._predicate_bucket_tokens(claim_effective)
         full_ev_buckets = self._predicate_bucket_tokens(evidence_effective)
         full_bucket_overlap = bool(full_claim_buckets and full_ev_buckets and (full_claim_buckets & full_ev_buckets))
+        if not cp and not full_claim_buckets:
+            return 0.0
         claim_low = (claim_effective or "").lower()
         evidence_low = (evidence_effective or "").lower()
         claim_preventive = bool(
@@ -6839,6 +6893,29 @@ class VerdictGenerator:
 
             linked_rel = self._normalize_relevance_label(linked_ev.get("relevance", "NEUTRAL"))
             seg_fact = str(seg.get("supporting_fact") or linked_ev.get("statement") or "").strip()
+
+            # Do not keep VALID/PARTIALLY_VALID on weak neutral linkage.
+            # This avoids promoting unrelated or background evidence into support.
+            if status in {"VALID", "PARTIALLY_VALID"} and linked_rel == "NEUTRAL":
+                entail_prob = float(linked_ev.get("nli_entail_prob", 0.0) or 0.0)
+                contradict_prob = float(linked_ev.get("nli_contradict_prob", 0.0) or 0.0)
+                support_strength = float(linked_ev.get("support_strength", 0.0) or 0.0)
+                pred_match = float(linked_ev.get("predicate_match_score", 0.0) or 0.0)
+                anchor_match = float(linked_ev.get("anchor_match_score", 0.0) or 0.0)
+                object_match_ok = bool(linked_ev.get("object_match_ok", False))
+                neutral_support_strong = (
+                    entail_prob >= 0.62
+                    and contradict_prob <= 0.38
+                    and object_match_ok
+                    and (pred_match >= 0.35 or anchor_match >= 0.45)
+                ) or (support_strength >= 0.70 and object_match_ok and pred_match >= 0.30 and anchor_match >= 0.45)
+                if not neutral_support_strong:
+                    seg["status"] = "UNKNOWN"
+                    seg["supporting_fact"] = ""
+                    seg["source_url"] = ""
+                    seg["evidence_used_ids"] = []
+                    continue
+
             if status in {"VALID", "PARTIALLY_VALID"} and _semantically_refutes(seg_text, seg_fact):
                 seg["status"] = "INVALID"
                 if seg_fact:
@@ -7028,6 +7105,11 @@ class VerdictGenerator:
         payload["policy_sufficient"] = bool(policy_sufficient)
         payload["trust_threshold_met"] = bool(trust_gate_passed)
         guard_reasons = list(payload.get("verdict_guard_reasons") or [])
+        class_probs = payload.get("class_probs") if isinstance(payload.get("class_probs"), dict) else {}
+        p_true = float(class_probs.get("true", 0.0) or 0.0)
+        p_false = float(class_probs.get("false", 0.0) or 0.0)
+        p_unv = float(class_probs.get("unverifiable", 0.0) or 0.0)
+        posterior_unverifiable_dominant = bool(class_probs and p_unv >= 0.55 and p_unv >= (max(p_true, p_false) + 0.05))
         preserve_multiclass = (
             original_verdict == Verdict.PARTIALLY_TRUE.value or has_unknown_status or mixed_status
         ) and not single_unknown_with_signal
@@ -7100,6 +7182,13 @@ class VerdictGenerator:
                 )
             )
         )
+        # If posterior strongly favors UNVERIFIABLE, do not promote to truth-leaning class
+        # from segment-status heuristics unless there is decisive directional signal.
+        if posterior_unverifiable_dominant and not (decisive_support_unlock or decisive_refute_unlock):
+            verdict = Verdict.UNVERIFIABLE.value
+            if "posterior_unverifiable_dominant" not in guard_reasons:
+                guard_reasons.append("posterior_unverifiable_dominant")
+
         trust_gate_effective = bool(trust_gate_passed or decisive_support_unlock or decisive_refute_unlock)
         if trust_gate_effective and not trust_gate_passed:
             payload["trust_gate_decisive_override"] = True
@@ -7191,6 +7280,40 @@ class VerdictGenerator:
                 payload["class_probs"] = {"true": 0.52, "false": 0.10, "unverifiable": 0.38}
             else:
                 payload["class_probs"] = {"true": 0.20, "false": 0.20, "unverifiable": 0.60}
+        else:
+            calibration_meta_existing = payload.get("calibration_meta")
+            calibration_meta_existing = calibration_meta_existing if isinstance(calibration_meta_existing, dict) else {}
+            v2_policy_active = bool(calibration_meta_existing.get("v2_policy_active", False))
+            if not v2_policy_active:
+                probs = payload.get("class_probs") or {}
+                p_true = float(probs.get("true", 0.0) or 0.0)
+                p_false = float(probs.get("false", 0.0) or 0.0)
+                p_unv = float(probs.get("unverifiable", 0.0) or 0.0)
+                max_cls = "true"
+                max_val = p_true
+                if p_false > max_val:
+                    max_cls = "false"
+                    max_val = p_false
+                if p_unv > max_val:
+                    max_cls = "unverifiable"
+                    max_val = p_unv
+                if verdict == Verdict.TRUE.value:
+                    final_cls = "true"
+                elif verdict == Verdict.FALSE.value:
+                    final_cls = "false"
+                else:
+                    final_cls = "unverifiable"
+                if final_cls != max_cls and max_val >= 0.55:
+                    if verdict == Verdict.TRUE.value:
+                        payload["class_probs"] = {"true": 0.72, "false": 0.12, "unverifiable": 0.16}
+                    elif verdict == Verdict.FALSE.value:
+                        payload["class_probs"] = {"true": 0.10, "false": 0.74, "unverifiable": 0.16}
+                    elif verdict == Verdict.PARTIALLY_TRUE.value:
+                        payload["class_probs"] = {"true": 0.52, "false": 0.10, "unverifiable": 0.38}
+                    else:
+                        payload["class_probs"] = {"true": 0.20, "false": 0.20, "unverifiable": 0.60}
+                    calibration_meta_existing["class_probs_resynced"] = True
+                    payload["calibration_meta"] = calibration_meta_existing
         if not isinstance(payload.get("calibration_meta"), dict):
             payload["calibration_meta"] = {"calibrator_version": payload.get("calibration_version")}
         if not isinstance(payload.get("evidence_attribution"), list):

@@ -1411,6 +1411,76 @@ def test_segment_valid_is_forced_invalid_when_supporting_fact_semantically_refut
     assert str(evidence_map[0].get("relevance") or "").upper() == "REFUTES"
 
 
+def test_segment_valid_with_weak_neutral_link_is_downgraded_to_unknown():
+    vg = _vg()
+    seg_text = "Antibiotics as the standard treatment for common viral colds"
+    evidence_map = [
+        {
+            "evidence_id": 0,
+            "statement": (
+                "Garlic supplements are commonly used by consumers for prevention and treatment " "of the common cold."
+            ),
+            "relevance": "NEUTRAL",
+            "relevance_score": 0.68,
+            "nli_entail_prob": 0.34,
+            "nli_contradict_prob": 0.33,
+            "support_strength": 0.45,
+            "predicate_match_score": 0.2,
+            "anchor_match_score": 0.28,
+            "object_match_ok": False,
+            "source_url": "https://pmc.ncbi.nlm.nih.gov/articles/PMC6465033",
+        }
+    ]
+    claim_breakdown = [
+        {
+            "claim_segment": seg_text,
+            "status": "VALID",
+            "supporting_fact": evidence_map[0]["statement"],
+            "source_url": evidence_map[0]["source_url"],
+            "evidence_used_ids": [0],
+        }
+    ]
+    out = vg._enforce_segment_evidence_polarity_consistency(claim_breakdown, evidence_map)
+    assert out[0]["status"] == "UNKNOWN"
+    assert out[0].get("evidence_used_ids") == []
+
+
+def test_unverifiable_posterior_dominance_blocks_partial_true_promotion():
+    vg = _vg()
+    claim = "Clinical trials are unnecessary for new medicines"
+    payload = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.6,
+        "truthfulness_percent": 35.0,
+        "policy_sufficient": True,
+        "trust_threshold_met": True,
+        "class_probs": {"true": 0.03, "false": 0.04, "unverifiable": 0.93},
+        "rationale": "test",
+        "claim_breakdown": [
+            {
+                "claim_segment": claim,
+                "status": "PARTIALLY_VALID",
+                "supporting_fact": "Some approvals can include non-randomized clinical trial evidence.",
+                "source_url": "https://pubmed.ncbi.nlm.nih.gov/33103322",
+                "evidence_used_ids": [0],
+            }
+        ],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Some approvals can include non-randomized clinical trial evidence.",
+                "relevance": "NEUTRAL",
+                "relevance_score": 0.41,
+                "source_url": "https://pubmed.ncbi.nlm.nih.gov/33103322",
+            }
+        ],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "UNVERIFIABLE"
+    reasons = set(out.get("verdict_guard_reasons") or [])
+    assert "posterior_unverifiable_dominant" in reasons
+
+
 def test_behavior_mismatch_is_not_admitted_as_support():
     vg = _vg()
     claim = "WHO declares that physical activity increases the risk of heart disease in adults"
@@ -1436,3 +1506,83 @@ def test_behavior_mismatch_is_not_admitted_as_support():
     normalized = vg._normalize_evidence_map(claim, evidence_map, evidence)
     assert normalized
     assert normalized[0]["relevance"] != "SUPPORTS"
+
+
+def test_negated_association_claim_marks_risk_factor_evidence_as_refute():
+    vg = _vg()
+    claim = "Smoking has no association with cardiovascular disease."
+    statement = "Smoking is a risk factor for cardiovascular disease."
+    evidence = [
+        {
+            "statement": statement,
+            "source_url": "https://example.org/risk",
+            "final_score": 0.71,
+            "credibility": 0.95,
+        }
+    ]
+    evidence_map = [
+        {
+            "evidence_id": 0,
+            "statement": statement,
+            "relevance": "NEUTRAL",
+            "relevance_score": 0.71,
+            "source_url": "https://example.org/risk",
+        }
+    ]
+    normalized = vg._normalize_evidence_map(claim, evidence_map, evidence)
+    assert normalized
+    assert str(normalized[0].get("relevance") or "").upper() == "REFUTES"
+
+
+def test_exclusive_population_claim_conflicts_with_opposite_group_evidence():
+    vg = _vg()
+    claim = "Breast cancer affects only women."
+    statement = "Breast cancer affects men too."
+    evidence = [
+        {
+            "statement": statement,
+            "source_url": "https://example.org/breast-cancer",
+            "final_score": 0.68,
+            "credibility": 0.95,
+        }
+    ]
+    evidence_map = [
+        {
+            "evidence_id": 0,
+            "statement": statement,
+            "relevance": "NEUTRAL",
+            "relevance_score": 0.68,
+            "source_url": "https://example.org/breast-cancer",
+        }
+    ]
+    normalized = vg._normalize_evidence_map(claim, evidence_map, evidence)
+    assert normalized
+    assert str(normalized[0].get("relevance") or "").upper() == "REFUTES"
+
+
+def test_hand_hygiene_claim_gets_nonzero_predicate_match_from_preventive_evidence():
+    vg = _vg()
+    claim = "Hand hygiene reduces transmission of many infectious diseases."
+    statement = "Hand hygiene helps prevent transmission of influenza and respiratory infections."
+    score = vg.compute_predicate_match(claim, statement)
+    assert score >= 0.4
+
+
+def test_class_probs_resynced_to_final_verdict_when_v2_not_active():
+    vg = _vg()
+    claim = "Smoking has no association with cardiovascular disease."
+    payload = {
+        "verdict": "UNVERIFIABLE",
+        "confidence": 0.68,
+        "truthfulness_percent": 35.0,
+        "policy_sufficient": True,
+        "trust_threshold_met": True,
+        "class_probs": {"true": 0.1, "false": 0.74, "unverifiable": 0.16},
+        "calibration_meta": {},
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN", "evidence_used_ids": []}],
+        "evidence_map": [],
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    probs = out.get("class_probs") or {}
+    assert float(probs.get("unverifiable", 0.0) or 0.0) >= 0.60
+    assert bool((out.get("calibration_meta") or {}).get("class_probs_resynced", False)) is True
