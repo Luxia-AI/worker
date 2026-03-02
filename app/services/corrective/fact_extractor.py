@@ -240,6 +240,10 @@ class FactExtractor:
         return None
 
     @staticmethod
+    def _is_provider_exhausted_payload(result: Any) -> bool:
+        return isinstance(result, dict) and str(result.get("_llm_error") or "") == "rate_limited_provider_exhausted"
+
+    @staticmethod
     def _confidence_mode() -> bool:
         value = os.getenv("LUXIA_CONFIDENCE_MODE")
         if value is None:
@@ -546,6 +550,9 @@ class FactExtractor:
         parsed = self._try_parse_result(result, allow_single_index_fallback=allow_single_index_fallback)
         if parsed is not None:
             return parsed
+        if self._is_provider_exhausted_payload(result):
+            logger.warning("[FactExtractor] Skipping JSON-repair retries: LLM providers exhausted by rate limit")
+            return None
 
         # Retry loop (no recursion)
         for attempt in range(max_retries):
@@ -560,6 +567,9 @@ class FactExtractor:
                     priority=LLMPriority.LOW,
                     call_tag="fact_extraction",
                 )
+                if self._is_provider_exhausted_payload(retry_result):
+                    logger.warning("[FactExtractor] Stopping retries: LLM providers exhausted by rate limit")
+                    return None
                 parsed = self._try_parse_result(retry_result, allow_single_index_fallback=allow_single_index_fallback)
                 if parsed is not None:
                     logger.info(f"[FactExtractor] Retry {attempt + 1} succeeded")
@@ -654,6 +664,13 @@ class FactExtractor:
                 priority=LLMPriority.LOW,
                 call_tag="fact_extraction",
             )
+            if self._is_provider_exhausted_payload(result):
+                retry_after = float(result.get("retry_after_seconds", 0.0) or 0.0)
+                logger.warning(
+                    "[FactExtractor] Fact extraction skipped: LLM providers exhausted (retry_after=%.2fs)",
+                    retry_after,
+                )
+                return []
 
             # Parse with retry logic
             parsed = await self._parse_llm_response(
@@ -674,6 +691,13 @@ class FactExtractor:
                     call_tag="fact_extraction",
                     allow_quota_override=True,
                 )
+                if self._is_provider_exhausted_payload(retry_result):
+                    retry_after = float(retry_result.get("retry_after_seconds", 0.0) or 0.0)
+                    logger.warning(
+                        "[FactExtractor] Confidence retry skipped: LLM providers exhausted (retry_after=%.2fs)",
+                        retry_after,
+                    )
+                    return []
                 parsed = await self._parse_llm_response(
                     retry_result,
                     prompt,
@@ -789,6 +813,9 @@ class FactExtractor:
                     call_tag="fact_extraction",
                     allow_quota_override=allow_override,
                 )
+                if self._is_provider_exhausted_payload(result):
+                    logger.warning("[FactExtractor] Per-page fallback stopped: LLM providers exhausted by rate limit")
+                    break
                 extracted = result.get("facts", [])
 
                 for fact in extracted:

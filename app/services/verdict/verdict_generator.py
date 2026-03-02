@@ -7668,19 +7668,30 @@ class VerdictGenerator:
         return self._truthfulness_band(truthfulness_percent)
 
     def _unverifiable_result(self, claim: str, reason: str) -> Dict[str, Any]:
-        """Return a forced binary fallback result when normal verdict generation fails."""
-        base = {
-            "verdict": Verdict.FALSE.value,
-            "confidence": 0.5,
-            "truthfulness_percent": 35.0,
-            "rationale": str(reason or "").strip(),
-            "claim_breakdown": [],
+        """Return a safe UNVERIFIABLE fallback when verdict generation fails."""
+        return {
+            "verdict": Verdict.UNVERIFIABLE.value,
+            "confidence": 0.35,
+            "truthfulness_percent": 25.0,
+            "rationale": str(reason or "").strip() or "LLM unavailable or evidence insufficient.",
+            "claim_breakdown": [
+                {
+                    "claim_segment": claim,
+                    "status": "UNKNOWN",
+                    "supporting_fact": "",
+                    "source_url": "",
+                    "evidence_used_ids": [],
+                }
+            ],
             "evidence_map": [],
             "key_findings": [],
+            "class_probs": {"true": 0.15, "false": 0.15, "unverifiable": 0.70},
             "claim": claim,
             "evidence_count": 0,
+            "trust_threshold_met": False,
+            "policy_sufficient": False,
+            "verdict_guard_reasons": ["llm_unavailable_or_failed"],
         }
-        return self._enforce_binary_verdict_payload(claim, base, evidence=[])
 
     # ================================================================
     # CLAIM-SEGMENT RETRIEVAL METHODS

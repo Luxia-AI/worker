@@ -213,6 +213,17 @@ class HybridLLMService:
         }
 
     @staticmethod
+    def _rate_limit_payload(call_tag: str, error: RateLimitError) -> Dict[str, Any]:
+        retry_after = getattr(error, "retry_after_seconds", None)
+        return {
+            "_llm_error": "rate_limited_provider_exhausted",
+            "_degraded_skip": True,
+            "degraded_mode": True,
+            "call_tag": call_tag or "unknown",
+            "retry_after_seconds": float(retry_after or 0.0),
+        }
+
+    @staticmethod
     def _warn_once(state: GroqJobState, key: str, message: str, *args: Any) -> None:
         if key in state.warned_events:
             return
@@ -437,15 +448,20 @@ class HybridLLMService:
                         call_tag or "unknown",
                     )
                     max_tokens = self._max_tokens_for_call(call_tag, response_format)
-                    async with self._groq_semaphore:
-                        return await self.groq_service.ainvoke(
-                            prompt,
-                            response_format,
-                            max_retries=1,
-                            temperature=temperature,
-                            max_tokens=max_tokens,
-                            force_client="fallback",
-                        )
+                    try:
+                        async with self._groq_semaphore:
+                            return await self.groq_service.ainvoke(
+                                prompt,
+                                response_format,
+                                max_retries=1,
+                                temperature=temperature,
+                                max_tokens=max_tokens,
+                                force_client="fallback",
+                            )
+                    except RateLimitError as e:
+                        if getattr(e, "provider_exhausted", False):
+                            return self._rate_limit_payload(call_tag, e)
+                        raise
             if priority == LLMPriority.LOW:
                 return self._mark_degraded_skip(call_tag or "non_critical")
             if budget_reason == "reserved_for_verdict":
@@ -479,6 +495,19 @@ class HybridLLMService:
                 return result
             except RateLimitError as e:
                 logger.warning(f"[HybridLLMService] Groq rate limited: {e}")
+                if getattr(e, "provider_exhausted", False):
+                    retry_after = float(getattr(e, "retry_after_seconds", 0.0) or 0.0)
+                    logger.warning(
+                        "[HybridLLMService] All Groq clients exhausted/cooling down "
+                        "(tag=%s retry_after=%.2fs). Entering degraded handling.",
+                        call_tag or "unknown",
+                        retry_after,
+                    )
+                    if priority == LLMPriority.LOW:
+                        return self._rate_limit_payload(call_tag, e)
+                    if confidence_mode and critical_call:
+                        return self._rate_limit_payload(call_tag, e)
+                    raise RuntimeError("LLM unavailable: all Groq clients are rate limited")
                 if confidence_mode and critical_call and getattr(self.groq_service, "has_fallback_client", False):
                     try:
                         logger.warning(

@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import re
+import time
 from typing import Any, Dict
 
 from groq import AsyncGroq
@@ -17,7 +19,16 @@ logger = get_logger(__name__)
 class RateLimitError(Exception):
     """Raised when Groq API returns 429 rate limit error"""
 
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        retry_after_seconds: float | None = None,
+        provider_exhausted: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+        self.provider_exhausted = provider_exhausted
 
 
 class GroqService:
@@ -67,6 +78,7 @@ class GroqService:
 
         if not self._clients:
             raise RuntimeError("Missing Groq client credentials")
+        self._client_cooldown_until: Dict[str, float] = {}
 
     @property
     def has_fallback_client(self) -> bool:
@@ -87,6 +99,30 @@ class GroqService:
     def _is_rate_limit_error(error: Exception) -> bool:
         error_str = str(error or "")
         return "429" in error_str or "rate_limit" in error_str.lower()
+
+    @staticmethod
+    def _parse_retry_after_seconds(error: Exception) -> float | None:
+        text = str(error or "")
+        # Example: "Please try again in 5m15.8784s"
+        m = re.search(r"try again in\s*(?:(\d+)m)?\s*([0-9]+(?:\.[0-9]+)?)s", text, flags=re.IGNORECASE)
+        if m:
+            mins = float(m.group(1) or 0.0)
+            secs = float(m.group(2) or 0.0)
+            return max(1.0, mins * 60.0 + secs)
+        # Generic fallback "retry after 12s"
+        s = re.search(r"retry\s+after\s*([0-9]+(?:\.[0-9]+)?)s", text, flags=re.IGNORECASE)
+        if s:
+            return max(1.0, float(s.group(1)))
+        return None
+
+    def _cooldown_remaining(self, client_name: str) -> float:
+        until = float(self._client_cooldown_until.get(client_name, 0.0) or 0.0)
+        return max(0.0, until - time.monotonic())
+
+    def _set_cooldown(self, client_name: str, retry_after_seconds: float | None) -> None:
+        if retry_after_seconds is None:
+            return
+        self._client_cooldown_until[client_name] = time.monotonic() + max(1.0, retry_after_seconds)
 
     @throttled(limit=10, period=60.0, name="groq_api")
     async def ainvoke(
@@ -130,8 +166,26 @@ class GroqService:
                 raise RuntimeError(f"Requested Groq client '{force_client}' is not configured")
 
         last_error: Exception | None = None
+        all_clients_cooling_down = True
+        shortest_retry_after: float | None = None
         for client_idx, (client_name, client) in enumerate(clients_to_use):
             is_last_client = client_idx == len(clients_to_use) - 1
+            cooldown_remaining = self._cooldown_remaining(client_name)
+            if cooldown_remaining > 0:
+                if shortest_retry_after is None or cooldown_remaining < shortest_retry_after:
+                    shortest_retry_after = cooldown_remaining
+                logger.warning(
+                    "[GroqService] Skipping %s Groq client due to cooldown (retry_in=%.2fs)",
+                    client_name,
+                    cooldown_remaining,
+                )
+                last_error = RateLimitError(
+                    f"Groq client '{client_name}' in cooldown for {cooldown_remaining:.2f}s",
+                    retry_after_seconds=cooldown_remaining,
+                    provider_exhausted=True,
+                )
+                continue
+            all_clients_cooling_down = False
             for attempt in range(max_retries):
                 try:
                     response = await client.chat.completions.create(**kwargs)
@@ -162,8 +216,13 @@ class GroqService:
                 except Exception as e:
                     last_error = e
                     if self._is_rate_limit_error(e):
+                        retry_after = self._parse_retry_after_seconds(e)
+                        self._set_cooldown(client_name, retry_after)
+                        if retry_after is not None:
+                            if shortest_retry_after is None or retry_after < shortest_retry_after:
+                                shortest_retry_after = retry_after
                         if attempt < max_retries - 1:
-                            wait_time = 2**attempt  # Exponential backoff: 1s, 2s, 4s
+                            wait_time = retry_after if retry_after is not None else 2**attempt
                             logger.warning(
                                 f"[GroqService] Rate limit hit on {client_name} client. Retrying in {wait_time}s "
                                 f"(attempt {attempt + 1}/{max_retries})"
@@ -188,8 +247,20 @@ class GroqService:
             if not is_last_client:
                 continue
 
+        if all_clients_cooling_down:
+            retry_after = shortest_retry_after if shortest_retry_after is not None else 1.0
+            raise RateLimitError(
+                "Groq rate limit exhausted on all configured clients",
+                retry_after_seconds=retry_after,
+                provider_exhausted=True,
+            )
         if isinstance(last_error, Exception) and self._is_rate_limit_error(last_error):
-            raise RateLimitError(f"Groq rate limit exceeded: {last_error}") from last_error
+            retry_after = self._parse_retry_after_seconds(last_error)
+            raise RateLimitError(
+                f"Groq rate limit exceeded: {last_error}",
+                retry_after_seconds=retry_after,
+                provider_exhausted=True,
+            ) from last_error
         if isinstance(last_error, Exception):
             raise last_error
 
