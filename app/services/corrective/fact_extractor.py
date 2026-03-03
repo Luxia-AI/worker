@@ -244,6 +244,15 @@ class FactExtractor:
         return isinstance(result, dict) and str(result.get("_llm_error") or "") == "rate_limited_provider_exhausted"
 
     @staticmethod
+    def _is_degraded_payload(result: Any) -> bool:
+        if not isinstance(result, dict):
+            return False
+        if bool(result.get("_degraded_skip", False)):
+            return True
+        llm_error = str(result.get("_llm_error") or "").strip().lower()
+        return llm_error in {"skipped_due_to_quota", "rate_limited_provider_exhausted"}
+
+    @staticmethod
     def _confidence_mode() -> bool:
         value = os.getenv("LUXIA_CONFIDENCE_MODE")
         if value is None:
@@ -550,7 +559,7 @@ class FactExtractor:
         parsed = self._try_parse_result(result, allow_single_index_fallback=allow_single_index_fallback)
         if parsed is not None:
             return parsed
-        if self._is_provider_exhausted_payload(result):
+        if self._is_degraded_payload(result):
             logger.warning("[FactExtractor] Skipping JSON-repair retries: LLM providers exhausted by rate limit")
             return None
 
@@ -579,6 +588,109 @@ class FactExtractor:
 
         logger.warning("[FactExtractor] All retries exhausted, returning None")
         return None
+
+    def _deterministic_sentence_fallback(
+        self,
+        pages: List[Dict[str, Any]],
+        claim_text: str = "",
+        claim_entities: Optional[List[str]] = None,
+        must_have_entities: Optional[List[str]] = None,
+        predicate_target: Optional[Dict[str, str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Deterministic fallback when LLM is unavailable/degraded.
+        Extracts claim-relevant atomic sentences directly from source pages.
+        """
+        if not pages:
+            return []
+
+        claim_tokens = self._tokenize(claim_text)
+        claim_entity_tokens: set[str] = set()
+        for ent in claim_entities or []:
+            claim_entity_tokens |= self._tokenize(ent)
+        must_have_tokens: set[str] = set()
+        for ent in must_have_entities or []:
+            must_have_tokens |= self._tokenize(ent)
+        claim_predicates = self._predicate_family_tokens(claim_text)
+        if isinstance(predicate_target, dict):
+            claim_predicates |= self._predicate_family_tokens(
+                " ".join(
+                    [
+                        str(predicate_target.get("subject") or ""),
+                        str(predicate_target.get("predicate") or ""),
+                        str(predicate_target.get("object") or ""),
+                    ]
+                )
+            )
+
+        picked: List[Dict[str, Any]] = []
+        for page in pages:
+            source_text = str(page.get("content") or "")
+            if not source_text:
+                continue
+            sentences = [clean_statement(s) for s in extract_sentences(source_text) if str(s or "").strip()]
+            if not sentences:
+                sentences = [
+                    clean_statement(s)
+                    for s in re.split(r"(?<=[.!?])\s+", source_text)
+                    if len(str(s or "").strip()) >= 24
+                ]
+            for sent in sentences[:280]:
+                if not self._is_truth_grounded_statement(sent):
+                    continue
+                sent_tokens = self._tokenize(sent)
+                if not sent_tokens:
+                    continue
+
+                lexical_overlap = len(sent_tokens & claim_tokens)
+                entity_overlap = len(sent_tokens & (must_have_tokens or claim_entity_tokens))
+                predicate_overlap = 0
+                if claim_predicates:
+                    sent_predicates = self._predicate_family_tokens(sent)
+                    predicate_overlap = len(sent_predicates & claim_predicates)
+
+                # Require at least one strong claim signal.
+                if lexical_overlap == 0 and entity_overlap == 0 and predicate_overlap == 0:
+                    continue
+                # Keep anchor relevance tight when must-have entities exist.
+                if must_have_tokens and entity_overlap == 0 and lexical_overlap < 2:
+                    continue
+
+                score = (
+                    (0.50 * min(1.0, lexical_overlap / max(1, len(claim_tokens) or 1)))
+                    + (0.30 * min(1.0, entity_overlap / max(1, len(must_have_tokens or claim_entity_tokens) or 1)))
+                    + (0.20 * (1.0 if predicate_overlap > 0 else 0.0))
+                )
+                if score < 0.16:
+                    continue
+
+                statement = self._ground_statement_to_source(sent, source_text)
+                fact = {
+                    "statement": statement,
+                    "confidence": round(max(0.55, min(0.90, 0.55 + (0.35 * score))), 3),
+                    "source_url": page.get("url", ""),
+                    "source": page.get("source", ""),
+                    "published_at": page.get("published_at", ""),
+                }
+                fact["fact_id"] = generate_fact_id(fact["statement"], fact["source_url"])
+                picked.append(fact)
+
+        picked = self._normalize_atomic_facts(picked)
+        picked = self._filter_truth_grounded_facts(picked)
+        picked = self._filter_claim_admissible_facts(
+            picked,
+            claim_text=claim_text,
+            claim_entities=claim_entities,
+            must_have_entities=must_have_entities,
+        )
+        dedup_by_id: Dict[str, Dict[str, Any]] = {}
+        for fact in picked:
+            fact_id = str(fact.get("fact_id", ""))
+            if fact_id and fact_id not in dedup_by_id:
+                dedup_by_id[fact_id] = fact
+        out = list(dedup_by_id.values())
+        logger.info("[FactExtractor] Deterministic fallback produced %d facts", len(out))
+        return out
 
     async def extract(
         self,
@@ -664,13 +776,20 @@ class FactExtractor:
                 priority=LLMPriority.LOW,
                 call_tag="fact_extraction",
             )
-            if self._is_provider_exhausted_payload(result):
+            if self._is_degraded_payload(result):
                 retry_after = float(result.get("retry_after_seconds", 0.0) or 0.0)
                 logger.warning(
-                    "[FactExtractor] Fact extraction skipped: LLM providers exhausted (retry_after=%.2fs)",
+                    "[FactExtractor] Fact extraction degraded/unavailable "
+                    "(retry_after=%.2fs), using deterministic fallback",
                     retry_after,
                 )
-                return []
+                return self._deterministic_sentence_fallback(
+                    valid_pages,
+                    claim_text=claim_text,
+                    claim_entities=claim_entities,
+                    must_have_entities=must_have_entities,
+                    predicate_target=predicate_target,
+                )
 
             # Parse with retry logic
             parsed = await self._parse_llm_response(
@@ -691,13 +810,19 @@ class FactExtractor:
                     call_tag="fact_extraction",
                     allow_quota_override=True,
                 )
-                if self._is_provider_exhausted_payload(retry_result):
+                if self._is_degraded_payload(retry_result):
                     retry_after = float(retry_result.get("retry_after_seconds", 0.0) or 0.0)
                     logger.warning(
-                        "[FactExtractor] Confidence retry skipped: LLM providers exhausted (retry_after=%.2fs)",
+                        "[FactExtractor] Confidence retry degraded/unavailable (retry_after=%.2fs)",
                         retry_after,
                     )
-                    return []
+                    return self._deterministic_sentence_fallback(
+                        valid_pages,
+                        claim_text=claim_text,
+                        claim_entities=claim_entities,
+                        must_have_entities=must_have_entities,
+                        predicate_target=predicate_target,
+                    )
                 parsed = await self._parse_llm_response(
                     retry_result,
                     prompt,
@@ -707,6 +832,15 @@ class FactExtractor:
 
             if parsed is None:
                 logger.warning("[FactExtractor] Could not parse LLM response after retries, using fallback")
+                deterministic = self._deterministic_sentence_fallback(
+                    valid_pages,
+                    claim_text=claim_text,
+                    claim_entities=claim_entities,
+                    must_have_entities=must_have_entities,
+                    predicate_target=predicate_target,
+                )
+                if deterministic:
+                    return deterministic
                 return await self._extract_per_page_fallback(
                     valid_pages,
                     predicate_target=predicate_target,
@@ -813,7 +947,7 @@ class FactExtractor:
                     call_tag="fact_extraction",
                     allow_quota_override=allow_override,
                 )
-                if self._is_provider_exhausted_payload(result):
+                if self._is_degraded_payload(result):
                     logger.warning("[FactExtractor] Per-page fallback stopped: LLM providers exhausted by rate limit")
                     break
                 extracted = result.get("facts", [])
@@ -845,6 +979,14 @@ class FactExtractor:
             claim_entities=claim_entities,
             must_have_entities=must_have_entities,
         )
+        if not facts:
+            facts = self._deterministic_sentence_fallback(
+                pages,
+                claim_text=claim_text,
+                claim_entities=claim_entities,
+                must_have_entities=must_have_entities,
+                predicate_target=predicate_target,
+            )
         log_value_payload(
             logger,
             "fact_extraction_fallback",

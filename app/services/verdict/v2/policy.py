@@ -56,6 +56,15 @@ def compute_verdict_policy_v2(
     if calibrator_features:
         features.update({k: float(v) for k, v in calibrator_features.items()})
     class_probs = calibrator.calibrate_distribution(class_probs_raw, features=features)
+    # Keep policy verdict aligned with calibrated posteriors unless evidence is too weak.
+    calibrated_verdict = _verdict_from_probs(
+        float(class_probs.get("true", 0.0) or 0.0),
+        float(class_probs.get("false", 0.0) or 0.0),
+        float(class_probs.get("unverifiable", 0.0) or 0.0),
+    )
+    calibrated_max = max(float(v or 0.0) for v in class_probs.values()) if class_probs else 0.0
+    if calibrated_max >= 0.45:
+        verdict = calibrated_verdict
     class_max = max(float(v or 0.0) for v in class_probs.values())
     confidence_seed = _clamp01((0.65 * float(post.get("confidence_raw", class_max) or class_max)) + (0.35 * class_max))
     calibrated_confidence = calibrator.calibrate(

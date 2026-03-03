@@ -74,21 +74,33 @@ def compute_posteriors_v2(
     agreement = _agreement_score(admissible)
     margin = _clamp01(abs(support_mass_n - refute_mass_n))
 
+    # Evidence sufficiency should reward directional mass while still penalizing noisy retrieval.
+    # Compared to earlier weighting, entropy penalty is softened to avoid over-indexing
+    # on uncertainty when one polarity is already dominant.
     sufficiency = _sigmoid(
         (1.45 * _clamp01(coverage))
         + (1.10 * _clamp01(diversity))
-        + (1.30 * _clamp01(support_mass_n + refute_mass_n))
-        - (1.20 * retrieval_entropy)
-        - 1.25
+        + (1.35 * _clamp01(support_mass_n + refute_mass_n))
+        - (0.95 * retrieval_entropy)
+        - 1.20
     )
+    directional_strength = _clamp01(max(support_mass_n, refute_mass_n))
     p_true_raw = support_mass_n * sufficiency * max(0.20, agreement)
     p_false_raw = refute_mass_n * sufficiency * max(0.20, agreement)
-    p_unv_raw = (1.0 - sufficiency) + (neutral_mass_n * (1.0 - margin))
+    # Uncertainty should shrink when directional evidence is strong and polarized.
+    uncertainty_base = (1.0 - sufficiency) * (1.0 - (0.55 * directional_strength))
+    residual_neutral = neutral_mass_n * (1.0 - (0.65 * margin))
+    p_unv_raw = max(0.0, uncertainty_base + residual_neutral)
     s = max(1e-9, p_true_raw + p_false_raw + p_unv_raw)
     p_true = _clamp01(p_true_raw / s)
     p_false = _clamp01(p_false_raw / s)
     p_unv = _clamp01(p_unv_raw / s)
-    conf_raw = _clamp01(max(p_true, p_false, p_unv) * (0.5 + 0.5 * sufficiency) * (1.0 - 0.30 * retrieval_entropy))
+    conf_raw = _clamp01(
+        max(p_true, p_false, p_unv)
+        * (0.45 + (0.55 * sufficiency))
+        * (1.0 - (0.22 * retrieval_entropy))
+        * (0.80 + (0.20 * max(margin, directional_strength)))
+    )
     return {
         "p_true": p_true,
         "p_false": p_false,
@@ -96,6 +108,7 @@ def compute_posteriors_v2(
         "support_mass": support_mass_n,
         "refute_mass": refute_mass_n,
         "neutral_mass": neutral_mass_n,
+        "directional_strength": directional_strength,
         "margin": margin,
         "sufficiency": sufficiency,
         "agreement": agreement,

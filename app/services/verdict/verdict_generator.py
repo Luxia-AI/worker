@@ -7428,6 +7428,29 @@ class VerdictGenerator:
                 meta["class_probs_resynced"] = True
                 meta["class_probs_resync_reason"] = "directional_true_lock"
                 payload["calibration_meta"] = meta
+        # Final probability/label coherence pass:
+        # if hard verdict is directional and posterior still peaks elsewhere,
+        # softly shift probability mass to keep output contract coherent.
+        probs_now = payload.get("class_probs") if isinstance(payload.get("class_probs"), dict) else {}
+        if verdict in {Verdict.TRUE.value, Verdict.FALSE.value} and probs_now:
+            confidence_now = float(payload.get("confidence", 0.0) or 0.0)
+            should_align = bool(directional_segment_lock or trust_gate_effective or confidence_now >= 0.55)
+            if should_align:
+                aligned = self._soft_align_class_probs_with_verdict(
+                    probs_now,
+                    verdict=verdict,
+                    min_margin=0.01,
+                    max_transfer=0.24,
+                )
+                if aligned != probs_now:
+                    payload["class_probs"] = aligned
+                    meta = payload.get("calibration_meta")
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    meta["class_probs_resynced"] = True
+                    if not meta.get("class_probs_resync_reason"):
+                        meta["class_probs_resync_reason"] = "verdict_probability_coherence"
+                    payload["calibration_meta"] = meta
         if not isinstance(payload.get("calibration_meta"), dict):
             payload["calibration_meta"] = {"calibrator_version": payload.get("calibration_version")}
         if not isinstance(payload.get("evidence_attribution"), list):
@@ -7666,6 +7689,66 @@ class VerdictGenerator:
                 return hard
             return self._truthfulness_band(truthfulness_percent)
         return self._truthfulness_band(truthfulness_percent)
+
+    @staticmethod
+    def _normalize_class_probs_dict(class_probs: Dict[str, Any]) -> Dict[str, float]:
+        p_true = max(0.0, float(class_probs.get("true", 0.0) or 0.0))
+        p_false = max(0.0, float(class_probs.get("false", 0.0) or 0.0))
+        p_unv = max(0.0, float(class_probs.get("unverifiable", 0.0) or 0.0))
+        total = p_true + p_false + p_unv
+        if total <= 0.0:
+            return {"true": 0.20, "false": 0.20, "unverifiable": 0.60}
+        return {
+            "true": p_true / total,
+            "false": p_false / total,
+            "unverifiable": p_unv / total,
+        }
+
+    @classmethod
+    def _soft_align_class_probs_with_verdict(
+        cls,
+        class_probs: Dict[str, Any],
+        verdict: str,
+        *,
+        min_margin: float = 0.01,
+        max_transfer: float = 0.24,
+    ) -> Dict[str, float]:
+        """
+        Keep posterior probabilities directionally consistent with the hard verdict
+        without collapsing uncertainty (small-mass transfer only).
+        """
+        probs = cls._normalize_class_probs_dict(class_probs)
+        verdict_up = str(verdict or "").upper()
+        if verdict_up == Verdict.TRUE.value:
+            target = "true"
+        elif verdict_up == Verdict.FALSE.value:
+            target = "false"
+        else:
+            return probs
+
+        p_target = float(probs.get(target, 0.0) or 0.0)
+        other_key = "false" if target == "true" else "true"
+        p_other = float(probs.get(other_key, 0.0) or 0.0)
+        p_unv = float(probs.get("unverifiable", 0.0) or 0.0)
+        strongest_other = max(p_other, p_unv)
+        if p_target >= strongest_other + min_margin:
+            return probs
+
+        needed = (strongest_other - p_target) + min_margin
+        transfer = min(max_transfer, max(0.0, needed + 0.02))
+        take_from_unv = min(transfer, p_unv)
+        p_unv -= take_from_unv
+        transfer_left = transfer - take_from_unv
+        if transfer_left > 0.0:
+            p_other = max(0.0, p_other - transfer_left)
+        p_target += transfer
+        return cls._normalize_class_probs_dict(
+            {
+                "true": p_target if target == "true" else p_other,
+                "false": p_target if target == "false" else p_other,
+                "unverifiable": p_unv,
+            }
+        )
 
     def _unverifiable_result(self, claim: str, reason: str) -> Dict[str, Any]:
         """Return a safe UNVERIFIABLE fallback when verdict generation fails."""
