@@ -641,6 +641,7 @@ class CorrectivePipeline:
         claim_entities = await self._extract_claim_entities(post_text, round_id)
         must_have_entities = self._select_must_have_entities(post_text, claim_entities)
         must_have_aliases = self._build_must_have_aliases(claim_entities, must_have_entities)
+        predicate_target = self._derive_predicate_target(post_text, claim_entities, must_have_aliases)
         await debug_reporter.log_step(
             step_name="Claim entities identified",
             description="Entity extraction on incoming claim",
@@ -649,11 +650,13 @@ class CorrectivePipeline:
                 "claim_entities": claim_entities,
                 "must_have_entities": must_have_entities,
                 "must_have_aliases": must_have_aliases,
+                "predicate_target": predicate_target,
             },
         )
         logger.info(
             f"[CorrectivePipeline:{round_id}] Claim entities: {claim_entities} | "
-            f"must_have={must_have_entities} aliases={must_have_aliases}"
+            f"must_have={must_have_entities} aliases={must_have_aliases} "
+            f"predicate_target={predicate_target}"
         )
 
         # ====================================================================
@@ -1187,6 +1190,7 @@ class CorrectivePipeline:
                 claim_text=post_text,
                 claim_entities=claim_entities,
                 must_have_entities=must_have_aliases or claim_entities[:1],
+                predicate_target=predicate_target,
             )
             await _emit_stage(
                 "extraction_done",
@@ -1894,6 +1898,80 @@ class CorrectivePipeline:
                     aliases.append(n)
                     break
         return aliases
+
+    @staticmethod
+    def _infer_predicate_phrase(claim: str) -> str:
+        text = re.sub(r"\s+", " ", str(claim or "").strip().lower())
+        if not text:
+            return ""
+
+        neg = re.search(
+            (
+                r"\b(?:does|do|did|is|are|was|were|can|could|should|would|has|have|had|will)\s+not\s+"
+                r"(?P<pred>[a-z][a-z\-]{2,}(?:\s+[a-z][a-z\-]{2,}){0,2})"
+            ),
+            text,
+        )
+        if neg:
+            return f"not {str(neg.group('pred') or '').strip()}".strip()
+
+        aux = re.search(
+            (
+                r"\b(?:does|do|did|is|are|was|were|can|could|may|might|must|should|would|will|has|have|had)\b\s+"
+                r"(?P<pred>[a-z][a-z\-]{2,}(?:\s+[a-z][a-z\-]{2,}){0,2})"
+            ),
+            text,
+        )
+        if aux:
+            return str(aux.group("pred") or "").strip()
+
+        lexical = re.search(
+            (
+                r"\b(?P<pred>reduce|reduces|reduced|increase|increases|increased|"
+                r"cause|causes|caused|prevent|prevents|prevented|"
+                r"treat|treats|treated|improve|improves|improved|"
+                r"control|controls|controlled|associate|associates|associated|"
+                r"link|links|linked)\b"
+            ),
+            text,
+        )
+        if lexical:
+            return str(lexical.group("pred") or "").strip()
+        return ""
+
+    def _derive_predicate_target(
+        self,
+        claim: str,
+        claim_entities: List[str],
+        must_have_aliases: List[str],
+    ) -> Dict[str, str]:
+        subject = ""
+        for candidate in (must_have_aliases or []) + (claim_entities or []):
+            normalized = self._normalize_entity_phrase(candidate)
+            if normalized and self._is_high_salience_entity(normalized):
+                subject = normalized
+                break
+
+        subject_tokens = set(self._entity_tokenize(subject))
+        object_ = ""
+        for candidate in claim_entities or []:
+            normalized = self._normalize_entity_phrase(candidate)
+            if not normalized or normalized == subject:
+                continue
+            candidate_tokens = set(self._entity_tokenize(normalized))
+            if subject_tokens and candidate_tokens and candidate_tokens <= subject_tokens:
+                continue
+            object_ = normalized
+            break
+
+        predicate = self._infer_predicate_phrase(claim)
+        if not (subject or predicate or object_):
+            return {}
+        return {
+            "subject": subject,
+            "predicate": predicate,
+            "object": object_,
+        }
 
     async def _extract_claim_entities(self, claim: str, round_id: str) -> List[str]:
         """Extract high-salience claim entities with deterministic noun-phrase fallback."""

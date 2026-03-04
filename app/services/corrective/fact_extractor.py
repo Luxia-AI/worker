@@ -436,12 +436,33 @@ class FactExtractor:
             families.add("associate")
         return families
 
+    @classmethod
+    def _predicate_target_tokens(cls, predicate_target: Optional[Dict[str, str]]) -> Dict[str, set[str]]:
+        if not isinstance(predicate_target, dict):
+            return {
+                "subject_tokens": set(),
+                "object_tokens": set(),
+                "predicate_tokens": set(),
+                "predicate_families": set(),
+            }
+        subject = str(predicate_target.get("subject") or "").strip()
+        predicate = str(predicate_target.get("predicate") or "").strip()
+        object_ = str(predicate_target.get("object") or "").strip()
+        combined = " ".join([subject, predicate, object_]).strip()
+        return {
+            "subject_tokens": cls._tokenize(subject),
+            "object_tokens": cls._tokenize(object_),
+            "predicate_tokens": cls._tokenize(predicate),
+            "predicate_families": cls._predicate_family_tokens(combined),
+        }
+
     def _filter_claim_admissible_facts(
         self,
         facts: List[Dict[str, Any]],
         claim_text: str = "",
         claim_entities: Optional[List[str]] = None,
         must_have_entities: Optional[List[str]] = None,
+        predicate_target: Optional[Dict[str, str]] = None,
     ) -> List[Dict[str, Any]]:
         claim_tokens = self._tokenize(claim_text)
         claim_predicates = self._predicate_family_tokens(claim_text)
@@ -451,6 +472,12 @@ class FactExtractor:
         must_have_tokens: set[str] = set()
         for ent in must_have_entities or []:
             must_have_tokens |= self._tokenize(ent)
+        target_profile = self._predicate_target_tokens(predicate_target)
+        target_subject_tokens = target_profile["subject_tokens"]
+        target_object_tokens = target_profile["object_tokens"]
+        target_predicate_families = target_profile["predicate_families"]
+        target_predicate_tokens = target_profile["predicate_tokens"]
+        combined_predicates = claim_predicates | target_predicate_families
 
         kept: List[Dict[str, Any]] = []
         for fact in facts:
@@ -475,10 +502,33 @@ class FactExtractor:
                 continue
 
             stmt_predicates = self._predicate_family_tokens(stmt)
-            if claim_predicates and not (stmt_predicates & claim_predicates):
+            if combined_predicates and not (stmt_predicates & combined_predicates):
                 # Relax only when anchor/entity alignment is strong to avoid zero-fact runs.
                 lexical_overlap = len(stmt_tokens & claim_tokens)
                 if not ((has_must_have or has_claim_entity) and lexical_overlap >= 2):
+                    continue
+
+            if target_subject_tokens or target_object_tokens:
+                subject_overlap = len(stmt_tokens & target_subject_tokens)
+                object_overlap = len(stmt_tokens & target_object_tokens)
+                predicate_overlap = 0
+                if target_predicate_tokens:
+                    predicate_overlap = len(stmt_tokens & target_predicate_tokens)
+                elif target_predicate_families:
+                    predicate_overlap = len(stmt_predicates & target_predicate_families)
+                lexical_overlap = len(stmt_tokens & claim_tokens)
+                directness = (
+                    (0.45 * (1.0 if subject_overlap > 0 else 0.0))
+                    + (0.30 * (1.0 if object_overlap > 0 else 0.0))
+                    + (0.25 * (1.0 if predicate_overlap > 0 else 0.0))
+                )
+                if target_subject_tokens and subject_overlap == 0:
+                    # Keep only when lexical evidence is very high and object is matched.
+                    if not (object_overlap > 0 and lexical_overlap >= 4):
+                        continue
+                if target_object_tokens and object_overlap == 0 and lexical_overlap < 3:
+                    continue
+                if directness < 0.25 and lexical_overlap < 3:
                     continue
             kept.append(fact)
         # Failsafe: preserve anchor-matching facts when strict predicate filtering empties output.
@@ -496,6 +546,14 @@ class FactExtractor:
             if must_have_tokens and not (stmt_tokens & must_have_tokens):
                 continue
             if claim_tokens and len(stmt_tokens & claim_tokens) < 2:
+                continue
+            if target_subject_tokens and not (stmt_tokens & target_subject_tokens):
+                continue
+            if (
+                target_object_tokens
+                and not (stmt_tokens & target_object_tokens)
+                and len(stmt_tokens & claim_tokens) < 3
+            ):
                 continue
             fallback.append(fact)
         return fallback
@@ -612,6 +670,11 @@ class FactExtractor:
         for ent in must_have_entities or []:
             must_have_tokens |= self._tokenize(ent)
         claim_predicates = self._predicate_family_tokens(claim_text)
+        target_profile = self._predicate_target_tokens(predicate_target)
+        target_subject_tokens = target_profile["subject_tokens"]
+        target_object_tokens = target_profile["object_tokens"]
+        target_predicate_tokens = target_profile["predicate_tokens"]
+        target_predicate_families = target_profile["predicate_families"]
         if isinstance(predicate_target, dict):
             claim_predicates |= self._predicate_family_tokens(
                 " ".join(
@@ -648,6 +711,13 @@ class FactExtractor:
                 if claim_predicates:
                     sent_predicates = self._predicate_family_tokens(sent)
                     predicate_overlap = len(sent_predicates & claim_predicates)
+                target_subject_overlap = len(sent_tokens & target_subject_tokens)
+                target_object_overlap = len(sent_tokens & target_object_tokens)
+                target_predicate_overlap = 0
+                if target_predicate_tokens:
+                    target_predicate_overlap = len(sent_tokens & target_predicate_tokens)
+                elif target_predicate_families:
+                    target_predicate_overlap = len(sent_predicates & target_predicate_families)
 
                 # Require at least one strong claim signal.
                 if lexical_overlap == 0 and entity_overlap == 0 and predicate_overlap == 0:
@@ -655,12 +725,22 @@ class FactExtractor:
                 # Keep anchor relevance tight when must-have entities exist.
                 if must_have_tokens and entity_overlap == 0 and lexical_overlap < 2:
                     continue
+                if target_subject_tokens and target_subject_overlap == 0:
+                    continue
+                if target_object_tokens and target_object_overlap == 0 and lexical_overlap < 3:
+                    continue
 
                 score = (
                     (0.50 * min(1.0, lexical_overlap / max(1, len(claim_tokens) or 1)))
                     + (0.30 * min(1.0, entity_overlap / max(1, len(must_have_tokens or claim_entity_tokens) or 1)))
                     + (0.20 * (1.0 if predicate_overlap > 0 else 0.0))
                 )
+                if target_subject_tokens or target_object_tokens or target_predicate_tokens:
+                    score += (
+                        0.10 * (1.0 if target_subject_overlap > 0 else 0.0)
+                        + 0.08 * (1.0 if target_object_overlap > 0 else 0.0)
+                        + 0.06 * (1.0 if target_predicate_overlap > 0 else 0.0)
+                    )
                 if score < 0.16:
                     continue
 
@@ -682,6 +762,7 @@ class FactExtractor:
             claim_text=claim_text,
             claim_entities=claim_entities,
             must_have_entities=must_have_entities,
+            predicate_target=predicate_target,
         )
         dedup_by_id: Dict[str, Dict[str, Any]] = {}
         for fact in picked:
@@ -760,10 +841,25 @@ class FactExtractor:
             claim_entities=claim_entities,
             must_have_entities=must_have_entities,
         )
+        predicate_focus_block = ""
+        if isinstance(predicate_target, dict):
+            subject = str(predicate_target.get("subject") or "").strip()
+            predicate = str(predicate_target.get("predicate") or "").strip()
+            object_ = str(predicate_target.get("object") or "").strip()
+            if subject or predicate or object_:
+                predicate_focus_block = (
+                    "\n\nPREDICATE TARGET (strict relevance):\n"
+                    f"- subject: {subject or '[]'}\n"
+                    f"- predicate: {predicate or '[]'}\n"
+                    f"- object: {object_ or '[]'}\n"
+                    "- Keep only facts directly confirming or directly contradicting this relation.\n"
+                    "- Exclude broad topic mentions that do not connect subject and object.\n"
+                )
         prompt = (
             f"{BATCH_FACT_PROMPT}{batch_content}\n\n"
             f"TARGET_FACTS_PER_SECTION: up to {target_facts_per_page} high-quality atomic facts."
             f"{claim_context_block}"
+            f"{predicate_focus_block}"
         )
 
         required_format = '{"results": [{"index": 0, "facts": [{"statement": "...", "confidence": 0.85}]}]}'
@@ -882,6 +978,7 @@ class FactExtractor:
                 claim_text=claim_text,
                 claim_entities=claim_entities,
                 must_have_entities=must_have_entities,
+                predicate_target=predicate_target,
             )
             dedup_by_id: Dict[str, Dict[str, Any]] = {}
             for fact in facts:
@@ -978,6 +1075,7 @@ class FactExtractor:
             claim_text=claim_text,
             claim_entities=claim_entities,
             must_have_entities=must_have_entities,
+            predicate_target=predicate_target,
         )
         if not facts:
             facts = self._deterministic_sentence_fallback(
