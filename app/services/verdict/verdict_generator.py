@@ -4879,6 +4879,24 @@ class VerdictGenerator:
                     and intervention_ok_for_support
                     and (support_strength >= support_strength_threshold or rel_score >= 0.55)
                 )
+                # Predicate matcher can under-fire on some relation phrasings
+                # (e.g., dependency/association constructions). Allow a strict
+                # semantic fallback only when overlap/support are strong and no
+                # contradiction cues are present.
+                predicate_semantic_backoff_ok = (
+                    segment_has_predicate
+                    and rel in {"SUPPORTS", "NEUTRAL"}
+                    and predicate_match_score < strict_predicate_threshold
+                    and anchor_overlap >= 0.50
+                    and content_overlap >= 2
+                    and intervention_ok_for_support
+                    and support_strength >= max(support_strength_threshold, 0.55)
+                    and rel_score >= 0.45
+                    and contradiction_score < CONTRADICTION_THRESHOLD
+                    and polarity != "contradicts"
+                )
+                if predicate_semantic_backoff_ok:
+                    strict_support_ok = True
                 noun_phrase_support_ok = (
                     (not segment_has_predicate)
                     and rel in {"SUPPORTS", "NEUTRAL"}
@@ -4908,6 +4926,9 @@ class VerdictGenerator:
                 score = (0.55 * rel_score) + (0.25 * anchor_overlap) + (0.20 * predicate_match_score)
                 if strict_support_ok and score > best_support_score:
                     best_support_score = score
+                    support_reason = (
+                        "predicate_semantic_backoff" if predicate_semantic_backoff_ok else "strict_predicate_gate"
+                    )
                     best_support_item = {
                         **em,
                         "evidence_id": em.get("evidence_id", ev_idx if ev_idx is not None else -1),
@@ -4917,6 +4938,7 @@ class VerdictGenerator:
                         "support_strength": support_strength,
                         "contradiction_score": contradiction_score,
                         "stance_used": rel,
+                        "reason": support_reason,
                     }
                 elif refute_ok and score > best_refute_score:
                     best_refute_score = score
@@ -5034,7 +5056,13 @@ class VerdictGenerator:
                 elif explicit_refute_present:
                     seg["status"] = "INVALID"
                 elif best_support_item is not None:
-                    if segment_requires_predicate_guard and pred_match < strict_predicate_threshold:
+                    chosen_reason = str(chosen.get("reason") or "")
+                    predicate_backoff_applied = chosen_reason == "predicate_semantic_backoff"
+                    if (
+                        segment_requires_predicate_guard
+                        and pred_match < strict_predicate_threshold
+                        and not predicate_backoff_applied
+                    ):
                         seg["status"] = "UNKNOWN"
                         seg["supporting_fact"] = ""
                         seg["source_url"] = ""
@@ -5068,6 +5096,7 @@ class VerdictGenerator:
                     segment_requires_predicate_guard
                     and str(seg.get("status") or "").upper() in {"VALID", "PARTIALLY_VALID"}
                     and pred_match <= 0.05
+                    and str(chosen.get("reason") or "") != "predicate_semantic_backoff"
                 ):
                     seg["status"] = "UNKNOWN"
                     seg["supporting_fact"] = ""
