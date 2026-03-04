@@ -67,6 +67,7 @@ def compute_verdict_policy_v2(
     p_false_cal = float(class_probs.get("false", 0.0) or 0.0)
     p_unv_cal = float(class_probs.get("unverifiable", 0.0) or 0.0)
     directional_margin = abs(p_true_cal - p_false_cal)
+    directional_competitor = max(p_true_cal, p_false_cal)
     support_signal = float(post.get("support_mass", 0.0) or 0.0)
     refute_signal = float(post.get("refute_mass", 0.0) or 0.0)
     directional_signal = max(support_signal, refute_signal)
@@ -75,11 +76,39 @@ def compute_verdict_policy_v2(
     calibrated_max = max(float(v or 0.0) for v in class_probs.values()) if class_probs else 0.0
     if calibrated_max >= 0.45:
         verdict = calibrated_verdict
-    # Strong UNVERIFIABLE guard for ambiguous/weak directional evidence.
-    if p_unv_cal >= 0.46 and (
-        directional_margin <= 0.12 or directional_signal <= 0.52 or sufficiency <= 0.56 or admissibility_rate <= 0.45
+    # Strong UNVERIFIABLE guard only when uncertainty clearly dominates and directional evidence is weak.
+    unv_margin = p_unv_cal - directional_competitor
+    if (
+        p_unv_cal >= 0.50
+        and unv_margin >= 0.10
+        and (
+            directional_margin <= 0.10
+            or directional_signal <= 0.50
+            or sufficiency <= 0.56
+            or admissibility_rate <= 0.45
+        )
     ):
         verdict = "UNVERIFIABLE"
+    # Directional lock: avoid conservative collapse to UNVERIFIABLE when calibrated
+    # directional posterior is clearly dominant and evidence sufficiency is acceptable.
+    if (
+        p_true_cal >= 0.54
+        and p_true_cal >= (p_false_cal + 0.08)
+        and p_true_cal >= (p_unv_cal + 0.05)
+        and support_signal >= 0.56
+        and sufficiency >= 0.60
+        and admissibility_rate >= 0.48
+    ):
+        verdict = "TRUE"
+    elif (
+        p_false_cal >= 0.54
+        and p_false_cal >= (p_true_cal + 0.08)
+        and p_false_cal >= (p_unv_cal + 0.05)
+        and refute_signal >= 0.56
+        and sufficiency >= 0.60
+        and admissibility_rate >= 0.48
+    ):
+        verdict = "FALSE"
     class_max = max(float(v or 0.0) for v in class_probs.values())
     confidence_seed = _clamp01((0.65 * float(post.get("confidence_raw", class_max) or class_max)) + (0.35 * class_max))
     calibrated_confidence = calibrator.calibrate(
@@ -101,11 +130,14 @@ def compute_verdict_policy_v2(
             or float(post.get("margin", 0.0) or 0.0) < 0.24
             or admissibility_rate < 0.50
         )
+        directional_conflict = directional_signal >= 0.60 and directional_margin >= 0.20
         if low_signal:
             calibrated_confidence = min(
                 float(calibrated_confidence),
                 min(float(UNVERIFIABLE_CONFIDENCE_CAP), 0.58),
             )
+        elif directional_conflict:
+            calibrated_confidence = min(float(calibrated_confidence), 0.62)
     calibrated_confidence = _clamp01(calibrated_confidence)
 
     truthfulness = _truthfulness_from_posteriors(verdict, p_true, p_false, p_unv)

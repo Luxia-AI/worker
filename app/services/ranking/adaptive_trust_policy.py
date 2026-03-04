@@ -727,7 +727,11 @@ class AdaptiveTrustPolicy:
         adaptive_override_possible = (
             contradicted_count == 0
             and strong_covered > 0
-            and ((coverage >= 0.25 and diversity >= 0.75) or avg_relevance >= 0.55)
+            and len(top_evidence) >= int(os.getenv("ADAPTIVE_OVERRIDE_MIN_EVIDENCE", "2"))
+            and (
+                (coverage >= float(os.getenv("ADAPTIVE_OVERRIDE_MIN_COVERAGE", "0.35")) and diversity >= 0.75)
+                or avg_relevance >= float(os.getenv("ADAPTIVE_OVERRIDE_MIN_RELEVANCE", "0.60"))
+            )
         )
         gate_reason = "adaptive_override" if adaptive_override_possible else "strict"
         if contradicted_count > 0 and gate_reason == "strict":
@@ -735,7 +739,12 @@ class AdaptiveTrustPolicy:
         pred_min = float(os.getenv("ADAPTIVE_MIN_PREDICATE_MATCH", "0.10"))
         obj_min = float(os.getenv("ADAPTIVE_MIN_OBJECT_MATCH", "0.20"))
         has_alignment_signals = bool(predicate_scores or object_scores)
-        if has_alignment_signals and is_sufficient and (avg_predicate_match < pred_min or avg_object_match < obj_min):
+        if (
+            has_alignment_signals
+            and is_sufficient
+            and contradicted_count == 0
+            and (avg_predicate_match < pred_min or avg_object_match < obj_min)
+        ):
             is_sufficient = False
             gate_reason = "predicate_object_guard"
 
@@ -793,13 +802,14 @@ class AdaptiveTrustPolicy:
         strong_coverage = coverage >= 0.95
         strong_agreement = agreement >= 0.9
         adaptive_override_guard = (
-            gate_reason == "adaptive_override" and coverage >= 0.60 and avg_relevance >= 0.65 and top_trust >= 0.55
+            gate_reason == "adaptive_override" and coverage >= 0.65 and avg_relevance >= 0.68 and top_trust >= 0.58
         )
         weak_relevance_guard_applied = False
         if (
             is_sufficient
             and not adaptive_override_guard
             and not (strong_coverage and strong_agreement)
+            and contradicted_count == 0
             and (trust_post < 0.55 or top_sem < 0.60 or top_trust < 0.55)
         ):
             logger.debug(

@@ -218,6 +218,31 @@ def _collapse_source_polarity_conflicts(candidates: List[Dict[str, Any]]) -> Lis
     return list(by_key.values())
 
 
+def _neutral_kg_dominance_penalty(item: Dict[str, Any]) -> float:
+    """
+    Penalize KG-only neutral statements that are weakly anchored to the claim.
+    Keeps strong contradiction candidates intact.
+    """
+    sem_signal = float(item.get("sem_score", 0.0) or 0.0)
+    kg_signal = float(item.get("kg_score", 0.0) or 0.0)
+    claim_overlap = float(item.get("claim_overlap", 0.0) or 0.0)
+    anchor_overlap = float(item.get("anchor_match_score", 0.0) or 0.0)
+    predicate_match = float(item.get("predicate_match_score", 0.0) or 0.0)
+    stance = str(item.get("stance") or "neutral")
+    if stance == "contradicts":
+        return 0.0
+    if sem_signal > 0.04 or kg_signal < 0.75:
+        return 0.0
+    low_alignment = (
+        claim_overlap < float(os.getenv("RANKING_KG_DOMINANCE_MAX_CLAIM_OVERLAP", "0.24"))
+        and anchor_overlap < float(os.getenv("RANKING_KG_DOMINANCE_MAX_ANCHOR_OVERLAP", "0.35"))
+        and predicate_match < float(os.getenv("RANKING_KG_DOMINANCE_MAX_PREDICATE_MATCH", "0.28"))
+    )
+    if not low_alignment:
+        return 0.0
+    return max(0.0, min(0.65, float(os.getenv("RANKING_KG_DOMINANCE_PENALTY", "0.22"))))
+
+
 def _load_cross_encoder():
     global _CROSS_ENCODER
     if _CROSS_ENCODER is not None:
@@ -387,11 +412,8 @@ async def rank_candidates(
             item["raw_final_score"] = raw_score
             item["final_score"] = penalized
             item["contradiction_penalty"] = round(raw_score - penalized, 4)
-        sem_signal = float(item.get("sem_score", 0.0) or 0.0)
-        kg_signal = float(item.get("kg_score", 0.0) or 0.0)
-        claim_overlap = float(item.get("claim_overlap", 0.0) or 0.0)
-        kg_dominance_penalty = float(os.getenv("RANKING_KG_DOMINANCE_PENALTY", "0.18"))
-        if sem_signal <= 0.02 and kg_signal >= 0.80 and claim_overlap < 0.20 and stance != "contradicts":
+        kg_dominance_penalty = _neutral_kg_dominance_penalty(item)
+        if kg_dominance_penalty > 0.0:
             raw_score = float(item.get("final_score", 0.0) or 0.0)
             damped = max(0.0, raw_score * (1.0 - max(0.0, min(0.60, kg_dominance_penalty))))
             item["raw_final_score"] = raw_score
@@ -433,6 +455,24 @@ async def rank_candidates(
             item["refute_verified"] = True
             item["stance"] = "contradicts"
             refute_verified_count_stage2 += 1
+            continue
+        # Deterministic fallback admission for strong contradiction candidates when NLI is uncertain.
+        stage1_refute_score = float(item.get("stage1_refute_score", 0.0) or 0.0)
+        contradiction_seed = float(item.get("contradict_score", 0.0) or 0.0)
+        anchor_overlap = float(item.get("anchor_match_score", 0.0) or 0.0)
+        predicate_match = float(item.get("predicate_match_score", 0.0) or 0.0)
+        if (
+            stage1_refute_score >= float(os.getenv("REFUTE_STAGE1_FALLBACK_MIN", "0.72"))
+            and contradiction_seed >= float(os.getenv("REFUTE_STAGE1_FALLBACK_CONTRADICT_MIN", "0.75"))
+            and anchor_overlap >= float(os.getenv("REFUTE_STAGE1_FALLBACK_ANCHOR_MIN", "0.35"))
+            and predicate_match >= float(os.getenv("REFUTE_STAGE1_FALLBACK_PREDICATE_MIN", "0.20"))
+            and contra_p >= float(os.getenv("REFUTE_STAGE1_FALLBACK_CONTRA_PROB_MIN", "0.30"))
+            and neutral_p <= float(os.getenv("REFUTE_STAGE1_FALLBACK_NEUTRAL_MAX", "0.62"))
+        ):
+            item["refute_verified"] = True
+            item["refute_verified_fallback"] = True
+            item["stance"] = "contradicts"
+            refute_verified_count_stage2 += 1
     contradicting_count = scorer.score(ranked).contra_count
 
     ranked.sort(
@@ -447,6 +487,7 @@ async def rank_candidates(
     # Keep a contradiction quota so verdict generation receives explicit polarity evidence.
     non_contradicting = [r for r in ranked if (r.get("stance") or "neutral") != "contradicts"]
     contradicting = [r for r in ranked if (r.get("stance") or "neutral") == "contradicts"]
+    verified_contradicting = [r for r in contradicting if bool(r.get("refute_verified", False))]
     contradiction_quota = 0
     if contradicting:
         try:
@@ -457,7 +498,8 @@ async def rank_candidates(
     top_ranked: List[Dict[str, Any]]
     if non_contradicting:
         primary = non_contradicting[: max(0, top_k - contradiction_quota)]
-        top_ranked = primary + contradicting[:contradiction_quota]
+        contradiction_source = verified_contradicting if verified_contradicting else contradicting
+        top_ranked = primary + contradiction_source[:contradiction_quota]
         if len(top_ranked) < top_k:
             top_ranked += non_contradicting[len(primary) : len(primary) + (top_k - len(top_ranked))]
     else:
