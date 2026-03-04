@@ -212,6 +212,15 @@ def _action_markers(text: str) -> set[str]:
     return markers
 
 
+def _contains_negation(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(?:no|not|never|without|cannot|can't|does not|do not|did not|doesn't|don't|didn't|none)\b",
+            str(text or "").lower(),
+        )
+    )
+
+
 def _has_object_refutation_signal(statement: str) -> bool:
     low = (statement or "").lower()
     patterns = (
@@ -254,6 +263,29 @@ def _claim_focus_tokens(text: str) -> set[str]:
     }
     tokens = {w for w in re.findall(r"\b[\w']+\b", (text or "").lower()) if w not in stop and len(w) > 3}
     return tokens
+
+
+def _is_claim_echo_candidate(
+    *,
+    claim_overlap: float,
+    anchor_match_score: float,
+    sem_s: float,
+    kg_raw: float,
+    candidate_type: str,
+) -> bool:
+    """
+    Detect likely claim-echo artifacts where KG text mirrors claim phrasing but
+    carries weak semantic corroboration. This is model-agnostic and domain-generic.
+    """
+    if str(candidate_type or "").upper() != "KG":
+        return False
+    if claim_overlap < 0.92:
+        return False
+    if anchor_match_score < 0.85:
+        return False
+    # If semantic corroboration is very weak while KG relation score is high,
+    # this often indicates extracted paraphrase artifacts rather than grounded evidence.
+    return sem_s < 0.15 and kg_raw >= 0.70
 
 
 def _relation_focus_tokens(text: str) -> tuple[set[str], set[str]]:
@@ -601,6 +633,7 @@ def hybrid_rank(
     claim_focus_tokens = _claim_focus_tokens(query_text)
     subject_focus_tokens, object_focus_tokens = _relation_focus_tokens(query_text)
     claim_actions = _action_markers(query_text)
+    claim_has_negation = _contains_negation(query_text)
     has_query_context = bool(str(query_text or "").strip())
     belief_claim = _claim_is_belief_or_survey(query_text)
 
@@ -677,11 +710,13 @@ def hybrid_rank(
         # Compute text-alignment features (needed for output even when no penalties)
         stmt_tokens = _statement_tokens(item["statement"])
         stmt_actions = _action_markers(item["statement"])
+        stmt_has_negation = _contains_negation(item["statement"])
         action_overlap_ok = not claim_actions or bool(claim_actions & stmt_actions)
         object_overlap = len(query_object_tokens & stmt_tokens) if query_object_tokens else 0
         focus_overlap = len(claim_focus_tokens & stmt_tokens) if claim_focus_tokens else 0
         subject_overlap = len(subject_focus_tokens & stmt_tokens) if subject_focus_tokens else 0
         object_relation_overlap = len(object_focus_tokens & stmt_tokens) if object_focus_tokens else 0
+        polarity_conflict = bool(claim_has_negation != stmt_has_negation)
 
         # ---- Alignment penalties: ONLY when query context exists ----
         # Uses bounded additive penalty instead of multiplicative chaining to
@@ -726,6 +761,27 @@ def hybrid_rank(
                     combined += p * 0.25
                 combined = min(combined, 0.65)
                 final_score *= 1.0 - combined
+        # Contradiction-aware directional penalty:
+        # high lexical alignment with polarity mismatch should not behave like support.
+        if has_query_context and polarity_conflict and claim_overlap >= 0.45:
+            # Stronger penalty when relation/object alignment is weak.
+            object_alignment_hint = 1.0 if object_relation_overlap > 0 else (0.35 if object_overlap > 0 else 0.0)
+            directional_mismatch = 1.0 - max(
+                0.0,
+                min(1.0, (0.55 * object_alignment_hint) + (0.45 * anchor_match_score)),
+            )
+            mismatch_penalty = min(0.28, 0.10 + (0.22 * directional_mismatch))
+            final_score *= 1.0 - mismatch_penalty
+
+        # Claim-echo suppression for KG artifacts.
+        if _is_claim_echo_candidate(
+            claim_overlap=claim_overlap,
+            anchor_match_score=anchor_match_score,
+            sem_s=sem_s,
+            kg_raw=kg_raw,
+            candidate_type=candidate_type,
+        ):
+            final_score *= 0.82
 
         final_score -= uncertainty_penalty
 
@@ -755,8 +811,12 @@ def hybrid_rank(
                 + (0.20 * max(kg_s, min(1.0, kg_raw))),
             ),
         )
+        if has_query_context and polarity_conflict and claim_overlap >= 0.45:
+            support_score *= 0.72
         explicit_refute = 1.0 if _has_object_refutation_signal(item["statement"]) else 0.0
         predicate_conflict = 1.0 if (claim_actions and not action_overlap_ok) else 0.0
+        if polarity_conflict and claim_overlap >= 0.45:
+            predicate_conflict = max(predicate_conflict, 0.75)
         kg_refute_path = max(kg_s, min(1.0, kg_raw)) if (explicit_refute > 0.0 or predicate_conflict > 0.0) else 0.0
         contradict_score = max(
             0.0,
@@ -802,6 +862,7 @@ def hybrid_rank(
             "object_relation_overlap": object_relation_overlap,
             "focus_overlap": focus_overlap,
             "action_overlap_ok": bool(action_overlap_ok),
+            "polarity_conflict": bool(polarity_conflict),
             "recency": recency_s,
             "recency_score": recency_score,
             "credibility": cred_s,

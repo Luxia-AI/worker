@@ -373,7 +373,17 @@ async def rank_candidates(
             stage1_refute_candidates.append(item)
         if stance == "contradicts":
             raw_score = float(item.get("final_score", 0.0) or 0.0)
-            penalized = max(0.0, raw_score * 0.90)
+            strong_refute = stage1_refute_score >= 0.60 or float(item.get("nli_contradict_prob", 0.0) or 0.0) >= 0.55
+            if strong_refute:
+                # Preserve strong contradictions so FALSE decisions remain well supported.
+                penalty_factor = 0.97
+            else:
+                # Weak contradiction cues are noisy; damp harder.
+                penalty_factor = 0.84
+            if bool(item.get("polarity_conflict", False)):
+                # Explicit polarity conflict with query is useful contradiction signal.
+                penalty_factor = min(0.99, penalty_factor + 0.04)
+            penalized = max(0.0, raw_score * penalty_factor)
             item["raw_final_score"] = raw_score
             item["final_score"] = penalized
             item["contradiction_penalty"] = round(raw_score - penalized, 4)

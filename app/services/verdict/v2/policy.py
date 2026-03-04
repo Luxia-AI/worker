@@ -26,7 +26,8 @@ def _truthfulness_from_posteriors(verdict: str, p_true: float, p_false: float, p
         return min(98.0, max(55.0, 60.0 + (40.0 * _clamp01(p_true))))
     if verdict == "FALSE":
         return min(45.0, max(2.0, 45.0 * (1.0 - _clamp01(p_false))))
-    return max(15.0, min(55.0, 35.0 + (15.0 * (_clamp01(p_true) - _clamp01(p_false)))))
+    # Keep UNVERIFIABLE in a moderate trust band.
+    return max(30.0, min(60.0, 45.0 + (10.0 * (_clamp01(p_true) - _clamp01(p_false)))))
 
 
 def compute_verdict_policy_v2(
@@ -62,9 +63,23 @@ def compute_verdict_policy_v2(
         float(class_probs.get("false", 0.0) or 0.0),
         float(class_probs.get("unverifiable", 0.0) or 0.0),
     )
+    p_true_cal = float(class_probs.get("true", 0.0) or 0.0)
+    p_false_cal = float(class_probs.get("false", 0.0) or 0.0)
+    p_unv_cal = float(class_probs.get("unverifiable", 0.0) or 0.0)
+    directional_margin = abs(p_true_cal - p_false_cal)
+    support_signal = float(post.get("support_mass", 0.0) or 0.0)
+    refute_signal = float(post.get("refute_mass", 0.0) or 0.0)
+    directional_signal = max(support_signal, refute_signal)
+    admissibility_rate = float(post.get("admissibility_rate", 0.0) or 0.0)
+    sufficiency = float(post.get("sufficiency", 0.0) or 0.0)
     calibrated_max = max(float(v or 0.0) for v in class_probs.values()) if class_probs else 0.0
     if calibrated_max >= 0.45:
         verdict = calibrated_verdict
+    # Strong UNVERIFIABLE guard for ambiguous/weak directional evidence.
+    if p_unv_cal >= 0.46 and (
+        directional_margin <= 0.12 or directional_signal <= 0.52 or sufficiency <= 0.56 or admissibility_rate <= 0.45
+    ):
+        verdict = "UNVERIFIABLE"
     class_max = max(float(v or 0.0) for v in class_probs.values())
     confidence_seed = _clamp01((0.65 * float(post.get("confidence_raw", class_max) or class_max)) + (0.35 * class_max))
     calibrated_confidence = calibrator.calibrate(
@@ -81,9 +96,16 @@ def compute_verdict_policy_v2(
     )
 
     if verdict == "UNVERIFIABLE":
-        low_signal = float(post.get("sufficiency", 0.0) or 0.0) < 0.45 or float(post.get("margin", 0.0) or 0.0) < 0.20
+        low_signal = (
+            float(post.get("sufficiency", 0.0) or 0.0) < 0.58
+            or float(post.get("margin", 0.0) or 0.0) < 0.24
+            or admissibility_rate < 0.50
+        )
         if low_signal:
-            calibrated_confidence = min(float(calibrated_confidence), float(UNVERIFIABLE_CONFIDENCE_CAP))
+            calibrated_confidence = min(
+                float(calibrated_confidence),
+                min(float(UNVERIFIABLE_CONFIDENCE_CAP), 0.58),
+            )
     calibrated_confidence = _clamp01(calibrated_confidence)
 
     truthfulness = _truthfulness_from_posteriors(verdict, p_true, p_false, p_unv)

@@ -172,6 +172,9 @@ class ConfidenceCalibrator:
                 elif polarity_strength >= 0.55 and polarity_margin >= 0.16:
                     unv_boost = 1.10
                 p_unv *= unv_boost
+            # Additional uncertainty lift for ambiguous directional split.
+            if polarity_margin <= 0.12 and polarity_strength <= 0.58:
+                p_unv *= 1.20
             # Preserve polarity separation without hard forcing.
             if contradict > support + 0.08:
                 p_false *= min(1.30, 1.12 + (0.10 * max(0.0, polarity_margin - 0.08)))
@@ -181,6 +184,11 @@ class ConfidenceCalibrator:
                 p_true *= min(1.30, 1.10 + (0.10 * max(0.0, polarity_margin - 0.08)))
                 if polarity_strength >= 0.60 and polarity_margin >= 0.18:
                     p_unv *= 0.90
+            # When both signals are weak, keep posterior conservative.
+            if polarity_strength <= 0.45:
+                p_true *= 0.92
+                p_false *= 0.92
+                p_unv *= 1.10
 
         # Re-normalize.
         total2 = max(1e-9, p_true + p_false + p_unv)

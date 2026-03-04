@@ -28,6 +28,7 @@ import os
 import re
 import urllib.parse
 import uuid
+from time import perf_counter
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from app.constants.config import (
@@ -1031,6 +1032,21 @@ class CorrectivePipeline:
                 )
             ),
         )
+        pipeline_started_at = perf_counter()
+        try:
+            default_runtime_budget = "430" if confidence_mode else "360"
+            max_runtime_seconds = float(os.getenv("PIPELINE_MAX_RUNTIME_SECONDS", default_runtime_budget))
+        except Exception:
+            max_runtime_seconds = 430.0 if confidence_mode else 360.0
+        max_runtime_seconds = max(30.0, float(max_runtime_seconds))
+        try:
+            default_headroom = "25" if confidence_mode else "15"
+            runtime_guard_headroom_seconds = float(
+                os.getenv("PIPELINE_RUNTIME_GUARD_HEADROOM_SECONDS", default_headroom)
+            )
+        except Exception:
+            runtime_guard_headroom_seconds = 25.0 if confidence_mode else 15.0
+        runtime_guard_headroom_seconds = max(3.0, float(runtime_guard_headroom_seconds))
         claim_frame = self._classify_claim_frame(post_text)
         logger.info(
             "[CorrectivePipeline:%s] Claim frame: type=%s strength=%s strong_therapeutic=%s",
@@ -1044,6 +1060,18 @@ class CorrectivePipeline:
         best_comparative_hits = 0
         new_trusted_urls_processed = 0
         for query_idx, query in enumerate(queries):
+            elapsed_runtime_seconds = perf_counter() - pipeline_started_at
+            if elapsed_runtime_seconds >= max_runtime_seconds:
+                logger.warning(
+                    "[CorrectivePipeline:%s] Runtime budget exceeded before query %d "
+                    "(elapsed=%.2fs budget=%.2fs); stopping search loop.",
+                    round_id,
+                    query_idx + 1,
+                    elapsed_runtime_seconds,
+                    max_runtime_seconds,
+                )
+                stop_reason = "runtime_budget_exceeded"
+                break
             # OPTIMIZATION: Hard limit on search queries to prevent runaway searches
             if search_api_calls >= self.MAX_SEARCH_QUERIES:
                 logger.info(
@@ -1120,6 +1148,16 @@ class CorrectivePipeline:
                     f"from {len(new_urls)} candidates for this query"
                 )
                 new_urls = new_urls[: self.MAX_URLS_PER_QUERY]
+            remaining_runtime = max_runtime_seconds - (perf_counter() - pipeline_started_at)
+            if remaining_runtime <= runtime_guard_headroom_seconds:
+                logger.info(
+                    "[CorrectivePipeline:%s] Runtime guard stop before scrape " "(remaining=%.2fs headroom=%.2fs).",
+                    round_id,
+                    remaining_runtime,
+                    runtime_guard_headroom_seconds,
+                )
+                stop_reason = "runtime_budget_guard"
+                break
             new_trusted_urls_processed += len(new_urls)
             scraped_pages = await scrape_pages(
                 self.scraper,
@@ -1367,6 +1405,7 @@ class CorrectivePipeline:
         )
 
         if self.log_manager:
+            elapsed_total = perf_counter() - pipeline_started_at
             await self.log_manager.add_log(
                 level="INFO",
                 message=f"Pipeline completed: {len(all_facts)} facts, {search_api_calls} API calls",
@@ -1383,6 +1422,8 @@ class CorrectivePipeline:
                     "search_api_calls": search_api_calls,
                     "queries_total": len(queries),
                     "queries_saved": len(queries) - search_api_calls,
+                    "elapsed_seconds": round(float(elapsed_total), 3),
+                    "runtime_budget_seconds": round(float(max_runtime_seconds), 3),
                 },
             )
 
@@ -1475,6 +1516,8 @@ class CorrectivePipeline:
                 "gain_estimate": round(float(gain_estimate or 0.0), 4),
                 "kg_timeout_count": kg_timeout_count,
                 "zero_extraction_rounds": zero_extraction_rounds,
+                "elapsed_seconds": round(float(perf_counter() - pipeline_started_at), 3),
+                "runtime_budget_seconds": round(float(max_runtime_seconds), 3),
             },
         )
         await debug_reporter.log_step(
@@ -1489,6 +1532,7 @@ class CorrectivePipeline:
             },
         )
         await debug_reporter.close()
+        elapsed_total = perf_counter() - pipeline_started_at
 
         output_facts = list(all_facts or [])
         if not output_facts and top_ranked:
@@ -1540,6 +1584,8 @@ class CorrectivePipeline:
             "data_source": "WEB_SEARCH" if search_api_calls > 0 else "CACHE",
             "search_api_calls": search_api_calls,
             "search_api_calls_saved": len(queries) - search_api_calls,
+            "elapsed_seconds": round(float(elapsed_total), 3),
+            "runtime_budget_seconds": round(float(max_runtime_seconds), 3),
             "urls_processed": len(processed_urls),
             "urls_skipped_already_processed": len(skipped_urls),
             "initial_top_score": final_trust_score,
@@ -1587,6 +1633,8 @@ class CorrectivePipeline:
                 "gain_estimate": round(float(gain_estimate or 0.0), 4),
                 "kg_timeout_count": int(kg_timeout_count),
                 "zero_extraction_rounds": int(zero_extraction_rounds),
+                "elapsed_seconds": round(float(elapsed_total), 3),
+                "runtime_budget_seconds": round(float(max_runtime_seconds), 3),
                 "kg_zero_signal": bool(debug_counts.get("kg_zero_signal", False)),
                 "kg_fallback_triggered": bool(debug_counts.get("kg_fallback_triggered", False)),
             },

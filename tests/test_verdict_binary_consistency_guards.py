@@ -1,0 +1,80 @@
+from app.services.verdict.verdict_generator import VerdictGenerator
+
+
+def _vg() -> VerdictGenerator:
+    vg = VerdictGenerator.__new__(VerdictGenerator)
+    vg._last_predicate_queries_generated = []
+    return vg
+
+
+def test_binary_false_without_refute_signal_downgrades_to_unverifiable():
+    vg = _vg()
+    claim = "X has no association with Y"
+    payload = {
+        "verdict": "FALSE",
+        "truthfulness_percent": 18.0,
+        "confidence": 0.84,
+        "claim_breakdown": [
+            {
+                "claim_segment": claim,
+                "status": "INVALID",
+                "supporting_fact": "X is associated with Y in observational cohorts.",
+                "source_url": "https://example.org/source",
+                "evidence_used_ids": [0],
+            }
+        ],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "X is associated with Y in observational cohorts.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.78,
+                "contradiction_score": 0.08,
+                "nli_contradict_prob": 0.05,
+                "object_match_ok": False,
+                "predicate_match_score": 0.28,
+                "source_url": "https://example.org/source",
+            }
+        ],
+        "class_probs": {"true": 0.46, "false": 0.28, "unverifiable": 0.26},
+        "trust_threshold_met": True,
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "UNVERIFIABLE"
+    assert "weak_directional_refute" in (out.get("verdict_guard_reasons") or [])
+
+
+def test_binary_true_without_support_signal_downgrades_to_unverifiable():
+    vg = _vg()
+    claim = "X prevents Y"
+    payload = {
+        "verdict": "TRUE",
+        "truthfulness_percent": 88.0,
+        "confidence": 0.86,
+        "claim_breakdown": [
+            {
+                "claim_segment": claim,
+                "status": "VALID",
+                "supporting_fact": "No conclusive data demonstrates prevention.",
+                "source_url": "https://example.org/source",
+                "evidence_used_ids": [0],
+            }
+        ],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "No conclusive data demonstrates prevention.",
+                "relevance": "REFUTES",
+                "relevance_score": 0.74,
+                "contradiction_score": 0.72,
+                "nli_contradict_prob": 0.70,
+                "object_match_ok": True,
+                "predicate_match_score": 0.52,
+                "source_url": "https://example.org/source",
+            }
+        ],
+        "class_probs": {"true": 0.33, "false": 0.41, "unverifiable": 0.26},
+        "trust_threshold_met": True,
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "UNVERIFIABLE"

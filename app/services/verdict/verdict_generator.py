@@ -7277,6 +7277,66 @@ class VerdictGenerator:
             payload["trust_gate_binary_lock_applied"] = False
             if "trust_gate_soft_feature" not in guard_reasons:
                 guard_reasons.append("trust_gate_soft_feature")
+
+        directional_support_evidence = bool(
+            strong_support_signal
+            or support_mass >= 0.70
+            or support_label_count >= 2
+            or (has_valid_like and not has_invalid_like and not has_unknown_status and support_mass >= 0.45)
+        )
+        directional_refute_evidence = bool(
+            strong_refute_signal
+            or contradict_mass >= 0.70
+            or refute_label_count >= 2
+            or structural_refute_count >= 1
+            or segment_refute_confident >= 1
+            or (
+                has_invalid_like
+                and not has_valid_like
+                and not has_unknown_status
+                and (segment_refute_confident >= 1 or contradict_mass >= 0.45)
+            )
+        )
+        weak_directional_signal = bool(
+            max(float(support_mass), float(contradict_mass)) < 0.45
+            and not directional_support_evidence
+            and not directional_refute_evidence
+        )
+        ambiguous_directional_split = bool(
+            support_mass > 0.0 and contradict_mass > 0.0 and abs(float(support_mass) - float(contradict_mass)) < 0.25
+        )
+        if verdict == Verdict.TRUE.value and (
+            not directional_support_evidence
+            and (mixed_status or has_unknown_status or weak_directional_signal)
+            or (ambiguous_directional_split and not decisive_support_unlock)
+        ):
+            verdict = Verdict.UNVERIFIABLE.value
+            if "weak_directional_support" not in guard_reasons:
+                guard_reasons.append("weak_directional_support")
+        if verdict == Verdict.FALSE.value and (
+            not directional_refute_evidence
+            and (mixed_status or has_unknown_status or weak_directional_signal)
+            or (ambiguous_directional_split and not decisive_refute_unlock)
+        ):
+            verdict = Verdict.UNVERIFIABLE.value
+            if "weak_directional_refute" not in guard_reasons:
+                guard_reasons.append("weak_directional_refute")
+        if (
+            verdict in {Verdict.TRUE.value, Verdict.FALSE.value}
+            and neutral_only_map
+            and support_mass < 0.45
+            and contradict_mass < 0.45
+        ):
+            verdict = Verdict.UNVERIFIABLE.value
+            if "neutral_only_directional_guard" not in guard_reasons:
+                guard_reasons.append("neutral_only_directional_guard")
+
+        if verdict in {Verdict.TRUE.value, Verdict.FALSE.value} and not (
+            directional_segment_lock or decisive_support_unlock or decisive_refute_unlock
+        ):
+            verdict = Verdict.UNVERIFIABLE.value
+            if "non_decisive_segment_lock" not in guard_reasons:
+                guard_reasons.append("non_decisive_segment_lock")
         payload["verdict_guard_reasons"] = sorted(set(guard_reasons))
 
         payload["verdict"] = verdict
