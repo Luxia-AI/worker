@@ -101,7 +101,12 @@ class ConfidenceCalibrator:
                 + (0.10 * evidence_quality)
             )
             penalty = 0.35 * contradict
-            score = (0.50 * score) + (0.25 * quality) + (0.25 * class_max_prob) - penalty
+            score = (0.62 * score) + (0.18 * quality) + (0.20 * class_max_prob) - penalty
+            # Directional floor: when class posterior is clearly directional,
+            # prevent the feature blend from collapsing confidence below the
+            # signal strength.
+            if class_max_prob >= 0.55:
+                score = max(score, 0.50 * class_max_prob)
             # Deep retrieval with low evidence quality should not inflate confidence.
             if retrieval_depth >= 0.66 and evidence_quality < 0.45:
                 score *= 0.92
@@ -164,31 +169,40 @@ class ConfidenceCalibrator:
             polarity_margin = abs(support - contradict)
 
             # Push uncertainty up when evidence is sparse or weakly admissible.
-            if coverage < 0.45 or admissible_ratio < 0.50:
-                unv_boost = 1.18
+            if coverage < 0.35 or admissible_ratio < 0.40:
+                unv_boost = 1.10
                 # If evidence is already strongly directional, avoid over-boosting UNVERIFIABLE.
-                if polarity_strength >= 0.65 and polarity_margin >= 0.22:
-                    unv_boost = 1.03
-                elif polarity_strength >= 0.55 and polarity_margin >= 0.16:
-                    unv_boost = 1.10
+                if polarity_strength >= 0.55 and polarity_margin >= 0.18:
+                    unv_boost = 1.02
+                elif polarity_strength >= 0.45 and polarity_margin >= 0.12:
+                    unv_boost = 1.05
                 p_unv *= unv_boost
             # Additional uncertainty lift for ambiguous directional split.
-            if polarity_margin <= 0.12 and polarity_strength <= 0.58:
-                p_unv *= 1.20
+            if polarity_margin <= 0.08 and polarity_strength <= 0.40:
+                p_unv *= 1.12
+            # Directional preservation: when polarity margin is meaningful,
+            # boost the winning direction proportionally to prevent UNVERIFIABLE
+            # from dominating well-supported claims.
+            if polarity_margin >= 0.10:
+                directional_boost = min(1.25, 1.0 + (0.15 * polarity_margin))
+                if support > contradict:
+                    p_true *= directional_boost
+                else:
+                    p_false *= directional_boost
             # Preserve polarity separation without hard forcing.
-            if contradict > support + 0.08:
-                p_false *= min(1.30, 1.12 + (0.10 * max(0.0, polarity_margin - 0.08)))
-                if polarity_strength >= 0.60 and polarity_margin >= 0.18:
-                    p_unv *= 0.90
-            if support > contradict + 0.08:
-                p_true *= min(1.30, 1.10 + (0.10 * max(0.0, polarity_margin - 0.08)))
-                if polarity_strength >= 0.60 and polarity_margin >= 0.18:
-                    p_unv *= 0.90
+            if contradict > support + 0.05:
+                p_false *= min(1.35, 1.15 + (0.12 * max(0.0, polarity_margin - 0.05)))
+                if polarity_strength >= 0.45 and polarity_margin >= 0.12:
+                    p_unv *= 0.85
+            if support > contradict + 0.05:
+                p_true *= min(1.35, 1.15 + (0.12 * max(0.0, polarity_margin - 0.05)))
+                if polarity_strength >= 0.45 and polarity_margin >= 0.12:
+                    p_unv *= 0.85
             # When both signals are weak, keep posterior conservative.
-            if polarity_strength <= 0.45:
-                p_true *= 0.92
-                p_false *= 0.92
-                p_unv *= 1.10
+            if polarity_strength <= 0.30:
+                p_true *= 0.95
+                p_false *= 0.95
+                p_unv *= 1.05
 
         # Re-normalize.
         total2 = max(1e-9, p_true + p_false + p_unv)

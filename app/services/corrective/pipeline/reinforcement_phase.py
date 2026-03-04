@@ -183,7 +183,8 @@ async def reinforcement_loop(
             log_manager,
         )
 
-        # Decay confidence threshold
-        conf_threshold -= round_count * 0.05
+        # Linear constant decay with floor to prevent accepting weak evidence.
+        # Old formula: conf_threshold -= round_count * 0.05 (quadratic decay).
+        conf_threshold = max(conf_threshold - 0.04, 0.55)
 
     return extracted_facts, triples, top_ranked

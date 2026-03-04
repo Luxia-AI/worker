@@ -75,21 +75,37 @@ def compute_posteriors_v2(
     margin = _clamp01(abs(support_mass_n - refute_mass_n))
 
     # Evidence sufficiency should reward directional mass while still penalizing noisy retrieval.
-    # Compared to earlier weighting, entropy penalty is softened to avoid over-indexing
-    # on uncertainty when one polarity is already dominant.
+    # When directional evidence is present, near-maximal entropy is a property of the
+    # retrieval score distribution, not genuine evidence insufficiency -- cap it.
+    directional_mass = _clamp01(support_mass_n + refute_mass_n)
+    effective_entropy = retrieval_entropy
+    if directional_mass >= 0.25:
+        effective_entropy = min(retrieval_entropy, 0.85)
     sufficiency = _sigmoid(
         (1.45 * _clamp01(coverage))
         + (1.10 * _clamp01(diversity))
-        + (1.35 * _clamp01(support_mass_n + refute_mass_n))
-        - (0.95 * retrieval_entropy)
-        - 1.20
+        + (1.35 * directional_mass)
+        - (0.55 * effective_entropy)
+        - 1.05
     )
     directional_strength = _clamp01(max(support_mass_n, refute_mass_n))
-    p_true_raw = support_mass_n * sufficiency * max(0.20, agreement)
-    p_false_raw = refute_mass_n * sufficiency * max(0.20, agreement)
+
+    # Use arithmetic mean of sufficiency and agreement instead of a triple product.
+    # Old formula: support_mass_n * sufficiency * agreement crushes signal via
+    # three-way multiplication (e.g. 0.45*0.65*0.50 = 0.146).
+    # New formula: support_mass_n * mean(sufficiency, agreement) preserves signal
+    # (e.g. 0.45 * mean(0.65,0.50) = 0.45*0.575 = 0.259).
+    eff_agreement = max(0.35, agreement)
+    directional_weight = (sufficiency + eff_agreement) / 2.0
+
+    p_true_raw = support_mass_n * directional_weight
+    p_false_raw = refute_mass_n * directional_weight
+
     # Uncertainty should shrink when directional evidence is strong and polarized.
     uncertainty_base = (1.0 - sufficiency) * (1.0 - (0.55 * directional_strength))
-    residual_neutral = neutral_mass_n * (1.0 - (0.65 * margin))
+    # Dampen neutral residual more aggressively when any directional signal exists.
+    neutral_damping = (0.65 * margin) + (0.20 * directional_strength)
+    residual_neutral = neutral_mass_n * max(0.10, 1.0 - neutral_damping)
     p_unv_raw = max(0.0, uncertainty_base + residual_neutral)
     s = max(1e-9, p_true_raw + p_false_raw + p_unv_raw)
     p_true = _clamp01(p_true_raw / s)

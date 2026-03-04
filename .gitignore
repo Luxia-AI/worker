@@ -212,3 +212,4 @@ __marimo__/
 .env.*
 validate_deployment.sh
 !README.md
+*-cwd

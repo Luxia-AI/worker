@@ -231,16 +231,18 @@ def _neutral_kg_dominance_penalty(item: Dict[str, Any]) -> float:
     stance = str(item.get("stance") or "neutral")
     if stance == "contradicts":
         return 0.0
-    if sem_signal > 0.04 or kg_signal < 0.75:
+    # Only apply penalty when semantic corroboration is truly absent.
+    if sem_signal > 0.08 or kg_signal < 0.75:
         return 0.0
+    # Relaxed alignment thresholds to keep legitimately aligned KG evidence.
     low_alignment = (
-        claim_overlap < float(os.getenv("RANKING_KG_DOMINANCE_MAX_CLAIM_OVERLAP", "0.24"))
-        and anchor_overlap < float(os.getenv("RANKING_KG_DOMINANCE_MAX_ANCHOR_OVERLAP", "0.35"))
-        and predicate_match < float(os.getenv("RANKING_KG_DOMINANCE_MAX_PREDICATE_MATCH", "0.28"))
+        claim_overlap < float(os.getenv("RANKING_KG_DOMINANCE_MAX_CLAIM_OVERLAP", "0.30"))
+        and anchor_overlap < float(os.getenv("RANKING_KG_DOMINANCE_MAX_ANCHOR_OVERLAP", "0.40"))
+        and predicate_match < float(os.getenv("RANKING_KG_DOMINANCE_MAX_PREDICATE_MATCH", "0.35"))
     )
     if not low_alignment:
         return 0.0
-    return max(0.0, min(0.65, float(os.getenv("RANKING_KG_DOMINANCE_PENALTY", "0.22"))))
+    return max(0.0, min(0.45, float(os.getenv("RANKING_KG_DOMINANCE_PENALTY", "0.15"))))
 
 
 def _load_cross_encoder():

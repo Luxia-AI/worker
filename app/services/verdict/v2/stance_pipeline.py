@@ -27,10 +27,12 @@ def _domain_from_url(url: str) -> str:
 
 def _base_probs_from_relevance(label: str) -> Tuple[float, float, float]:
     if label == "SUPPORTS":
-        return 0.72, 0.10, 0.18
+        return 0.72, 0.08, 0.20
     if label == "REFUTES":
-        return 0.10, 0.72, 0.18
-    return 0.18, 0.18, 0.64
+        return 0.08, 0.72, 0.20
+    # NEUTRAL does not mean "unverifiable"; distribute more evenly and let
+    # NLI scores differentiate downstream.
+    return 0.25, 0.25, 0.50
 
 
 def _stage1_refute_score(claim: str, statement: str, row: Dict[str, Any]) -> float:

@@ -77,36 +77,36 @@ def compute_verdict_policy_v2(
     if calibrated_max >= 0.45:
         verdict = calibrated_verdict
     # Strong UNVERIFIABLE guard only when uncertainty clearly dominates and directional evidence is weak.
+    # Count how many weakness signals are active. Require at least 3 of 4
+    # to force UNVERIFIABLE, preventing a single borderline signal from
+    # overriding otherwise-reasonable directional evidence.
     unv_margin = p_unv_cal - directional_competitor
-    if (
-        p_unv_cal >= 0.50
-        and unv_margin >= 0.10
-        and (
-            directional_margin <= 0.10
-            or directional_signal <= 0.50
-            or sufficiency <= 0.56
-            or admissibility_rate <= 0.45
-        )
-    ):
+    _weakness_count = (
+        int(directional_margin <= 0.10)
+        + int(directional_signal <= 0.45)
+        + int(sufficiency <= 0.52)
+        + int(admissibility_rate <= 0.40)
+    )
+    if p_unv_cal >= 0.55 and unv_margin >= 0.12 and _weakness_count >= 3:
         verdict = "UNVERIFIABLE"
     # Directional lock: avoid conservative collapse to UNVERIFIABLE when calibrated
     # directional posterior is clearly dominant and evidence sufficiency is acceptable.
     if (
-        p_true_cal >= 0.54
-        and p_true_cal >= (p_false_cal + 0.08)
-        and p_true_cal >= (p_unv_cal + 0.05)
-        and support_signal >= 0.56
-        and sufficiency >= 0.60
-        and admissibility_rate >= 0.48
+        p_true_cal >= 0.44
+        and p_true_cal >= (p_false_cal + 0.06)
+        and p_true_cal >= (p_unv_cal + 0.03)
+        and support_signal >= 0.35
+        and sufficiency >= 0.48
+        and admissibility_rate >= 0.40
     ):
         verdict = "TRUE"
     elif (
-        p_false_cal >= 0.54
-        and p_false_cal >= (p_true_cal + 0.08)
-        and p_false_cal >= (p_unv_cal + 0.05)
-        and refute_signal >= 0.56
-        and sufficiency >= 0.60
-        and admissibility_rate >= 0.48
+        p_false_cal >= 0.44
+        and p_false_cal >= (p_true_cal + 0.06)
+        and p_false_cal >= (p_unv_cal + 0.03)
+        and refute_signal >= 0.35
+        and sufficiency >= 0.48
+        and admissibility_rate >= 0.40
     ):
         verdict = "FALSE"
     class_max = max(float(v or 0.0) for v in class_probs.values())

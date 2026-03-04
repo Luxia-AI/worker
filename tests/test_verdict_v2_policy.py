@@ -4,6 +4,27 @@ from app.services.verdict.v2.stance_pipeline import build_evidence_scores_v2
 from app.services.verdict.v2.types import EvidenceScoreV2
 
 
+def _make_score(
+    support: float = 0.0,
+    contradict: float = 0.0,
+    neutral: float = 0.0,
+    weight: float = 1.0,
+    admissible: bool = True,
+    domain: str = "example.org",
+) -> EvidenceScoreV2:
+    return EvidenceScoreV2(
+        support_score=support,
+        contradict_score=contradict,
+        neutral_score=neutral,
+        nli_entail_prob=support,
+        nli_contradict_prob=contradict,
+        nli_neutral_prob=neutral,
+        admissible=admissible,
+        weight=weight,
+        source_domain=domain,
+    )
+
+
 def test_verdict_policy_v2_is_deterministic_for_identical_inputs():
     scores = [
         EvidenceScoreV2(
@@ -114,3 +135,58 @@ def test_stance_pipeline_support_rows_do_not_inflate_refute_mass(monkeypatch):
     assert len(scores) == 1
     s = scores[0]
     assert s.support_score > s.contradict_score
+
+
+# --- Tests for majority-vote UNVERIFIABLE guard and relaxed directional lock ---
+
+
+def test_single_weakness_signal_does_not_force_unverifiable():
+    """When only 1 of 4 weakness signals fires, verdict should NOT be forced to UNVERIFIABLE."""
+    # Strong support evidence with only sufficiency slightly below threshold
+    scores = [
+        _make_score(support=0.70, contradict=0.10, neutral=0.20, weight=0.85, domain="nih.gov"),
+        _make_score(support=0.65, contradict=0.15, neutral=0.20, weight=0.80, domain="who.int"),
+        _make_score(support=0.60, contradict=0.10, neutral=0.30, weight=0.75, domain="cdc.gov"),
+    ]
+    calibrator = ConfidenceCalibrator(None)
+    out = compute_verdict_policy_v2(scores, coverage=0.70, diversity=0.90, calibrator=calibrator)
+    assert (
+        out["verdict"] != "UNVERIFIABLE"
+    ), f"Strong support evidence should not be forced to UNVERIFIABLE; got {out['verdict']}"
+
+
+def test_genuinely_weak_evidence_still_yields_unverifiable():
+    """When evidence is genuinely weak across multiple dimensions, UNVERIFIABLE should still trigger."""
+    scores = [
+        _make_score(support=0.08, contradict=0.07, neutral=0.85, weight=0.10, domain="blog.org"),
+    ]
+    calibrator = ConfidenceCalibrator(None)
+    out = compute_verdict_policy_v2(scores, coverage=0.05, diversity=0.10, calibrator=calibrator)
+    assert (
+        out["verdict"] == "UNVERIFIABLE"
+    ), f"Genuinely weak evidence should still yield UNVERIFIABLE; got {out['verdict']}"
+
+
+def test_directional_lock_rescues_moderate_support():
+    """Directional lock with relaxed thresholds should allow moderate support to produce TRUE."""
+    scores = [
+        _make_score(support=0.55, contradict=0.10, neutral=0.35, weight=0.75, domain="nih.gov"),
+        _make_score(support=0.50, contradict=0.15, neutral=0.35, weight=0.70, domain="who.int"),
+        _make_score(support=0.48, contradict=0.12, neutral=0.40, weight=0.65, domain="cdc.gov"),
+    ]
+    calibrator = ConfidenceCalibrator(None)
+    out = compute_verdict_policy_v2(scores, coverage=0.60, diversity=0.80, calibrator=calibrator)
+    assert (
+        out["verdict"] == "TRUE"
+    ), f"Moderate support evidence with decent coverage should produce TRUE; got {out['verdict']}"
+
+
+def test_directional_lock_rescues_moderate_refute():
+    """Directional lock with relaxed thresholds should allow moderate refute to produce FALSE."""
+    scores = [
+        _make_score(support=0.08, contradict=0.75, neutral=0.17, weight=0.85, domain="nih.gov"),
+        _make_score(support=0.10, contradict=0.70, neutral=0.20, weight=0.80, domain="who.int"),
+    ]
+    calibrator = ConfidenceCalibrator(None)
+    out = compute_verdict_policy_v2(scores, coverage=0.80, diversity=0.75, calibrator=calibrator)
+    assert out["verdict"] == "FALSE", f"Strong refute evidence should produce FALSE; got {out['verdict']}"

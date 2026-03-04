@@ -682,6 +682,12 @@ def hybrid_rank(
             + (w_source_quality * source_quality_s)
         )
 
+        # Signal concentration bonus: reward evidence that scores well on
+        # multiple orthogonal signals.  This widens the gap between high-quality
+        # multi-signal evidence and single-signal noise.
+        _signal_count = sum(1 for _sv in (sem_s, kg_s, ent_s, claim_overlap) if _sv >= 0.30)
+        final_score += 0.05 * max(0, _signal_count - 1)
+
         # ---- Authority credibility bonus (general, not claim/entity specific) ----
         # Health claim verification gives significant priority to authoritative sources.
         credibility_bonus = 0.0
@@ -753,13 +759,17 @@ def hybrid_rank(
                 penalties.append(0.25)
 
             # Bounded combined penalty: worst penalty dominates, others add
-            # with diminishing returns.  Caps at 65% total reduction.
+            # with diminishing returns.  Caps at 55% total reduction.
             if penalties:
                 penalties.sort(reverse=True)
                 combined = penalties[0]
                 for p in penalties[1:]:
                     combined += p * 0.25
-                combined = min(combined, 0.65)
+                combined = min(combined, 0.55)
+                # Semantic rescue: if semantic similarity is strong, reduce
+                # penalty to preserve genuinely relevant evidence.
+                if sem_s >= 0.70:
+                    combined *= max(0.40, 1.0 - (0.50 * sem_s))
                 final_score *= 1.0 - combined
         # Contradiction-aware directional penalty:
         # high lexical alignment with polarity mismatch should not behave like support.
@@ -830,10 +840,10 @@ def hybrid_rank(
         )
         final_rank_priority = max(support_score, contradict_score)
 
-        # Soft blend with stance priority (0.95 base / 0.05 priority) to
+        # Soft blend with stance priority (0.92 base / 0.08 priority) to
         # avoid compressing the base score.  Priority acts primarily as a
         # tiebreaker rather than a dominating term.
-        final_score = (0.95 * max(0.0, min(1.0, final_score))) + (0.05 * final_rank_priority)
+        final_score = (0.92 * max(0.0, min(1.0, final_score))) + (0.08 * final_rank_priority)
 
         recency_score = recency_s  # alias for output clarity
 
@@ -991,7 +1001,7 @@ def hybrid_rank(
         ]
         if kg_dropped:
             best_kg = max(kg_dropped, key=lambda x: x.get("final_score", 0))
-            if best_kg.get("kg_score_raw", 0) >= 0.30 or best_kg.get("final_score", 0) >= 0.10:
+            if best_kg.get("kg_score_raw", 0) >= 0.20 or best_kg.get("final_score", 0) >= 0.08:
                 results.append(best_kg)
                 if _debug:
                     logger.debug(

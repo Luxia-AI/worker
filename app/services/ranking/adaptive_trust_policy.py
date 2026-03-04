@@ -778,8 +778,11 @@ class AdaptiveTrustPolicy:
                 # Adaptive formula: trust_post = mean(subclaim_trust) * (0.5 + 0.5*coverage)
                 trust_post = mean_subclaim_trust * (self.BASE_WEIGHT + self.COVERAGE_WEIGHT * coverage)
             else:
-                # Keep trust aligned with coverage if lexical upgrades matched but weighted trust list is empty.
-                trust_post = max(0.0, float(top_trust or 0.0) * float(coverage or 0.0))
+                # Always compute a meaningful trust_post when evidence exists.
+                # Use a floor on effective coverage to avoid zeroing trust when
+                # coverage is low but evidence quality (top_trust) is decent.
+                effective_coverage = max(0.25, float(coverage or 0.0))
+                trust_post = max(0.0, float(top_trust or 0.0) * effective_coverage)
 
             # Deterministic trust floor for confidence-mode pass paths:
             # when gating passes with meaningful coverage and top trust exists,
@@ -810,7 +813,7 @@ class AdaptiveTrustPolicy:
             and not adaptive_override_guard
             and not (strong_coverage and strong_agreement)
             and contradicted_count == 0
-            and (trust_post < 0.55 or top_sem < 0.60 or top_trust < 0.55)
+            and (trust_post < 0.40 or top_sem < 0.45 or top_trust < 0.40)
         ):
             logger.debug(
                 "[AdaptiveTrustPolicy] Applying weak relevance guard "
@@ -823,7 +826,7 @@ class AdaptiveTrustPolicy:
             verdict_state = "evidence_insufficiency"
             weak_relevance_guard_applied = True
 
-        if is_sufficient and top_trust < 0.20:
+        if is_sufficient and top_trust < 0.15:
             is_sufficient = False
             verdict_state = "evidence_insufficiency"
             weak_relevance_guard_applied = True
