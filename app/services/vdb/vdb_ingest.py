@@ -135,22 +135,18 @@ class VDBIngest:
                 f"[VDBIngest] Filtered {len(facts)} facts -> {len(trusted_facts)} trusted, {skipped_count} skipped"
             )
 
-        # Only store facts with a clear directional stance relative to the claim.
-        # NEUTRAL facts carry no supporting/refuting signal and pollute VDB retrieval.
-        directional_facts = [
-            f for f in trusted_facts if str(f.get("stance") or "").upper().strip() in ("SUPPORTS", "REFUTES")
-        ]
-        neutral_dropped = len(trusted_facts) - len(directional_facts)
-        if neutral_dropped > 0:
-            logger.info(
-                "[VDBIngest] Dropped %d NEUTRAL-stance facts before VDB ingestion " "(%d directional kept)",
-                neutral_dropped,
-                len(directional_facts),
-            )
-        if not directional_facts:
-            logger.info("[VDBIngest] No directional (SUPPORTS/REFUTES) facts to ingest")
-            return []
-        trusted_facts = directional_facts
+        # Log stance distribution.  All trusted facts are ingested; SUPPORTS/REFUTES
+        # receive a directional embedding prefix in _embed_text (vector-space separation),
+        # while NEUTRAL facts embed as plain text and still surface as context.
+        n_supports = sum(1 for f in trusted_facts if str(f.get("stance") or "").upper().strip() == "SUPPORTS")
+        n_refutes = sum(1 for f in trusted_facts if str(f.get("stance") or "").upper().strip() == "REFUTES")
+        logger.info(
+            "[VDBIngest] Ingesting %d facts (SUPPORTS=%d REFUTES=%d NEUTRAL=%d)",
+            len(trusted_facts),
+            n_supports,
+            n_refutes,
+            len(trusted_facts) - n_supports - n_refutes,
+        )
 
         # Enrich trusted facts with metadata before embedding
         trusted_facts = await self.metadata_enricher.enrich_facts(trusted_facts)

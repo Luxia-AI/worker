@@ -752,12 +752,19 @@ class FactExtractor:
                     continue
 
                 statement = self._ground_statement_to_source(sent, source_text)
-                # Heuristic stance: compare negation polarity between statement and claim.
-                # This is approximate; LLM-based extraction gives more reliable stance labels.
+                # Heuristic stance: use negation polarity + relevance score.
+                # When both claim and statement are affirmative AND token overlap is
+                # strong (score >= 0.35), treat the fact as supporting.  Polarity
+                # mismatch (one negated, one not) signals a refuting fact.
+                # The LLM path produces more reliable labels; this fallback is
+                # approximate but now covers all three values.
                 claim_negated = self._has_negation_marker(claim_text)
                 stmt_negated = self._has_negation_marker(statement)
                 if claim_negated != stmt_negated:
                     heuristic_stance = "REFUTES"
+                elif not claim_negated and not stmt_negated and score >= 0.35:
+                    # Both affirmative and sufficiently aligned → claim-supporting
+                    heuristic_stance = "SUPPORTS"
                 else:
                     heuristic_stance = "NEUTRAL"
                 fact = {
