@@ -622,6 +622,7 @@ class RelationExtractor:
                             "source_url": src,
                             "fact_id": fact.get("fact_id"),
                             "source_statement": fact.get("statement", ""),
+                            "stance": str(fact.get("stance") or "").upper().strip() or "NEUTRAL",
                             "claim_context_hash": str(fact.get("claim_context_hash") or claim_hash or ""),
                             "claim_context_entities": list(
                                 fact.get("claim_context_entities")

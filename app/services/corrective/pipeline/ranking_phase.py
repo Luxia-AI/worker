@@ -381,6 +381,23 @@ async def rank_candidates(
     for item in ranked:
         statement = str(item.get("statement") or item.get("text") or "")
         stance = stance_classifier.classify_stance(query_text, statement) if statement else "neutral"
+
+        # Stored-stance override: when a fact was explicitly labeled at ingestion time
+        # as SUPPORTS or REFUTES (by the LLM during extraction), trust that label as an
+        # additional signal.  This prevents NLI/lexical classifiers from misinterpreting
+        # facts whose polarity is clear from the extraction context.
+        stored_stance = str(item.get("stored_stance") or "").upper().strip()
+        if stored_stance == "REFUTES" and stance in ("neutral", "entails"):
+            # The LLM said this refutes the claim but lexical classification disagrees.
+            # Only override when NLI hasn't already provided a strong entailment signal.
+            nli_entail = float(item.get("nli_entail_prob", 0.0) or 0.0)
+            if nli_entail < 0.50:
+                stance = "contradicts"
+        elif stored_stance == "SUPPORTS" and stance == "contradicts":
+            # LLM said this supports the claim but lexical says contradicts; defer to lexical
+            # (lexical negation detection is more reliable than stored stance in isolation).
+            pass  # keep lexical "contradicts" verdict
+
         item["stance"] = stance
         neg_overlap = float(item.get("negation_anchor_overlap", 0.0) or 0.0)
         contradiction_seed = float(item.get("contradict_score", 0.0) or 0.0)

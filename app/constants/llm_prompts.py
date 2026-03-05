@@ -30,8 +30,13 @@ Exclude:
 - opinion/normative language
 - rumors, claims-about-claims, rhetorical questions, anecdotal statements
 - generic background not tied to a concrete assertion in the text
+Assign a stance label relative to the CLAIM CONTEXT for each fact:
+- "SUPPORTS": statement affirms or is consistent with the claim being TRUE
+- "REFUTES": statement contradicts or is inconsistent with the claim being TRUE
+- "NEUTRAL": topically related but neither confirms nor denies the claim
 Return ONLY valid JSON with this exact structure (no extra text, no markdown):
-{{"facts": [{{"statement": "...", "confidence": 0.85}}, {{"statement": "...", "confidence": 0.90}}]}}
+{{"facts": [{{"statement": "...", "confidence": 0.85, "stance": "SUPPORTS"}},
+{{"statement": "...", "confidence": 0.90, "stance": "REFUTES"}}]}}
 
 Content:
 {content}"""
@@ -57,9 +62,14 @@ Strict extraction rules:
 3) Generic background information must be excluded.
 4) If the predicate phrase (or a clear semantic equivalent) is not present, skip it.
 5) Return atomic single-claim statements only.
+6) Assign stance relative to the CLAIM CONTEXT:
+   - "SUPPORTS": confirms the predicate relation holds
+   - "REFUTES": denies the predicate relation holds
+   - "NEUTRAL": related but inconclusive
 
 Return ONLY valid JSON:
-{{"facts": [{{"statement": "...", "confidence": 0.85}}, {{"statement": "...", "confidence": 0.90}}]}}
+{{"facts": [{{"statement": "...", "confidence": 0.85, "stance": "REFUTES"}},
+{{"statement": "...", "confidence": 0.90, "stance": "SUPPORTS"}}]}}
 
 Content:
 {content}"""

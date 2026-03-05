@@ -153,7 +153,11 @@ class CorrectivePipeline:
         }
 
     @staticmethod
-    def _cache_fast_path_allowed(adaptive_trust: Dict[str, Any], verdict_result: Dict[str, Any]) -> bool:
+    def _cache_fast_path_allowed(
+        adaptive_trust: Dict[str, Any],
+        verdict_result: Dict[str, Any],
+        top_ranked: List[Dict[str, Any]] | None = None,
+    ) -> bool:
         def _tokens(text: str) -> set[str]:
             stop = {
                 "the",
@@ -208,6 +212,26 @@ class CorrectivePipeline:
             except Exception:
                 unv_prob = 0.0
             if unv_prob >= 0.50:
+                return False
+
+        # Directional confidence gate: do not short-circuit to cache when the verdict
+        # is TRUE or FALSE but confidence is low.  Low-confidence directional verdicts
+        # indicate the evidence is ambiguous or cross-contaminated.
+        if verdict in ("TRUE", "FALSE"):
+            conf = float(verdict_result.get("confidence", 0.0) or 0.0)
+            if conf < 0.62:
+                return False
+
+        # Cross-claim contamination guard: if we have ranked evidence and NONE of the
+        # top-5 items have claim_context_match=True (i.e., they were all retrieved from
+        # prior claims via semantic proximity), force a fresh web search.
+        # This prevents facts extracted for claim A from producing a verdict for claim B.
+        if top_ranked:
+            top5 = top_ranked[:5]
+            claim_ctx_hits = sum(1 for r in top5 if bool(r.get("claim_context_match", False)))
+            if claim_ctx_hits == 0:
+                # No claim-specific evidence at all — existing VDB facts are all from
+                # other claim contexts.  Do not accept this as a cache hit.
                 return False
 
         # Deterministic gate from adaptive trust metrics (not LLM phrasing).
@@ -791,7 +815,7 @@ class CorrectivePipeline:
                 f"[CorrectivePipeline:{round_id}] Verdict (cache-sufficient): {verdict_result['verdict']} "
                 f"(confidence: {verdict_result['confidence']:.2f})"
             )
-            cache_allowed = self._cache_fast_path_allowed(adaptive_trust, verdict_result)
+            cache_allowed = self._cache_fast_path_allowed(adaptive_trust, verdict_result, top_ranked=top_ranked)
             if cache_allowed:
                 await _emit_stage("search_done", {"search_api_calls": 0, "queries_total": 0})
                 await _emit_stage("extraction_done", {"facts": 0, "triples": 0})

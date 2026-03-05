@@ -304,12 +304,18 @@ class VDBRetrieval:
             claim_overlap_count = len(candidate_tokens & claim_tokens) if claim_tokens else 0
             claim_specific_overlap_count = len(candidate_tokens & claim_specific_tokens) if claim_specific_tokens else 0
             strong_anchor = _strong_anchor_match(candidate_tokens, usable_claim_anchors)
+            stored_stance = str(metadata.get("stance") or "").upper().strip()
             claim_context_match = bool(
                 normalized_claim_hash and stored_claim_hash and stored_claim_hash == normalized_claim_hash
             )
             claim_alignment_boost = 0.0
             if claim_context_match:
                 claim_alignment_boost += 0.12
+                # Extra boost for claim-specific evidence that also has a clear directional
+                # stance (SUPPORTS or REFUTES).  This separates claim-aligned directional
+                # facts from generic domain facts that just happen to share the same hash.
+                if stored_stance in ("SUPPORTS", "REFUTES"):
+                    claim_alignment_boost += 0.08
             if anchor_overlap_count > 0:
                 claim_alignment_boost += min(0.10, 0.02 * anchor_overlap_count)
             if claim_overlap_count > 0:
@@ -342,6 +348,9 @@ class VDBRetrieval:
                 "doc_type": metadata.get("doc_type"),
                 "fact_type": metadata.get("fact_type"),
                 "count_value": metadata.get("count_value"),
+                # Stored stance label from ingestion time.  Provides a directional seed
+                # for downstream ranking before NLI runs.  Values: SUPPORTS, REFUTES, NEUTRAL, "".
+                "stored_stance": stored_stance,
                 "claim_context_hash": stored_claim_hash,
                 "claim_context_match": claim_context_match,
                 "claim_context_entities": claim_ctx_entities,

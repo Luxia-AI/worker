@@ -124,6 +124,7 @@ class KGIngest:
                     # Extract optional fields
                     confidence = float(triple.get("confidence", 0.0))
                     source_url = triple.get("source_url")
+                    stance = str(triple.get("stance") or "").upper().strip()
                     claim_context_hash = str(triple.get("claim_context_hash") or "").strip()
                     claim_context_entities = (
                         triple.get("claim_context_entities") or triple.get("claim_entities_ctx") or []
@@ -133,6 +134,18 @@ class KGIngest:
                     claim_context_entities = [str(e).strip().lower() for e in claim_context_entities if str(e).strip()][
                         :20
                     ]
+
+                    # Only ingest triples with a clear directional stance.
+                    # NEUTRAL triples provide no claim-aligned signal in the KG.
+                    if stance not in ("SUPPORTS", "REFUTES"):
+                        logger.debug(
+                            "[KGIngest] Skipped NEUTRAL-stance triple: %s->%s->%s",
+                            subj_name,
+                            rel_predicate,
+                            obj_name,
+                        )
+                        failed += 1
+                        continue
 
                     # Ingest the triple
                     try:
@@ -149,6 +162,7 @@ class KGIngest:
                                 source_url,
                                 claim_context_hash,
                                 claim_context_entities,
+                                stance,
                             ),
                             timeout=NEO4J_QUERY_TIMEOUT,
                         )
@@ -193,6 +207,7 @@ class KGIngest:
         source_url: str | None,
         claim_context_hash: str = "",
         claim_context_entities: List[str] | None = None,
+        stance: str = "",
     ) -> None:
         """Ingest a single triple with proper KG structure."""
         claim_context_entities = claim_context_entities or []
@@ -213,6 +228,7 @@ class KGIngest:
         ON CREATE SET
             rel.predicate = $rel_predicate,
             rel.confidence = $confidence,
+            rel.polarity = CASE WHEN $polarity <> '' THEN $polarity ELSE NULL END,
             rel.claim_context_hash = CASE WHEN $claim_context_hash <> '' THEN $claim_context_hash ELSE NULL END,
             rel.claim_context_entities = CASE
                 WHEN size($claim_context_entities) > 0 THEN $claim_context_entities
@@ -221,6 +237,7 @@ class KGIngest:
             rel.updated_at = datetime()
         ON MATCH SET
             rel.confidence = CASE WHEN rel.confidence < $confidence THEN $confidence ELSE rel.confidence END,
+            rel.polarity = CASE WHEN $polarity <> '' THEN $polarity ELSE rel.polarity END,
             rel.claim_context_hash = CASE
                 WHEN $claim_context_hash <> '' THEN $claim_context_hash
                 ELSE rel.claim_context_hash
@@ -244,6 +261,7 @@ class KGIngest:
             "rel_rid": rel_rid,
             "rel_predicate": rel_predicate,
             "confidence": confidence,
+            "polarity": stance,
             "claim_context_hash": claim_context_hash,
             "claim_context_entities": claim_context_entities,
         }

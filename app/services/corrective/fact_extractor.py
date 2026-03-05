@@ -25,9 +25,16 @@ Claim alignment rules (strict):
 - Drop off-topic biomedical facts even if true in isolation.
 - Keep explicit support and explicit contradiction statements when claim-relevant.
 
+Stance labeling (required):
+For EVERY fact you extract, assign one of these stance values relative to the CLAIM CONTEXT:
+- "SUPPORTS": the statement is consistent with the claim being TRUE (it affirms the claim or a key part of it)
+- "REFUTES": the statement is inconsistent with the claim being TRUE (it contradicts or negates the claim)
+- "NEUTRAL": the statement is topically related but neither confirms nor denies the claim
+
 IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
 Return ONLY valid JSON with this exact structure:
-{{"results": [{{"index": 0, "facts": [{{"statement": "...", "confidence": 0.85}}]}}, {{"index": 1, "facts": [...]}}]}}
+{{"results": [{{"index": 0, "facts": [{{"statement": "...", "confidence": 0.85, "stance": "SUPPORTS"}}]}},
+{{"index": 1, "facts": [...]}}]}}
 Index integrity:
 - Facts under each "index" must come only from that section index.
 - Do not move or merge facts across section indices.
@@ -745,9 +752,18 @@ class FactExtractor:
                     continue
 
                 statement = self._ground_statement_to_source(sent, source_text)
+                # Heuristic stance: compare negation polarity between statement and claim.
+                # This is approximate; LLM-based extraction gives more reliable stance labels.
+                claim_negated = self._has_negation_marker(claim_text)
+                stmt_negated = self._has_negation_marker(statement)
+                if claim_negated != stmt_negated:
+                    heuristic_stance = "REFUTES"
+                else:
+                    heuristic_stance = "NEUTRAL"
                 fact = {
                     "statement": statement,
                     "confidence": round(max(0.55, min(0.90, 0.55 + (0.35 * score))), 3),
+                    "stance": heuristic_stance,
                     "source_url": page.get("url", ""),
                     "source": page.get("source", ""),
                     "published_at": page.get("published_at", ""),
@@ -862,7 +878,9 @@ class FactExtractor:
             f"{predicate_focus_block}"
         )
 
-        required_format = '{"results": [{"index": 0, "facts": [{"statement": "...", "confidence": 0.85}]}]}'
+        required_format = (
+            '{"results": [{"index": 0, "facts": [{"statement": "...", "confidence": 0.85, "stance": "SUPPORTS"}]}]}'
+        )
 
         try:
             # Single batched LLM call for ALL pages

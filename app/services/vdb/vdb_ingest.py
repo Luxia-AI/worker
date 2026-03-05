@@ -135,12 +135,42 @@ class VDBIngest:
                 f"[VDBIngest] Filtered {len(facts)} facts -> {len(trusted_facts)} trusted, {skipped_count} skipped"
             )
 
+        # Only store facts with a clear directional stance relative to the claim.
+        # NEUTRAL facts carry no supporting/refuting signal and pollute VDB retrieval.
+        directional_facts = [
+            f for f in trusted_facts if str(f.get("stance") or "").upper().strip() in ("SUPPORTS", "REFUTES")
+        ]
+        neutral_dropped = len(trusted_facts) - len(directional_facts)
+        if neutral_dropped > 0:
+            logger.info(
+                "[VDBIngest] Dropped %d NEUTRAL-stance facts before VDB ingestion " "(%d directional kept)",
+                neutral_dropped,
+                len(directional_facts),
+            )
+        if not directional_facts:
+            logger.info("[VDBIngest] No directional (SUPPORTS/REFUTES) facts to ingest")
+            return []
+        trusted_facts = directional_facts
+
         # Enrich trusted facts with metadata before embedding
         trusted_facts = await self.metadata_enricher.enrich_facts(trusted_facts)
 
         logger.info(f"[VDBIngest] Embedding {len(trusted_facts)} facts from trusted domains")
 
-        statements = [f["statement"] for f in trusted_facts]
+        # Stance-aware embedding: prepend a directional prefix to the statement text
+        # when a stance label is available.  This creates better vector-space separation
+        # between SUPPORTS (claim-affirming) and REFUTES (claim-negating) facts so that
+        # retrieval can distinguish them via cosine similarity.
+        def _embed_text(fact: dict) -> str:
+            stmt = fact["statement"]
+            stance = str(fact.get("stance") or "").upper().strip()
+            if stance == "SUPPORTS":
+                return f"[SUPPORTS_CLAIM] {stmt}"
+            if stance == "REFUTES":
+                return f"[REFUTES_CLAIM] {stmt}"
+            return stmt
+
+        statements = [_embed_text(f) for f in trusted_facts]
         embeddings = await embed_async(statements)
 
         vectors = []
@@ -160,6 +190,7 @@ class VDBIngest:
                 "doc_type": fact.get("doc_type"),
                 "fact_type": fact.get("fact_type"),
                 "count_value": fact.get("count_value"),
+                "stance": str(fact.get("stance") or "").upper().strip() or None,
                 "claim_context_hash": str(fact.get("claim_context_hash") or "").strip() or None,
                 "claim_context_entities": claim_ctx_entities or None,
             }
