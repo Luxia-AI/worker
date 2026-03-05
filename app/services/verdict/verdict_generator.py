@@ -4611,6 +4611,15 @@ class VerdictGenerator:
                     )
                 )
                 polarity_conflict = claim_neg != stmt_neg
+                # When heuristic entailment substantially exceeds contradiction
+                # probability the polarity conflict is almost certainly noise from
+                # compound claim structure (e.g. "A, not B" where the "not B" clause
+                # makes claim_neg=True for the full string, causing every affirmative
+                # supporting statement to appear as a polarity-conflict refutation).
+                # The entailment margin is a safer discriminator than negation matching.
+                entail_dominates = nli_entail_prob > nli_contradict_prob + 0.30
+                if entail_dominates and polarity_conflict:
+                    polarity_conflict = False
                 contradiction_alignment = (
                     predicate_match_score >= 0.25
                     or anchor_score >= 0.45
@@ -4632,8 +4641,13 @@ class VerdictGenerator:
                         contradiction_score >= CONTRADICTION_THRESHOLD
                         and predicate_match_score >= 0.4
                         and (claim_neg != stmt_neg)
+                        and not entail_dominates
                     )
-                    or (polarity_rel == "contradicts" and (predicate_match_score >= 0.25 or anchor_score >= 0.45))
+                    or (
+                        polarity_rel == "contradicts"
+                        and (predicate_match_score >= 0.25 or anchor_score >= 0.45)
+                        and not entail_dominates
+                    )
                     or numeric_rel == "CONTRADICTS"
                     or dna_rel == "CONTRADICTS"
                 )
@@ -4691,9 +4705,25 @@ class VerdictGenerator:
                     if numeric_rel == "SUPPORTS" and predicate_match_score >= PREDICATE_MATCH_THRESHOLD:
                         support_gate = support_gate or (anchor_score >= ANCHOR_THRESHOLD)
                     # Prevent broad negated claims from being "supported" only by narrow population/scope evidence.
-                    scope_mismatch_for_negated_claim = claim_neg and scope_alignment < 0.34
+                    # Exception: when entailment clearly dominates, scope mismatch is likely an artefact
+                    # of compound claim structure rather than a genuine scope problem.
+                    scope_mismatch_for_negated_claim = claim_neg and scope_alignment < 0.34 and not entail_dominates
                     if scope_mismatch_for_negated_claim:
                         support_gate = False
+                    # NLI-backed fallback: when entailment clearly dominates and key
+                    # structural signals are strong, bypass the intervention_match
+                    # requirement.  Compound claims like "A, not B" often fail
+                    # intervention_match because the object_span includes the compound
+                    # "A not B" rather than just the intervention target.
+                    if not support_gate and entail_dominates:
+                        support_gate = (
+                            predicate_match_score >= PREDICATE_MATCH_THRESHOLD
+                            and anchor_score >= max(0.25, ANCHOR_THRESHOLD - 0.05)
+                            and object_overlap_ok
+                            and not self._is_explicit_refutation_statement(statement)
+                            and not self._is_reporting_statement(statement)
+                            and not self._is_claim_mention_statement(statement)
+                        )
                     if support_gate:
                         relevance = "SUPPORTS"
                         relevance_score = max(relevance_score, support_strength, 0.62)
