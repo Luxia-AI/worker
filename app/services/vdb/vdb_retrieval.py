@@ -225,6 +225,12 @@ class VDBRetrieval:
             pinecone_filter["topic"] = {"$in": list(set(topic_list + ["other"]))}
         if self.language:
             pinecone_filter["language"] = self.language
+        # Scope retrieval to facts extracted for this specific claim.
+        # Without this filter, semantically similar facts from other claims
+        # (e.g. antibiotics facts surfacing for a vitamin C query) pollute
+        # the evidence pool and produce false support/refute signals.
+        if normalized_claim_hash:
+            pinecone_filter["claim_context_hash"] = normalized_claim_hash
 
         try:
             response = self.index.query(
@@ -248,6 +254,8 @@ class VDBRetrieval:
                 fallback_filter: Dict[str, Any] = {}
                 if self.language:
                     fallback_filter["language"] = self.language
+                if normalized_claim_hash:
+                    fallback_filter["claim_context_hash"] = normalized_claim_hash
                 response = self.index.query(
                     vector=vector,
                     top_k=top_k,

@@ -4658,8 +4658,13 @@ class VerdictGenerator:
                 if refute_by_rule and not self._dose_scope_refute_allowed(claim, statement):
                     refute_by_rule = False
                 if refute_by_rule:
-                    contradiction_alignment_ok = intervention_match or (
-                        refute_by_polarity_override and intervention_anchors_ok
+                    # Explicit refutation statements ("No X is safe", "X does not cause Y")
+                    # carry their own intervention signal in the negation itself —
+                    # bypass the intervention_match requirement for them.
+                    contradiction_alignment_ok = (
+                        intervention_match
+                        or (refute_by_polarity_override and intervention_anchors_ok)
+                        or self._is_explicit_refutation_statement(statement)
                     )
                     if contradiction_alignment_ok:
                         relevance = "REFUTES"
