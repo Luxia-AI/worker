@@ -16,6 +16,7 @@ Integration hooks:
 
 from __future__ import annotations
 
+import os
 import re
 import threading
 from dataclasses import asdict, dataclass, field
@@ -313,7 +314,7 @@ class CorrectiveQueryDesigner:
         "procurement",
     )
 
-    # Explicit synonym seed map (tiny, expand later)
+    # Optional static seed map (disabled by default to avoid patch-stacking overfit).
     _ENTITY_SYNONYMS: Dict[str, Tuple[str, ...]] = {
         "vaccine": ("vaccination", "immunization", "immunisation"),
         "vaccines": ("vaccination", "immunization", "immunisation"),
@@ -651,17 +652,35 @@ class CorrectiveQueryDesigner:
 
     def _build_synonym_map(self, anchors: Iterable[str]) -> Dict[str, List[str]]:
         synonyms: Dict[str, List[str]] = {}
+        static_synonyms_enabled = str(os.getenv("QUERY_DESIGNER_STATIC_SYNONYMS_ENABLED", "false")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         for anchor in anchors:
             key = anchor.lower().strip()
             if not key:
                 continue
             values: List[str] = []
-            if key in self._ENTITY_SYNONYMS:
-                values.extend(self._ENTITY_SYNONYMS[key])
-            if key.endswith("s") and key[:-1] in self._ENTITY_SYNONYMS:
-                values.extend(self._ENTITY_SYNONYMS[key[:-1]])
-            if not key.endswith("s") and f"{key}s" in self._ENTITY_SYNONYMS:
-                values.extend(self._ENTITY_SYNONYMS[f"{key}s"])
+
+            # Dynamic, claim-anchored morphology variants (domain-general).
+            if key.endswith("s") and len(key) > 3:
+                values.append(key[:-1])
+            elif len(key) > 3 and not key.endswith("s"):
+                values.append(f"{key}s")
+            if "-" in key:
+                values.append(key.replace("-", " "))
+            if " " in key:
+                values.append(re.sub(r"\s+", " ", key).strip())
+
+            if static_synonyms_enabled:
+                if key in self._ENTITY_SYNONYMS:
+                    values.extend(self._ENTITY_SYNONYMS[key])
+                if key.endswith("s") and key[:-1] in self._ENTITY_SYNONYMS:
+                    values.extend(self._ENTITY_SYNONYMS[key[:-1]])
+                if not key.endswith("s") and f"{key}s" in self._ENTITY_SYNONYMS:
+                    values.extend(self._ENTITY_SYNONYMS[f"{key}s"])
             values = self._dedupe([v for v in values if v])
             if values:
                 synonyms[key] = values

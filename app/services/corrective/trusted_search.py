@@ -491,8 +491,18 @@ class TrustedSearch:
         if q.count('"') % 2 == 1:
             q = q.replace('"', "")
         # Keep query compact and avoid over-constraining.
-        tokens = q.split()
-        q = " ".join(tokens[:18]).strip()
+        raw_tokens = q.split()
+        collapsed_tokens: List[str] = []
+        for token in raw_tokens:
+            t = str(token or "").strip()
+            if not t:
+                continue
+            # Collapse accidental token repetition from query reformulation loops
+            # (e.g., "treat treat treat") while preserving normal phrase structure.
+            if collapsed_tokens and t.lower() == collapsed_tokens[-1].lower():
+                continue
+            collapsed_tokens.append(t)
+        q = " ".join(collapsed_tokens[:18]).strip()
         # Collapse duplicated/stacked negation artifacts from generated templates.
         q = re.sub(r"\b(do|does)\s+not\s+(?:do|does)\s+not\b", r"\1 not", q, flags=re.IGNORECASE)
         q = re.sub(r"\b(?:do|does)\s+not\s+cannot\b", "does not", q, flags=re.IGNORECASE)
@@ -835,7 +845,17 @@ class TrustedSearch:
         concise_direct = self._build_direct_query(claim_clean, entities=entity_obj.anchors)
         if not concise_direct:
             concise_direct = f"{a_term} {action_term} {b_variants[0]}".strip()
-        logic_track = self._build_claim_logic_query_tracks(a_term, action_term, b_variants[0], claim_clean)
+        balanced_tracks_enabled = str(os.getenv("QUERY_BALANCED_TRACKS_ENABLED", "true")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        logic_track = (
+            self._build_claim_logic_query_tracks(a_term, action_term, b_variants[0], claim_clean)
+            if balanced_tracks_enabled
+            else []
+        )
         queries: List[str] = [
             concise_direct,
             *logic_track,

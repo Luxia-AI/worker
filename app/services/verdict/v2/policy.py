@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+import os
 from typing import Any, Dict, Iterable
 
 from app.constants.config import UNVERIFIABLE_CONFIDENCE_CAP
@@ -37,6 +39,13 @@ def compute_verdict_policy_v2(
     calibrator: ConfidenceCalibrator,
     calibrator_features: Dict[str, float] | None = None,
 ) -> Dict[str, Any]:
+    policy_v3_enabled = str(os.getenv("VERDICT_POLICY_V3_ENABLED", "true")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    policy_k = max(0.5, min(8.0, float(os.getenv("VERDICT_POLICY_V3_SIGMOID_K", "2.5"))))
     post = compute_posteriors_v2(scores=scores, coverage=coverage, diversity=diversity)
     p_true = float(post["p_true"])
     p_false = float(post["p_false"])
@@ -141,18 +150,44 @@ def compute_verdict_policy_v2(
     calibrated_confidence = _clamp01(calibrated_confidence)
 
     truthfulness = _truthfulness_from_posteriors(verdict, p_true, p_false, p_unv)
+    support_mass = float(post.get("support_mass", 0.0) or 0.0)
+    refute_mass = float(post.get("refute_mass", 0.0) or 0.0)
+    neutral_mass = float(post.get("neutral_mass", 0.0) or 0.0)
+    directional_delta = float(support_mass - refute_mass)
+    try:
+        truth_score_binary = float(1.0 / (1.0 + math.exp(-policy_k * directional_delta)))
+    except OverflowError:
+        truth_score_binary = 1.0 if directional_delta > 0 else 0.0
+    verdict_binary = "TRUE" if truth_score_binary >= 0.5 else "FALSE"
+
     return {
         "verdict": verdict,
+        "verdict_binary": verdict_binary,
         "truthfulness_percent": float(truthfulness),
+        "truth_score_binary": float(truth_score_binary),
         "calibrated_confidence": float(calibrated_confidence),
         "class_probs_raw": class_probs_raw,
         "class_probs": class_probs,
-        "support_mass": float(post.get("support_mass", 0.0) or 0.0),
-        "refute_mass": float(post.get("refute_mass", 0.0) or 0.0),
-        "neutral_mass": float(post.get("neutral_mass", 0.0) or 0.0),
+        "support_mass": support_mass,
+        "refute_mass": refute_mass,
+        "neutral_mass": neutral_mass,
         "evidence_sufficiency": float(post.get("sufficiency", 0.0) or 0.0),
         "agreement_score": float(post.get("agreement", 0.0) or 0.0),
         "retrieval_entropy": float(post.get("retrieval_entropy", 0.0) or 0.0),
         "margin": float(post.get("margin", 0.0) or 0.0),
         "admissibility_rate": float(post.get("admissibility_rate", 0.0) or 0.0),
+        "policy_trace": [
+            {
+                "step": "posterior_v2",
+                "verdict": verdict,
+                "verdict_binary": verdict_binary,
+                "support_mass": round(float(support_mass), 4),
+                "contradict_mass": round(float(refute_mass), 4),
+                "neutral_mass": round(float(neutral_mass), 4),
+                "sufficiency": round(float(post.get("sufficiency", 0.0) or 0.0), 4),
+                "directional_delta": round(float(directional_delta), 4),
+                "truth_score_binary": round(float(truth_score_binary), 4),
+                "enabled": bool(policy_v3_enabled),
+            }
+        ],
     }

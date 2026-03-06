@@ -441,6 +441,7 @@ async def rank_candidates(
 
     ranked = _collapse_source_polarity_conflicts(ranked)
 
+    stage1_min_for_nli = float(os.getenv("REFUTE_STAGE1_MIN_FOR_NLI", "0.25"))
     stage2_input: List[Dict[str, Any]] = [
         {
             "evidence_id": idx,
@@ -448,7 +449,7 @@ async def rank_candidates(
             "stage1_refute_score": float(it.get("stage1_refute_score", 0.0) or 0.0),
         }
         for idx, it in enumerate(ranked)
-        if float(it.get("stage1_refute_score", 0.0) or 0.0) >= 0.30
+        if float(it.get("stage1_refute_score", 0.0) or 0.0) >= stage1_min_for_nli
     ]
     stage2_verified = (
         _ENTAILMENT_VERIFIER.verify_refutes(
@@ -470,7 +471,7 @@ async def rank_candidates(
         item["nli_entail_prob"] = round(entail_p, 4)
         item["nli_contradict_prob"] = round(contra_p, 4)
         item["nli_neutral_prob"] = round(neutral_p, 4)
-        if contra_p >= 0.45:
+        if contra_p >= float(os.getenv("REFUTE_NLI_CONTRADICT_MIN", "0.42")):
             item["refute_verified"] = True
             item["stance"] = "contradicts"
             refute_verified_count_stage2 += 1
@@ -492,6 +493,21 @@ async def rank_candidates(
             item["refute_verified_fallback"] = True
             item["stance"] = "contradicts"
             refute_verified_count_stage2 += 1
+            continue
+        # Secondary fallback: admit contradiction when stage1 + structural alignment
+        # are strong but NLI remains uncertain in clinical wording.
+        if (
+            stage1_refute_score >= float(os.getenv("REFUTE_STAGE1_ALIGNMENT_MIN", "0.66"))
+            and contradiction_seed >= float(os.getenv("REFUTE_STAGE1_ALIGNMENT_CONTRADICT_MIN", "0.66"))
+            and anchor_overlap >= float(os.getenv("REFUTE_STAGE1_ALIGNMENT_ANCHOR_MIN", "0.32"))
+            and predicate_match >= float(os.getenv("REFUTE_STAGE1_ALIGNMENT_PREDICATE_MIN", "0.22"))
+            and contra_p >= float(os.getenv("REFUTE_STAGE1_ALIGNMENT_CONTRA_PROB_MIN", "0.24"))
+            and neutral_p <= float(os.getenv("REFUTE_STAGE1_ALIGNMENT_NEUTRAL_MAX", "0.70"))
+        ):
+            item["refute_verified"] = True
+            item["refute_verified_alignment"] = True
+            item["stance"] = "contradicts"
+            refute_verified_count_stage2 += 1
     contradicting_count = scorer.score(ranked).contra_count
 
     ranked.sort(
@@ -504,6 +520,8 @@ async def rank_candidates(
     )
 
     # Keep a contradiction quota so verdict generation receives explicit polarity evidence.
+    contradiction_strength_pool = max((float(r.get("contradict_score", 0.0) or 0.0) for r in ranked), default=0.0)
+    support_strength_pool = max((float(r.get("support_score", 0.0) or 0.0) for r in ranked), default=0.0)
     non_contradicting = [r for r in ranked if (r.get("stance") or "neutral") != "contradicts"]
     contradicting = [r for r in ranked if (r.get("stance") or "neutral") == "contradicts"]
     verified_contradicting = [r for r in contradicting if bool(r.get("refute_verified", False))]
@@ -513,6 +531,10 @@ async def rank_candidates(
             contradiction_quota = max(1, int(os.getenv("RANKING_MIN_CONTRADICTION_QUOTA", "1")))
         except Exception:
             contradiction_quota = 1
+        if contradiction_strength_pool >= float(
+            os.getenv("RANKING_CONTRADICTION_POOL_MIN", "0.62")
+        ) and support_strength_pool <= float(os.getenv("RANKING_SUPPORT_POOL_MAX_FOR_EXTRA_CONTRADICTION", "0.72")):
+            contradiction_quota = max(contradiction_quota, int(os.getenv("RANKING_EXTRA_CONTRADICTION_QUOTA", "2")))
     contradiction_quota = min(contradiction_quota, top_k)
     top_ranked: List[Dict[str, Any]]
     if non_contradicting:

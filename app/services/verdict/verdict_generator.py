@@ -15,6 +15,7 @@ previously-ingested facts are found even when full-claim semantic
 similarity favors other topics.
 """
 
+import math
 import os
 import re
 from enum import Enum
@@ -2590,6 +2591,25 @@ class VerdictGenerator:
             "policy_sufficient": not policy_insufficient,
             "trust_gate_binary_lock_applied": bool(trust_gate_binary_lock_applied),
             "verdict_guard_reasons": sorted(set(verdict_guard_reasons)),
+            "support_mass": float(v2_policy_output.get("support_mass", 0.0) or 0.0),
+            "contradict_mass": float(v2_policy_output.get("refute_mass", 0.0) or 0.0),
+            "neutral_mass": float(v2_policy_output.get("neutral_mass", 0.0) or 0.0),
+            "sufficiency_score": float(v2_policy_output.get("evidence_sufficiency", 0.0) or 0.0),
+            "policy_trace": [
+                {
+                    "step": "v2_policy",
+                    "verdict": str(v2_policy_output.get("verdict") or ""),
+                    "sufficiency": round(float(v2_policy_output.get("evidence_sufficiency", 0.0) or 0.0), 4),
+                    "support_mass": round(float(v2_policy_output.get("support_mass", 0.0) or 0.0), 4),
+                    "contradict_mass": round(float(v2_policy_output.get("refute_mass", 0.0) or 0.0), 4),
+                    "neutral_mass": round(float(v2_policy_output.get("neutral_mass", 0.0) or 0.0), 4),
+                },
+                {
+                    "step": "trust_gate",
+                    "policy_sufficient": bool(not policy_insufficient),
+                    "trust_threshold_met": bool(not policy_insufficient),
+                },
+            ],
             "segment_evidence_counts": segment_evidence_counts,
             "undercovered_segments": undercovered_segments,
             "min_evidence_per_segment_target": int(min_per_segment_target),
@@ -3038,6 +3058,14 @@ class VerdictGenerator:
 
     @staticmethod
     def _concept_aliases() -> Dict[str, List[str]]:
+        static_map_enabled = str(os.getenv("VERDICT_STATIC_CONCEPT_MAP_ENABLED", "false")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        if not static_map_enabled:
+            return {}
         return {
             "vaccine": ["vaccine", "vaccines", "vaccination"],
             "flu": ["flu", "influenza"],
@@ -3057,9 +3085,30 @@ class VerdictGenerator:
     def _concept_hits(self, text: str) -> set[str]:
         low = (text or "").lower()
         hits: set[str] = set()
-        for concept, aliases in self._concept_aliases().items():
-            if any(alias in low for alias in aliases):
-                hits.add(concept)
+        alias_map = self._concept_aliases()
+        if alias_map:
+            for concept, aliases in alias_map.items():
+                if any(alias in low for alias in aliases):
+                    hits.add(concept)
+            return hits
+        tokens = [t for t in re.findall(r"\b[a-z][a-z0-9_-]{2,}\b", low) if len(t) >= 4]
+        stop = {
+            "with",
+            "from",
+            "that",
+            "this",
+            "these",
+            "those",
+            "about",
+            "into",
+            "without",
+            "because",
+            "claim",
+            "evidence",
+        }
+        for tok in tokens:
+            if tok not in stop:
+                hits.add(tok)
         return hits
 
     @staticmethod
@@ -7404,6 +7453,71 @@ class VerdictGenerator:
         payload["verdict_guard_reasons"] = sorted(set(guard_reasons))
 
         payload["verdict"] = verdict
+        payload["verdict_internal"] = verdict
+
+        support_mass = float(payload.get("support_mass", support_mass) or support_mass)
+        contradict_mass = float(payload.get("contradict_mass", contradict_mass) or contradict_mass)
+        neutral_mass = float(payload.get("neutral_mass", 0.0) or 0.0)
+        sufficiency_score = float(payload.get("sufficiency_score", payload.get("evidence_sufficiency", 0.0)) or 0.0)
+        policy_v3_enabled = str(os.getenv("VERDICT_POLICY_V3_ENABLED", "true")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        policy_k = max(0.5, min(8.0, float(os.getenv("VERDICT_POLICY_V3_SIGMOID_K", "2.5"))))
+        directional_delta = float(support_mass - contradict_mass)
+        try:
+            truth_score_binary = float(1.0 / (1.0 + math.exp(-policy_k * directional_delta)))
+        except OverflowError:
+            truth_score_binary = 1.0 if directional_delta > 0 else 0.0
+
+        probs_for_binary = payload.get("class_probs") if isinstance(payload.get("class_probs"), dict) else {}
+        if abs(directional_delta) < 1e-9 and probs_for_binary:
+            p_true_b = float(probs_for_binary.get("true", 0.0) or 0.0)
+            p_false_b = float(probs_for_binary.get("false", 0.0) or 0.0)
+            denom = max(1e-9, p_true_b + p_false_b)
+            truth_score_binary = max(0.0, min(1.0, p_true_b / denom))
+
+        if verdict == Verdict.TRUE.value:
+            verdict_binary = Verdict.TRUE.value
+        elif verdict == Verdict.FALSE.value:
+            verdict_binary = Verdict.FALSE.value
+        else:
+            verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
+        payload["verdict_binary"] = verdict_binary
+        payload["truth_score_binary"] = round(float(truth_score_binary), 6)
+        payload["support_mass"] = float(support_mass)
+        payload["contradict_mass"] = float(contradict_mass)
+        payload["neutral_mass"] = float(neutral_mass)
+        payload["sufficiency_score"] = float(sufficiency_score)
+        if verdict in {Verdict.UNVERIFIABLE.value, Verdict.PARTIALLY_TRUE.value}:
+            payload["abstain_reason"] = (
+                payload["verdict_guard_reasons"][0]
+                if payload.get("verdict_guard_reasons")
+                else ("insufficient_evidence" if not bool(payload.get("policy_sufficient", False)) else "mixed_signal")
+            )
+        else:
+            payload["abstain_reason"] = ""
+
+        policy_trace = payload.get("policy_trace")
+        if not isinstance(policy_trace, list):
+            policy_trace = []
+        policy_trace.append(
+            {
+                "step": "deterministic_binary_projection",
+                "enabled": bool(policy_v3_enabled),
+                "support_mass": round(float(support_mass), 4),
+                "contradict_mass": round(float(contradict_mass), 4),
+                "neutral_mass": round(float(neutral_mass), 4),
+                "sufficiency_score": round(float(sufficiency_score), 4),
+                "directional_delta": round(float(directional_delta), 4),
+                "truth_score_binary": round(float(truth_score_binary), 4),
+                "verdict_internal": verdict,
+                "verdict_binary": verdict_binary,
+            }
+        )
+        payload["policy_trace"] = policy_trace
 
         best_ev = self._pick_best_binary_evidence(verdict, evidence_map, evidence)
         best_stmt = str(best_ev.get("statement") or "").strip()

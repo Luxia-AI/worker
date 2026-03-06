@@ -129,6 +129,7 @@ class CorrectivePipeline:
     def _trust_payload_adaptive(adaptive_trust: Dict[str, Any]) -> Dict[str, Any]:
         trust_post = float(adaptive_trust.get("trust_post", 0.0) or 0.0)
         is_sufficient = bool(adaptive_trust.get("is_sufficient", False))
+        sufficiency_reason = str(adaptive_trust.get("gate_reason") or "")
         return {
             "trust_policy_mode": "adaptive",
             "trust_metric_name": "adaptive_trust_post",
@@ -138,6 +139,8 @@ class CorrectivePipeline:
             "adaptive_is_sufficient": is_sufficient,
             "adaptive_trust_post": trust_post,
             "trust_post_adaptive": trust_post,
+            "adaptive_sufficiency_reason": sufficiency_reason,
+            "trust_sufficiency_reason": sufficiency_reason,
         }
 
     @staticmethod
@@ -1598,20 +1601,39 @@ class CorrectivePipeline:
                 if len(output_triples) >= 3:
                     break
 
+        ranking_top_scores = [round(float(r.get("final_score", 0.0) or 0.0), 4) for r in top_ranked[:5]]
+        support_strength = max((float(r.get("support_score", 0.0) or 0.0) for r in top_ranked), default=0.0)
+        contradiction_strength = max((float(r.get("contradict_score", 0.0) or 0.0) for r in top_ranked), default=0.0)
+        evidence_sources = sorted(
+            {
+                str(urllib.parse.urlparse(str(r.get("source_url") or "")).netloc or "").strip().lower()
+                for r in top_ranked[:10]
+                if str(r.get("source_url") or "").strip()
+            }
+        )
+
         return {
             "round_id": round_id,
             "status": final_status,
             "facts": output_facts,
             "triples": output_triples,
             "queries": queries_executed,
+            "queries_planned": queries,
             "queries_total": len(queries),
+            "queries_used": len(queries_executed),
             "semantic_candidates_count": len(dedup_sem),
             "kg_candidates_count": len(kg_candidates),
             "ranked": top_ranked,
+            "claim_entities": claim_entities,
+            "predicate_target": predicate_target,
             "used_web_search": search_api_calls > 0,
             "data_source": "WEB_SEARCH" if search_api_calls > 0 else "CACHE",
             "search_api_calls": search_api_calls,
             "search_api_calls_saved": len(queries) - search_api_calls,
+            "query_budget": {
+                "total": int(len(queries)),
+                "used": int(search_api_calls),
+            },
             "elapsed_seconds": round(float(elapsed_total), 3),
             "runtime_budget_seconds": round(float(max_runtime_seconds), 3),
             "urls_processed": len(processed_urls),
@@ -1649,6 +1671,10 @@ class CorrectivePipeline:
                 sum(float(e.get("kg_score", 0.0) or 0.0) for e in top_ranked[:5]),
                 3,
             ),
+            "retrieval_scores_top": ranking_top_scores,
+            "support_strength": round(float(support_strength), 4),
+            "contradiction_strength": round(float(contradiction_strength), 4),
+            "evidence_sources": evidence_sources,
             "llm": get_groq_job_metadata(),
             "domain": normalized_domain,
             "health_scope": {

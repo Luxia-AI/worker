@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any
 
@@ -83,6 +84,157 @@ def _trust_failed_band(score: float) -> str:
     return "MOSTLY_TRUE"
 
 
+def _env_flag(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _host(url: Any) -> str:
+    val = str(url or "").strip()
+    if not val:
+        return ""
+    try:
+        return str(urllib.parse.urlparse(val).netloc or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _build_debug_block(
+    result: dict[str, Any], verdict_result: dict[str, Any], final_evidence: list[dict[str, Any]]
+) -> dict[str, Any]:
+    ranked = result.get("ranked", []) if isinstance(result.get("ranked"), list) else []
+    evidence_map = verdict_result.get("evidence_map", []) if isinstance(verdict_result, dict) else []
+    claim_breakdown = verdict_result.get("claim_breakdown", []) if isinstance(verdict_result, dict) else []
+    support_count = 0
+    refute_count = 0
+    neutral_count = 0
+    for row in evidence_map:
+        if not isinstance(row, dict):
+            continue
+        rel = str(row.get("relevance") or "").strip().upper()
+        if rel == "SUPPORTS":
+            support_count += 1
+        elif rel == "REFUTES":
+            refute_count += 1
+        else:
+            neutral_count += 1
+
+    alignment_values: list[float] = []
+    for seg in claim_breakdown:
+        if not isinstance(seg, dict):
+            continue
+        dbg = seg.get("alignment_debug")
+        if not isinstance(dbg, dict):
+            continue
+        for key in ("final_score", "score", "predicate_match_score"):
+            if dbg.get(key) is not None:
+                try:
+                    alignment_values.append(float(dbg.get(key)))
+                except (TypeError, ValueError):
+                    pass
+                break
+    alignment_score = float(sum(alignment_values) / len(alignment_values)) if alignment_values else 0.0
+
+    sources = {
+        _host(e.get("source_url") if isinstance(e, dict) else "")
+        for e in (evidence_map if evidence_map else final_evidence)
+        if isinstance(e, dict)
+    }
+    sources.discard("")
+
+    policy_path = verdict_result.get("policy_trace")
+    if not isinstance(policy_path, list):
+        policy_path = []
+    if not policy_path:
+        guard_reasons = verdict_result.get("verdict_guard_reasons", [])
+        if isinstance(guard_reasons, list) and guard_reasons:
+            policy_path = [{"step": "guards", "reasons": guard_reasons}]
+
+    ranking_top = []
+    for r in ranked[:5]:
+        if not isinstance(r, dict):
+            continue
+        ranking_top.append(
+            {
+                "final_score": round(float(r.get("final_score", 0.0) or 0.0), 4),
+                "sem_score": round(float(r.get("sem_score", 0.0) or 0.0), 4),
+                "kg_score": round(float(r.get("kg_score", 0.0) or 0.0), 4),
+                "support_score": round(float(r.get("support_score", 0.0) or 0.0), 4),
+                "contradict_score": round(float(r.get("contradict_score", 0.0) or 0.0), 4),
+                "stance": str(r.get("stance") or "neutral"),
+            }
+        )
+
+    return {
+        "claim_entities": result.get("claim_entities", []),
+        "claim_predicate": (
+            (result.get("predicate_target") or {}).get("predicate")
+            if isinstance(result.get("predicate_target"), dict)
+            else ""
+        ),
+        "generated_queries": result.get("queries_planned", result.get("queries", [])),
+        "vector_hits": int(result.get("semantic_candidates_count", 0) or 0),
+        "kg_hits": int(result.get("kg_candidates_count", 0) or 0),
+        "retrieval_scores": {
+            "top": result.get("retrieval_scores_top", []),
+            "avg_top5": round(float(result.get("ranking_avg_score", 0.0) or 0.0), 4),
+        },
+        "ranking_scores": {
+            "top": ranking_top,
+            "support_strength": round(
+                float(
+                    result.get(
+                        "support_strength",
+                        verdict_result.get("support_mass", 0.0) if isinstance(verdict_result, dict) else 0.0,
+                    )
+                    or 0.0
+                ),
+                4,
+            ),
+            "contradiction_strength": round(
+                float(
+                    result.get(
+                        "contradiction_strength",
+                        verdict_result.get("contradict_mass", 0.0) if isinstance(verdict_result, dict) else 0.0,
+                    )
+                    or 0.0
+                ),
+                4,
+            ),
+        },
+        "evidence_stance_distribution": {
+            "supports": int(support_count),
+            "refutes": int(refute_count),
+            "neutral": int(neutral_count),
+        },
+        "evidence_sources": sorted(sources),
+        "alignment_score": round(float(alignment_score), 4),
+        "verdict_policy_path": policy_path,
+        "trust_gate": {
+            "threshold_met": bool(
+                result.get(
+                    "trust_threshold_met",
+                    verdict_result.get("trust_threshold_met", False) if isinstance(verdict_result, dict) else False,
+                )
+            ),
+            "sufficiency_reason": str(
+                result.get("trust_sufficiency_reason") or result.get("adaptive_sufficiency_reason") or ""
+            ),
+        },
+        "stop_reason": (
+            str((result.get("pipeline_diagnostics_v2") or {}).get("stop_reason", ""))
+            if isinstance(result.get("pipeline_diagnostics_v2"), dict)
+            else ""
+        ),
+        "query_budget": result.get(
+            "query_budget",
+            {"total": int(result.get("queries_total", 0) or 0), "used": int(result.get("search_api_calls", 0) or 0)},
+        ),
+    }
+
+
 async def _get_pipeline() -> Any:
     global _pipeline
     if _pipeline is not None:
@@ -128,6 +280,16 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
     final_evidence = verdict_evidence if verdict_evidence else ranked_evidence
     llm_meta = result.get("llm", {}) or {}
     status = str(result.get("status", "completed") or "completed")
+    binary_first = _env_flag("VERDICT_POLICY_V3_ENABLED", True)
+    verdict_internal = str(verdict_result.get("verdict", "UNVERIFIABLE") or "UNVERIFIABLE")
+    verdict_binary = str(verdict_result.get("verdict_binary") or "").upper()
+    if verdict_binary not in {"TRUE", "FALSE"}:
+        truthfulness_hint = float(verdict_result.get("truth_score_binary", 0.5) or 0.5)
+        verdict_binary = "TRUE" if truthfulness_hint >= 0.5 else "FALSE"
+    response_verdict = verdict_binary if binary_first else verdict_internal
+    display_verdict = response_verdict if binary_first else verdict_result.get("display_verdict", verdict_internal)
+    debug_block_enabled = _env_flag("VERDICT_DEBUG_BLOCK_ENABLED", True)
+    debug_block = _build_debug_block(result, verdict_result, final_evidence) if debug_block_enabled else {}
 
     return {
         "status": "completed",
@@ -138,8 +300,11 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "claim": payload.claim,
         "pipeline_status": status,
         "result_status": status,
-        "verdict": verdict_result.get("verdict", "FALSE"),
-        "display_verdict": verdict_result.get("display_verdict", verdict_result.get("verdict", "FALSE")),
+        "verdict": response_verdict,
+        "verdict_binary": verdict_binary,
+        "verdict_internal": verdict_internal,
+        "abstain_reason": verdict_result.get("abstain_reason", ""),
+        "display_verdict": display_verdict,
         "verdict_band": verdict_result.get("verdict_band"),
         "verdict_confidence": verdict_result.get("confidence", 0.0),
         "calibrated_confidence": verdict_result.get("calibrated_confidence", verdict_result.get("confidence", 0.0)),
@@ -176,6 +341,11 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "health_scope": result.get("health_scope"),
         "pipeline_diagnostics_v2": result.get("pipeline_diagnostics_v2"),
         "trust_snapshot_v2": result.get("trust_snapshot_v2"),
+        "support_mass": verdict_result.get("support_mass"),
+        "contradict_mass": verdict_result.get("contradict_mass", verdict_result.get("refute_mass")),
+        "neutral_mass": verdict_result.get("neutral_mass"),
+        "sufficiency_score": verdict_result.get("sufficiency_score", verdict_result.get("evidence_sufficiency")),
+        "policy_trace": verdict_result.get("policy_trace", []),
         "degraded_mode": bool(llm_meta.get("degraded_mode", False)),
         "llm": llm_meta,
         "evidence": [
@@ -190,6 +360,7 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
             }
             for e in final_evidence[:5]
         ],
+        "debug": debug_block,
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "worker_service": SERVICE_NAME,
     }
@@ -209,6 +380,9 @@ def _format_fallback_response(payload: VerifyRequest, error_message: str) -> dic
         "pipeline_status": "fallback",
         "result_status": "fallback",
         "verdict": verdict,
+        "verdict_binary": verdict,
+        "verdict_internal": "UNVERIFIABLE",
+        "abstain_reason": "pipeline_fallback_error",
         "display_verdict": display_verdict,
         "verdict_band": verdict_band,
         "verdict_confidence": confidence,
@@ -247,6 +421,27 @@ def _format_fallback_response(payload: VerifyRequest, error_message: str) -> dic
         "health_scope": None,
         "pipeline_diagnostics_v2": None,
         "trust_snapshot_v2": None,
+        "support_mass": 0.0,
+        "contradict_mass": 0.0,
+        "neutral_mass": 0.0,
+        "sufficiency_score": 0.0,
+        "policy_trace": [{"step": "fallback", "reason": error_message}],
+        "debug": {
+            "claim_entities": [],
+            "claim_predicate": "",
+            "generated_queries": [],
+            "vector_hits": 0,
+            "kg_hits": 0,
+            "retrieval_scores": {"top": [], "avg_top5": 0.0},
+            "ranking_scores": {"top": [], "support_strength": 0.0, "contradiction_strength": 0.0},
+            "evidence_stance_distribution": {"supports": 0, "refutes": 0, "neutral": 0},
+            "evidence_sources": [],
+            "alignment_score": 0.0,
+            "verdict_policy_path": [{"step": "fallback"}],
+            "trust_gate": {"threshold_met": False, "sufficiency_reason": "pipeline_fallback_error"},
+            "stop_reason": "fallback",
+            "query_budget": {"total": 0, "used": 0},
+        },
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "worker_service": SERVICE_NAME,
     }
