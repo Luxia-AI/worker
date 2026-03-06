@@ -7556,18 +7556,46 @@ class VerdictGenerator:
             )
             class_margin = abs(p_true_b - p_false_b)
             absolute_claim = self._has_absolute_quantifier(claim)
+            requirement_claim = self._has_requirement_quantifier(claim)
             no_directional_labels = bool(support_label_count == 0 and refute_label_count == 0)
+            binary_fallback_reason = ""
             if no_directional_labels:
-                verdict_binary = Verdict.FALSE.value
+                # Neutral-only evidence is common in hard claims.
+                # Avoid a global FALSE bias by using claim polarity + directional mass.
+                if not trust_gate_passed:
+                    verdict_binary = Verdict.FALSE.value
+                    binary_fallback_reason = "neutral_only_trust_gate_fail"
+                elif absolute_claim or requirement_claim:
+                    # Requirement/absolute claims remain conservative unless
+                    # positive directional evidence clearly dominates.
+                    if directional_delta >= max(uncertainty_margin, 0.08) and (p_true_b - p_false_b) >= 0.05:
+                        verdict_binary = Verdict.TRUE.value
+                        binary_fallback_reason = "neutral_only_requirement_positive_delta"
+                    else:
+                        verdict_binary = Verdict.FALSE.value
+                        binary_fallback_reason = "neutral_only_requirement_conservative_false"
+                elif abs(directional_delta) >= uncertainty_margin:
+                    verdict_binary = Verdict.TRUE.value if directional_delta > 0 else Verdict.FALSE.value
+                    binary_fallback_reason = "neutral_only_mass_direction"
+                elif probs_for_binary and class_margin >= 0.01:
+                    verdict_binary = Verdict.TRUE.value if p_true_b >= p_false_b else Verdict.FALSE.value
+                    binary_fallback_reason = "neutral_only_class_probs_tiebreak"
+                else:
+                    verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
+                    binary_fallback_reason = "neutral_only_sigmoid_tiebreak"
             elif absolute_claim and support_label_count == 0:
                 verdict_binary = Verdict.FALSE.value
+                binary_fallback_reason = "absolute_without_support"
             elif abs(directional_delta) < uncertainty_margin:
                 if probs_for_binary and class_margin >= 0.05:
                     verdict_binary = Verdict.TRUE.value if p_true_b > p_false_b else Verdict.FALSE.value
+                    binary_fallback_reason = "low_delta_class_probs"
                 else:
                     verdict_binary = Verdict.FALSE.value
+                    binary_fallback_reason = "low_delta_default_false"
             else:
                 verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
+                binary_fallback_reason = "directional_sigmoid"
         payload["verdict_binary"] = verdict_binary
         payload["truth_score_binary"] = round(float(truth_score_binary), 6)
         payload["support_mass"] = float(support_mass)
@@ -7597,6 +7625,7 @@ class VerdictGenerator:
             "truth_score_binary": round(float(truth_score_binary), 4),
             "verdict_internal": verdict,
             "verdict_binary": verdict_binary,
+            "binary_fallback_reason": binary_fallback_reason if "binary_fallback_reason" in locals() else "",
         }
         if not policy_trace or policy_trace[-1] != projection_entry:
             policy_trace.append(projection_entry)
@@ -7772,6 +7801,24 @@ class VerdictGenerator:
                     if not meta.get("class_probs_resync_reason"):
                         meta["class_probs_resync_reason"] = "verdict_probability_coherence"
                     payload["calibration_meta"] = meta
+        # When internal verdict is abstained but binary projection is emitted for downstream
+        # consumers, keep posterior distribution coherent with that projected decision while
+        # preserving uncertainty mass.
+        probs_now = payload.get("class_probs") if isinstance(payload.get("class_probs"), dict) else {}
+        if verdict in {Verdict.UNVERIFIABLE.value, Verdict.PARTIALLY_TRUE.value} and probs_now:
+            projected = self._project_probs_for_binary_output(
+                probs_now,
+                verdict_binary=verdict_binary,
+                sufficiency_score=sufficiency_score,
+            )
+            if projected != probs_now:
+                payload["class_probs"] = projected
+                meta = payload.get("calibration_meta")
+                if not isinstance(meta, dict):
+                    meta = {}
+                meta["class_probs_resynced"] = True
+                meta["class_probs_resync_reason"] = "binary_projection_from_internal_uncertainty"
+                payload["calibration_meta"] = meta
         if not isinstance(payload.get("calibration_meta"), dict):
             payload["calibration_meta"] = {"calibrator_version": payload.get("calibration_version")}
         if not isinstance(payload.get("evidence_attribution"), list):
@@ -8024,6 +8071,54 @@ class VerdictGenerator:
             "false": p_false / total,
             "unverifiable": p_unv / total,
         }
+
+    @classmethod
+    def _project_probs_for_binary_output(
+        cls,
+        class_probs: Dict[str, Any],
+        *,
+        verdict_binary: str,
+        sufficiency_score: float,
+    ) -> Dict[str, float]:
+        """
+        Project internal ternary probabilities into a binary-facing posterior while
+        retaining explicit uncertainty mass.
+        """
+        probs = cls._normalize_class_probs_dict(class_probs)
+        vb = str(verdict_binary or "").upper()
+        if vb not in {Verdict.TRUE.value, Verdict.FALSE.value}:
+            return probs
+
+        p_true = float(probs.get("true", 0.0) or 0.0)
+        p_false = float(probs.get("false", 0.0) or 0.0)
+        denom = max(1e-9, p_true + p_false)
+        if denom <= 1e-6:
+            if vb == Verdict.TRUE.value:
+                p_true_bin, p_false_bin = 0.65, 0.35
+            else:
+                p_true_bin, p_false_bin = 0.35, 0.65
+        else:
+            p_true_bin = p_true / denom
+            p_false_bin = p_false / denom
+
+        suff = max(0.0, min(1.0, float(sufficiency_score or 0.0)))
+        # Keep uncertainty explicit but avoid dominant UNVERIFIABLE posterior
+        # when emitting binary output.
+        p_unv = max(0.20, min(0.45, 0.45 - 0.20 * suff))
+        remaining = max(1e-9, 1.0 - p_unv)
+        projected = cls._normalize_class_probs_dict(
+            {
+                "true": remaining * p_true_bin,
+                "false": remaining * p_false_bin,
+                "unverifiable": p_unv,
+            }
+        )
+        return cls._soft_align_class_probs_with_verdict(
+            projected,
+            verdict=vb,
+            min_margin=0.01,
+            max_transfer=0.12,
+        )
 
     @classmethod
     def _soft_align_class_probs_with_verdict(
