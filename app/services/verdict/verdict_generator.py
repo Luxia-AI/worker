@@ -4676,6 +4676,8 @@ class VerdictGenerator:
                     or anchor_score >= 0.45
                     or (intervention_match and anchor_score >= 0.30)
                 )
+                claim_requirement = self._has_requirement_quantifier(claim)
+                statement_limited_use = self._statement_indicates_limited_use(statement)
                 refute_by_polarity_override = (
                     polarity_conflict
                     and contradiction_alignment
@@ -4688,6 +4690,12 @@ class VerdictGenerator:
                 )
                 refute_by_rule = (
                     refute_by_polarity_override
+                    or (
+                        claim_requirement
+                        and statement_limited_use
+                        and predicate_match_score >= 0.35
+                        and anchor_score >= 0.35
+                    )
                     or (
                         self._has_absolute_quantifier(claim)
                         and predicate_match_score >= 0.45
@@ -4762,6 +4770,10 @@ class VerdictGenerator:
                     # absolute-support evidence; non-absolute evidence should
                     # not be promoted to SUPPORTS.
                     if self._has_absolute_quantifier(claim) and not self._has_absolute_quantifier(statement):
+                        support_gate = False
+                    # Requirement claims ("necessary/standard") are contradicted by
+                    # limited-use language ("sometimes/selected cases").
+                    if claim_requirement and statement_limited_use:
                         support_gate = False
                     # Numeric exact-match can support if predicate and anchor are both present.
                     if numeric_rel == "SUPPORTS" and predicate_match_score >= PREDICATE_MATCH_THRESHOLD:
@@ -4990,6 +5002,16 @@ class VerdictGenerator:
                 )
                 if predicate_semantic_backoff_ok:
                     strict_support_ok = True
+                segment_has_absolute = self._has_absolute_quantifier(segment)
+                statement_has_absolute = self._has_absolute_quantifier(statement)
+                segment_has_requirement = self._has_requirement_quantifier(segment)
+                statement_limited_use = self._statement_indicates_limited_use(statement)
+                if segment_has_absolute and not statement_has_absolute:
+                    strict_support_ok = False
+                    strong_neutral_support = False
+                if segment_has_requirement and statement_limited_use:
+                    strict_support_ok = False
+                    strong_neutral_support = False
                 noun_phrase_support_ok = (
                     (not segment_has_predicate)
                     and rel in {"SUPPORTS", "NEUTRAL"}
@@ -5016,6 +5038,15 @@ class VerdictGenerator:
                         or self._segment_polarity(segment, statement, stance="neutral") == "contradicts"
                     )
                 )
+                if (
+                    not refute_ok
+                    and segment_has_requirement
+                    and statement_limited_use
+                    and predicate_match_score >= 0.35
+                    and anchor_overlap >= 0.35
+                    and float(em.get("credibility", 0.0) or 0.0) >= min_refute_cred
+                ):
+                    refute_ok = True
                 score = (0.55 * rel_score) + (0.25 * anchor_overlap) + (0.20 * predicate_match_score)
                 if strict_support_ok and score > best_support_score:
                     best_support_score = score
@@ -6159,6 +6190,32 @@ class VerdictGenerator:
         return bool(
             re.search(
                 r"\b(always|never|all|none|every|entirely|completely|must|only|prevents|prevents|cures|cure)\b",
+                low,
+            )
+        )
+
+    @staticmethod
+    def _has_requirement_quantifier(text: str) -> bool:
+        low = (text or "").lower()
+        return bool(
+            re.search(
+                (
+                    r"\b(necessary|necessarily|unnecessary|required|requirement|"
+                    r"standard treatment|standard of care|routine treatment|first-?line)\b"
+                ),
+                low,
+            )
+        )
+
+    @staticmethod
+    def _statement_indicates_limited_use(text: str) -> bool:
+        low = (text or "").lower()
+        return bool(
+            re.search(
+                (
+                    r"\b(sometimes|in some cases|selected cases|only in|limited (?:to|use)|"
+                    r"not (?:the )?standard(?: treatment)?|not recommended|only when indicated)\b"
+                ),
                 low,
             )
         )
@@ -7482,9 +7539,9 @@ class VerdictGenerator:
             truth_score_binary = 1.0 if directional_delta > 0 else 0.0
 
         probs_for_binary = payload.get("class_probs") if isinstance(payload.get("class_probs"), dict) else {}
+        p_true_b = float(probs_for_binary.get("true", 0.0) or 0.0) if probs_for_binary else 0.0
+        p_false_b = float(probs_for_binary.get("false", 0.0) or 0.0) if probs_for_binary else 0.0
         if abs(directional_delta) < 1e-9 and probs_for_binary:
-            p_true_b = float(probs_for_binary.get("true", 0.0) or 0.0)
-            p_false_b = float(probs_for_binary.get("false", 0.0) or 0.0)
             denom = max(1e-9, p_true_b + p_false_b)
             truth_score_binary = max(0.0, min(1.0, p_true_b / denom))
 
@@ -7493,7 +7550,24 @@ class VerdictGenerator:
         elif verdict == Verdict.FALSE.value:
             verdict_binary = Verdict.FALSE.value
         else:
-            verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
+            uncertainty_margin = max(
+                0.01,
+                min(0.25, float(os.getenv("VERDICT_BINARY_UNCERTAINTY_MARGIN", "0.08"))),
+            )
+            class_margin = abs(p_true_b - p_false_b)
+            absolute_claim = self._has_absolute_quantifier(claim)
+            no_directional_labels = bool(support_label_count == 0 and refute_label_count == 0)
+            if no_directional_labels:
+                verdict_binary = Verdict.FALSE.value
+            elif absolute_claim and support_label_count == 0:
+                verdict_binary = Verdict.FALSE.value
+            elif abs(directional_delta) < uncertainty_margin:
+                if probs_for_binary and class_margin >= 0.05:
+                    verdict_binary = Verdict.TRUE.value if p_true_b > p_false_b else Verdict.FALSE.value
+                else:
+                    verdict_binary = Verdict.FALSE.value
+            else:
+                verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
         payload["verdict_binary"] = verdict_binary
         payload["truth_score_binary"] = round(float(truth_score_binary), 6)
         payload["support_mass"] = float(support_mass)
