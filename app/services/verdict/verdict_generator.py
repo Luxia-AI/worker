@@ -3040,6 +3040,8 @@ class VerdictGenerator:
             r"\bno evidence\b",
             r"\bnot recommended\b",
             r"\bnot effective\b",
+            r"\bnot\s+(?:the\s+)?standard\s+treatment\b",
+            r"\bunnecessary\b",
             r"\bineffective\b",
             r"\bdo(?:es)?\s+not\s+work\b",
             r"\bdoes\s+not\s+enter\b",
@@ -4687,6 +4689,12 @@ class VerdictGenerator:
                 refute_by_rule = (
                     refute_by_polarity_override
                     or (
+                        self._has_absolute_quantifier(claim)
+                        and predicate_match_score >= 0.45
+                        and anchor_score >= 0.45
+                        and not object_overlap_ok
+                    )
+                    or (
                         contradiction_score >= CONTRADICTION_THRESHOLD
                         and predicate_match_score >= 0.4
                         and (claim_neg != stmt_neg)
@@ -4774,6 +4782,7 @@ class VerdictGenerator:
                             predicate_match_score >= PREDICATE_MATCH_THRESHOLD
                             and anchor_score >= max(0.25, ANCHOR_THRESHOLD - 0.05)
                             and object_overlap_ok
+                            and (not self._has_absolute_quantifier(claim) or self._has_absolute_quantifier(statement))
                             and not self._is_explicit_refutation_statement(statement)
                             and not self._is_reporting_statement(statement)
                             and not self._is_claim_mention_statement(statement)
@@ -7503,20 +7512,20 @@ class VerdictGenerator:
         policy_trace = payload.get("policy_trace")
         if not isinstance(policy_trace, list):
             policy_trace = []
-        policy_trace.append(
-            {
-                "step": "deterministic_binary_projection",
-                "enabled": bool(policy_v3_enabled),
-                "support_mass": round(float(support_mass), 4),
-                "contradict_mass": round(float(contradict_mass), 4),
-                "neutral_mass": round(float(neutral_mass), 4),
-                "sufficiency_score": round(float(sufficiency_score), 4),
-                "directional_delta": round(float(directional_delta), 4),
-                "truth_score_binary": round(float(truth_score_binary), 4),
-                "verdict_internal": verdict,
-                "verdict_binary": verdict_binary,
-            }
-        )
+        projection_entry = {
+            "step": "deterministic_binary_projection",
+            "enabled": bool(policy_v3_enabled),
+            "support_mass": round(float(support_mass), 4),
+            "contradict_mass": round(float(contradict_mass), 4),
+            "neutral_mass": round(float(neutral_mass), 4),
+            "sufficiency_score": round(float(sufficiency_score), 4),
+            "directional_delta": round(float(directional_delta), 4),
+            "truth_score_binary": round(float(truth_score_binary), 4),
+            "verdict_internal": verdict,
+            "verdict_binary": verdict_binary,
+        }
+        if not policy_trace or policy_trace[-1] != projection_entry:
+            policy_trace.append(projection_entry)
         payload["policy_trace"] = policy_trace
 
         best_ev = self._pick_best_binary_evidence(verdict, evidence_map, evidence)
@@ -8026,6 +8035,21 @@ class VerdictGenerator:
         """
         segments = split_claim_into_segments(claim)
         filtered = [s for s in segments if self._is_meaningful_segment(s)]
+        if len(filtered) > 1:
+            stitched: List[str] = []
+            for seg in filtered:
+                seg_clean = re.sub(r"\s+", " ", str(seg or "")).strip(" ,.")
+                if not seg_clean:
+                    continue
+                if (
+                    stitched
+                    and re.match(r"^(and|or|but)\b", seg_clean.lower())
+                    and len(re.findall(r"\b\w+\b", seg_clean)) <= 6
+                ):
+                    stitched[-1] = f"{stitched[-1]} {seg_clean}".strip()
+                    continue
+                stitched.append(seg_clean)
+            filtered = stitched
         if not filtered:
             cleaned = re.sub(r"\s+", " ", (claim or "")).strip(" ,.")
             filtered = [cleaned] if cleaned else []
