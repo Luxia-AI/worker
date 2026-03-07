@@ -208,3 +208,30 @@ def test_binary_projection_uses_normalized_evidence_map_masses_over_stale_payloa
     assert out["mass_source"] == "normalized_evidence_map"
     assert out["support_mass"] > out["contradict_mass"]
     assert out["verdict_binary"] == "TRUE"
+
+
+def test_binary_projection_keeps_truth_and_confidence_consistent_when_internal_unverifiable():
+    vg = _vg()
+    claim = "Disruptions in intervention X increase risk of outcome Y."
+    payload = {
+        "verdict": "UNVERIFIABLE",
+        "truthfulness_percent": 44.0,
+        "confidence": 0.30,
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN", "evidence_used_ids": []}],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Disruptions in intervention X can lead to higher outcome Y risk.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.85,
+                "source_url": "https://example.org/s1",
+            }
+        ],
+        "class_probs": {"true": 0.58, "false": 0.17, "unverifiable": 0.25},
+        "trust_threshold_met": True,
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "UNVERIFIABLE"
+    assert out["verdict_binary"] == "TRUE"
+    assert float(out["truthfulness_percent"]) >= 50.5
+    assert float(out["confidence"]) >= 0.35

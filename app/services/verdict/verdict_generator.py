@@ -7873,6 +7873,15 @@ class VerdictGenerator:
         if not trust_gate_passed and not trust_gate_effective:
             # Keep trust-failed outcomes conservative even when evidence looks directional.
             truth = min(74.0, float(truth))
+        if verdict in {Verdict.UNVERIFIABLE.value, Verdict.PARTIALLY_TRUE.value} and verdict_binary in {
+            Verdict.TRUE.value,
+            Verdict.FALSE.value,
+        }:
+            binary_truth = max(1.0, min(99.0, float(truth_score_binary) * 100.0))
+            if verdict_binary == Verdict.TRUE.value:
+                truth = max(float(truth), max(50.5, binary_truth))
+            else:
+                truth = min(float(truth), min(49.5, binary_truth))
         payload["truthfulness_percent"] = truth
         payload["truth_score_percent"] = truth
         payload["verdict_band"] = self._truthfulness_band(truth)
@@ -7896,6 +7905,15 @@ class VerdictGenerator:
             confidence = max(confidence, 0.72)
         if not trust_gate_passed and not trust_gate_effective:
             confidence = min(confidence, 0.68)
+        if verdict in {Verdict.UNVERIFIABLE.value, Verdict.PARTIALLY_TRUE.value} and verdict_binary in {
+            Verdict.TRUE.value,
+            Verdict.FALSE.value,
+        }:
+            directional_certainty = max(0.0, min(1.0, abs((2.0 * float(truth_score_binary)) - 1.0)))
+            binary_conf_floor = 0.35 + (0.50 * directional_certainty)
+            if not trust_gate_passed and not trust_gate_effective:
+                binary_conf_floor = min(binary_conf_floor, 0.68)
+            confidence = max(confidence, binary_conf_floor)
         payload["confidence"] = max(0.05, min(0.98, confidence))
         payload["calibrated_confidence"] = payload["confidence"]
         if not isinstance(payload.get("class_probs"), dict):
