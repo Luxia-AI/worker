@@ -64,3 +64,33 @@ def test_neutral_only_trust_gate_low_margin_uses_sigmoid_tiebreak():
     assert (out.get("policy_trace") or [])[-1].get(
         "binary_fallback_reason"
     ) == "neutral_only_trust_gate_low_margin_sigmoid"
+
+
+def test_inverse_modifier_claim_maps_protective_statement_to_support():
+    vg = _vg()
+    claim = "Vaccination coverage disruptions increase outbreak risk."
+    statement = "Vaccination coverage is critical for preventing outbreaks."
+    evidence = [
+        {
+            "statement": statement,
+            "source_url": "https://example.org/vax",
+            "final_score": 0.81,
+            "credibility": 0.95,
+        }
+    ]
+    evidence_map = [
+        {
+            "evidence_id": 0,
+            "statement": statement,
+            "relevance": "NEUTRAL",
+            "relevance_score": 0.81,
+            "source_url": "https://example.org/vax",
+        }
+    ]
+    normalized = vg._normalize_evidence_map(claim, evidence_map, evidence)
+    assert normalized
+    assert str(normalized[0].get("relevance") or "").upper() == "SUPPORTS"
+
+
+def test_effect_direction_detects_lead_to_as_harm_direction():
+    assert VerdictGenerator._effect_direction_sign("Coverage disruptions can lead to outbreaks.") == 1

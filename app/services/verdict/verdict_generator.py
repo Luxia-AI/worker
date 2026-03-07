@@ -4740,6 +4740,7 @@ class VerdictGenerator:
                 stmt_neg = self._has_negation_cue(statement)
                 claim_direction = self._effect_direction_sign(claim)
                 stmt_direction = self._effect_direction_sign(statement)
+                claim_inverse_modifier = self._has_inverse_exposure_modifier(claim)
                 polarity_conflict = claim_neg != stmt_neg
                 # When heuristic entailment substantially exceeds contradiction
                 # probability the polarity conflict is almost certainly noise from
@@ -4755,12 +4756,25 @@ class VerdictGenerator:
                     or anchor_score >= 0.45
                     or (intervention_match and anchor_score >= 0.30)
                 )
+                inverse_directional_support = bool(
+                    claim_inverse_modifier
+                    and claim_direction == 1
+                    and stmt_direction == -1
+                    and intervention_match
+                    and object_overlap_ok
+                    and anchor_score >= 0.45
+                    and support_strength >= 0.45
+                    and contradiction_score < 0.40
+                    and not self._is_explicit_refutation_statement(statement)
+                )
                 direction_conflict = bool(
                     claim_direction != 0
                     and stmt_direction != 0
                     and claim_direction != stmt_direction
                     and (predicate_match_score >= 0.25 or anchor_score >= 0.35)
                 )
+                if inverse_directional_support:
+                    direction_conflict = False
                 claim_requirement = self._has_requirement_quantifier(claim)
                 statement_limited_use = self._statement_indicates_limited_use(statement)
                 refute_by_polarity_override = (
@@ -4865,6 +4879,21 @@ class VerdictGenerator:
                     # should not be promoted as support.
                     if direction_conflict:
                         support_gate = False
+                    directional_support_override = bool(
+                        (
+                            claim_direction != 0
+                            and claim_direction == stmt_direction
+                            and anchor_score >= 0.55
+                            and intervention_match
+                            and object_overlap_ok
+                            and support_strength >= support_strength_threshold
+                            and contradiction_score < 0.40
+                            and not self._is_explicit_refutation_statement(statement)
+                        )
+                        or inverse_directional_support
+                    )
+                    if directional_support_override:
+                        support_gate = True
                     # Numeric exact-match can support if predicate and anchor are both present.
                     if numeric_rel == "SUPPORTS" and predicate_match_score >= PREDICATE_MATCH_THRESHOLD:
                         support_gate = support_gate or (anchor_score >= ANCHOR_THRESHOLD)
@@ -6289,6 +6318,7 @@ class VerdictGenerator:
         inc_patterns = (
             r"\b(increase|increases|increased|increasing|higher|raise|raises|raised|worse|worsen|worsens|"
             r"worsened|exacerbate|exacerbates|exacerbated|harmful|risk factor|associated with)\b",
+            r"\b(lead(?:s|ing)?\s+to|result(?:s|ed|ing)?\s+in|contribute(?:s|d|ing)?\s+to)\b",
         )
         dec_patterns = (
             r"\b(decrease|decreases|decreased|decreasing|lower|lowers|lowered|reduce|reduces|reduced|reducing|"
@@ -6303,6 +6333,33 @@ class VerdictGenerator:
         if dec_hits > inc_hits:
             return -1
         return 0
+
+    @staticmethod
+    def _has_inverse_exposure_modifier(text: str) -> bool:
+        """
+        Detect claim phrasing that describes degradation/reduction of a factor
+        (e.g., disruption/decline/loss), which can invert apparent direction.
+        """
+        low = VerdictGenerator._normalize_negation_text(text)
+        if not low:
+            return False
+        return bool(
+            re.search(
+                r"\b("
+                r"disrupt(?:ion|ions|ed|ing)?|"
+                r"declin(?:e|es|ed|ing)|"
+                r"decreas(?:e|es|ed|ing)|"
+                r"reduc(?:e|es|ed|ing)|"
+                r"drop(?:s|ped|ping)?|"
+                r"lower(?:s|ed|ing)?|"
+                r"loss|lack|lacks|lacking|"
+                r"insufficient|insufficiency|shortage|"
+                r"interrupt(?:ion|ions|ed|ing)?"
+                r")\b",
+                low,
+                re.IGNORECASE,
+            )
+        )
 
     @staticmethod
     def _has_absolute_quantifier(text: str) -> bool:
@@ -7634,9 +7691,29 @@ class VerdictGenerator:
         payload["verdict"] = verdict
         payload["verdict_internal"] = verdict
 
-        support_mass = float(payload.get("support_mass", support_mass) or support_mass)
-        contradict_mass = float(payload.get("contradict_mass", contradict_mass) or contradict_mass)
-        neutral_mass = float(payload.get("neutral_mass", 0.0) or 0.0)
+        map_support_mass = float(support_mass)
+        map_contradict_mass = float(contradict_mass)
+        map_neutral_mass = sum(
+            float(item.get("relevance_score", 0.0) or 0.0)
+            for item in (evidence_map or [])
+            if self._normalize_relevance_for_binary(str(item.get("relevance") or "")) == "NEUTRAL"
+        )
+        payload_support_mass = float(payload.get("support_mass", map_support_mass) or map_support_mass)
+        payload_contradict_mass = float(payload.get("contradict_mass", map_contradict_mass) or map_contradict_mass)
+        payload_neutral_mass = float(payload.get("neutral_mass", map_neutral_mass) or map_neutral_mass)
+        has_directional_map_labels = any(lbl in {"SUPPORTS", "CONTRADICTS"} for lbl in rel_labels)
+        if evidence_map and has_directional_map_labels:
+            # Use masses derived from the normalized evidence map to keep scoring
+            # consistent with current relevance decisions.
+            support_mass = map_support_mass
+            contradict_mass = map_contradict_mass
+            neutral_mass = map_neutral_mass
+            payload["mass_source"] = "normalized_evidence_map"
+        else:
+            support_mass = payload_support_mass
+            contradict_mass = payload_contradict_mass
+            neutral_mass = payload_neutral_mass
+            payload["mass_source"] = "payload_fallback"
         sufficiency_score = float(payload.get("sufficiency_score", payload.get("evidence_sufficiency", 0.0)) or 0.0)
         policy_v3_enabled = str(os.getenv("VERDICT_POLICY_V3_ENABLED", "true")).strip().lower() in {
             "1",
@@ -7718,8 +7795,8 @@ class VerdictGenerator:
                     verdict_binary = Verdict.TRUE.value if p_true_b > p_false_b else Verdict.FALSE.value
                     binary_fallback_reason = "low_delta_class_probs"
                 else:
-                    verdict_binary = Verdict.FALSE.value
-                    binary_fallback_reason = "low_delta_default_false"
+                    verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
+                    binary_fallback_reason = "low_delta_sigmoid_tiebreak"
             else:
                 verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
                 binary_fallback_reason = "directional_sigmoid"

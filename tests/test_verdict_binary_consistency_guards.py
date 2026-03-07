@@ -143,3 +143,68 @@ def test_contradicts_label_is_counted_as_directional_refute_signal():
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out["verdict"] == "FALSE"
     assert out["verdict_binary"] == "FALSE"
+
+
+def test_low_delta_binary_projection_uses_sigmoid_instead_of_default_false():
+    vg = _vg()
+    claim = "Intervention X has mixed evidence on reducing endpoint Y."
+    payload = {
+        "verdict": "UNVERIFIABLE",
+        "truthfulness_percent": 50.0,
+        "confidence": 0.5,
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN", "evidence_used_ids": []}],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Some studies report endpoint reduction under intervention X.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.41,
+                "source_url": "https://example.org/s1",
+            },
+            {
+                "evidence_id": 1,
+                "statement": "Other studies find no consistent endpoint reduction.",
+                "relevance": "CONTRADICTS",
+                "relevance_score": 0.39,
+                "source_url": "https://example.org/s2",
+            },
+        ],
+        "support_mass": 0.41,
+        "contradict_mass": 0.39,
+        "class_probs": {"true": 0.36, "false": 0.35, "unverifiable": 0.29},
+        "trust_threshold_met": True,
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "UNVERIFIABLE"
+    assert out["verdict_binary"] == "TRUE"
+    assert (out.get("policy_trace") or [])[-1].get("binary_fallback_reason") == "low_delta_sigmoid_tiebreak"
+
+
+def test_binary_projection_uses_normalized_evidence_map_masses_over_stale_payload_masses():
+    vg = _vg()
+    claim = "Intervention X reduces endpoint Y."
+    payload = {
+        "verdict": "UNVERIFIABLE",
+        "truthfulness_percent": 50.0,
+        "confidence": 0.5,
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN", "evidence_used_ids": []}],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Intervention X reduces endpoint Y in controlled studies.",
+                "relevance": "SUPPORTS",
+                "relevance_score": 0.82,
+                "source_url": "https://example.org/s1",
+            }
+        ],
+        # Simulate stale masses from a pre-normalization stage.
+        "support_mass": 0.10,
+        "contradict_mass": 0.90,
+        "neutral_mass": 0.0,
+        "class_probs": {"true": 0.42, "false": 0.33, "unverifiable": 0.25},
+        "trust_threshold_met": True,
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["mass_source"] == "normalized_evidence_map"
+    assert out["support_mass"] > out["contradict_mass"]
+    assert out["verdict_binary"] == "TRUE"
