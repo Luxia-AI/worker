@@ -78,3 +78,31 @@ def test_binary_true_without_support_signal_downgrades_to_unverifiable():
     }
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out["verdict"] == "UNVERIFIABLE"
+
+
+def test_neutral_only_trust_gate_uses_directional_signal_for_binary_projection():
+    vg = _vg()
+    claim = "X can improve Y in adults"
+    payload = {
+        "verdict": "UNVERIFIABLE",
+        "truthfulness_percent": 44.0,
+        "confidence": 0.5,
+        "claim_breakdown": [{"claim_segment": claim, "status": "UNKNOWN", "evidence_used_ids": []}],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Contextual background statement about X and Y.",
+                "relevance": "NEUTRAL",
+                "relevance_score": 0.42,
+                "source_url": "https://example.org/source",
+            }
+        ],
+        "support_mass": 0.24,
+        "contradict_mass": 0.05,
+        "class_probs": {"true": 0.58, "false": 0.30, "unverifiable": 0.12},
+        "trust_threshold_met": False,
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "UNVERIFIABLE"
+    assert out["verdict_binary"] == "TRUE"
+    assert (out.get("policy_trace") or [])[-1].get("binary_fallback_reason") == "neutral_only_trust_gate_directional"

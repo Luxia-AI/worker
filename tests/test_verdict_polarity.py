@@ -88,6 +88,17 @@ def test_positive_segment_negative_evidence_is_contradiction_and_false():
     assert reconciled["verdict"] == "FALSE"
 
 
+def test_unicode_apostrophe_negation_is_detected_as_contradiction():
+    vg = _vg()
+    polarity = vg._segment_polarity(
+        "HIV can be cured with a short course of antibiotics.",
+        "HIV can’t be cured with a short course of antibiotics.",
+        stance="neutral",
+    )
+    assert polarity == "contradicts"
+    assert vg._is_explicit_refutation_statement("HIV can’t be cured.")
+
+
 def test_ineffective_and_do_not_work_are_symmetric_entailment():
     vg = _vg()
     polarity = vg._segment_polarity(

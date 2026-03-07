@@ -1308,6 +1308,7 @@ class VerdictGenerator:
         def _has_negation(text: str) -> bool:
             if not text:
                 return False
+            low = VerdictGenerator._normalize_negation_text(text)
             neg_terms = {
                 "no",
                 "not",
@@ -1324,7 +1325,7 @@ class VerdictGenerator:
                 "cannot",
                 "can't",
             }
-            tokens = {w.lower() for w in re.findall(r"\b[\w']+\b", text)}
+            tokens = {w.lower() for w in re.findall(r"\b[\w']+\b", low)}
             return any(t in tokens for t in neg_terms)
 
         stance_classifier = getattr(self, "stance_classifier", None) or DummyStanceClassifier()
@@ -3027,16 +3028,93 @@ class VerdictGenerator:
         return True
 
     @staticmethod
+    def _normalize_negation_text(text: str) -> str:
+        normalized = str(text or "")
+        # Normalize Unicode apostrophes to keep negation detection stable.
+        normalized = (
+            normalized.replace("\u2019", "'")
+            .replace("\u2018", "'")
+            .replace("\u02bc", "'")
+            .replace("\uff07", "'")
+            .replace("\u00b4", "'")
+            .replace("`", "'")
+        )
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip().lower()
+
+    @staticmethod
+    def _has_negation_cue(text: str) -> bool:
+        low = VerdictGenerator._normalize_negation_text(text)
+        if not low:
+            return False
+        neg_patterns = (
+            r"\bno\b",
+            r"\bnot\b",
+            r"\bnever\b",
+            r"\bnone\b",
+            r"\bwithout\b",
+            r"\bcannot\b",
+            r"\bcan't\b",
+            r"\bwon't\b",
+            r"\bdoesn't\b",
+            r"\bdon't\b",
+            r"\bdidn't\b",
+            r"\bisn't\b",
+            r"\baren't\b",
+            r"\bwasn't\b",
+            r"\bweren't\b",
+            r"\bhasn't\b",
+            r"\bhaven't\b",
+            r"\bhadn't\b",
+            r"\bwouldn't\b",
+            r"\bshouldn't\b",
+            r"\bcouldn't\b",
+            r"\bdoes\s+not\b",
+            r"\bdo\s+not\b",
+            r"\bdid\s+not\b",
+            r"\bis\s+not\b",
+            r"\bare\s+not\b",
+            r"\bwas\s+not\b",
+            r"\bwere\s+not\b",
+            r"\bhas\s+not\b",
+            r"\bhave\s+not\b",
+            r"\bhad\s+not\b",
+            r"\bwill\s+not\b",
+            r"\bwould\s+not\b",
+            r"\bshould\s+not\b",
+            r"\bcould\s+not\b",
+            r"\bmust\s+not\b",
+            # Encoding-safe contraction fallbacks (e.g., can?t / doesn?t).
+            r"\bcan\W?t\b",
+            r"\bwon\W?t\b",
+            r"\bdoesn\W?t\b",
+            r"\bdon\W?t\b",
+            r"\bdidn\W?t\b",
+            r"\bisn\W?t\b",
+            r"\baren\W?t\b",
+            r"\bwasn\W?t\b",
+            r"\bweren\W?t\b",
+            r"\bhasn\W?t\b",
+            r"\bhaven\W?t\b",
+            r"\bhadn\W?t\b",
+            r"\bwouldn\W?t\b",
+            r"\bshouldn\W?t\b",
+            r"\bcouldn\W?t\b",
+        )
+        return any(re.search(p, low, flags=re.IGNORECASE) for p in neg_patterns)
+
+    @staticmethod
     def _is_explicit_refutation_statement(text: str) -> bool:
         if not text:
             return False
-        low = text.lower()
+        low = VerdictGenerator._normalize_negation_text(text)
         patterns = (
             r"\bdo(?:es)?\s+not\b",
             r"\bdon['’]?t\b",
             r"\bdoesn['’]?t\b",
             r"\bdidn['’]?t\b",
             r"\bcannot\b",
+            r"\bcan(?:not|\W?t)\s+be\s+(?:\w+\s+){0,2}(?:cured|treated|effective|recommended|safe|true)\b",
             r"\bno evidence\b",
             r"\bnot recommended\b",
             r"\bnot effective\b",
@@ -3202,7 +3280,8 @@ class VerdictGenerator:
             return "neutral"
 
         def _sanitize_for_negation(text: str) -> str:
-            cleaned = re.sub(r"\bnot\s+only\b", " ", text, flags=re.IGNORECASE)
+            cleaned = VerdictGenerator._normalize_negation_text(text or "")
+            cleaned = re.sub(r"\bnot\s+only\b", " ", cleaned, flags=re.IGNORECASE)
             cleaned = re.sub(r"\bnot\s+necessarily\b", " ", cleaned, flags=re.IGNORECASE)
             cleaned = re.sub(r"\bno\s+longer\b", " ", cleaned, flags=re.IGNORECASE)
             return re.sub(r"\s+", " ", cleaned).strip()
@@ -3211,6 +3290,20 @@ class VerdictGenerator:
             low = _sanitize_for_negation(text or "")
             if not low:
                 return False
+            if VerdictGenerator._has_negation_cue(low):
+                if re.search(
+                    (
+                        r"\b(work|works|working|treat|treats|treated|treating|help|helps|helped|helping|"
+                        r"cure|cures|cured|curing|prevent|prevents|prevented|preventing|"
+                        r"cause|causes|caused|causing|reduce|reduces|reduced|reducing|"
+                        r"effective|effectiveness|efficacious|recommend|recommended|safe|true|"
+                        r"associated|association|linked|link|integrate|integrates|integrated|"
+                        r"integration|alter|alters|altered|affect|affects|affected)\b"
+                    ),
+                    low,
+                    flags=re.IGNORECASE,
+                ):
+                    return True
             strong_patterns = (
                 r"\b(?:ineffective|inefficacy|not effective|not recommended|no effect|cannot treat|can't treat)\b",
                 r"\b(?:do|does|did)\s+not\s+(?:work|treat|help|cure|prevent|cause|reduce)\b",
@@ -4390,14 +4483,8 @@ class VerdictGenerator:
         anchor_overlap = self._segment_anchor_overlap(claim_text, evidence_text)
         explicit_refute = 1.0 if self._is_explicit_refutation_statement(evidence_text) else 0.0
         predicate = self.compute_predicate_match(claim_text, evidence_text)
-        claim_neg = bool(
-            re.search(r"\b(no|not|never|cannot|can't|does not|do not|without)\b", (claim_text or "").lower())
-        )
-        ev_neg = bool(
-            re.search(
-                r"\b(no|not|never|cannot|can't|does not|do not|without|doesn't|don't)\b", (evidence_text or "").lower()
-            )
-        )
+        claim_neg = self._has_negation_cue(claim_text)
+        ev_neg = self._has_negation_cue(evidence_text)
         negation_mismatch = 1.0 if claim_neg != ev_neg else 0.0
         polarity_signal = 1.0 if pol == "contradicts" else 0.0
         score = (
@@ -4649,18 +4736,8 @@ class VerdictGenerator:
                 # Refutation can be decided by direct contradiction, independent of support gates.
                 numeric_rel = self._numeric_relation_relevance(claim, statement)
                 dna_rel = self._dna_integration_relevance(claim, statement)
-                claim_neg = bool(
-                    re.search(
-                        r"\b(no|not|never|cannot|can't|does not|do not|did not|without|doesn't|don't|didn't)\b",
-                        claim.lower(),
-                    )
-                )
-                stmt_neg = bool(
-                    re.search(
-                        r"\b(no|not|never|cannot|can't|does not|do not|did not|without|doesn't|don't|didn't)\b",
-                        statement.lower(),
-                    )
-                )
+                claim_neg = self._has_negation_cue(claim)
+                stmt_neg = self._has_negation_cue(statement)
                 polarity_conflict = claim_neg != stmt_neg
                 # When heuristic entailment substantially exceeds contradiction
                 # probability the polarity conflict is almost certainly noise from
@@ -7052,16 +7129,7 @@ class VerdictGenerator:
             return best_id, best_ev
 
         def _has_negation(text: str) -> bool:
-            return bool(
-                re.search(
-                    (
-                        r"\b(?:no|not|never|without|cannot|can't|does not|do not|did not|"
-                        r"doesn't|don't|didn't|is not|are not|was not|were not|isn't|aren't|"
-                        r"wasn't|weren't)\b"
-                    ),
-                    str(text or "").lower(),
-                )
-            )
+            return self._has_negation_cue(text)
 
         def _semantically_refutes(seg_text: str, fact_text: str) -> bool:
             seg = str(seg_text or "").strip()
@@ -7563,8 +7631,18 @@ class VerdictGenerator:
                 # Neutral-only evidence is common in hard claims.
                 # Avoid a global FALSE bias by using claim polarity + directional mass.
                 if not trust_gate_passed:
-                    verdict_binary = Verdict.FALSE.value
-                    binary_fallback_reason = "neutral_only_trust_gate_fail"
+                    if abs(directional_delta) >= max(uncertainty_margin, 0.10) and class_margin >= 0.04:
+                        verdict_binary = Verdict.TRUE.value if directional_delta > 0 else Verdict.FALSE.value
+                        binary_fallback_reason = "neutral_only_trust_gate_directional"
+                    elif probs_for_binary and class_margin >= 0.10:
+                        verdict_binary = Verdict.TRUE.value if p_true_b >= p_false_b else Verdict.FALSE.value
+                        binary_fallback_reason = "neutral_only_trust_gate_class_probs"
+                    elif absolute_claim or requirement_claim:
+                        verdict_binary = Verdict.FALSE.value
+                        binary_fallback_reason = "neutral_only_trust_gate_conservative_false"
+                    else:
+                        verdict_binary = Verdict.FALSE.value
+                        binary_fallback_reason = "neutral_only_trust_gate_fail"
                 elif absolute_claim or requirement_claim:
                     # Requirement/absolute claims remain conservative unless
                     # positive directional evidence clearly dominates.
