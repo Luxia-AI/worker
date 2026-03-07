@@ -4738,6 +4738,8 @@ class VerdictGenerator:
                 dna_rel = self._dna_integration_relevance(claim, statement)
                 claim_neg = self._has_negation_cue(claim)
                 stmt_neg = self._has_negation_cue(statement)
+                claim_direction = self._effect_direction_sign(claim)
+                stmt_direction = self._effect_direction_sign(statement)
                 polarity_conflict = claim_neg != stmt_neg
                 # When heuristic entailment substantially exceeds contradiction
                 # probability the polarity conflict is almost certainly noise from
@@ -4753,6 +4755,12 @@ class VerdictGenerator:
                     or anchor_score >= 0.45
                     or (intervention_match and anchor_score >= 0.30)
                 )
+                direction_conflict = bool(
+                    claim_direction != 0
+                    and stmt_direction != 0
+                    and claim_direction != stmt_direction
+                    and (predicate_match_score >= 0.25 or anchor_score >= 0.35)
+                )
                 claim_requirement = self._has_requirement_quantifier(claim)
                 statement_limited_use = self._statement_indicates_limited_use(statement)
                 refute_by_polarity_override = (
@@ -4766,7 +4774,8 @@ class VerdictGenerator:
                     )
                 )
                 refute_by_rule = (
-                    refute_by_polarity_override
+                    direction_conflict
+                    or refute_by_polarity_override
                     or (
                         claim_requirement
                         and statement_limited_use
@@ -4851,6 +4860,10 @@ class VerdictGenerator:
                     # Requirement claims ("necessary/standard") are contradicted by
                     # limited-use language ("sometimes/selected cases").
                     if claim_requirement and statement_limited_use:
+                        support_gate = False
+                    # Directional inconsistency ("increases risk" vs "benefits/protects")
+                    # should not be promoted as support.
+                    if direction_conflict:
                         support_gate = False
                     # Numeric exact-match can support if predicate and anchor are both present.
                     if numeric_rel == "SUPPORTS" and predicate_match_score >= PREDICATE_MATCH_THRESHOLD:
@@ -6262,6 +6275,36 @@ class VerdictGenerator:
         return "NEUTRAL"
 
     @staticmethod
+    def _effect_direction_sign(text: str) -> int:
+        """
+        Generic directional signal:
+        +1 => harmful/increasing-risk direction
+        -1 => protective/decreasing-risk direction
+         0 => unclear/mixed
+        """
+        low = VerdictGenerator._normalize_negation_text(text)
+        if not low:
+            return 0
+
+        inc_patterns = (
+            r"\b(increase|increases|increased|increasing|higher|raise|raises|raised|worse|worsen|worsens|"
+            r"worsened|exacerbate|exacerbates|exacerbated|harmful|risk factor|associated with)\b",
+        )
+        dec_patterns = (
+            r"\b(decrease|decreases|decreased|decreasing|lower|lowers|lowered|reduce|reduces|reduced|reducing|"
+            r"prevent|prevents|prevented|preventing|protect|protects|protected|benefit|benefits|improve|improves|"
+            r"improved|improving)\b",
+        )
+
+        inc_hits = sum(1 for p in inc_patterns if re.search(p, low, flags=re.IGNORECASE))
+        dec_hits = sum(1 for p in dec_patterns if re.search(p, low, flags=re.IGNORECASE))
+        if inc_hits > dec_hits:
+            return 1
+        if dec_hits > inc_hits:
+            return -1
+        return 0
+
+    @staticmethod
     def _has_absolute_quantifier(text: str) -> bool:
         low = (text or "").lower()
         return bool(
@@ -7289,7 +7332,9 @@ class VerdictGenerator:
                 fallback_id = evidence_idx_by_stmt.get(fact_text, -1) if fact_text else -1
                 if fallback_id < 0:
                     desired = (
-                        {"SUPPORTS", "NEUTRAL"} if status in {"VALID", "PARTIALLY_VALID"} else {"REFUTES", "NEUTRAL"}
+                        {"SUPPORTS", "NEUTRAL"}
+                        if status in {"VALID", "PARTIALLY_VALID"}
+                        else {"CONTRADICTS", "NEUTRAL"}
                     )
                     for em in evidence_map:
                         rel = self._normalize_relevance_for_binary(str(em.get("relevance") or "NEUTRAL"))
@@ -7320,7 +7365,7 @@ class VerdictGenerator:
             for item in (evidence_map or [])
         )
         strong_refute_signal = any(
-            str(item.get("relevance") or "").upper() == "REFUTES"
+            self._normalize_relevance_for_binary(str(item.get("relevance") or "")) == "CONTRADICTS"
             and float(item.get("relevance_score", 0.0) or 0.0) >= 0.35
             for item in (evidence_map or [])
         )
@@ -7335,7 +7380,7 @@ class VerdictGenerator:
         contradict_mass = sum(
             float(item.get("relevance_score", 0.0) or 0.0)
             for item in (evidence_map or [])
-            if self._normalize_relevance_for_binary(str(item.get("relevance") or "")) == "REFUTES"
+            if self._normalize_relevance_for_binary(str(item.get("relevance") or "")) == "CONTRADICTS"
         )
         contradiction_score_max = max(
             [float(item.get("contradiction_score", 0.0) or 0.0) for item in (evidence_map or [])] or [0.0]
@@ -7405,7 +7450,7 @@ class VerdictGenerator:
         p_false = float(class_probs.get("false", 0.0) or 0.0)
         p_unv = float(class_probs.get("unverifiable", 0.0) or 0.0)
         support_label_count = sum(1 for lbl in rel_labels if lbl == "SUPPORTS")
-        refute_label_count = sum(1 for lbl in rel_labels if lbl == "REFUTES")
+        refute_label_count = sum(1 for lbl in rel_labels if lbl == "CONTRADICTS")
         posterior_unverifiable_dominant = bool(class_probs and p_unv >= 0.55 and p_unv >= (max(p_true, p_false) + 0.05))
         preserve_multiclass = (
             original_verdict == Verdict.PARTIALLY_TRUE.value or has_unknown_status or mixed_status
@@ -7472,7 +7517,7 @@ class VerdictGenerator:
                 (
                     contradict_mass >= 1.20
                     and support_mass <= 0.20
-                    and sum(1 for lbl in rel_labels if lbl == "REFUTES") >= 2
+                    and sum(1 for lbl in rel_labels if lbl == "CONTRADICTS") >= 2
                 )
                 or (
                     structural_refute_count >= 1 and contradiction_score_max >= 0.62 and nli_contradict_prob_max >= 0.62
@@ -7609,6 +7654,7 @@ class VerdictGenerator:
         probs_for_binary = payload.get("class_probs") if isinstance(payload.get("class_probs"), dict) else {}
         p_true_b = float(probs_for_binary.get("true", 0.0) or 0.0) if probs_for_binary else 0.0
         p_false_b = float(probs_for_binary.get("false", 0.0) or 0.0) if probs_for_binary else 0.0
+        p_unv_b = float(probs_for_binary.get("unverifiable", 0.0) or 0.0) if probs_for_binary else 0.0
         if abs(directional_delta) < 1e-9 and probs_for_binary:
             denom = max(1e-9, p_true_b + p_false_b)
             truth_score_binary = max(0.0, min(1.0, p_true_b / denom))
@@ -7637,6 +7683,9 @@ class VerdictGenerator:
                     elif probs_for_binary and class_margin >= 0.10:
                         verdict_binary = Verdict.TRUE.value if p_true_b >= p_false_b else Verdict.FALSE.value
                         binary_fallback_reason = "neutral_only_trust_gate_class_probs"
+                    elif abs(directional_delta) >= 0.03 and class_margin < 0.05 and p_unv_b < 0.45:
+                        verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
+                        binary_fallback_reason = "neutral_only_trust_gate_low_margin_sigmoid"
                     elif absolute_claim or requirement_claim:
                         verdict_binary = Verdict.FALSE.value
                         binary_fallback_reason = "neutral_only_trust_gate_conservative_false"

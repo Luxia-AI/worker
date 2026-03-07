@@ -106,3 +106,40 @@ def test_neutral_only_trust_gate_uses_directional_signal_for_binary_projection()
     assert out["verdict"] == "UNVERIFIABLE"
     assert out["verdict_binary"] == "TRUE"
     assert (out.get("policy_trace") or [])[-1].get("binary_fallback_reason") == "neutral_only_trust_gate_directional"
+
+
+def test_contradicts_label_is_counted_as_directional_refute_signal():
+    vg = _vg()
+    claim = "Daily supplement X prevents all respiratory infections."
+    payload = {
+        "verdict": "FALSE",
+        "truthfulness_percent": 20.0,
+        "confidence": 0.64,
+        "claim_breakdown": [
+            {
+                "claim_segment": claim,
+                "status": "INVALID",
+                "supporting_fact": "Evidence shows no universal prevention effect.",
+                "source_url": "https://example.org/source",
+                "evidence_used_ids": [0],
+            }
+        ],
+        "evidence_map": [
+            {
+                "evidence_id": 0,
+                "statement": "Evidence shows no universal prevention effect.",
+                "relevance": "CONTRADICTS",
+                "relevance_score": 0.82,
+                "contradiction_score": 0.10,
+                "nli_contradict_prob": 0.10,
+                "object_match_ok": True,
+                "predicate_match_score": 0.36,
+                "source_url": "https://example.org/source",
+            }
+        ],
+        "class_probs": {"true": 0.22, "false": 0.54, "unverifiable": 0.24},
+        "trust_threshold_met": True,
+    }
+    out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
+    assert out["verdict"] == "FALSE"
+    assert out["verdict_binary"] == "FALSE"
