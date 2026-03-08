@@ -8510,7 +8510,73 @@ class VerdictGenerator:
         final_breakdown = payload.get("claim_breakdown") or []
         if final_breakdown and all(str(seg.get("status") or "UNKNOWN").upper() == "UNKNOWN" for seg in final_breakdown):
             payload["key_findings"] = []
-        return payload
+        return self._ensure_eval_payload_contract(payload)
+
+    def _ensure_eval_payload_contract(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Guarantee a stable verdict payload contract for evaluation tooling."""
+        out = dict(payload or {})
+        verdict_internal = str(out.get("verdict_internal") or out.get("verdict") or Verdict.UNVERIFIABLE.value).upper()
+        if verdict_internal not in {
+            Verdict.TRUE.value,
+            Verdict.FALSE.value,
+            Verdict.PARTIALLY_TRUE.value,
+            Verdict.UNVERIFIABLE.value,
+        }:
+            verdict_internal = Verdict.UNVERIFIABLE.value
+        out["verdict"] = verdict_internal
+        out["verdict_internal"] = verdict_internal
+
+        verdict_binary = str(out.get("verdict_binary") or "").upper()
+        if verdict_binary not in {Verdict.TRUE.value, Verdict.FALSE.value}:
+            truth_binary = float(out.get("truth_score_binary", 0.5) or 0.5)
+            verdict_binary = Verdict.TRUE.value if truth_binary >= 0.5 else Verdict.FALSE.value
+        out["verdict_binary"] = verdict_binary
+
+        confidence = float(out.get("confidence", out.get("calibrated_confidence", 0.5)) or 0.5)
+        confidence = max(0.05, min(0.98, confidence))
+        out["confidence"] = confidence
+        out["calibrated_confidence"] = float(out.get("calibrated_confidence", confidence) or confidence)
+
+        out["support_mass"] = float(out.get("support_mass", 0.0) or 0.0)
+        out["contradict_mass"] = float(out.get("contradict_mass", 0.0) or 0.0)
+        out["neutral_mass"] = float(out.get("neutral_mass", 0.0) or 0.0)
+        out["sufficiency_score"] = float(out.get("sufficiency_score", out.get("evidence_sufficiency", 0.0)) or 0.0)
+
+        if not isinstance(out.get("class_probs"), dict):
+            if verdict_internal == Verdict.TRUE.value:
+                out["class_probs"] = {"true": 0.70, "false": 0.12, "unverifiable": 0.18}
+            elif verdict_internal == Verdict.FALSE.value:
+                out["class_probs"] = {"true": 0.12, "false": 0.70, "unverifiable": 0.18}
+            elif verdict_internal == Verdict.PARTIALLY_TRUE.value:
+                out["class_probs"] = {"true": 0.52, "false": 0.10, "unverifiable": 0.38}
+            else:
+                out["class_probs"] = {"true": 0.20, "false": 0.20, "unverifiable": 0.60}
+
+        policy_trace = out.get("policy_trace")
+        if not isinstance(policy_trace, list):
+            out["policy_trace"] = []
+
+        if "policy_sufficient" not in out:
+            out["policy_sufficient"] = bool(out.get("trust_threshold_met", False))
+        if "trust_threshold_met" not in out:
+            out["trust_threshold_met"] = bool(out.get("policy_sufficient", False))
+
+        if "abstain_reason" not in out:
+            if verdict_internal in {Verdict.UNVERIFIABLE.value, Verdict.PARTIALLY_TRUE.value}:
+                out["abstain_reason"] = "mixed_or_insufficient_evidence"
+            else:
+                out["abstain_reason"] = ""
+
+        if not isinstance(out.get("debug"), dict):
+            out["debug"] = {}
+        debug_obj: Dict[str, Any] = out["debug"]
+        debug_obj.setdefault("verdict_policy_path", out.get("policy_trace", []))
+        debug_obj.setdefault("support_strength", float(out.get("support_mass", 0.0) or 0.0))
+        debug_obj.setdefault("contradiction_strength", float(out.get("contradict_mass", 0.0) or 0.0))
+        debug_obj.setdefault("alignment_score", None)
+        out["debug"] = debug_obj
+
+        return out
 
     def _build_human_rationale(
         self,
