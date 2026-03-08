@@ -127,6 +127,7 @@ class TopicClassifier:
         prompt = (
             "Choose the single best topic for the statement from this taxonomy: "
             f"{', '.join(TOPIC_TAXONOMY)}.\n"
+            "Use only explicit statement content. Do not infer missing context.\n"
             'Return JSON only: {"topic": "...", "confidence": 0.0}\n'
             f"Statement: {statement}"
         )

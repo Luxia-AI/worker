@@ -283,6 +283,9 @@ class ClaimCanonicalizer:
             return None
         prompt = (
             "Normalize the health claim segment into canonical structured form without changing meaning.\n"
+            "Preserve negation, numbers, units, timeframe, and modality exactly.\n"
+            "Do not introduce new entities, mechanisms, or causal direction.\n"
+            "If uncertain, keep fields close to original text instead of guessing.\n"
             "Return JSON only.\n"
             "{\n"
             '  "normalized_text": "...",\n'

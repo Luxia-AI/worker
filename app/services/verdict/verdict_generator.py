@@ -22,6 +22,7 @@ from enum import Enum
 from hashlib import sha1
 from time import perf_counter
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from prometheus_client import Counter
 
@@ -122,6 +123,14 @@ INSTRUCTIONS:
 3. Determine each segment's status based on evidence strength and credibility
 4. Calculate truthfulness_percent by comparing claim content against evidence
 
+EVIDENCE INTERPRETATION GUARDS (STRICT):
+- Do NOT treat "belief/concern/perception/hesitancy/myth/misinformation" statements as factual support.
+- If evidence reports what people believe, mark as NEUTRAL unless the claim itself is about beliefs/surveys.
+- Give higher weight to direct biological/clinical assertions over meta-discussion.
+- Explicit negation statements (e.g., "does not contain", "cannot",
+  "no evidence") should be treated as contradiction when aligned.
+- Never infer unstated facts; use only explicit evidence text.
+
 CRITICAL RULES FOR CLAIM SEGMENTS:
 - claim_segment MUST be copied from the original claim (verbatim), but you may
   trim leading/trailing filler words for readability
@@ -152,6 +161,7 @@ Analyze the entire claim holistically against all evidence:
 CONFIDENCE CALCULATION:
 - How confident are you in this verdict based on evidence quality and quantity?
 - Consider source credibility, evidence recency, and consensus
+- Reduce confidence when support/refute is based on one source or one weakly aligned statement.
 - Return as a decimal between 0.0 and 1.0 (calculate this based on actual evidence)
 
 Return ONLY valid JSON (no markdown, no extra text):
@@ -164,7 +174,7 @@ Return ONLY valid JSON (no markdown, no extra text):
         {{
             "claim_segment": "Verbatim text copied from the claim (trim OK)",
             "status": "VALID|INVALID|PARTIALLY_VALID|PARTIALLY_INVALID|UNKNOWN",
-            "supporting_fact": "The evidence fact that supports or contradicts this segment",
+            "supporting_fact": "Short direct evidence sentence supporting or contradicting this segment",
             "source_url": "https://source.url.of.the.fact"
         }}
     ],
@@ -203,6 +213,8 @@ Instructions:
 - Keep language precise and non-hyped. Do not use boilerplate phrasing.
 - Do not invent evidence. Use only the provided inputs.
 - If evidence is mixed or limited, state that clearly.
+- Do NOT present belief/rumor/misinformation-reporting statements as factual proof.
+- Keep quoted evidence snippets short and concrete.
 
 Return ONLY valid JSON:
 {{
@@ -1111,18 +1123,34 @@ class VerdictGenerator:
                 final_payload["rationale"] = llm_rationale
             return final_payload
 
+    @staticmethod
+    def _compact_statement_text(text: Any, max_chars: int = 220) -> str:
+        raw = str(text or "").strip()
+        if not raw:
+            return ""
+        cleaned = re.sub(r"\s+", " ", raw)
+        cleaned = re.sub(r"\[[0-9,\s\-]+\]", "", cleaned)
+        cleaned = re.sub(r"\(\s*(?:ref|refs?|citation)\s*[:#]?\s*[0-9,\s\-]+\)", "", cleaned, flags=re.IGNORECASE)
+        cleaned = cleaned.strip(" -;,.")
+        if len(cleaned) <= max_chars:
+            return cleaned
+        boundary = max(cleaned.rfind(". ", 0, max_chars), cleaned.rfind("; ", 0, max_chars))
+        if boundary >= int(max_chars * 0.55):
+            return cleaned[: boundary + 1].strip()
+        return (cleaned[: max_chars - 1].rstrip() + "…").strip()
+
     def _format_evidence_for_prompt(self, evidence: List[Dict[str, Any]]) -> str:
         """Format evidence list into readable text for the LLM prompt."""
         lines = []
         for i, ev in enumerate(evidence):
-            statement = ev.get("statement") or ev.get("text") or "[No statement]"
+            statement = self._compact_statement_text(ev.get("statement") or ev.get("text") or "")
             source_url = ev.get("source_url") or ev.get("source") or "Unknown"
             score = ev.get("final_score") or ev.get("score") or 0
             credibility = ev.get("credibility") or 0.5
             grade = ev.get("grade") or "N/A"
 
             # Skip items without valid statement
-            if not statement or statement == "[No statement]":
+            if not statement:
                 continue
 
             lines.append(
@@ -1174,7 +1202,7 @@ class VerdictGenerator:
 
         lines: List[str] = []
         for i, ev in enumerate(relevant):
-            stmt = str(ev.get("statement") or "").strip()
+            stmt = self._compact_statement_text(ev.get("statement") or "")
             src = str(ev.get("source_url") or "").strip()
             rel = self._normalize_relevance_label(ev.get("relevance", "NEUTRAL"))
             score = float(ev.get("relevance_score", 0.0) or 0.0)
@@ -3014,6 +3042,9 @@ class VerdictGenerator:
             r"\bupdated\b",
             r"\bheadline\b",
             r"\brumou?r\b",
+            r"\bbelief\s+in\b",
+            r"\bodds\s+of\b.{0,24}\bbeliev(?:e|ed|es|ing)\b",
+            r"\b(attitude|attitudes|perception|perceptions)\s+about\b",
         )
         return any(re.search(p, low) for p in reporting_patterns)
 
@@ -3039,9 +3070,11 @@ class VerdictGenerator:
             r"\bconcerns?\s+about\b",
             r"\bworried\s+about\b",
             r"\bbeliev(?:e|ed|es|ing)\s+that\b",
+            r"\bbelief\s+in\b",
             r"\bperceiv(?:e|ed|es|ing)\s+that\b",
             r"\bhesitan(?:cy|t)\b",
             r"\bacceptance\b",
+            r"\bodds\s+of\b.{0,24}\bbeliev(?:e|ed|es|ing)\b",
         )
         return any(re.search(p, low) for p in mention_patterns)
 
@@ -4761,6 +4794,7 @@ class VerdictGenerator:
     ) -> List[Dict[str, Any]]:
         normalized: List[Dict[str, Any]] = []
         evidence_by_id: Dict[int, Dict[str, Any]] = {idx: ev for idx, ev in enumerate(evidence)}
+        claim_belief_mode = self._segment_is_belief_or_survey_claim(claim)
 
         for item in evidence_map or []:
             if not isinstance(item, dict):
@@ -4805,6 +4839,9 @@ class VerdictGenerator:
             claim_scope = self._scope_profile(claim)
             stmt_scope = self._scope_profile(statement)
             scope_alignment = self._scope_alignment_score(claim_scope, stmt_scope)
+            explicit_refute_statement = self._is_explicit_refutation_statement(statement)
+            reporting_statement = self._is_reporting_statement(statement)
+            claim_mention_statement = self._is_claim_mention_statement(statement)
             nli_entail_prob = max(
                 0.0,
                 min(
@@ -4821,7 +4858,7 @@ class VerdictGenerator:
                     1.0,
                     (0.55 * contradiction_score)
                     + (0.25 * max(0.0, 1.0 - predicate_match_score))
-                    + (0.20 * (1.0 if self._is_explicit_refutation_statement(statement) else 0.0)),
+                    + (0.20 * (1.0 if explicit_refute_statement else 0.0)),
                 ),
             )
             nli_neutral_prob = max(0.0, 1.0 - max(nli_entail_prob, nli_contradict_prob))
@@ -4868,7 +4905,7 @@ class VerdictGenerator:
                     and anchor_score >= 0.45
                     and support_strength >= 0.45
                     and contradiction_score < 0.40
-                    and not self._is_explicit_refutation_statement(statement)
+                    and not explicit_refute_statement
                 )
                 direction_conflict = bool(
                     claim_direction != 0
@@ -4887,7 +4924,7 @@ class VerdictGenerator:
                         contradiction_score >= max(0.45, CONTRADICTION_THRESHOLD - 0.10)
                         or nli_contradict_prob >= 0.55
                         or polarity_rel == "contradicts"
-                        or self._is_explicit_refutation_statement(statement)
+                        or explicit_refute_statement
                     )
                 )
                 refute_by_rule = (
@@ -4932,7 +4969,7 @@ class VerdictGenerator:
                     contradiction_alignment_ok = (
                         intervention_match
                         or (refute_by_polarity_override and intervention_anchors_ok)
-                        or self._is_explicit_refutation_statement(statement)
+                        or explicit_refute_statement
                     )
                     if contradiction_alignment_ok:
                         relevance = "REFUTES"
@@ -4951,9 +4988,7 @@ class VerdictGenerator:
                 else:
                     support_strength_threshold = float(os.getenv("SEGMENT_SUPPORT_STRENGTH_THRESHOLD", "0.30"))
                     support_polarity_ok = polarity_rel == "entails" or (
-                        polarity_rel == "neutral"
-                        and predicate_match_score >= 0.7
-                        and not self._is_explicit_refutation_statement(statement)
+                        polarity_rel == "neutral" and predicate_match_score >= 0.7 and not explicit_refute_statement
                     )
                     support_gate = (
                         predicate_match_score >= PREDICATE_MATCH_THRESHOLD
@@ -4966,8 +5001,8 @@ class VerdictGenerator:
                             or base_score >= 0.40
                             or seed_rel == "SUPPORTS"
                         )
-                        and not self._is_reporting_statement(statement)
-                        and not self._is_claim_mention_statement(statement)
+                        and not reporting_statement
+                        and not claim_mention_statement
                     )
                     # Absolute claims ("only/all/every/always") require
                     # absolute-support evidence; non-absolute evidence should
@@ -4991,7 +5026,7 @@ class VerdictGenerator:
                             and object_overlap_ok
                             and support_strength >= support_strength_threshold
                             and contradiction_score < 0.40
-                            and not self._is_explicit_refutation_statement(statement)
+                            and not explicit_refute_statement
                         )
                         or inverse_directional_support
                     )
@@ -5017,9 +5052,9 @@ class VerdictGenerator:
                             and anchor_score >= max(0.25, ANCHOR_THRESHOLD - 0.05)
                             and object_overlap_ok
                             and (not self._has_absolute_quantifier(claim) or self._has_absolute_quantifier(statement))
-                            and not self._is_explicit_refutation_statement(statement)
-                            and not self._is_reporting_statement(statement)
-                            and not self._is_claim_mention_statement(statement)
+                            and not explicit_refute_statement
+                            and not reporting_statement
+                            and not claim_mention_statement
                         )
                     if support_gate:
                         relevance = "SUPPORTS"
@@ -5044,6 +5079,25 @@ class VerdictGenerator:
                     else:
                         relevance = "NEUTRAL"
                         relevance_score *= 0.55
+                if not claim_belief_mode:
+                    # Meta/reporting statements should not be used as factual support
+                    # for biological/clinical truth assertions.
+                    if relevance == "SUPPORTS" and (reporting_statement or claim_mention_statement):
+                        relevance = "NEUTRAL"
+                        relevance_score *= 0.45
+                    # Recover explicit refutations that were neutralized by intermediate gates.
+                    if (
+                        relevance == "NEUTRAL"
+                        and explicit_refute_statement
+                        and object_overlap_ok
+                        and predicate_match_score >= 0.35
+                        and anchor_score >= 0.25
+                    ):
+                        relevance = "REFUTES"
+                        relevance_score = max(relevance_score, contradiction_score, nli_contradict_prob, 0.62)
+                        refute_eligible = (
+                            nli_contradict_prob >= 0.45 and predicate_match_score >= 0.25 and credibility >= 0.6
+                        )
             normalized.append(
                 {
                     "evidence_id": ev_idx if ev_idx >= 0 else len(normalized),
@@ -6469,7 +6523,10 @@ class VerdictGenerator:
         low = (text or "").lower()
         return bool(
             re.search(
-                r"\b(always|never|all|none|every|entirely|completely|must|only|prevents|prevents|cures|cure)\b",
+                (
+                    r"\b(always|never|all|none|every|entirely|completely|must|only|"
+                    r"exactly|exact|precisely|prevents|prevents|cures|cure)\b"
+                ),
                 low,
             )
         )
@@ -6509,6 +6566,46 @@ class VerdictGenerator:
             except Exception:
                 continue
         return nums
+
+    @staticmethod
+    def _is_exact_numeric_claim(text: str) -> bool:
+        low = str(text or "").lower()
+        if not low:
+            return False
+        if not re.search(r"\b\d+(?:\.\d+)?\b", low):
+            return False
+        if re.search(r"\b(more than|less than|at least|at most|vs|versus|compared to)\b", low):
+            return False
+        return bool(re.search(r"\b(exactly|exact|precisely)\b", low))
+
+    @staticmethod
+    def _source_domain(url: str) -> str:
+        try:
+            host = (urlparse(str(url or "")).hostname or "").lower().strip()
+        except Exception:
+            host = ""
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+
+    def _exact_numeric_support_stats(self, claim: str, evidence_map: List[Dict[str, Any]]) -> Tuple[int, int]:
+        support_count = 0
+        support_domains: set[str] = set()
+        for ev in evidence_map or []:
+            stmt = str(ev.get("statement") or "").strip()
+            if not stmt:
+                continue
+            rel = str(ev.get("relevance") or "NEUTRAL").upper()
+            numeric_rel = self._numeric_relation_relevance(claim, stmt)
+            if rel != "SUPPORTS" and numeric_rel != "SUPPORTS":
+                continue
+            if not self._extract_simple_numbers(stmt):
+                continue
+            support_count += 1
+            dom = self._source_domain(str(ev.get("source_url") or ""))
+            if dom:
+                support_domains.add(dom)
+        return support_count, len(support_domains)
 
     def _numeric_relation_relevance(self, claim: str, statement: str) -> str:
         """
@@ -6626,7 +6723,7 @@ class VerdictGenerator:
             fact = str(seg.get("supporting_fact") or "").strip()
             if not segment or not fact:
                 continue
-            text = fact
+            text = VerdictGenerator._compact_statement_text(fact)
             key = re.sub(r"\s+", " ", text).strip().lower()
             if key and key not in seen:
                 findings.append(text)
@@ -6639,7 +6736,7 @@ class VerdictGenerator:
             rel = str(em.get("relevance") or "").upper()
             if rel not in {"SUPPORTS", "REFUTES"}:
                 continue
-            stmt = str(em.get("statement") or "").strip()
+            stmt = VerdictGenerator._compact_statement_text(em.get("statement") or "")
             if not stmt:
                 continue
             text = stmt
@@ -6662,7 +6759,7 @@ class VerdictGenerator:
         seen: set[tuple[str, str]] = set()
 
         for seg in claim_breakdown or []:
-            fact = str(seg.get("supporting_fact") or "").strip()
+            fact = VerdictGenerator._compact_statement_text(seg.get("supporting_fact") or "")
             src = str(seg.get("source_url") or "").strip()
             status = str(seg.get("status") or "UNKNOWN").upper()
             if not fact:
@@ -6684,7 +6781,7 @@ class VerdictGenerator:
             rel = str(em.get("relevance") or "").upper()
             if rel not in {"SUPPORTS", "REFUTES"}:
                 continue
-            stmt = str(em.get("statement") or "").strip()
+            stmt = VerdictGenerator._compact_statement_text(em.get("statement") or "")
             src = str(em.get("source_url") or "").strip()
             if not stmt:
                 continue
@@ -7737,6 +7834,24 @@ class VerdictGenerator:
         p_unv = float(class_probs.get("unverifiable", 0.0) or 0.0)
         support_label_count = sum(1 for lbl in rel_labels if lbl == "SUPPORTS")
         refute_label_count = sum(1 for lbl in rel_labels if lbl == "CONTRADICTS")
+        exact_numeric_claim = self._is_exact_numeric_claim(claim)
+        exact_numeric_support_count = 0
+        exact_numeric_unique_sources = 0
+        exact_numeric_fragile_support = False
+        if exact_numeric_claim:
+            exact_numeric_support_count, exact_numeric_unique_sources = self._exact_numeric_support_stats(
+                claim,
+                evidence_map,
+            )
+            min_support_evidence = max(1, int(os.getenv("EXACT_NUMERIC_MIN_SUPPORT_EVIDENCE", "2")))
+            min_source_domains = max(1, int(os.getenv("EXACT_NUMERIC_MIN_SOURCE_DOMAINS", "2")))
+            exact_numeric_fragile_support = (
+                exact_numeric_support_count < min_support_evidence or exact_numeric_unique_sources < min_source_domains
+            )
+            payload["exact_numeric_support_count"] = int(exact_numeric_support_count)
+            payload["exact_numeric_unique_sources"] = int(exact_numeric_unique_sources)
+            payload["exact_numeric_min_support_evidence"] = int(min_support_evidence)
+            payload["exact_numeric_min_source_domains"] = int(min_source_domains)
         posterior_unverifiable_dominant = bool(class_probs and p_unv >= 0.55 and p_unv >= (max(p_true, p_false) + 0.05))
         preserve_multiclass = (
             original_verdict == Verdict.PARTIALLY_TRUE.value or has_unknown_status or mixed_status
@@ -7784,6 +7899,10 @@ class VerdictGenerator:
                 verdict = Verdict.UNVERIFIABLE.value
             elif neutral_only_map:
                 verdict = Verdict.PARTIALLY_TRUE.value
+        if verdict == Verdict.TRUE.value and exact_numeric_claim and exact_numeric_fragile_support:
+            verdict = Verdict.UNVERIFIABLE.value
+            if "exact_numeric_insufficient_corroboration" not in guard_reasons:
+                guard_reasons.append("exact_numeric_insufficient_corroboration")
 
         decisive_support_unlock = bool(
             verdict == Verdict.TRUE.value
@@ -7978,74 +8097,80 @@ class VerdictGenerator:
         elif verdict == Verdict.FALSE.value:
             verdict_binary = Verdict.FALSE.value
         else:
-            uncertainty_margin = max(
-                0.01,
-                min(0.25, float(os.getenv("VERDICT_BINARY_UNCERTAINTY_MARGIN", "0.08"))),
-            )
-            class_margin = abs(p_true_b - p_false_b)
-            absolute_claim = self._has_absolute_quantifier(claim)
-            requirement_claim = self._has_requirement_quantifier(claim)
-            no_directional_labels = bool(support_label_count == 0 and refute_label_count == 0)
-            binary_fallback_reason = ""
-            if no_directional_labels:
-                # Neutral-only evidence is common in hard claims.
-                # Avoid a global FALSE bias by using claim polarity + directional mass.
-                if not trust_gate_passed:
-                    if abs(directional_delta) >= max(uncertainty_margin, 0.10) and class_margin >= 0.04:
-                        verdict_binary = Verdict.TRUE.value if directional_delta > 0 else Verdict.FALSE.value
-                        binary_fallback_reason = "neutral_only_trust_gate_directional"
-                    elif probs_for_binary and class_margin >= 0.10:
-                        verdict_binary = Verdict.TRUE.value if p_true_b >= p_false_b else Verdict.FALSE.value
-                        binary_fallback_reason = "neutral_only_trust_gate_class_probs"
-                    elif abs(directional_delta) >= 0.03 and class_margin < 0.05 and p_unv_b < 0.45:
-                        verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
-                        binary_fallback_reason = "neutral_only_trust_gate_low_margin_sigmoid"
-                    elif absolute_claim or requirement_claim:
-                        # Keep conservative tendency for hard requirement/absolute claims,
-                        # but avoid a blanket FALSE bias when directional signal is weak.
-                        if (p_false_b - p_true_b) >= 0.08 or directional_delta <= -0.08:
-                            verdict_binary = Verdict.FALSE.value
-                            binary_fallback_reason = "neutral_only_trust_gate_conservative_false"
-                        elif probs_for_binary and class_margin >= 0.03:
+            if exact_numeric_claim and exact_numeric_fragile_support:
+                verdict_binary = Verdict.FALSE.value
+                binary_fallback_reason = "exact_numeric_insufficient_corroboration"
+            else:
+                uncertainty_margin = max(
+                    0.01,
+                    min(0.25, float(os.getenv("VERDICT_BINARY_UNCERTAINTY_MARGIN", "0.08"))),
+                )
+                class_margin = abs(p_true_b - p_false_b)
+                absolute_claim = self._has_absolute_quantifier(claim)
+                requirement_claim = self._has_requirement_quantifier(claim)
+                no_directional_labels = bool(support_label_count == 0 and refute_label_count == 0)
+                binary_fallback_reason = ""
+                if no_directional_labels:
+                    # Neutral-only evidence is common in hard claims.
+                    # Avoid a global FALSE bias by using claim polarity + directional mass.
+                    if not trust_gate_passed:
+                        if abs(directional_delta) >= max(uncertainty_margin, 0.10) and class_margin >= 0.04:
+                            verdict_binary = Verdict.TRUE.value if directional_delta > 0 else Verdict.FALSE.value
+                            binary_fallback_reason = "neutral_only_trust_gate_directional"
+                        elif probs_for_binary and class_margin >= 0.10:
                             verdict_binary = Verdict.TRUE.value if p_true_b >= p_false_b else Verdict.FALSE.value
-                            binary_fallback_reason = "neutral_only_trust_gate_conservative_probs"
+                            binary_fallback_reason = "neutral_only_trust_gate_class_probs"
+                        elif abs(directional_delta) >= 0.03 and class_margin < 0.05 and p_unv_b < 0.45:
+                            verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
+                            binary_fallback_reason = "neutral_only_trust_gate_low_margin_sigmoid"
+                        elif absolute_claim or requirement_claim:
+                            # Keep conservative tendency for hard requirement/absolute claims,
+                            # but avoid a blanket FALSE bias when directional signal is weak.
+                            if (p_false_b - p_true_b) >= 0.08 or directional_delta <= -0.08:
+                                verdict_binary = Verdict.FALSE.value
+                                binary_fallback_reason = "neutral_only_trust_gate_conservative_false"
+                            elif probs_for_binary and class_margin >= 0.03:
+                                verdict_binary = Verdict.TRUE.value if p_true_b >= p_false_b else Verdict.FALSE.value
+                                binary_fallback_reason = "neutral_only_trust_gate_conservative_probs"
+                            else:
+                                verdict_binary = (
+                                    Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
+                                )
+                                binary_fallback_reason = "neutral_only_trust_gate_conservative_sigmoid"
                         else:
                             verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
-                            binary_fallback_reason = "neutral_only_trust_gate_conservative_sigmoid"
+                            binary_fallback_reason = "neutral_only_trust_gate_tiebreak"
+                    elif absolute_claim or requirement_claim:
+                        # Requirement/absolute claims remain conservative unless
+                        # positive directional evidence clearly dominates.
+                        if directional_delta >= max(uncertainty_margin, 0.08) and (p_true_b - p_false_b) >= 0.05:
+                            verdict_binary = Verdict.TRUE.value
+                            binary_fallback_reason = "neutral_only_requirement_positive_delta"
+                        else:
+                            verdict_binary = Verdict.FALSE.value
+                            binary_fallback_reason = "neutral_only_requirement_conservative_false"
+                    elif abs(directional_delta) >= uncertainty_margin:
+                        verdict_binary = Verdict.TRUE.value if directional_delta > 0 else Verdict.FALSE.value
+                        binary_fallback_reason = "neutral_only_mass_direction"
+                    elif probs_for_binary and class_margin >= 0.01:
+                        verdict_binary = Verdict.TRUE.value if p_true_b >= p_false_b else Verdict.FALSE.value
+                        binary_fallback_reason = "neutral_only_class_probs_tiebreak"
                     else:
                         verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
-                        binary_fallback_reason = "neutral_only_trust_gate_tiebreak"
-                elif absolute_claim or requirement_claim:
-                    # Requirement/absolute claims remain conservative unless
-                    # positive directional evidence clearly dominates.
-                    if directional_delta >= max(uncertainty_margin, 0.08) and (p_true_b - p_false_b) >= 0.05:
-                        verdict_binary = Verdict.TRUE.value
-                        binary_fallback_reason = "neutral_only_requirement_positive_delta"
+                        binary_fallback_reason = "neutral_only_sigmoid_tiebreak"
+                elif absolute_claim and support_label_count == 0:
+                    verdict_binary = Verdict.FALSE.value
+                    binary_fallback_reason = "absolute_without_support"
+                elif abs(directional_delta) < uncertainty_margin:
+                    if probs_for_binary and class_margin >= 0.05:
+                        verdict_binary = Verdict.TRUE.value if p_true_b > p_false_b else Verdict.FALSE.value
+                        binary_fallback_reason = "low_delta_class_probs"
                     else:
-                        verdict_binary = Verdict.FALSE.value
-                        binary_fallback_reason = "neutral_only_requirement_conservative_false"
-                elif abs(directional_delta) >= uncertainty_margin:
-                    verdict_binary = Verdict.TRUE.value if directional_delta > 0 else Verdict.FALSE.value
-                    binary_fallback_reason = "neutral_only_mass_direction"
-                elif probs_for_binary and class_margin >= 0.01:
-                    verdict_binary = Verdict.TRUE.value if p_true_b >= p_false_b else Verdict.FALSE.value
-                    binary_fallback_reason = "neutral_only_class_probs_tiebreak"
+                        verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
+                        binary_fallback_reason = "low_delta_sigmoid_tiebreak"
                 else:
                     verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
-                    binary_fallback_reason = "neutral_only_sigmoid_tiebreak"
-            elif absolute_claim and support_label_count == 0:
-                verdict_binary = Verdict.FALSE.value
-                binary_fallback_reason = "absolute_without_support"
-            elif abs(directional_delta) < uncertainty_margin:
-                if probs_for_binary and class_margin >= 0.05:
-                    verdict_binary = Verdict.TRUE.value if p_true_b > p_false_b else Verdict.FALSE.value
-                    binary_fallback_reason = "low_delta_class_probs"
-                else:
-                    verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
-                    binary_fallback_reason = "low_delta_sigmoid_tiebreak"
-            else:
-                verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
-                binary_fallback_reason = "directional_sigmoid"
+                    binary_fallback_reason = "directional_sigmoid"
         payload["verdict_binary"] = verdict_binary
         payload["truth_score_binary"] = round(float(truth_score_binary), 6)
         payload["support_mass"] = float(support_mass)
@@ -8172,6 +8297,8 @@ class VerdictGenerator:
             and posterior_unverifiable_dominant
             and not (decisive_support_unlock or decisive_refute_unlock or directional_segment_lock)
         ):
+            confidence = min(confidence, 0.55)
+        if exact_numeric_claim and exact_numeric_fragile_support:
             confidence = min(confidence, 0.55)
         payload["confidence"] = max(0.05, min(0.98, confidence))
         payload["calibrated_confidence"] = payload["confidence"]

@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import urllib.parse
 from datetime import datetime, timezone
 from typing import Any
@@ -99,6 +100,22 @@ def _host(url: Any) -> str:
         return str(urllib.parse.urlparse(val).netloc or "").strip().lower()
     except Exception:
         return ""
+
+
+def _clean_evidence_text(text: Any, max_chars: int = 220) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    cleaned = re.sub(r"\s+", " ", raw)
+    cleaned = re.sub(r"\[[0-9,\s\-]+\]", "", cleaned)
+    cleaned = re.sub(r"\(\s*(?:ref|refs?|citation)\s*[:#]?\s*[0-9,\s\-]+\)", "", cleaned, flags=re.IGNORECASE)
+    cleaned = cleaned.strip(" -;,.")
+    if len(cleaned) <= max_chars:
+        return cleaned
+    boundary = max(cleaned.rfind(". ", 0, max_chars), cleaned.rfind("; ", 0, max_chars))
+    if boundary >= int(max_chars * 0.55):
+        return cleaned[: boundary + 1].strip()
+    return (cleaned[: max_chars - 1].rstrip() + "…").strip()
 
 
 def _build_debug_block(
@@ -242,6 +259,10 @@ def _build_debug_block(
         "support_mass": round(float(verdict_result.get("support_mass", 0.0) or 0.0), 4),
         "contradict_mass": round(float(verdict_result.get("contradict_mass", 0.0) or 0.0), 4),
         "neutral_mass": round(float(verdict_result.get("neutral_mass", 0.0) or 0.0), 4),
+        "exact_numeric_support_count": int(verdict_result.get("exact_numeric_support_count", 0) or 0),
+        "exact_numeric_unique_sources": int(verdict_result.get("exact_numeric_unique_sources", 0) or 0),
+        "exact_numeric_min_support_evidence": int(verdict_result.get("exact_numeric_min_support_evidence", 0) or 0),
+        "exact_numeric_min_source_domains": int(verdict_result.get("exact_numeric_min_source_domains", 0) or 0),
         "sufficiency_score": round(float(verdict_result.get("sufficiency_score", 0.0) or 0.0), 4),
         "direction_gap": round(float(verdict_result.get("direction_gap", 0.0) or 0.0), 4),
         "verdict_policy_path": policy_path,
@@ -354,7 +375,11 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "calibration_meta": verdict_result.get("calibration_meta"),
         "evidence_attribution": verdict_result.get("evidence_attribution"),
         "verdict_rationale": verdict_result.get("rationale", ""),
-        "key_findings": verdict_result.get("key_findings", []),
+        "key_findings": [
+            _clean_evidence_text(item, max_chars=180)
+            for item in (verdict_result.get("key_findings", []) or [])
+            if str(item or "").strip()
+        ][:5],
         "claim_breakdown": verdict_result.get("claim_breakdown", []),
         "evidence_map": verdict_result.get("evidence_map", []),
         "evidence_count": int(verdict_result.get("evidence_count", len(final_evidence)) or len(final_evidence)),
@@ -395,7 +420,7 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "llm": llm_meta,
         "evidence": [
             {
-                "statement": e.get("statement", ""),
+                "statement": _clean_evidence_text(e.get("statement", "")),
                 "source_url": e.get("source_url", ""),
                 "score": round(float(e.get("score", e.get("final_score", 0)) or 0), 3),
                 "sem_score": round(float(e.get("sem_score", e.get("score", 0.0)) or 0.0), 3),

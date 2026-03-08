@@ -11,6 +11,7 @@ BIOMED_NER_PROMPT = """You are a biomedical Named Entity Recognition (NER) model
 Extract only medically relevant entities that are explicitly asserted in the fact.
 Do not infer entities not directly present in the statement.
 Do not return entities from speculative/hedged parts (may, might, could, possible, hypothesis).
+Do not return belief/rumor/misinformation framing words as biomedical entities.
 Entities: diseases, conditions, symptoms, chemicals, nutrients, organs, viruses,
 medication names, biological processes.
 Return ONLY valid JSON (no markdown, no extra text):
@@ -29,6 +30,7 @@ Exclude:
 - speculation/hedging (may, might, could, possible, potentially, suggests, appears)
 - opinion/normative language
 - rumors, claims-about-claims, rhetorical questions, anecdotal statements
+- survey/belief/perception statements unless the claim itself is explicitly about beliefs
 - generic background not tied to a concrete assertion in the text
 Assign a stance label relative to the CLAIM CONTEXT for each fact:
 - "SUPPORTS": statement affirms or is consistent with the claim being TRUE
@@ -66,6 +68,7 @@ Strict extraction rules:
    - "SUPPORTS": confirms the predicate relation holds
    - "REFUTES": denies the predicate relation holds
    - "NEUTRAL": related but inconclusive
+7) Do not use "belief in X", "concern about X", or rumor discussion as factual support.
 
 Return ONLY valid JSON:
 {{"facts": [{{"statement": "...", "confidence": 0.85, "stance": "REFUTES"}},
@@ -88,6 +91,7 @@ Requirements:
 - Confidence: float 0-1 indicating support strength
 - For negated statements, encode negation in relation label (e.g., "does_not_cause", "not_associated_with")
 - Do not infer relations not explicitly stated in the sentence
+- Skip triples that only describe beliefs, rumors, perceptions, or misinformation discussions.
 - If no triples found: {{"triples": []}}
 
 Example:
@@ -116,7 +120,8 @@ Hard constraints:
 4) If claim includes numbers/dose/population, include them verbatim in at least one query.
 5) Keep each query concise (4-10 words) and evidence-oriented.
 6) No promotional language, no broad/vague phrases.
-7) Output valid JSON only. No markdown. No prose.
+7) Keep contradiction-track queries explicit (e.g., "does not", "cannot", "no evidence") when claim is positive.
+8) Output valid JSON only. No markdown. No prose.
 
 Expected JSON schema:
 {"queries":["q1","q2","q3","q4"]}

@@ -1034,6 +1034,9 @@ class TrustedSearch:
             "- generate diverse perspectives: direct evidence, mechanism, guideline, review, opposing view\n"
             "- prefer broad semantic queries first (do not force site: operators)\n"
             "- include numeric comparison phrasing when claim compares magnitudes/counts\n"
+            "- preserve negation exactly (do not flip does/do not/cannot)\n"
+            "- avoid belief/rumor phrasing unless the claim itself is explicitly about beliefs\n"
+            "- no repeated tokens and no malformed grammar\n"
             "- keep each query concise and content-rich\n\n"
             f"Claim: {claim}\n"
             f"Anchors: {anchors}\n"
@@ -1556,6 +1559,9 @@ Constraints:
 - Return at most {max_items} queries
 - queries must be short strings
 - no markdown, no prose
+- preserve claim polarity and negation exactly
+- do not generate belief/rumor-only queries for factual claims
+- avoid repeated tokens and malformed phrases
 
 POST TEXT:
 {text}
@@ -2681,6 +2687,7 @@ FAILED ENTITIES:
         prompt = (
             REINFORCEMENT_QUERY_PROMPT.format(statements=base_statements, entities=base_entities)
             + f'\nReturn JSON only: {{"queries":["..."]}} with max {max_items} queries.'
+            + "\nPreserve negation exactly and avoid repeated tokens."
         )
         retry_prompt = (
             "Return exactly the JSON object with key 'queries' and an array of strings. No other text.\n"
