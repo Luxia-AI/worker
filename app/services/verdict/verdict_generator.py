@@ -315,6 +315,80 @@ class VerdictGenerator:
         score = 0.25 + 0.45 * max(0.0, min(1.0, conf)) + 0.35 * max(0.0, min(1.0, overlap_ratio))
         return max(0.0, min(1.0, score))
 
+    def _dual_track_segments(self, claim: str, canonical_claim: Optional[Dict[str, Any]]) -> List[str]:
+        base_segments = self._split_claim_into_segments(claim)
+        if not isinstance(canonical_claim, dict):
+            return base_segments
+        segments = list(base_segments)
+        canonical_segments = canonical_claim.get("segments", [])
+        if not isinstance(canonical_segments, list):
+            return base_segments
+        for seg in canonical_segments:
+            if not isinstance(seg, dict):
+                continue
+            if not bool(seg.get("canonical_accepted", False)):
+                continue
+            normalized = str(seg.get("normalized_text") or "").strip()
+            if not normalized:
+                continue
+            if normalized not in segments:
+                segments.append(normalized)
+        return segments
+
+    def _compute_dual_track_alignment(
+        self,
+        evidence_map: List[Dict[str, Any]],
+        canonical_claim: Optional[Dict[str, Any]],
+    ) -> Tuple[float, float, float]:
+        if not evidence_map:
+            return 0.0, 0.0, 0.0
+
+        def _best_alignment(segment_text: str) -> float:
+            seg = str(segment_text or "").strip()
+            if not seg:
+                return 0.0
+            best = 0.0
+            for ev in evidence_map:
+                if not isinstance(ev, dict):
+                    continue
+                stmt = str(ev.get("statement") or "").strip()
+                if not stmt:
+                    continue
+                anchor = float(self._segment_anchor_overlap(seg, stmt) or 0.0)
+                predicate = float(self.compute_predicate_match(seg, stmt) or 0.0)
+                local = max(0.0, min(1.0, (0.55 * anchor) + (0.45 * predicate)))
+                if local > best:
+                    best = local
+            return best
+
+        canonical_payload = canonical_claim if isinstance(canonical_claim, dict) else {}
+        canonical_segments = canonical_payload.get("segments", [])
+        if not isinstance(canonical_segments, list):
+            canonical_segments = []
+
+        original_scores: List[float] = []
+        canonical_scores: List[float] = []
+        for seg in canonical_segments:
+            if not isinstance(seg, dict):
+                continue
+            original = str(seg.get("original_text") or "").strip()
+            normalized = str(seg.get("normalized_text") or "").strip()
+            if original:
+                original_scores.append(_best_alignment(original))
+            if bool(seg.get("canonical_accepted", False)) and normalized:
+                canonical_scores.append(_best_alignment(normalized))
+
+        if not original_scores:
+            # Fallback when canonical payload is absent.
+            original_scores = [_best_alignment(str(ev.get("statement") or "")) for ev in evidence_map[:3]]
+        align_orig = sum(original_scores) / max(1, len(original_scores))
+        align_canon = (sum(canonical_scores) / len(canonical_scores)) if canonical_scores else 0.0
+        if canonical_scores:
+            align_fused = (0.7 * align_orig) + (0.3 * align_canon)
+        else:
+            align_fused = align_orig
+        return float(align_orig), float(align_canon), float(align_fused)
+
     def _policy_says_insufficient(
         self,
         claim: str,
@@ -722,6 +796,7 @@ class VerdictGenerator:
         cache_sufficient: bool = False,
         adaptive_metrics: Optional[Dict[str, Any]] = None,
         evidence_snapshot_id: Optional[str] = None,
+        canonical_claim: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Generate a verdict for the claim based on ranked evidence.
@@ -743,6 +818,7 @@ class VerdictGenerator:
                 - key_findings: List of key findings
         """
         self._last_predicate_queries_generated = []
+        canonical_claim_payload = canonical_claim if isinstance(canonical_claim, dict) else {}
         attempted_web_urls: set[str] = set()
         if self.confidence_mode:
             top_k = max(top_k, int(os.getenv("CONFIDENCE_VERDICT_TOP_K", "10")))
@@ -754,7 +830,7 @@ class VerdictGenerator:
                 used_web_search,
                 cache_sufficient,
             )
-            segments = self._split_claim_into_segments(claim)[: self.WEB_SEGMENTS_LIMIT]
+            segments = self._dual_track_segments(claim, canonical_claim_payload)[: self.WEB_SEGMENTS_LIMIT]
             web_boost = await self._fetch_web_evidence_for_unknown_segments(
                 segments,
                 max_queries_per_segment=2 if used_web_search else 3,
@@ -776,6 +852,14 @@ class VerdictGenerator:
                     claim,
                     "No evidence retrieved after forced targeted web recovery",
                 )
+                fallback["claim_original"] = claim
+                fallback["claim_canonical_segments"] = canonical_claim_payload.get("segments", [])
+                fallback["canonical_accept_rate"] = float(
+                    canonical_claim_payload.get("canonical_accept_rate", 0.0) or 0.0
+                )
+                fallback["canonical_rejections"] = canonical_claim_payload.get("canonical_rejections", [])
+                fallback["queries_original"] = canonical_claim_payload.get("queries_original", [])
+                fallback["queries_canonical"] = canonical_claim_payload.get("queries_canonical", [])
                 return self._enforce_binary_verdict_payload(claim, fallback, evidence=[])
             ranked_evidence = sorted(web_boost, key=self._deterministic_evidence_sort_key)
 
@@ -828,7 +912,7 @@ class VerdictGenerator:
                     f"[VerdictGenerator] Pre-verdict evidence insufficient/weak (round={round_i}). "
                     f"insufficient={insufficient} weak={weak} -> web search"
                 )
-                segments = self._split_claim_into_segments(claim)[: self.WEB_SEGMENTS_LIMIT]
+                segments = self._dual_track_segments(claim, canonical_claim_payload)[: self.WEB_SEGMENTS_LIMIT]
                 web_boost = await self._fetch_web_evidence_for_unknown_segments(
                     segments,
                     max_queries_per_segment=2 if used_web_search else 3,
@@ -849,7 +933,7 @@ class VerdictGenerator:
             logger.warning(
                 "[VerdictGenerator] Top evidence still empty before verdict; running emergency evidence recovery."
             )
-            emergency_segments = self._split_claim_into_segments(claim)[: self.WEB_SEGMENTS_LIMIT]
+            emergency_segments = self._dual_track_segments(claim, canonical_claim_payload)[: self.WEB_SEGMENTS_LIMIT]
             emergency_web = await self._fetch_web_evidence_for_unknown_segments(
                 emergency_segments,
                 max_queries_per_segment=4,
@@ -890,7 +974,14 @@ class VerdictGenerator:
                 top_evidence,
                 adaptive_metrics=adaptive_metrics,
                 evidence_snapshot_id=evidence_snapshot_id,
+                canonical_claim=canonical_claim_payload,
             )
+            verdict_result["claim_original"] = claim
+            verdict_result["claim_canonical_segments"] = canonical_claim_payload.get("segments", [])
+            verdict_result["canonical_accept_rate"] = float(
+                canonical_claim_payload.get("canonical_accept_rate", 0.0) or 0.0
+            )
+            verdict_result["canonical_rejections"] = canonical_claim_payload.get("canonical_rejections", [])
 
             logger.debug(
                 f"[VerdictGenerator] Generated verdict: {verdict_result['verdict']} "
@@ -1133,6 +1224,7 @@ class VerdictGenerator:
         evidence: List[Dict[str, Any]],
         adaptive_metrics: Optional[Dict[str, Any]] = None,
         evidence_snapshot_id: Optional[str] = None,
+        canonical_claim: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Parse and validate LLM result, with fallback handling."""
         # Handle LLM error indicators
@@ -2506,6 +2598,8 @@ class VerdictGenerator:
 
         key_findings = self._build_evidence_grounded_key_findings(claim_breakdown, evidence_map)
         direct_evidence = self._build_direct_evidence_list(claim_breakdown, evidence_map)
+        canonical_payload = canonical_claim if isinstance(canonical_claim, dict) else {}
+        align_orig, align_canon, align_fused = self._compute_dual_track_alignment(evidence_map, canonical_payload)
         evidence_for_payload = list(evidence or [])
         evidence_backfilled_from_map = False
         if not evidence_for_payload and evidence_map:
@@ -2577,6 +2671,15 @@ class VerdictGenerator:
             "key_findings": key_findings,
             "direct_evidence": direct_evidence,
             "claim": claim,
+            "claim_original": str(canonical_payload.get("claim_original") or claim),
+            "claim_canonical_segments": canonical_payload.get("segments", []),
+            "canonical_accept_rate": float(canonical_payload.get("canonical_accept_rate", 0.0) or 0.0),
+            "canonical_rejections": canonical_payload.get("canonical_rejections", []),
+            "queries_original": canonical_payload.get("queries_original", []),
+            "queries_canonical": canonical_payload.get("queries_canonical", []),
+            "alignment_orig": float(align_orig),
+            "alignment_canon": float(align_canon),
+            "alignment_fused": float(align_fused),
             "evidence_count": len(evidence_for_payload),
             "evidence_backfilled_from_map": bool(evidence_backfilled_from_map),
             "required_segments_count": reconciled["required_segments_count"],
@@ -7330,6 +7433,132 @@ class VerdictGenerator:
                 seg["evidence_used_ids"] = [rep_id] if rep_id >= 0 else []
         return claim_breakdown
 
+    def _apply_policy_v3_deterministic_projection(
+        self,
+        payload: Dict[str, Any],
+        support_mass: float,
+        contradict_mass: float,
+        neutral_mass: float,
+        sufficiency_score: float,
+    ) -> Dict[str, Any]:
+        payload = dict(payload or {})
+        s = max(0.0, float(support_mass or 0.0))
+        c = max(0.0, float(contradict_mass or 0.0))
+        n = max(0.0, float(neutral_mass or 0.0))
+        suff = max(0.0, min(1.0, float(sufficiency_score or 0.0)))
+
+        directional_delta = float(s - c)
+        try:
+            truth_score = float(1.0 / (1.0 + math.exp(-4.0 * directional_delta)))
+        except OverflowError:
+            truth_score = 1.0 if directional_delta > 0 else 0.0
+
+        verdict_binary = Verdict.TRUE.value if truth_score >= 0.5 else Verdict.FALSE.value
+        denom = s + c + n + 1e-6
+        direction_gap = abs(s - c) / denom
+
+        evidence_map = payload.get("evidence_map", []) if isinstance(payload.get("evidence_map"), list) else []
+        evidence_count = max(1, int(payload.get("evidence_count", len(evidence_map)) or len(evidence_map) or 1))
+        avg_credibility = 0.0
+        if evidence_map:
+            avg_credibility = sum(float(ev.get("credibility", 0.5) or 0.5) for ev in evidence_map) / len(evidence_map)
+        else:
+            avg_credibility = 0.5
+        align_fused = max(
+            0.0, min(1.0, float(payload.get("alignment_fused", payload.get("alignment_orig", 0.0)) or 0.0))
+        )
+        evidence_quality = max(
+            0.0,
+            min(
+                1.0,
+                (0.45 * min(1.0, evidence_count / 8.0)) + (0.30 * float(avg_credibility)) + (0.25 * align_fused),
+            ),
+        )
+
+        internal_abstain = bool((suff < 0.40) or (direction_gap < 0.15))
+        verdict_internal = Verdict.UNVERIFIABLE.value if internal_abstain else verdict_binary
+        abstain_reason = ""
+        if internal_abstain:
+            if suff < 0.40:
+                abstain_reason = "insufficient_evidence"
+            else:
+                abstain_reason = "low_direction_gap"
+
+        confidence_raw = (0.45 * suff) + (0.35 * direction_gap) + (0.20 * evidence_quality)
+        align_orig = float(payload.get("alignment_orig", 0.0) or 0.0)
+        align_canon = float(payload.get("alignment_canon", 0.0) or 0.0)
+        if align_canon > 0.0 and abs(align_orig - align_canon) > 0.25:
+            confidence_raw -= 0.15
+
+        canonical_segments = payload.get("claim_canonical_segments", [])
+        canonical_rejections = payload.get("canonical_rejections", [])
+        total_segments = len(canonical_segments) if isinstance(canonical_segments, list) else 0
+        rejected_segments = len(canonical_rejections) if isinstance(canonical_rejections, list) else 0
+        reject_rate = (float(rejected_segments) / float(total_segments)) if total_segments > 0 else 0.0
+        if reject_rate > 0.40:
+            confidence_raw -= 0.10
+
+        confidence = max(0.05, min(0.95, confidence_raw))
+        if internal_abstain:
+            confidence = min(confidence, 0.55)
+
+        p_unv = max(0.0, min(0.75, (1.0 - suff) * 0.45))
+        directional_mass = max(1e-6, 1.0 - p_unv)
+        p_true = truth_score * directional_mass
+        p_false = (1.0 - truth_score) * directional_mass
+        norm = max(1e-6, p_true + p_false + p_unv)
+        class_probs = {
+            "true": float(p_true / norm),
+            "false": float(p_false / norm),
+            "unverifiable": float(p_unv / norm),
+        }
+
+        payload["verdict"] = verdict_internal
+        payload["verdict_internal"] = verdict_internal
+        payload["verdict_binary"] = verdict_binary
+        payload["truth_score_binary"] = float(truth_score)
+        payload["truthfulness_percent"] = float(max(1.0, min(99.0, truth_score * 100.0)))
+        payload["truth_score_percent"] = payload["truthfulness_percent"]
+        payload["confidence"] = float(confidence)
+        payload["calibrated_confidence"] = float(confidence)
+        payload["class_probs"] = class_probs
+        payload["support_mass"] = float(s)
+        payload["contradict_mass"] = float(c)
+        payload["neutral_mass"] = float(n)
+        payload["sufficiency_score"] = float(suff)
+        payload["direction_gap"] = float(direction_gap)
+        payload["abstain_reason"] = abstain_reason
+        payload["verdict_band"] = self._truthfulness_band(payload["truthfulness_percent"])
+        payload["display_verdict"] = self._display_verdict_label(
+            verdict=verdict_internal,
+            truthfulness_percent=float(payload["truthfulness_percent"]),
+            trust_gate_passed=bool(payload.get("trust_threshold_met", False)),
+            analysis_counts=payload.get("analysis_counts"),
+        )
+        payload["policy_sufficient"] = bool(suff >= 0.40)
+
+        policy_trace = payload.get("policy_trace")
+        if not isinstance(policy_trace, list):
+            policy_trace = []
+        policy_trace.append(
+            {
+                "step": "policy_v3_mass_aggregation",
+                "enabled": True,
+                "support_mass": round(float(s), 4),
+                "contradict_mass": round(float(c), 4),
+                "neutral_mass": round(float(n), 4),
+                "sufficiency_score": round(float(suff), 4),
+                "direction_gap": round(float(direction_gap), 4),
+                "truth_score_binary": round(float(truth_score), 4),
+                "evidence_quality": round(float(evidence_quality), 4),
+                "verdict_internal": verdict_internal,
+                "verdict_binary": verdict_binary,
+                "abstain_reason": abstain_reason,
+            }
+        )
+        payload["policy_trace"] = policy_trace
+        return payload
+
     def _enforce_binary_verdict_payload(
         self,
         claim: str,
@@ -7721,6 +7950,14 @@ class VerdictGenerator:
             "yes",
             "on",
         }
+        policy_v3_deterministic_enabled = str(
+            os.getenv("VERDICT_POLICY_V3_DETERMINISTIC_CORE_ENABLED", "false")
+        ).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         policy_k = max(0.5, min(8.0, float(os.getenv("VERDICT_POLICY_V3_SIGMOID_K", "2.5"))))
         directional_delta = float(support_mass - contradict_mass)
         try:
@@ -8041,6 +8278,18 @@ class VerdictGenerator:
                 meta["class_probs_resynced"] = True
                 meta["class_probs_resync_reason"] = "binary_projection_from_internal_uncertainty"
                 payload["calibration_meta"] = meta
+        if policy_v3_enabled and policy_v3_deterministic_enabled:
+            payload = self._apply_policy_v3_deterministic_projection(
+                payload=payload,
+                support_mass=float(support_mass),
+                contradict_mass=float(contradict_mass),
+                neutral_mass=float(neutral_mass),
+                sufficiency_score=float(sufficiency_score),
+            )
+            verdict = str(payload.get("verdict_internal") or payload.get("verdict") or Verdict.UNVERIFIABLE.value)
+            verdict_binary = str(payload.get("verdict_binary") or Verdict.FALSE.value)
+            truth_score_binary = float(payload.get("truth_score_binary", truth_score_binary) or truth_score_binary)
+            confidence = float(payload.get("confidence", confidence) or confidence)
         if not isinstance(payload.get("calibration_meta"), dict):
             payload["calibration_meta"] = {"calibrator_version": payload.get("calibration_version")}
         if not isinstance(payload.get("evidence_attribution"), list):

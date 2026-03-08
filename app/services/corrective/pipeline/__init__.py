@@ -41,6 +41,8 @@ from app.constants.config import (
 )
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.services.common.claim_canonicalizer import ClaimCanonicalizer
+from app.services.common.list_ops import dedupe_list
 from app.services.corrective.entity_extractor import EntityExtractor
 from app.services.corrective.fact_extractor import FactExtractor
 from app.services.corrective.pipeline.extraction_phase import extract_all, scrape_pages
@@ -111,6 +113,7 @@ class CorrectivePipeline:
 
         # Verdict generation (RAG phase)
         self.verdict_generator = VerdictGenerator()
+        self.claim_canonicalizer = ClaimCanonicalizer()
 
         # Trust ranking
         self.trust_ranker = TrustRankingModule()
@@ -623,6 +626,24 @@ class CorrectivePipeline:
             biomedical_confidence=1.0,
             scope_reason="health_only_mode_assumed",
         )
+        dual_track_query_enabled = str(os.getenv("DUAL_TRACK_QUERY_ENABLED", "true")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        canonical_claim_obj = await self.claim_canonicalizer.canonicalize_claim(post_text)
+        canonical_claim_payload = canonical_claim_obj.to_dict()
+        canonical_original_segments, canonical_normalized_segments = self.claim_canonicalizer.split_query_tracks(
+            canonical_claim_obj
+        )
+        dual_track_templates = self.claim_canonicalizer.build_dual_track_queries(canonical_claim_obj, max_per_segment=8)
+        queries_original: List[str] = [post_text] if str(post_text or "").strip() else []
+        queries_canonical: List[str] = [q for q in canonical_normalized_segments if q][:3]
+        canonical_claim_payload["queries_original"] = list(queries_original)
+        canonical_claim_payload["queries_canonical"] = list(queries_canonical)
+        canonical_claim_payload["query_templates_original"] = dual_track_templates.get("queries_original", [])
+        canonical_claim_payload["query_templates_canonical"] = dual_track_templates.get("queries_canonical", [])
 
         async def _emit_stage(stage: str, payload: Dict[str, Any] | None = None) -> None:
             if not stage_callback:
@@ -637,6 +658,7 @@ class CorrectivePipeline:
             {
                 "claim_preview": post_text[:120],
                 "domain": normalized_domain,
+                "canonical_accept_rate": round(float(canonical_claim_obj.canonical_accept_rate), 4),
                 "health_scope": {
                     "in_scope": health_scope.health_in_scope,
                     "biomedical_confidence": health_scope.biomedical_confidence,
@@ -665,6 +687,16 @@ class CorrectivePipeline:
         # ====================================================================
         # PHASE 1: Extract entities from claim (1 LLM call)
         # ====================================================================
+        await debug_reporter.log_step(
+            step_name="Claim canonicalization",
+            description="Dual-track canonicalization with semantic drift guard",
+            input_data={"claim": post_text},
+            output_data={
+                "canonical_accept_rate": round(float(canonical_claim_obj.canonical_accept_rate), 4),
+                "segments": canonical_claim_payload.get("segments", []),
+                "canonical_rejections": canonical_claim_payload.get("canonical_rejections", []),
+            },
+        )
         claim_entities = await self._extract_claim_entities(post_text, round_id)
         must_have_entities = self._select_must_have_entities(post_text, claim_entities)
         must_have_aliases = self._build_must_have_aliases(claim_entities, must_have_entities)
@@ -693,11 +725,23 @@ class CorrectivePipeline:
         logger.info(f"[CorrectivePipeline:{round_id}] Claim topics: {claim_topics} (conf={topic_conf:.2f})")
 
         retrieval_queries = self._build_retrieval_queries(post_text)
+        if dual_track_query_enabled:
+            for canonical_segment in canonical_normalized_segments[:3]:
+                seg = str(canonical_segment or "").strip()
+                if seg and seg not in retrieval_queries:
+                    retrieval_queries.append(seg)
+            retrieval_queries = dedupe_list(retrieval_queries)
         await debug_reporter.log_step(
             step_name="Subclaims identified",
             description="Claim decomposition and retrieval query seed construction",
             input_data={"claim": post_text},
-            output_data={"retrieval_queries": retrieval_queries},
+            output_data={
+                "retrieval_queries": retrieval_queries,
+                "retrieval_query_tracks": {
+                    "original": retrieval_queries[: max(1, min(3, len(retrieval_queries)))],
+                    "canonical": canonical_normalized_segments[:3],
+                },
+            },
         )
         raw_retrieval_top_k = max(PIPELINE_RETRIEVAL_TOP_K, top_k * 3)
         dedup_sem, kg_candidates, retrieval_metrics = await retrieve_candidates(
@@ -724,11 +768,19 @@ class CorrectivePipeline:
             "sem_filtered": int(retrieval_metrics.get("sem_filtered", len(dedup_sem))),
             "sem_in_ranked": 0,
         }
+        sem_hits_canonical = self._count_track_hits(dedup_sem, canonical_normalized_segments)
+        kg_hits_canonical = self._count_track_hits(kg_candidates, canonical_normalized_segments)
+        sem_hits_original = len(dedup_sem)
+        kg_hits_original = len(kg_candidates)
         await _emit_stage(
             "retrieval_done",
             {
                 "semantic_candidates_count": len(dedup_sem),
                 "kg_candidates_count": len(kg_candidates),
+                "semantic_candidates_count_original": sem_hits_original,
+                "semantic_candidates_count_canonical": sem_hits_canonical,
+                "kg_candidates_count_original": kg_hits_original,
+                "kg_candidates_count_canonical": kg_hits_canonical,
                 "debug_counts": debug_counts,
             },
         )
@@ -812,6 +864,7 @@ class CorrectivePipeline:
                 cache_sufficient=True,
                 adaptive_metrics=adaptive_trust,
                 evidence_snapshot_id=current_snapshot_id,
+                canonical_claim=canonical_claim_payload,
             )
 
             logger.info(
@@ -837,9 +890,16 @@ class CorrectivePipeline:
                     "facts": [],  # No new facts extracted
                     "triples": [],
                     "queries": [post_text],
+                    "queries_original": queries_original,
+                    "queries_canonical": queries_canonical,
                     "semantic_candidates_count": len(dedup_sem),
                     "kg_candidates_count": len(kg_candidates),
+                    "semantic_candidates_count_original": sem_hits_original,
+                    "semantic_candidates_count_canonical": sem_hits_canonical,
+                    "kg_candidates_count_original": kg_hits_original,
+                    "kg_candidates_count_canonical": kg_hits_canonical,
                     "ranked": top_ranked,
+                    "canonical_claim": canonical_claim_payload,
                     "used_web_search": False,
                     "data_source": "CACHE",
                     "initial_top_score": adaptive_trust["trust_post"],
@@ -919,18 +979,49 @@ class CorrectivePipeline:
         # Generate all search queries upfront (1 LLM call only)
         raw_subclaims = self.trust_ranker.adaptive_policy.decompose_claim(post_text)
         query_subclaims = [s.strip() for s in raw_subclaims if s and s.strip()]
-        queries = await self.search_agent.generate_search_queries(
+        queries_original = await self.search_agent.generate_search_queries(
             post_text,
             failed_entities,
             max_queries=self.MAX_SEARCH_QUERIES,
             subclaims=query_subclaims,
             entities=claim_entities,
         )
+        queries_canonical: List[str] = []
+        if dual_track_query_enabled:
+            canonical_segments_for_queries = [s for s in canonical_normalized_segments if s][:4]
+            canonical_claim_for_queries = " ".join(canonical_segments_for_queries).strip()
+            if canonical_segments_for_queries and canonical_claim_for_queries:
+                canonical_subclaims = canonical_segments_for_queries[:4]
+                queries_canonical = await self.search_agent.generate_search_queries(
+                    canonical_claim_for_queries,
+                    failed_entities,
+                    max_queries=max(1, min(self.MAX_SEARCH_QUERIES, 4)),
+                    subclaims=canonical_subclaims,
+                    entities=claim_entities,
+                )
+        # Keep planner deterministic and bounded: original track remains primary.
+        template_original = dual_track_templates.get("queries_original", []) if dual_track_query_enabled else []
+        template_canonical = dual_track_templates.get("queries_canonical", []) if dual_track_query_enabled else []
+        queries = dedupe_list(
+            (queries_original[:5] if queries_original else [])
+            + (template_original[:2] if isinstance(template_original, list) else [])
+            + (queries_canonical[:3] if queries_canonical else [])
+            + (template_canonical[:2] if isinstance(template_canonical, list) else [])
+        )[:8]
+        canonical_claim_payload["queries_original"] = list(queries_original)
+        canonical_claim_payload["queries_canonical"] = list(queries_canonical)
         await debug_reporter.log_step(
             step_name="Google search queries generated",
             description="Query generation before web search execution",
             input_data={"raw_subclaims": raw_subclaims, "entities": claim_entities},
-            output_data={"queries": queries, "query_count": len(queries)},
+            output_data={
+                "queries": queries,
+                "query_count": len(queries),
+                "queries_original": queries_original,
+                "queries_canonical": queries_canonical,
+                "query_templates_original": dual_track_templates.get("queries_original", []),
+                "query_templates_canonical": dual_track_templates.get("queries_canonical", []),
+            },
         )
 
         if not queries:
@@ -942,6 +1033,7 @@ class CorrectivePipeline:
                 ranked_evidence=top_ranked,
                 top_k=internal_top_k,
                 used_web_search=False,
+                canonical_claim=canonical_claim_payload,
             )
             await _emit_stage("search_done", {"search_api_calls": 0, "queries_total": 0})
             await _emit_stage("extraction_done", {"facts": 0, "triples": 0})
@@ -961,9 +1053,16 @@ class CorrectivePipeline:
                 "facts": [],
                 "triples": [],
                 "queries": [],
+                "queries_original": queries_original,
+                "queries_canonical": queries_canonical,
                 "semantic_candidates_count": len(dedup_sem),
                 "kg_candidates_count": len(kg_candidates),
+                "semantic_candidates_count_original": sem_hits_original,
+                "semantic_candidates_count_canonical": sem_hits_canonical,
+                "kg_candidates_count_original": kg_hits_original,
+                "kg_candidates_count_canonical": kg_hits_canonical,
                 "ranked": top_ranked,
+                "canonical_claim": canonical_claim_payload,
                 "used_web_search": False,
                 "data_source": "CACHE",
                 "search_api_calls": 0,
@@ -1509,6 +1608,7 @@ class CorrectivePipeline:
             used_web_search=search_api_calls > 0,
             adaptive_metrics=final_adaptive_trust,
             evidence_snapshot_id=final_snapshot_id,
+            canonical_claim=canonical_claim_payload,
         )
         # Final trust harmonization:
         # force the verdict payload to respect the final adaptive trust gate used by pipeline output.
@@ -1618,12 +1718,19 @@ class CorrectivePipeline:
             "facts": output_facts,
             "triples": output_triples,
             "queries": queries_executed,
+            "queries_original": queries_original,
+            "queries_canonical": queries_canonical,
             "queries_planned": queries,
             "queries_total": len(queries),
             "queries_used": len(queries_executed),
             "semantic_candidates_count": len(dedup_sem),
             "kg_candidates_count": len(kg_candidates),
+            "semantic_candidates_count_original": sem_hits_original,
+            "semantic_candidates_count_canonical": sem_hits_canonical,
+            "kg_candidates_count_original": kg_hits_original,
+            "kg_candidates_count_canonical": kg_hits_canonical,
             "ranked": top_ranked,
+            "canonical_claim": canonical_claim_payload,
             "claim_entities": claim_entities,
             "predicate_target": predicate_target,
             "used_web_search": search_api_calls > 0,
@@ -1694,6 +1801,34 @@ class CorrectivePipeline:
             },
             **adaptive_payload,
         }
+
+    @staticmethod
+    def _count_track_hits(candidates: List[Dict[str, Any]], segments: List[str]) -> int:
+        if not candidates or not segments:
+            return 0
+        segment_tokens: List[set[str]] = []
+        for segment in segments:
+            tokens = {t for t in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", str(segment or "").lower())}
+            if tokens:
+                segment_tokens.append(tokens)
+        if not segment_tokens:
+            return 0
+        hits = 0
+        for candidate in candidates:
+            statement = str(candidate.get("statement") or candidate.get("text") or "").strip().lower()
+            if not statement:
+                continue
+            statement_tokens = {t for t in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", statement)}
+            if not statement_tokens:
+                continue
+            best_overlap = 0.0
+            for seg_tokens in segment_tokens:
+                overlap = len(seg_tokens & statement_tokens) / max(1, len(seg_tokens))
+                if overlap > best_overlap:
+                    best_overlap = overlap
+            if best_overlap >= 0.35:
+                hits += 1
+        return int(hits)
 
     @staticmethod
     def _entity_tokenize(text: str) -> List[str]:

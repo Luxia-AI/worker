@@ -167,16 +167,41 @@ def _build_debug_block(
             }
         )
 
+    canonical_claim = result.get("canonical_claim", {})
+    if not isinstance(canonical_claim, dict):
+        canonical_claim = {}
+    canonical_segments = canonical_claim.get("segments", [])
+    if not isinstance(canonical_segments, list):
+        canonical_segments = []
+    canonical_rejections = canonical_claim.get("canonical_rejections", [])
+    if not isinstance(canonical_rejections, list):
+        canonical_rejections = []
+    alignment_orig = float(verdict_result.get("alignment_orig", alignment_score) or alignment_score)
+    alignment_canon = float(verdict_result.get("alignment_canon", 0.0) or 0.0)
+    alignment_fused = float(verdict_result.get("alignment_fused", alignment_orig) or alignment_orig)
+
     return {
+        "claim_original": str(
+            verdict_result.get("claim_original") or canonical_claim.get("claim_original") or result.get("claim") or ""
+        ),
+        "claim_canonical_segments": canonical_segments,
+        "canonical_accept_rate": round(float(canonical_claim.get("canonical_accept_rate", 0.0) or 0.0), 4),
+        "canonical_rejections": canonical_rejections,
         "claim_entities": result.get("claim_entities", []),
         "claim_predicate": (
             (result.get("predicate_target") or {}).get("predicate")
             if isinstance(result.get("predicate_target"), dict)
             else ""
         ),
+        "queries_original": result.get("queries_original", []),
+        "queries_canonical": result.get("queries_canonical", []),
         "generated_queries": result.get("queries_planned", result.get("queries", [])),
         "vector_hits": int(result.get("semantic_candidates_count", 0) or 0),
+        "vector_hits_original": int(result.get("semantic_candidates_count_original", 0) or 0),
+        "vector_hits_canonical": int(result.get("semantic_candidates_count_canonical", 0) or 0),
         "kg_hits": int(result.get("kg_candidates_count", 0) or 0),
+        "kg_hits_original": int(result.get("kg_candidates_count_original", 0) or 0),
+        "kg_hits_canonical": int(result.get("kg_candidates_count_canonical", 0) or 0),
         "retrieval_scores": {
             "top": result.get("retrieval_scores_top", []),
             "avg_top5": round(float(result.get("ranking_avg_score", 0.0) or 0.0), 4),
@@ -211,7 +236,19 @@ def _build_debug_block(
         },
         "evidence_sources": sorted(sources),
         "alignment_score": round(float(alignment_score), 4),
+        "alignment_orig": round(float(alignment_orig), 4),
+        "alignment_canon": round(float(alignment_canon), 4),
+        "alignment_fused": round(float(alignment_fused), 4),
+        "support_mass": round(float(verdict_result.get("support_mass", 0.0) or 0.0), 4),
+        "contradict_mass": round(float(verdict_result.get("contradict_mass", 0.0) or 0.0), 4),
+        "neutral_mass": round(float(verdict_result.get("neutral_mass", 0.0) or 0.0), 4),
+        "sufficiency_score": round(float(verdict_result.get("sufficiency_score", 0.0) or 0.0), 4),
+        "direction_gap": round(float(verdict_result.get("direction_gap", 0.0) or 0.0), 4),
         "verdict_policy_path": policy_path,
+        "policy_trace": policy_path,
+        "verdict_binary": str(verdict_result.get("verdict_binary") or ""),
+        "verdict_internal": str(verdict_result.get("verdict_internal") or verdict_result.get("verdict") or ""),
+        "abstain_reason": str(verdict_result.get("abstain_reason") or ""),
         "trust_gate": {
             "threshold_met": bool(
                 result.get(
@@ -280,7 +317,10 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
     final_evidence = verdict_evidence if verdict_evidence else ranked_evidence
     llm_meta = result.get("llm", {}) or {}
     status = str(result.get("status", "completed") or "completed")
-    binary_first = _env_flag("VERDICT_POLICY_V3_ENABLED", True)
+    binary_first = _env_flag(
+        "BINARY_EXTERNAL_VERDICT_ENABLED",
+        _env_flag("VERDICT_POLICY_V3_ENABLED", True),
+    )
     verdict_internal = str(verdict_result.get("verdict", "UNVERIFIABLE") or "UNVERIFIABLE")
     verdict_binary = str(verdict_result.get("verdict_binary") or "").upper()
     if verdict_binary not in {"TRUE", "FALSE"}:
