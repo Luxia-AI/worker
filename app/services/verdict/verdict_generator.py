@@ -8001,11 +8001,20 @@ class VerdictGenerator:
                         verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
                         binary_fallback_reason = "neutral_only_trust_gate_low_margin_sigmoid"
                     elif absolute_claim or requirement_claim:
-                        verdict_binary = Verdict.FALSE.value
-                        binary_fallback_reason = "neutral_only_trust_gate_conservative_false"
+                        # Keep conservative tendency for hard requirement/absolute claims,
+                        # but avoid a blanket FALSE bias when directional signal is weak.
+                        if (p_false_b - p_true_b) >= 0.08 or directional_delta <= -0.08:
+                            verdict_binary = Verdict.FALSE.value
+                            binary_fallback_reason = "neutral_only_trust_gate_conservative_false"
+                        elif probs_for_binary and class_margin >= 0.03:
+                            verdict_binary = Verdict.TRUE.value if p_true_b >= p_false_b else Verdict.FALSE.value
+                            binary_fallback_reason = "neutral_only_trust_gate_conservative_probs"
+                        else:
+                            verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
+                            binary_fallback_reason = "neutral_only_trust_gate_conservative_sigmoid"
                     else:
-                        verdict_binary = Verdict.FALSE.value
-                        binary_fallback_reason = "neutral_only_trust_gate_fail"
+                        verdict_binary = Verdict.TRUE.value if truth_score_binary >= 0.5 else Verdict.FALSE.value
+                        binary_fallback_reason = "neutral_only_trust_gate_tiebreak"
                 elif absolute_claim or requirement_claim:
                     # Requirement/absolute claims remain conservative unless
                     # positive directional evidence clearly dominates.
@@ -8133,7 +8142,12 @@ class VerdictGenerator:
         if verdict == Verdict.TRUE.value:
             confidence = max(confidence, 0.62 if best_stmt else 0.45)
         elif verdict == Verdict.FALSE.value:
-            confidence = max(confidence, 0.75 if best_stmt else 0.50)
+            false_conf_floor = 0.58
+            if not (directional_refute_evidence or decisive_refute_unlock or directional_segment_lock):
+                false_conf_floor = 0.46
+            if not trust_gate_passed and not trust_gate_effective:
+                false_conf_floor = min(false_conf_floor, 0.50)
+            confidence = max(confidence, false_conf_floor if best_stmt else 0.40)
         elif verdict == Verdict.PARTIALLY_TRUE.value:
             confidence = max(confidence, 0.50 if best_stmt else 0.35)
         else:
@@ -8151,6 +8165,14 @@ class VerdictGenerator:
             if not trust_gate_passed and not trust_gate_effective:
                 binary_conf_floor = min(binary_conf_floor, 0.68)
             confidence = max(confidence, binary_conf_floor)
+        if verdict in {Verdict.TRUE.value, Verdict.FALSE.value} and weak_directional_signal:
+            confidence = min(confidence, 0.60)
+        if (
+            verdict in {Verdict.TRUE.value, Verdict.FALSE.value}
+            and posterior_unverifiable_dominant
+            and not (decisive_support_unlock or decisive_refute_unlock or directional_segment_lock)
+        ):
+            confidence = min(confidence, 0.55)
         payload["confidence"] = max(0.05, min(0.98, confidence))
         payload["calibrated_confidence"] = payload["confidence"]
         if not isinstance(payload.get("class_probs"), dict):

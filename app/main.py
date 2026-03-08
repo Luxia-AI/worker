@@ -371,7 +371,11 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "trust_metric_name": result.get("trust_metric_name", "trust_post"),
         "trust_metric_value": float(result.get("trust_metric_value", 0.0) or 0.0),
         "trust_threshold": result.get("trust_threshold", 0.70),
-        "trust_threshold_met": bool(result.get("trust_threshold_met", False)),
+        "trust_threshold_met": bool(
+            verdict_result.get("trust_threshold_met", result.get("trust_threshold_met", False))
+            if isinstance(verdict_result, dict)
+            else result.get("trust_threshold_met", False)
+        ),
         "trust_post": float(result.get("trust_post", 0.0) or 0.0),
         "coverage": result.get("coverage"),
         "diversity": result.get("diversity"),
