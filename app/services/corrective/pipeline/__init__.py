@@ -67,6 +67,8 @@ from app.services.vdb.vdb_ingest import VDBIngest
 from app.services.vdb.vdb_retrieval import VDBRetrieval
 from app.services.verdict.verdict_generator import VerdictGenerator
 from app.shared.trust_config import get_trust_config
+from app.utils.pipeline_trace import DEBUG as TRACE_DEBUG
+from app.utils.pipeline_trace import trace
 
 logger = get_logger(__name__)
 
@@ -594,6 +596,7 @@ class CorrectivePipeline:
 
         This minimizes Groq API calls by using cached knowledge when available.
         """
+        trace_started_at = perf_counter()
         round_id = round_id or str(uuid.uuid4())
         failed_entities = failed_entities or []
         confidence_mode = self._confidence_mode()
@@ -612,6 +615,13 @@ class CorrectivePipeline:
         await debug_reporter.initialize(post_text)
 
         logger.info(f"[CorrectivePipeline:{round_id}] Start for post: {post_text}")
+        trace(
+            "CLAIM_RECEIVED",
+            {
+                "claim": post_text,
+                "post_id": round_id,
+            },
+        )
         normalized_domain = "health"
         if str(domain or "").strip().lower() not in {"", "health", "biomedical", "medicine"}:
             logger.warning(
@@ -634,6 +644,7 @@ class CorrectivePipeline:
         }
         canonical_claim_obj = await self.claim_canonicalizer.canonicalize_claim(post_text)
         canonical_claim_payload = canonical_claim_obj.to_dict()
+        trace("CLAIM_CANONICALIZATION", canonical_claim_payload)
         canonical_original_segments, canonical_normalized_segments = self.claim_canonicalizer.split_query_tracks(
             canonical_claim_obj
         )
@@ -652,6 +663,100 @@ class CorrectivePipeline:
             maybe = stage_callback(stage, body)
             if maybe is not None:
                 await maybe
+
+        def _trace_final_stages(
+            ranked_evidence: List[Dict[str, Any]],
+            verdict_payload: Dict[str, Any],
+            claim_text: str,
+            total_latency: float,
+        ) -> None:
+            if not TRACE_DEBUG:
+                return
+
+            evidence_items = [
+                {
+                    "text": str(item.get("statement") or item.get("text") or ""),
+                    "source": str(item.get("source_url") or item.get("source") or ""),
+                    "score": float(item.get("final_score", 0.0) or 0.0),
+                }
+                for item in (ranked_evidence or [])
+                if str(item.get("statement") or item.get("text") or "").strip()
+            ]
+            trace(
+                "EVIDENCE_EXTRACTION",
+                {
+                    "evidence_count": len(evidence_items),
+                    "sample": evidence_items[:3],
+                },
+            )
+
+            stance_results = [
+                {
+                    "text": str(item.get("statement") or item.get("text") or ""),
+                    "stance": str(item.get("stance") or "neutral"),
+                    "support_score": float(item.get("support_score", 0.0) or 0.0),
+                    "contradict_score": float(item.get("contradict_score", 0.0) or 0.0),
+                }
+                for item in (ranked_evidence or [])
+            ]
+            trace("STANCE_CLASSIFICATION", stance_results)
+
+            support_mass = float(verdict_payload.get("support_mass", 0.0) or 0.0)
+            contradict_mass = float(verdict_payload.get("contradict_mass", 0.0) or 0.0)
+            neutral_mass = float(verdict_payload.get("neutral_mass", 0.0) or 0.0)
+            trace(
+                "EVIDENCE_AGGREGATION",
+                {
+                    "support_mass": support_mass,
+                    "contradict_mass": contradict_mass,
+                    "neutral_mass": neutral_mass,
+                },
+            )
+
+            verdict_internal = {
+                "verdict_internal": str(
+                    verdict_payload.get("verdict_internal") or verdict_payload.get("verdict") or "UNVERIFIABLE"
+                ),
+                "abstain_reason": str(verdict_payload.get("abstain_reason") or ""),
+                "policy_trace": verdict_payload.get("policy_trace") or [],
+            }
+            trace("VERDICT_ENGINE_INTERNAL", verdict_internal)
+
+            truth_score = verdict_payload.get("truth_score_binary")
+            if truth_score is None:
+                truth_score = verdict_payload.get(
+                    "truth_score_percent",
+                    verdict_payload.get("truthfulness_percent", 0.0),
+                )
+            confidence = float(verdict_payload.get("confidence", 0.0) or 0.0)
+            verdict = str(verdict_payload.get("verdict_binary") or verdict_payload.get("verdict") or "UNVERIFIABLE")
+            sources = sorted(
+                {
+                    str(item.get("source_url") or item.get("source") or "")
+                    for item in (ranked_evidence or [])
+                    if str(item.get("source_url") or item.get("source") or "").strip()
+                }
+            )[:10]
+            trace(
+                "FINAL_VERDICT",
+                {
+                    "truth_score": truth_score,
+                    "confidence": confidence,
+                    "verdict": verdict,
+                    "sources": sources,
+                },
+            )
+
+            trace(
+                "PIPELINE_SUMMARY",
+                {
+                    "claim": claim_text,
+                    "verdict": verdict,
+                    "truth_score": truth_score,
+                    "confidence": confidence,
+                    "latency_seconds": round(float(total_latency), 3),
+                },
+            )
 
         await _emit_stage(
             "started",
@@ -731,6 +836,7 @@ class CorrectivePipeline:
                 if seg and seg not in retrieval_queries:
                     retrieval_queries.append(seg)
             retrieval_queries = dedupe_list(retrieval_queries)
+        trace("QUERY_GENERATION", {"queries": retrieval_queries})
         await debug_reporter.log_step(
             step_name="Subclaims identified",
             description="Claim decomposition and retrieval query seed construction",
@@ -772,6 +878,39 @@ class CorrectivePipeline:
         kg_hits_canonical = self._count_track_hits(kg_candidates, canonical_normalized_segments)
         sem_hits_original = len(dedup_sem)
         kg_hits_original = len(kg_candidates)
+        trace(
+            "VECTOR_RETRIEVAL",
+            {
+                "results_count": len(dedup_sem),
+                "top_results": dedup_sem[:3],
+            },
+        )
+        if TRACE_DEBUG:
+            kg_nodes = sorted(
+                {
+                    str(item.get("subject") or "").strip()
+                    for item in kg_candidates[:50]
+                    if str(item.get("subject") or "").strip()
+                }
+                | {
+                    str(item.get("object") or "").strip()
+                    for item in kg_candidates[:50]
+                    if str(item.get("object") or "").strip()
+                }
+            )
+            kg_edges = [
+                {
+                    "subject": str(item.get("subject") or "").strip(),
+                    "predicate": str(item.get("relation") or item.get("predicate") or "").strip(),
+                    "object": str(item.get("object") or "").strip(),
+                    "source_url": str(item.get("source_url") or "").strip(),
+                }
+                for item in kg_candidates[:20]
+            ]
+        else:
+            kg_nodes = []
+            kg_edges = []
+        trace("KG_RETRIEVAL", {"kg_nodes": kg_nodes, "kg_edges": kg_edges})
         await _emit_stage(
             "retrieval_done",
             {
@@ -873,6 +1012,12 @@ class CorrectivePipeline:
             )
             cache_allowed = self._cache_fast_path_allowed(adaptive_trust, verdict_result, top_ranked=top_ranked)
             if cache_allowed:
+                _trace_final_stages(
+                    top_ranked,
+                    verdict_result,
+                    post_text,
+                    perf_counter() - trace_started_at,
+                )
                 await _emit_stage("search_done", {"search_api_calls": 0, "queries_total": 0})
                 await _emit_stage("extraction_done", {"facts": 0, "triples": 0})
                 await _emit_stage("ingestion_done", {"facts_ingested": 0, "triples_ingested": 0})
@@ -1034,6 +1179,12 @@ class CorrectivePipeline:
                 top_k=internal_top_k,
                 used_web_search=False,
                 canonical_claim=canonical_claim_payload,
+            )
+            _trace_final_stages(
+                top_ranked,
+                verdict_result,
+                post_text,
+                perf_counter() - trace_started_at,
             )
             await _emit_stage("search_done", {"search_api_calls": 0, "queries_total": 0})
             await _emit_stage("extraction_done", {"facts": 0, "triples": 0})
@@ -1664,6 +1815,12 @@ class CorrectivePipeline:
         )
         await debug_reporter.close()
         elapsed_total = perf_counter() - pipeline_started_at
+        _trace_final_stages(
+            top_ranked,
+            verdict_result,
+            post_text,
+            perf_counter() - trace_started_at,
+        )
 
         output_facts = list(all_facts or [])
         if not output_facts and top_ranked:
