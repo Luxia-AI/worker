@@ -8186,6 +8186,44 @@ class VerdictGenerator:
         else:
             payload["abstain_reason"] = ""
 
+        binary_external_enabled = str(os.getenv("BINARY_EXTERNAL_VERDICT_ENABLED", "false")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        internal_promoted_from_abstain = False
+        if (
+            binary_external_enabled
+            and verdict in {Verdict.UNVERIFIABLE.value, Verdict.PARTIALLY_TRUE.value}
+            and verdict_binary in {Verdict.TRUE.value, Verdict.FALSE.value}
+        ):
+            align_min_delta = max(0.04, min(0.25, float(os.getenv("BINARY_ALIGN_MIN_DIRECTIONAL_DELTA", "0.08"))))
+            align_min_class_margin = max(
+                0.03,
+                min(0.40, float(os.getenv("BINARY_ALIGN_MIN_CLASS_MARGIN", "0.10"))),
+            )
+            class_margin = abs(float(p_true_b) - float(p_false_b))
+            directional_enough = bool(
+                directional_segment_lock
+                or decisive_support_unlock
+                or decisive_refute_unlock
+                or abs(float(directional_delta)) >= align_min_delta
+                or class_margin >= align_min_class_margin
+                or (support_label_count + refute_label_count) >= 1
+            )
+            if directional_enough and not exact_numeric_fragile_support:
+                payload["verdict_internal_original"] = verdict
+                verdict = verdict_binary
+                payload["verdict"] = verdict
+                payload["verdict_internal"] = verdict
+                payload["abstain_reason"] = ""
+                internal_promoted_from_abstain = True
+                guard_reasons = list(payload.get("verdict_guard_reasons") or [])
+                if "binary_external_alignment" not in guard_reasons:
+                    guard_reasons.append("binary_external_alignment")
+                payload["verdict_guard_reasons"] = sorted(set(guard_reasons))
+
         policy_trace = payload.get("policy_trace")
         if not isinstance(policy_trace, list):
             policy_trace = []
@@ -8253,6 +8291,12 @@ class VerdictGenerator:
                 truth = max(float(truth), max(50.5, binary_truth))
             else:
                 truth = min(float(truth), min(49.5, binary_truth))
+        if internal_promoted_from_abstain:
+            promoted_truth = max(1.0, min(99.0, float(truth_score_binary) * 100.0))
+            if verdict == Verdict.TRUE.value:
+                truth = max(50.5, min(float(truth), max(50.5, promoted_truth)))
+            elif verdict == Verdict.FALSE.value:
+                truth = min(49.5, max(float(truth), min(49.5, promoted_truth)))
         payload["truthfulness_percent"] = truth
         payload["truth_score_percent"] = truth
         payload["verdict_band"] = self._truthfulness_band(truth)
@@ -8300,6 +8344,8 @@ class VerdictGenerator:
             confidence = min(confidence, 0.55)
         if exact_numeric_claim and exact_numeric_fragile_support:
             confidence = min(confidence, 0.55)
+        if internal_promoted_from_abstain and not (decisive_support_unlock or decisive_refute_unlock):
+            confidence = min(confidence, 0.62)
         payload["confidence"] = max(0.05, min(0.98, confidence))
         payload["calibrated_confidence"] = payload["confidence"]
         if not isinstance(payload.get("class_probs"), dict):
