@@ -658,12 +658,18 @@ class CorrectivePipeline:
             canonical_claim_obj
         )
         dual_track_templates = self.claim_canonicalizer.build_dual_track_queries(canonical_claim_obj, max_per_segment=8)
+        authority_rewrite_triggered = any(
+            str(seg.get("predicate_family") or "").strip().lower() == "recommendation"
+            for seg in (canonical_claim_payload.get("segments") or [])
+            if isinstance(seg, dict)
+        )
         queries_original: List[str] = [post_text] if str(post_text or "").strip() else []
         queries_canonical: List[str] = [q for q in canonical_normalized_segments if q][:3]
         canonical_claim_payload["queries_original"] = list(queries_original)
         canonical_claim_payload["queries_canonical"] = list(queries_canonical)
         canonical_claim_payload["query_templates_original"] = dual_track_templates.get("queries_original", [])
         canonical_claim_payload["query_templates_canonical"] = dual_track_templates.get("queries_canonical", [])
+        canonical_claim_payload["authority_rewrite_triggered"] = bool(authority_rewrite_triggered)
 
         async def _emit_stage(stage: str, payload: Dict[str, Any] | None = None) -> None:
             if not stage_callback:
@@ -1178,6 +1184,7 @@ class CorrectivePipeline:
                 "query_templates_original": dual_track_templates.get("queries_original", []),
                 "query_templates_canonical": dual_track_templates.get("queries_canonical", []),
                 "query_facets": query_facets,
+                "authority_rewrite_triggered": bool(authority_rewrite_triggered),
             },
         )
 

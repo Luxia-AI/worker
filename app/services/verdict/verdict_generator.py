@@ -5204,9 +5204,17 @@ class VerdictGenerator:
                     ),
                 ),
             )
+            is_refute_candidate = bool(
+                relevance == "REFUTES"
+                or explicit_refute_statement
+                or contradiction_score >= max(0.35, CONTRADICTION_THRESHOLD - 0.10)
+                or nli_contradict_prob >= 0.45
+                or polarity_rel == "contradicts"
+            )
             refute_gate_block_reason = ""
             refute_gate_passed = bool(
-                refute_eligibility_score >= refute_threshold
+                is_refute_candidate
+                and refute_eligibility_score >= refute_threshold
                 and credibility >= 0.55
                 and quantifier_consistency >= 1.0
                 and dose_scope_consistency >= 1.0
@@ -5217,7 +5225,9 @@ class VerdictGenerator:
                     or polarity_rel == "contradicts"
                 )
             )
-            if not refute_gate_passed:
+            if not is_refute_candidate:
+                refute_gate_block_reason = "not_refute_candidate"
+            elif not refute_gate_passed:
                 if quantifier_consistency < 1.0:
                     refute_gate_block_reason = "quantifier_scope_guard"
                 elif dose_scope_consistency < 1.0:
@@ -5270,6 +5280,7 @@ class VerdictGenerator:
                     "refute_eligible": bool(refute_eligible),
                     "refute_eligibility_score": round(float(refute_eligibility_score), 4),
                     "refute_threshold": round(float(refute_threshold), 4),
+                    "refute_candidate": bool(is_refute_candidate),
                     "refute_gate_passed": bool(refute_gate_passed),
                     "refute_gate_block_reason": str(refute_gate_block_reason),
                     "quantifier_consistency": round(float(quantifier_consistency), 4),
@@ -7849,23 +7860,89 @@ class VerdictGenerator:
         evidence_map: List[Dict[str, Any]],
         evidence_count: int,
         source_domains: int,
-    ) -> Tuple[float, float, float, float]:
+    ) -> Tuple[float, float, float, float, Dict[str, Any]]:
         support_mass = 0.0
         contradict_mass = 0.0
         neutral_mass = 0.0
         directional_count = 0
         quality_sum = 0.0
+        support_labeled_count = 0
+        support_admitted_count = 0
+        refute_labeled_count = 0
+        refute_admitted_count = 0
+        neutral_labeled_count = 0
 
-        for item in evidence_map or []:
+        for idx, item in enumerate(evidence_map or []):
             if not isinstance(item, dict):
                 continue
             rel = self._normalize_relevance_label(item.get("relevance", "NEUTRAL"))
             credibility = max(0.0, min(1.0, float(item.get("credibility", 0.5) or 0.5)))
             rel_score = max(0.0, min(1.0, float(item.get("relevance_score", 0.0) or 0.0)))
-            support_score = max(0.0, min(1.0, float(item.get("support_score", 0.0) or 0.0)))
-            refute_score = max(0.0, min(1.0, float(item.get("refute_score", 0.0) or 0.0)))
+            support_score = max(0.0, min(1.0, float(item.get("support_score", rel_score) or rel_score)))
+            refute_score = max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        item.get(
+                            "refute_score",
+                            max(
+                                float(item.get("contradiction_score", 0.0) or 0.0),
+                                float(item.get("nli_contradict_prob", 0.0) or 0.0),
+                            ),
+                        )
+                    ),
+                ),
+            )
             neutral_score = max(0.0, min(1.0, float(item.get("neutral_score", 0.0) or 0.0)))
-            refute_gate_passed = bool(item.get("refute_gate_passed", False))
+            refute_threshold = max(0.05, float(item.get("refute_threshold", 0.60) or 0.60))
+            refute_eligibility_score = max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        item.get(
+                            "refute_eligibility_score",
+                            (0.45 * refute_score)
+                            + (0.20 * float(item.get("predicate_match_score", 0.0) or 0.0))
+                            + (0.20 * float(item.get("object_match_score", 0.0) or 0.0))
+                            + (0.15 * float(item.get("anchor_match_score", 0.0) or 0.0)),
+                        )
+                        or 0.0
+                    ),
+                ),
+            )
+            raw_refute_gate_passed = item.get("refute_gate_passed", None)
+            if isinstance(raw_refute_gate_passed, bool):
+                refute_gate_passed = raw_refute_gate_passed
+            elif isinstance(raw_refute_gate_passed, str):
+                refute_gate_passed = raw_refute_gate_passed.strip().lower() in {"1", "true", "yes", "on"}
+            else:
+                refute_gate_passed = bool(refute_eligibility_score >= refute_threshold)
+            subject_match = max(0.0, min(1.0, float(item.get("subject_match_score", 0.0) or 0.0)))
+            predicate_match = max(0.0, min(1.0, float(item.get("predicate_match_score", 0.0) or 0.0)))
+            object_match = max(
+                0.0,
+                min(
+                    1.0,
+                    float(
+                        item.get(
+                            "object_match_score",
+                            1.0 if bool(item.get("object_match_ok", False)) else 0.0,
+                        )
+                        or 0.0
+                    ),
+                ),
+            )
+            alignment_score = max(
+                0.0,
+                min(
+                    1.0,
+                    (0.40 * float(item.get("anchor_match_score", 0.0) or 0.0))
+                    + (0.30 * predicate_match)
+                    + (0.30 * object_match),
+                ),
+            )
             quality = max(
                 0.0,
                 min(
@@ -7873,22 +7950,115 @@ class VerdictGenerator:
                     (
                         0.35 * credibility
                         + 0.25 * float(item.get("anchor_match_score", 0.0) or 0.0)
-                        + 0.20 * float(item.get("predicate_match_score", 0.0) or 0.0)
-                        + 0.20 * float(item.get("object_match_score", 0.0) or 0.0)
+                        + 0.20 * predicate_match
+                        + 0.20 * object_match
                     ),
                 ),
             )
             quality_sum += quality
             base_weight = max(rel_score, 0.10) * (0.55 + (0.45 * credibility))
+            stance_before = rel
+            admission_passed = False
+            admission_block_reason = ""
+            admitted_to_support = False
+            admitted_to_refute = False
 
-            if rel == "REFUTES" and refute_gate_passed:
-                contradict_mass += max(base_weight, refute_score, float(item.get("contradiction_score", 0.0) or 0.0))
-                directional_count += 1
-            elif rel == "SUPPORTS" and support_score >= 0.45:
-                support_mass += max(base_weight, support_score, float(item.get("nli_entail_prob", 0.0) or 0.0))
-                directional_count += 1
+            if rel == "SUPPORTS":
+                support_labeled_count += 1
+                support_admission_score = max(
+                    support_score,
+                    rel_score,
+                    (0.40 * support_score) + (0.20 * predicate_match) + (0.20 * object_match) + (0.20 * quality),
+                )
+                support_directional_guard = (
+                    predicate_match >= 0.20 and object_match >= 0.20 and alignment_score >= 0.25 and quality >= 0.20
+                )
+                if support_admission_score >= 0.35 or support_directional_guard:
+                    contribution = max(
+                        base_weight,
+                        support_admission_score,
+                        float(item.get("nli_entail_prob", 0.0) or 0.0),
+                    )
+                    support_mass += contribution
+                    directional_count += 1
+                    support_admitted_count += 1
+                    admission_passed = True
+                    admitted_to_support = True
+                else:
+                    if support_admission_score < 0.35:
+                        admission_block_reason = "low_support_admission_score"
+                    elif predicate_match < 0.20:
+                        admission_block_reason = "low_predicate_match"
+                    elif object_match < 0.20:
+                        admission_block_reason = "low_object_semantic_match"
+                    elif alignment_score < 0.25:
+                        admission_block_reason = "low_alignment_score"
+                    else:
+                        admission_block_reason = "support_gate_failed"
+                    neutral_mass += max(base_weight * 0.80, neutral_score)
+            elif rel == "REFUTES":
+                refute_labeled_count += 1
+                fallback_refute_guard = (
+                    refute_score >= 0.50 and predicate_match >= 0.20 and object_match >= 0.20 and quality >= 0.20
+                )
+                if refute_gate_passed or fallback_refute_guard:
+                    if fallback_refute_guard and not refute_gate_passed:
+                        item["refute_gate_block_reason"] = "gate_relaxed_by_directional_signal"
+                    contribution = max(
+                        base_weight,
+                        refute_score,
+                        float(item.get("contradiction_score", 0.0) or 0.0),
+                        float(item.get("nli_contradict_prob", 0.0) or 0.0),
+                    )
+                    contradict_mass += contribution
+                    directional_count += 1
+                    refute_admitted_count += 1
+                    admission_passed = True
+                    admitted_to_refute = True
+                else:
+                    admission_block_reason = str(item.get("refute_gate_block_reason") or "").strip()
+                    if not admission_block_reason:
+                        if refute_eligibility_score < refute_threshold:
+                            admission_block_reason = "low_refute_eligibility_score"
+                        elif predicate_match < 0.20:
+                            admission_block_reason = "low_predicate_match"
+                        elif object_match < 0.20:
+                            admission_block_reason = "low_object_semantic_match"
+                        else:
+                            admission_block_reason = "refute_gate_failed"
+                    neutral_mass += max(base_weight * 0.80, neutral_score)
             else:
+                neutral_labeled_count += 1
+                admission_block_reason = "not_directional_label"
                 neutral_mass += max(base_weight * 0.80, neutral_score)
+
+            effective_refute_gate_passed = bool(refute_gate_passed or admitted_to_refute)
+            item["refute_eligibility_score"] = round(float(refute_eligibility_score), 4)
+            item["refute_threshold"] = round(float(refute_threshold), 4)
+            item["refute_gate_passed"] = bool(effective_refute_gate_passed)
+            current_block_reason = str(item.get("refute_gate_block_reason") or "").strip()
+            if rel != "REFUTES":
+                item["refute_gate_block_reason"] = current_block_reason or "not_refute_candidate"
+            elif not effective_refute_gate_passed:
+                item["refute_gate_block_reason"] = (
+                    current_block_reason or admission_block_reason or "refute_gate_failed"
+                )
+            else:
+                item["refute_gate_block_reason"] = current_block_reason
+
+            item["stance_label_before_admission"] = stance_before
+            item["admission_passed"] = bool(admission_passed)
+            item["admission_block_reason"] = str(admission_block_reason)
+            item["admitted_to_support_mass"] = bool(admitted_to_support)
+            item["admitted_to_contradict_mass"] = bool(admitted_to_refute)
+            item["final_stance"] = (
+                "SUPPORTS" if admitted_to_support else ("REFUTES" if admitted_to_refute else "NEUTRAL")
+            )
+            item["alignment_score"] = round(float(alignment_score), 4)
+            item["subject_match_score"] = round(float(subject_match), 4)
+            item["predicate_match_score"] = round(float(predicate_match), 4)
+            item["object_match_score"] = round(float(object_match), 4)
+            evidence_map[idx] = item
 
         evidence_density = min(1.0, float(evidence_count) / 8.0)
         diversity = min(1.0, float(source_domains) / 4.0)
@@ -7902,7 +8072,35 @@ class VerdictGenerator:
         )
         if self._has_absolute_quantifier(claim):
             sufficiency *= 0.92
-        return float(support_mass), float(contradict_mass), float(neutral_mass), float(max(0.0, min(1.0, sufficiency)))
+        support_zero_with_labels = bool(support_labeled_count > 0 and support_mass <= 1e-9)
+        refute_zero_with_labels = bool(refute_labeled_count > 0 and contradict_mass <= 1e-9)
+        warnings: List[str] = []
+        if support_zero_with_labels:
+            warnings.append("support_labeled_but_zero_support_mass")
+        if refute_zero_with_labels:
+            warnings.append("refute_labeled_but_zero_contradict_mass")
+        diagnostics = {
+            "support_labeled_count": int(support_labeled_count),
+            "support_admitted_count": int(support_admitted_count),
+            "refute_labeled_count": int(refute_labeled_count),
+            "refute_admitted_count": int(refute_admitted_count),
+            "neutral_labeled_count": int(neutral_labeled_count),
+            "support_zero_with_labels": support_zero_with_labels,
+            "refute_zero_with_labels": refute_zero_with_labels,
+            "warnings": warnings,
+            "admission_block_reasons": [
+                str(item.get("admission_block_reason") or "")
+                for item in evidence_map
+                if isinstance(item, dict) and str(item.get("admission_block_reason") or "").strip()
+            ],
+        }
+        return (
+            float(support_mass),
+            float(contradict_mass),
+            float(neutral_mass),
+            float(max(0.0, min(1.0, sufficiency))),
+            diagnostics,
+        )
 
     @staticmethod
     def _compute_verdict_invariant(
@@ -7975,7 +8173,13 @@ class VerdictGenerator:
         evidence_count = max(1, int(out.get("evidence_count", len(evidence_map)) or len(evidence_map) or 1))
         source_domains = max(0, len(sources))
 
-        support_mass, contradict_mass, neutral_mass, derived_sufficiency = self._compute_deterministic_masses(
+        (
+            support_mass,
+            contradict_mass,
+            neutral_mass,
+            derived_sufficiency,
+            mass_diagnostics,
+        ) = self._compute_deterministic_masses(
             claim=claim,
             evidence_map=evidence_map,
             evidence_count=evidence_count,
@@ -7993,6 +8197,25 @@ class VerdictGenerator:
         zero_yield_penalty = float(out.get("zero_yield_penalty", 0.0) or 0.0)
         if zero_yield_penalty > 0:
             sufficiency *= max(0.50, 1.0 - min(0.50, zero_yield_penalty))
+        out["support_labeled_count"] = int(mass_diagnostics.get("support_labeled_count", 0) or 0)
+        out["support_admitted_count"] = int(mass_diagnostics.get("support_admitted_count", 0) or 0)
+        out["refute_labeled_count"] = int(mass_diagnostics.get("refute_labeled_count", 0) or 0)
+        out["refute_admitted_count"] = int(mass_diagnostics.get("refute_admitted_count", 0) or 0)
+        out["neutral_labeled_count"] = int(mass_diagnostics.get("neutral_labeled_count", 0) or 0)
+        out["admission_block_reasons"] = list(mass_diagnostics.get("admission_block_reasons", []) or [])
+        out["admission_warnings"] = list(mass_diagnostics.get("warnings", []) or [])
+        if mass_diagnostics.get("support_zero_with_labels"):
+            logger.warning(
+                "[VerdictGenerator][AdmissionInvariant] support labeled=%s but support_mass=0.0; reasons=%s",
+                out["support_labeled_count"],
+                out["admission_block_reasons"],
+            )
+        if mass_diagnostics.get("refute_zero_with_labels"):
+            logger.warning(
+                "[VerdictGenerator][AdmissionInvariant] refute labeled=%s but contradict_mass=0.0; reasons=%s",
+                out["refute_labeled_count"],
+                out["admission_block_reasons"],
+            )
 
         out = self._apply_policy_v3_deterministic_projection(
             payload=out,

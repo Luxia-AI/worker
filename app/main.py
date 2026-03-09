@@ -127,8 +127,11 @@ def _build_debug_block(
     support_count = 0
     refute_count = 0
     neutral_count = 0
+    support_admitted_count_fallback = 0
+    refute_admitted_count_fallback = 0
     refute_gate_passed_count = 0
     refute_gate_block_reasons: dict[str, int] = {}
+    evidence_admission: list[dict[str, Any]] = []
     for row in evidence_map:
         if not isinstance(row, dict):
             continue
@@ -139,11 +142,36 @@ def _build_debug_block(
             refute_count += 1
         else:
             neutral_count += 1
+        if bool(row.get("admitted_to_support_mass", False)):
+            support_admitted_count_fallback += 1
+        if bool(row.get("admitted_to_contradict_mass", False)):
+            refute_admitted_count_fallback += 1
         if bool(row.get("refute_gate_passed", False)):
             refute_gate_passed_count += 1
         block_reason = str(row.get("refute_gate_block_reason") or "").strip()
         if block_reason:
             refute_gate_block_reasons[block_reason] = refute_gate_block_reasons.get(block_reason, 0) + 1
+        evidence_admission.append(
+            {
+                "evidence_id": row.get("evidence_id"),
+                "stance_label_before_admission": str(
+                    row.get("stance_label_before_admission") or row.get("relevance") or "NEUTRAL"
+                ),
+                "final_stance": str(row.get("final_stance") or row.get("relevance") or "NEUTRAL"),
+                "admission_passed": bool(row.get("admission_passed", False)),
+                "admission_block_reason": str(row.get("admission_block_reason") or ""),
+                "admitted_to_support_mass": bool(row.get("admitted_to_support_mass", False)),
+                "admitted_to_contradict_mass": bool(row.get("admitted_to_contradict_mass", False)),
+                "refute_eligibility_score": float(row.get("refute_eligibility_score", 0.0) or 0.0),
+                "refute_threshold": float(row.get("refute_threshold", 0.0) or 0.0),
+                "refute_gate_passed": bool(row.get("refute_gate_passed", False)),
+                "refute_gate_block_reason": str(row.get("refute_gate_block_reason") or ""),
+                "subject_match_score": float(row.get("subject_match_score", 0.0) or 0.0),
+                "predicate_match_score": float(row.get("predicate_match_score", 0.0) or 0.0),
+                "object_match_score": float(row.get("object_match_score", 0.0) or 0.0),
+                "alignment_score": float(row.get("alignment_score", 0.0) or 0.0),
+            }
+        )
 
     alignment_values: list[float] = []
     for seg in claim_breakdown:
@@ -198,6 +226,7 @@ def _build_debug_block(
             {
                 "evidence_id": row.get("evidence_id"),
                 "relevance": str(row.get("relevance") or "NEUTRAL"),
+                "refute_candidate": bool(row.get("refute_candidate", False)),
                 "refute_eligibility_score": float(row.get("refute_eligibility_score", 0.0) or 0.0),
                 "refute_threshold": float(row.get("refute_threshold", 0.0) or 0.0),
                 "refute_gate_passed": bool(row.get("refute_gate_passed", False)),
@@ -217,6 +246,28 @@ def _build_debug_block(
     alignment_orig = float(verdict_result.get("alignment_orig", alignment_score) or alignment_score)
     alignment_canon = float(verdict_result.get("alignment_canon", 0.0) or 0.0)
     alignment_fused = float(verdict_result.get("alignment_fused", alignment_orig) or alignment_orig)
+    support_labeled_count = int(verdict_result.get("support_labeled_count", support_count) or support_count)
+    support_admitted_count = int(
+        verdict_result.get("support_admitted_count", support_admitted_count_fallback) or support_admitted_count_fallback
+    )
+    refute_labeled_count = int(verdict_result.get("refute_labeled_count", refute_count) or refute_count)
+    refute_admitted_count = int(
+        verdict_result.get("refute_admitted_count", refute_admitted_count_fallback) or refute_admitted_count_fallback
+    )
+    neutral_labeled_count = int(verdict_result.get("neutral_labeled_count", neutral_count) or neutral_count)
+    canonical_triplets = []
+    for seg in canonical_segments:
+        if not isinstance(seg, dict):
+            continue
+        canonical_triplets.append(
+            {
+                "segment_id": seg.get("segment_id"),
+                "subject": str(seg.get("subject") or ""),
+                "predicate": str(seg.get("predicate") or ""),
+                "object": str(seg.get("object") or ""),
+                "predicate_family": str(seg.get("predicate_family") or ""),
+            }
+        )
 
     return {
         "claim_original": str(
@@ -227,6 +278,7 @@ def _build_debug_block(
         "canonical_rejections": canonical_rejections,
         "canonical_parse_failed": bool(canonical_claim.get("canonical_parse_failed", False)),
         "canonical_failure_reason": str(canonical_claim.get("canonical_failure_reason") or ""),
+        "canonical_triplets": canonical_triplets,
         "claim_entities": result.get("claim_entities", []),
         "claim_predicate": (
             (result.get("predicate_target") or {}).get("predicate")
@@ -237,6 +289,7 @@ def _build_debug_block(
         "queries_canonical": result.get("queries_canonical", []),
         "generated_queries": result.get("queries_planned", result.get("queries", [])),
         "query_facets": result.get("query_facets", []),
+        "authority_rewrite_triggered": bool(canonical_claim.get("authority_rewrite_triggered", False)),
         "vector_hits": int(result.get("semantic_candidates_count", 0) or 0),
         "vector_hits_original": int(result.get("semantic_candidates_count_original", 0) or 0),
         "vector_hits_canonical": int(result.get("semantic_candidates_count_canonical", 0) or 0),
@@ -275,6 +328,12 @@ def _build_debug_block(
             "refutes": int(refute_count),
             "neutral": int(neutral_count),
         },
+        "support_labeled_count": support_labeled_count,
+        "support_admitted_count": support_admitted_count,
+        "refute_labeled_count": refute_labeled_count,
+        "refute_admitted_count": refute_admitted_count,
+        "neutral_labeled_count": neutral_labeled_count,
+        "evidence_admission": evidence_admission[:20],
         "evidence_sources": sorted(sources),
         "alignment_score": round(float(alignment_score), 4),
         "alignment_orig": round(float(alignment_orig), 4),
@@ -299,6 +358,8 @@ def _build_debug_block(
         "refute_gate_passed_count": int(refute_gate_passed_count),
         "refute_gate_block_reasons": refute_gate_block_reasons,
         "evidence_refute_gates": evidence_refute_gates,
+        "admission_block_reasons": verdict_result.get("admission_block_reasons", []),
+        "admission_warnings": verdict_result.get("admission_warnings", []),
         "trust_gate": {
             "threshold_met": bool(
                 result.get(

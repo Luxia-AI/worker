@@ -117,3 +117,53 @@ def test_dual_track_query_templates_have_bounded_budget():
     assert len(merged) <= 8
     assert len(built["queries_original"]) <= 5
     assert len(built["queries_canonical"]) <= 3
+
+
+def test_recommendation_authority_claim_role_assignment(monkeypatch):
+    monkeypatch.setenv("REFUTE_NLI_ENABLED", "false")
+    monkeypatch.setenv("CLAIM_CANONICALIZATION_ENABLED", "true")
+    monkeypatch.setenv("CLAIM_CANONICAL_LLM_FALLBACK_ENABLED", "false")
+    monkeypatch.setenv("CLAIM_CANONICAL_DRIFT_GUARD_ENABLED", "false")
+    canonicalizer = ClaimCanonicalizer()
+
+    claim = "Eating junk food daily is the primary recommendation of the WHO."
+    result = asyncio.run(canonicalizer.canonicalize_claim(claim))
+    assert result.segments
+    seg = result.segments[0]
+    assert "who" in seg.subject.lower()
+    assert seg.predicate in {"recommends", "advises"}
+    assert seg.predicate_family == "recommendation"
+    assert "eating junk food daily" in seg.object.lower()
+
+
+def test_recommendation_authority_queries_are_sane_and_grammar_safe():
+    canonical_claim = CanonicalClaim(
+        claim_original="Eating junk food daily is the primary recommendation of the WHO.",
+        segments=[
+            CanonicalClaimSegment(
+                segment_id="s1",
+                original_text="Eating junk food daily is the primary recommendation of the WHO",
+                normalized_text="WHO recommends eating junk food daily",
+                subject="WHO",
+                predicate="recommends",
+                object="eating junk food daily",
+                polarity="positive",
+                quantifier="",
+                comparator="",
+                numeric_value="",
+                unit="",
+                population="",
+                timeframe="",
+                modality="",
+                parse_confidence=0.95,
+                canonical_source="rules",
+                predicate_family="recommendation",
+                canonical_accepted=True,
+            )
+        ],
+    )
+    built = ClaimCanonicalizer.build_dual_track_queries(canonical_claim, max_per_segment=8)
+    merged = [q.lower() for q in built["queries_merged"]]
+    assert any("who recommends eating junk food daily" in q for q in merged)
+    assert any("who advises against eating junk food daily" in q for q in merged)
+    assert all("does not is" not in q for q in merged)

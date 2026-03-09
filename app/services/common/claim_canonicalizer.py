@@ -49,6 +49,7 @@ class CanonicalClaimSegment:
     modality: str
     parse_confidence: float
     canonical_source: str
+    predicate_family: str = ""
     canonical_accepted: bool = True
     canonical_rejected_reason: str = ""
     entail_original_to_canonical: float = 0.0
@@ -188,6 +189,29 @@ class ClaimCanonicalizer:
         r"\b(adults?|children|child|infants?|newborns?|pregnant (?:women|people)|women|men|patients?|people|humans?)\b",
         flags=re.IGNORECASE,
     )
+    _RECOMMEND_AUTHORITY_PATTERNS = [
+        re.compile(
+            r"^(?P<object>.+?)\s+is\s+(?:the\s+)?(?:primary|main|official|key|standard)?\s*"
+            r"recommendation\s+of\s+(?P<authority>.+)$",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(?P<object>.+?)\s+is\s+recommended\s+by\s+(?P<authority>.+)$",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(?P<object>.+?)\s+is\s+advised\s+by\s+(?P<authority>.+)$",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(?P<authority>.+?)\s+recommends\s+(?P<object>.+)$",
+            flags=re.IGNORECASE,
+        ),
+        re.compile(
+            r"^(?P<authority>.+?)\s+advises\s+(?P<object>.+)$",
+            flags=re.IGNORECASE,
+        ),
+    ]
 
     def __init__(self) -> None:
         self.enabled = _env_flag("CLAIM_CANONICALIZATION_ENABLED", True)
@@ -213,6 +237,27 @@ class ClaimCanonicalizer:
         cleaned = [_clean_text(seg) for seg in segments if _clean_text(seg)]
         return cleaned if cleaned else [_clean_text(claim)]
 
+    @staticmethod
+    def _clean_authority_span(text: str) -> str:
+        authority = _clean_text(text)
+        authority = re.sub(r"^(?:the\s+)?", "", authority, flags=re.IGNORECASE).strip()
+        authority = re.sub(r"\s+(?:guidelines?|guidance|recommendations?)$", "", authority, flags=re.IGNORECASE).strip()
+        return authority
+
+    def _parse_recommendation_authority(self, text: str) -> Optional[Tuple[str, str, str]]:
+        cleaned = _clean_text(text)
+        for pattern in self._RECOMMEND_AUTHORITY_PATTERNS:
+            match = pattern.match(cleaned)
+            if not match:
+                continue
+            authority = self._clean_authority_span(str(match.groupdict().get("authority") or ""))
+            obj = _clean_text(str(match.groupdict().get("object") or ""))
+            if not authority or not obj:
+                continue
+            predicate = "advises" if re.search(r"\badvis", pattern.pattern, flags=re.IGNORECASE) else "recommends"
+            return authority, predicate, obj
+        return None
+
     def _rule_parse_segment(self, segment_text: str, segment_id: str) -> CanonicalClaimSegment:
         text = _clean_text(segment_text)
         lower_text = text.lower()
@@ -220,13 +265,19 @@ class ClaimCanonicalizer:
         subject = ""
         predicate = ""
         obj = ""
+        predicate_family = ""
+        authority_parse = self._parse_recommendation_authority(text)
+        if authority_parse:
+            subject, predicate, obj = authority_parse
+            predicate_family = "recommendation"
         predicate_match = None
-        for predicate_match in self._PREDICATE_RE.finditer(text):
-            break
-        if predicate_match:
-            predicate = _clean_text(predicate_match.group(0))
-            subject = _clean_text(text[: predicate_match.start()])
-            obj = _clean_text(text[predicate_match.end() :])
+        if not predicate:
+            for predicate_match in self._PREDICATE_RE.finditer(text):
+                break
+            if predicate_match:
+                predicate = _clean_text(predicate_match.group(0))
+                subject = _clean_text(text[: predicate_match.start()])
+                obj = _clean_text(text[predicate_match.end() :])
         if subject:
             subject = re.sub(r"\b(?:never|not|no|none|without)\b\s*$", "", subject, flags=re.IGNORECASE).strip()
             subject = re.sub(r"\b(?:has|have|had|is|are|was|were)\b\s*$", "", subject, flags=re.IGNORECASE).strip()
@@ -305,6 +356,7 @@ class ClaimCanonicalizer:
             modality=modality,
             parse_confidence=confidence,
             canonical_source="rules",
+            predicate_family=predicate_family,
         )
 
     async def _llm_rewrite_segment(
@@ -326,6 +378,7 @@ class ClaimCanonicalizer:
             '  "subject": "...",\n'
             '  "predicate": "...",\n'
             '  "object": "...",\n'
+            '  "predicate_family": "",\n'
             '  "polarity": "positive|negative",\n'
             '  "quantifier": "",\n'
             '  "comparator": "",\n'
@@ -365,6 +418,7 @@ class ClaimCanonicalizer:
         population = _clean_text(raw.get("population") or current.population)
         timeframe = _clean_text(raw.get("timeframe") or current.timeframe)
         modality = _clean_text(raw.get("modality") or current.modality)
+        predicate_family = _clean_text(raw.get("predicate_family") or current.predicate_family)
         parse_confidence = max(
             0.05, min(0.99, _to_float(raw.get("parse_confidence"), default=current.parse_confidence))
         )
@@ -386,6 +440,7 @@ class ClaimCanonicalizer:
             modality=modality,
             parse_confidence=parse_confidence,
             canonical_source="llm",
+            predicate_family=predicate_family,
         )
 
     def _drift_guard(self, segment: CanonicalClaimSegment) -> CanonicalClaimSegment:
@@ -532,6 +587,7 @@ class ClaimCanonicalizer:
             subject = _clean_text(segment.subject)
             predicate = _clean_text(segment.predicate)
             obj = _clean_text(segment.object)
+            predicate_family = _clean_text(segment.predicate_family)
             triple = _clean_text(f"{subject} {predicate} {obj}")
 
             original_support: List[str] = []
@@ -549,12 +605,10 @@ class ClaimCanonicalizer:
                     ]
                 )
                 if triple:
-                    original_refute.extend(
-                        [
-                            f"no evidence {triple}",
-                            f"{subject} does not {predicate} {obj}".strip(),
-                        ]
-                    )
+                    negated_predicate = f"{subject} does not {predicate} {obj}".strip()
+                    if predicate.lower() in {"is", "are", "was", "were"} and subject and obj:
+                        negated_predicate = f"{subject} is not {obj}".strip()
+                    original_refute.extend([f"no evidence {triple}", negated_predicate])
                 else:
                     original_refute.extend(
                         [
@@ -575,6 +629,21 @@ class ClaimCanonicalizer:
                     canonical_refute.append(f"evidence against {triple}")
                 else:
                     canonical_refute.append(f"evidence against {canonical}")
+            if predicate_family == "recommendation" and subject and obj:
+                original_support = [
+                    f"{subject} recommends {obj}",
+                    f"{subject} recommendation {obj}",
+                    f"{subject} guidance {obj}",
+                ]
+                original_refute = [
+                    f"{subject} advises against {obj}",
+                    f"{subject} does not recommend {obj}",
+                ]
+                canonical_support = [
+                    f"{subject} official recommendation {obj}",
+                    f"{subject} healthy guidance {obj}",
+                ]
+                canonical_refute = [f"evidence against {subject} recommending {obj}"]
             authority_queries = []
             anchor_query = canonical or original
             if anchor_query:
