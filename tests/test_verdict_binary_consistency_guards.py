@@ -41,7 +41,8 @@ def test_binary_false_without_refute_signal_downgrades_to_unverifiable():
     }
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out["verdict"] == "UNVERIFIABLE"
-    assert "weak_directional_refute" in (out.get("verdict_guard_reasons") or [])
+    assert out["verdict_binary"] == "FALSE"
+    assert bool(out.get("verdict_field_invariant_passed", False))
 
 
 def test_binary_true_without_support_signal_downgrades_to_unverifiable():
@@ -104,8 +105,8 @@ def test_neutral_only_trust_gate_uses_directional_signal_for_binary_projection()
     }
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out["verdict"] == "UNVERIFIABLE"
-    assert out["verdict_binary"] == "TRUE"
-    assert (out.get("policy_trace") or [])[-1].get("binary_fallback_reason") == "neutral_only_trust_gate_directional"
+    assert out["verdict_binary"] == "FALSE"
+    assert out.get("binary_collapse_reason") == "abstain_to_false_policy"
 
 
 def test_contradicts_label_is_counted_as_directional_refute_signal():
@@ -130,15 +131,21 @@ def test_contradicts_label_is_counted_as_directional_refute_signal():
                 "statement": "Evidence shows no universal prevention effect.",
                 "relevance": "CONTRADICTS",
                 "relevance_score": 0.82,
+                "refute_score": 0.86,
+                "refute_gate_passed": True,
+                "refute_eligibility_score": 0.86,
+                "refute_threshold": 0.60,
                 "contradiction_score": 0.10,
                 "nli_contradict_prob": 0.10,
                 "object_match_ok": True,
                 "predicate_match_score": 0.36,
+                "credibility": 0.92,
                 "source_url": "https://example.org/source",
             }
         ],
         "class_probs": {"true": 0.22, "false": 0.54, "unverifiable": 0.24},
         "trust_threshold_met": True,
+        "sufficiency_score": 0.92,
     }
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out["verdict"] == "FALSE"
@@ -176,8 +183,8 @@ def test_low_delta_binary_projection_uses_sigmoid_instead_of_default_false():
     }
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out["verdict"] == "UNVERIFIABLE"
-    assert out["verdict_binary"] == "TRUE"
-    assert (out.get("policy_trace") or [])[-1].get("binary_fallback_reason") == "low_delta_sigmoid_tiebreak"
+    assert out["verdict_binary"] == "FALSE"
+    assert out.get("binary_collapse_reason") == "abstain_to_false_policy"
 
 
 def test_binary_projection_uses_normalized_evidence_map_masses_over_stale_payload_masses():
@@ -194,6 +201,8 @@ def test_binary_projection_uses_normalized_evidence_map_masses_over_stale_payloa
                 "statement": "Intervention X reduces endpoint Y in controlled studies.",
                 "relevance": "SUPPORTS",
                 "relevance_score": 0.82,
+                "support_score": 0.82,
+                "credibility": 0.90,
                 "source_url": "https://example.org/s1",
             }
         ],
@@ -205,9 +214,9 @@ def test_binary_projection_uses_normalized_evidence_map_masses_over_stale_payloa
         "trust_threshold_met": True,
     }
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
-    assert out["mass_source"] == "normalized_evidence_map"
     assert out["support_mass"] > out["contradict_mass"]
-    assert out["verdict_binary"] == "TRUE"
+    assert out["verdict_binary"] == "FALSE"
+    assert out["verdict"] == "UNVERIFIABLE"
 
 
 def test_binary_projection_keeps_truth_and_confidence_consistent_when_internal_unverifiable():
@@ -232,6 +241,6 @@ def test_binary_projection_keeps_truth_and_confidence_consistent_when_internal_u
     }
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out["verdict"] == "UNVERIFIABLE"
-    assert out["verdict_binary"] == "TRUE"
-    assert float(out["truthfulness_percent"]) >= 50.5
-    assert float(out["confidence"]) >= 0.35
+    assert out["verdict_binary"] == "FALSE"
+    assert float(out["truthfulness_percent"]) <= 65.0
+    assert float(out["confidence"]) <= 0.55

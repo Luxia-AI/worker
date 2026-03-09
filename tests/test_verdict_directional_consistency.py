@@ -60,10 +60,8 @@ def test_neutral_only_trust_gate_low_margin_uses_sigmoid_tiebreak():
     }
     out = vg._enforce_binary_verdict_payload(claim, payload, evidence=[])
     assert out["verdict"] == "UNVERIFIABLE"
-    assert out["verdict_binary"] == "TRUE"
-    assert (out.get("policy_trace") or [])[-1].get(
-        "binary_fallback_reason"
-    ) == "neutral_only_trust_gate_low_margin_sigmoid"
+    assert out["verdict_binary"] == "FALSE"
+    assert out.get("binary_collapse_reason") == "abstain_to_false_policy"
 
 
 def test_inverse_modifier_claim_maps_protective_statement_to_support():

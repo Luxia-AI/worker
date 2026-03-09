@@ -95,12 +95,43 @@ class CanonicalClaim:
             )
         return out
 
+    @property
+    def canonical_parse_failures(self) -> List[Dict[str, Any]]:
+        failures: List[Dict[str, Any]] = []
+        for segment in self.segments:
+            missing_predicate = not bool(str(segment.predicate or "").strip())
+            missing_object = not bool(str(segment.object or "").strip())
+            low_conf = float(segment.parse_confidence or 0.0) < 0.55
+            if not (missing_predicate or missing_object or low_conf):
+                continue
+            reason_parts: List[str] = []
+            if missing_predicate:
+                reason_parts.append("missing_predicate")
+            if missing_object:
+                reason_parts.append("missing_object")
+            if low_conf:
+                reason_parts.append("low_parse_confidence")
+            failures.append(
+                {
+                    "segment_id": segment.segment_id,
+                    "original_text": segment.original_text,
+                    "normalized_text": segment.normalized_text,
+                    "reason": ",".join(reason_parts),
+                    "parse_confidence": round(float(segment.parse_confidence), 4),
+                }
+            )
+        return failures
+
     def to_dict(self) -> Dict[str, Any]:
+        parse_failures = self.canonical_parse_failures
         return {
             "claim_original": self.claim_original,
             "segments": [segment.to_dict() for segment in self.segments],
             "canonical_accept_rate": round(float(self.canonical_accept_rate), 4),
             "canonical_rejections": self.canonical_rejections,
+            "canonical_parse_failures": parse_failures,
+            "canonical_parse_failed": bool(parse_failures),
+            "canonical_failure_reason": "; ".join(str(f.get("reason") or "") for f in parse_failures[:3]),
         }
 
 
@@ -196,6 +227,9 @@ class ClaimCanonicalizer:
             predicate = _clean_text(predicate_match.group(0))
             subject = _clean_text(text[: predicate_match.start()])
             obj = _clean_text(text[predicate_match.end() :])
+        if subject:
+            subject = re.sub(r"\b(?:never|not|no|none|without)\b\s*$", "", subject, flags=re.IGNORECASE).strip()
+            subject = re.sub(r"\b(?:has|have|had|is|are|was|were)\b\s*$", "", subject, flags=re.IGNORECASE).strip()
         if not subject:
             tokens = re.findall(r"\b[a-zA-Z][a-zA-Z\-]{2,}\b", text)
             subject = _clean_text(" ".join(tokens[:4])) if tokens else ""
@@ -453,6 +487,10 @@ class ClaimCanonicalizer:
 
             if self.drift_guard_enabled:
                 parsed = self._drift_guard(parsed)
+            if (not parsed.predicate or not parsed.object) and parsed.canonical_accepted:
+                parsed.canonical_accepted = False
+                parsed.canonical_rejected_reason = parsed.canonical_rejected_reason or "canonical_parse_incomplete"
+                parsed.parse_confidence = max(0.05, min(0.99, float(parsed.parse_confidence or 0.0) * 0.80))
             parsed_segments.append(parsed)
 
         return CanonicalClaim(claim_original=claim_text, segments=parsed_segments)
@@ -486,6 +524,7 @@ class ClaimCanonicalizer:
         """
         queries_original: List[str] = []
         queries_canonical: List[str] = []
+        query_facets: List[Dict[str, str]] = []
 
         for segment in canonical_claim.segments:
             original = _clean_text(segment.original_text)
@@ -506,6 +545,7 @@ class ClaimCanonicalizer:
                         original,
                         f"{original} evidence",
                         f"{original} systematic review",
+                        f"{original} guideline statement",
                     ]
                 )
                 if triple:
@@ -528,16 +568,30 @@ class ClaimCanonicalizer:
                     [
                         canonical,
                         f"{canonical} clinical evidence",
+                        f"{canonical} authoritative guideline",
                     ]
                 )
                 if triple:
                     canonical_refute.append(f"evidence against {triple}")
                 else:
                     canonical_refute.append(f"evidence against {canonical}")
+            authority_queries = []
+            anchor_query = canonical or original
+            if anchor_query:
+                authority_queries.extend(
+                    [
+                        f"{anchor_query} site:who.int OR site:cdc.gov",
+                        f"{anchor_query} site:nih.gov OR site:pubmed.ncbi.nlm.nih.gov",
+                    ]
+                )
 
-            per_segment = (original_support[:3] + original_refute[:2] + canonical_support[:2] + canonical_refute[:1])[
-                : max(1, int(max_per_segment))
-            ]
+            per_segment = (
+                original_support[:3]
+                + original_refute[:2]
+                + canonical_support[:2]
+                + canonical_refute[:1]
+                + authority_queries[:1]
+            )[: max(1, int(max_per_segment))]
             for query in per_segment:
                 q = _clean_text(query)
                 if not q:
@@ -545,9 +599,31 @@ class ClaimCanonicalizer:
                 if query in original_support or query in original_refute:
                     if q not in queries_original:
                         queries_original.append(q)
+                    facet = "support" if query in original_support else "refute"
+                    query_facets.append(
+                        {
+                            "query": q,
+                            "track": "original",
+                            "facet": facet,
+                            "segment_id": segment.segment_id,
+                        }
+                    )
                 else:
                     if q not in queries_canonical:
                         queries_canonical.append(q)
+                    facet = "support"
+                    if query in canonical_refute:
+                        facet = "refute"
+                    elif query in authority_queries:
+                        facet = "authoritative"
+                    query_facets.append(
+                        {
+                            "query": q,
+                            "track": "canonical",
+                            "facet": facet,
+                            "segment_id": segment.segment_id,
+                        }
+                    )
 
         merged: List[str] = []
         for query in queries_original + queries_canonical:
@@ -557,4 +633,5 @@ class ClaimCanonicalizer:
             "queries_original": queries_original,
             "queries_canonical": queries_canonical,
             "queries_merged": merged,
+            "query_facets": query_facets,
         }

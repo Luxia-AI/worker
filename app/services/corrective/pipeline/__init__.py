@@ -644,6 +644,15 @@ class CorrectivePipeline:
         }
         canonical_claim_obj = await self.claim_canonicalizer.canonicalize_claim(post_text)
         canonical_claim_payload = canonical_claim_obj.to_dict()
+        canonical_parse_failed = bool(canonical_claim_payload.get("canonical_parse_failed", False))
+        if canonical_parse_failed:
+            logger.warning(
+                "[CorrectivePipeline:%s] Canonical parsing incomplete; guarded fallback to original-track retrieval. "
+                "reason=%s",
+                round_id,
+                str(canonical_claim_payload.get("canonical_failure_reason") or ""),
+            )
+            canonical_claim_payload["canonical_guarded_fallback"] = True
         trace("CLAIM_CANONICALIZATION", canonical_claim_payload)
         canonical_original_segments, canonical_normalized_segments = self.claim_canonicalizer.split_query_tracks(
             canonical_claim_obj
@@ -1147,6 +1156,7 @@ class CorrectivePipeline:
         # Keep planner deterministic and bounded: original track remains primary.
         template_original = dual_track_templates.get("queries_original", []) if dual_track_query_enabled else []
         template_canonical = dual_track_templates.get("queries_canonical", []) if dual_track_query_enabled else []
+        query_facets = dual_track_templates.get("query_facets", []) if dual_track_query_enabled else []
         queries = dedupe_list(
             (queries_original[:5] if queries_original else [])
             + (template_original[:2] if isinstance(template_original, list) else [])
@@ -1155,6 +1165,7 @@ class CorrectivePipeline:
         )[:8]
         canonical_claim_payload["queries_original"] = list(queries_original)
         canonical_claim_payload["queries_canonical"] = list(queries_canonical)
+        canonical_claim_payload["query_facets"] = query_facets
         await debug_reporter.log_step(
             step_name="Google search queries generated",
             description="Query generation before web search execution",
@@ -1166,6 +1177,7 @@ class CorrectivePipeline:
                 "queries_canonical": queries_canonical,
                 "query_templates_original": dual_track_templates.get("queries_original", []),
                 "query_templates_canonical": dual_track_templates.get("queries_canonical", []),
+                "query_facets": query_facets,
             },
         )
 
@@ -1748,6 +1760,29 @@ class CorrectivePipeline:
         trust_snapshot_v2 = self.trust_ranker.compute_uncertainty_snapshot(final_top_ranked_evidence, internal_top_k)
         trust_snapshot_v2["sufficiency_reason"] = str(final_adaptive_trust.get("gate_reason") or "")
         trust_snapshot_v2["info_gain"] = round(float(gain_estimate or 0.0), 4)
+        zero_yield_penalty = min(0.50, (0.08 * float(zero_extraction_rounds)) + (0.04 * float(low_yield_rounds)))
+        if zero_yield_penalty > 0.0:
+            final_adaptive_trust = dict(final_adaptive_trust)
+            final_adaptive_trust["trust_post"] = max(
+                0.0,
+                float(final_adaptive_trust.get("trust_post", 0.0) or 0.0) * (1.0 - zero_yield_penalty),
+            )
+            final_adaptive_trust["coverage"] = max(
+                0.0,
+                float(final_adaptive_trust.get("coverage", 0.0) or 0.0) * (1.0 - (0.70 * zero_yield_penalty)),
+            )
+            final_adaptive_trust["is_sufficient"] = bool(
+                final_adaptive_trust.get("is_sufficient", False) and zero_yield_penalty < 0.12
+            )
+            final_adaptive_trust["zero_yield_penalty"] = round(float(zero_yield_penalty), 4)
+            gate_reason = str(final_adaptive_trust.get("gate_reason") or "").strip()
+            suffix = "zero_yield_penalty"
+            final_adaptive_trust["gate_reason"] = f"{gate_reason}|{suffix}" if gate_reason else suffix
+            logger.info(
+                "[CorrectivePipeline:%s] Applied zero-yield penalty to sufficiency/trust (penalty=%.3f)",
+                round_id,
+                zero_yield_penalty,
+            )
         final_trust_score = final_trust_post["trust_post"]
         adaptive_payload = self._trust_payload_adaptive(final_adaptive_trust)
         fixed_payload = self._trust_payload_fixed(final_trust_score, self.CONF_THRESHOLD)
@@ -1761,6 +1796,7 @@ class CorrectivePipeline:
             evidence_snapshot_id=final_snapshot_id,
             canonical_claim=canonical_claim_payload,
         )
+        verdict_result["zero_yield_penalty"] = round(float(zero_yield_penalty), 4)
         # Final trust harmonization:
         # force the verdict payload to respect the final adaptive trust gate used by pipeline output.
         verdict_with_trust = dict(verdict_result or {})
@@ -1878,6 +1914,7 @@ class CorrectivePipeline:
             "queries_original": queries_original,
             "queries_canonical": queries_canonical,
             "queries_planned": queries,
+            "query_facets": canonical_claim_payload.get("query_facets", []),
             "queries_total": len(queries),
             "queries_used": len(queries_executed),
             "semantic_candidates_count": len(dedup_sem),
@@ -1951,6 +1988,8 @@ class CorrectivePipeline:
                 "gain_estimate": round(float(gain_estimate or 0.0), 4),
                 "kg_timeout_count": int(kg_timeout_count),
                 "zero_extraction_rounds": int(zero_extraction_rounds),
+                "low_yield_rounds": int(low_yield_rounds),
+                "zero_yield_penalty": round(float(zero_yield_penalty), 4),
                 "elapsed_seconds": round(float(elapsed_total), 3),
                 "runtime_budget_seconds": round(float(max_runtime_seconds), 3),
                 "kg_zero_signal": bool(debug_counts.get("kg_zero_signal", False)),

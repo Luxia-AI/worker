@@ -127,6 +127,8 @@ def _build_debug_block(
     support_count = 0
     refute_count = 0
     neutral_count = 0
+    refute_gate_passed_count = 0
+    refute_gate_block_reasons: dict[str, int] = {}
     for row in evidence_map:
         if not isinstance(row, dict):
             continue
@@ -137,6 +139,11 @@ def _build_debug_block(
             refute_count += 1
         else:
             neutral_count += 1
+        if bool(row.get("refute_gate_passed", False)):
+            refute_gate_passed_count += 1
+        block_reason = str(row.get("refute_gate_block_reason") or "").strip()
+        if block_reason:
+            refute_gate_block_reasons[block_reason] = refute_gate_block_reasons.get(block_reason, 0) + 1
 
     alignment_values: list[float] = []
     for seg in claim_breakdown:
@@ -183,6 +190,20 @@ def _build_debug_block(
                 "stance": str(r.get("stance") or "neutral"),
             }
         )
+    evidence_refute_gates = []
+    for row in evidence_map[:10]:
+        if not isinstance(row, dict):
+            continue
+        evidence_refute_gates.append(
+            {
+                "evidence_id": row.get("evidence_id"),
+                "relevance": str(row.get("relevance") or "NEUTRAL"),
+                "refute_eligibility_score": float(row.get("refute_eligibility_score", 0.0) or 0.0),
+                "refute_threshold": float(row.get("refute_threshold", 0.0) or 0.0),
+                "refute_gate_passed": bool(row.get("refute_gate_passed", False)),
+                "refute_gate_block_reason": str(row.get("refute_gate_block_reason") or ""),
+            }
+        )
 
     canonical_claim = result.get("canonical_claim", {})
     if not isinstance(canonical_claim, dict):
@@ -204,6 +225,8 @@ def _build_debug_block(
         "claim_canonical_segments": canonical_segments,
         "canonical_accept_rate": round(float(canonical_claim.get("canonical_accept_rate", 0.0) or 0.0), 4),
         "canonical_rejections": canonical_rejections,
+        "canonical_parse_failed": bool(canonical_claim.get("canonical_parse_failed", False)),
+        "canonical_failure_reason": str(canonical_claim.get("canonical_failure_reason") or ""),
         "claim_entities": result.get("claim_entities", []),
         "claim_predicate": (
             (result.get("predicate_target") or {}).get("predicate")
@@ -213,6 +236,7 @@ def _build_debug_block(
         "queries_original": result.get("queries_original", []),
         "queries_canonical": result.get("queries_canonical", []),
         "generated_queries": result.get("queries_planned", result.get("queries", [])),
+        "query_facets": result.get("query_facets", []),
         "vector_hits": int(result.get("semantic_candidates_count", 0) or 0),
         "vector_hits_original": int(result.get("semantic_candidates_count_original", 0) or 0),
         "vector_hits_canonical": int(result.get("semantic_candidates_count_canonical", 0) or 0),
@@ -269,7 +293,12 @@ def _build_debug_block(
         "policy_trace": policy_path,
         "verdict_binary": str(verdict_result.get("verdict_binary") or ""),
         "verdict_internal": str(verdict_result.get("verdict_internal") or verdict_result.get("verdict") or ""),
+        "binary_collapse_reason": str(verdict_result.get("binary_collapse_reason") or ""),
         "abstain_reason": str(verdict_result.get("abstain_reason") or ""),
+        "shadow_comparison": verdict_result.get("shadow_comparison", {}),
+        "refute_gate_passed_count": int(refute_gate_passed_count),
+        "refute_gate_block_reasons": refute_gate_block_reasons,
+        "evidence_refute_gates": evidence_refute_gates,
         "trust_gate": {
             "threshold_met": bool(
                 result.get(
@@ -342,13 +371,20 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "BINARY_EXTERNAL_VERDICT_ENABLED",
         _env_flag("VERDICT_POLICY_V3_ENABLED", True),
     )
-    verdict_internal = str(verdict_result.get("verdict", "UNVERIFIABLE") or "UNVERIFIABLE")
+    verdict_internal = str(
+        verdict_result.get("verdict_internal") or verdict_result.get("verdict") or "UNVERIFIABLE"
+    ).upper()
+    if verdict_internal == "PARTIALLY_TRUE":
+        verdict_internal = "UNVERIFIABLE"
+    if verdict_internal not in {"TRUE", "FALSE", "UNVERIFIABLE"}:
+        verdict_internal = "UNVERIFIABLE"
     verdict_binary = str(verdict_result.get("verdict_binary") or "").upper()
-    if verdict_binary not in {"TRUE", "FALSE"}:
-        truthfulness_hint = float(verdict_result.get("truth_score_binary", 0.5) or 0.5)
-        verdict_binary = "TRUE" if truthfulness_hint >= 0.5 else "FALSE"
+    if verdict_internal == "UNVERIFIABLE":
+        verdict_binary = "FALSE"
+    elif verdict_binary not in {"TRUE", "FALSE"}:
+        verdict_binary = verdict_internal
     response_verdict = verdict_binary if binary_first else verdict_internal
-    display_verdict = response_verdict if binary_first else verdict_result.get("display_verdict", verdict_internal)
+    display_verdict = response_verdict
     debug_block_enabled = _env_flag("VERDICT_DEBUG_BLOCK_ENABLED", True)
     debug_block = _build_debug_block(result, verdict_result, final_evidence) if debug_block_enabled else {}
 
@@ -364,8 +400,10 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "verdict": response_verdict,
         "verdict_binary": verdict_binary,
         "verdict_internal": verdict_internal,
+        "binary_collapse_reason": ("abstain_to_false_policy" if verdict_internal == "UNVERIFIABLE" else ""),
         "abstain_reason": verdict_result.get("abstain_reason", ""),
         "display_verdict": display_verdict,
+        "verdict_field_invariant_passed": bool(verdict_result.get("verdict_field_invariant_passed", True)),
         "verdict_band": verdict_result.get("verdict_band"),
         "confidence": verdict_result.get("confidence", 0.0),
         "verdict_confidence": verdict_result.get("confidence", 0.0),
@@ -416,6 +454,7 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "neutral_mass": verdict_result.get("neutral_mass"),
         "sufficiency_score": verdict_result.get("sufficiency_score", verdict_result.get("evidence_sufficiency")),
         "policy_trace": verdict_result.get("policy_trace", []),
+        "shadow_comparison": verdict_result.get("shadow_comparison", {}),
         "degraded_mode": bool(llm_meta.get("degraded_mode", False)),
         "llm": llm_meta,
         "evidence": [
