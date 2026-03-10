@@ -5246,9 +5246,14 @@ class VerdictGenerator:
                 relevance = "REFUTES"
                 relevance_score = max(relevance_score, refute_score, contradiction_score, nli_contradict_prob, 0.62)
                 refute_eligible = True
-            elif relevance == "REFUTES" and not refute_eligible:
-                relevance = "NEUTRAL"
-                relevance_score *= 0.55
+            elif relevance == "REFUTES":
+                # Preserve contradiction candidates for deterministic refute admission.
+                # The final admission layer decides whether this directional signal is
+                # admitted to contradiction mass with explicit block reasons.
+                relevance = "REFUTES"
+                relevance_score = max(relevance_score, refute_score, contradiction_score, nli_contradict_prob, 0.45)
+                if not refute_gate_block_reason:
+                    refute_gate_block_reason = "refute_candidate_requires_admission_review"
             normalized.append(
                 {
                     "evidence_id": ev_idx if ev_idx >= 0 else len(normalized),
@@ -7920,11 +7925,29 @@ class VerdictGenerator:
         support_admitted_count = 0
         refute_labeled_count = 0
         refute_admitted_count = 0
+        refute_gate_passed_count = 0
         neutral_labeled_count = 0
         neutral_topical_count = 0
         directional_blocked_count = 0
         directional_sources: set[str] = set()
         directional_block_reasons: List[str] = []
+        claim_has_absolute_quantifier = self._has_absolute_quantifier(claim)
+
+        # Refute admission thresholds are explicit and centralized here to avoid
+        # hidden/stacked gate behavior across the evidence loop.
+        refute_cfg = {
+            "fatal_scope_floor": 0.12,
+            "fatal_subject_floor": 0.05,
+            "fatal_object_floor": 0.05,
+            "fatal_alignment_floor": 0.08,
+            "predicate_min": 0.10,
+            "object_min": 0.08,
+            "alignment_min": 0.14,
+            "contradiction_min": 0.38,
+            "subject_or_object_min": 0.16,
+            "admission_threshold": 0.46,
+            "admission_threshold_absolute": 0.42,
+        }
 
         for idx, item in enumerate(evidence_map or []):
             if not isinstance(item, dict):
@@ -8025,6 +8048,11 @@ class VerdictGenerator:
                     float(item.get("population_consistency_score", item.get("scope_alignment", 1.0)) or 0.0),
                 ),
             )
+            polarity_match_score = polarity_compatibility_score
+            quantifier_match_score = quantifier_consistency_score
+            comparator_match_score = comparator_consistency_score
+            timeframe_match_score = timeframe_consistency_score
+            population_match_score = population_consistency_score
             source_quality_score = max(
                 0.0,
                 min(1.0, float(item.get("source_quality_score", item.get("credibility", 0.5)) or 0.0)),
@@ -8045,6 +8073,7 @@ class VerdictGenerator:
                     (0.32 * subject_match + 0.28 * predicate_match + 0.20 * object_match + 0.20 * alignment_score),
                 ),
             )
+            semantic_alignment_score = overall_alignment_score
             quality = max(
                 0.0,
                 min(
@@ -8074,6 +8103,10 @@ class VerdictGenerator:
                 0.0,
                 min(1.0, max(support_score, float(item.get("nli_entail_prob", 0.0) or 0.0))),
             )
+            polarity_opposition_score = max(
+                0.0,
+                min(1.0, max(1.0 - polarity_match_score, contradiction_signal)),
+            )
             base_weight = max(rel_score, 0.10) * (0.55 + (0.45 * source_quality_score))
             stance_before = rel
             if stance_before not in {"SUPPORTS", "REFUTES"}:
@@ -8088,13 +8121,15 @@ class VerdictGenerator:
             admission_block_reason = ""
             admitted_to_support = False
             admitted_to_refute = False
+            refute_admission_score = 0.0
+            refute_block_reason = ""
 
             fatal_mismatch_reason = ""
-            if timeframe_consistency_score < 0.20:
+            if timeframe_consistency_score < refute_cfg["fatal_scope_floor"]:
                 fatal_mismatch_reason = "timeframe_mismatch"
-            elif population_consistency_score < 0.20:
+            elif population_consistency_score < refute_cfg["fatal_scope_floor"]:
                 fatal_mismatch_reason = "population_mismatch"
-            elif comparator_consistency_score < 0.20:
+            elif comparator_consistency_score < refute_cfg["fatal_scope_floor"]:
                 fatal_mismatch_reason = "comparator_mismatch"
 
             if stance_before == "SUPPORTS":
@@ -8180,32 +8215,129 @@ class VerdictGenerator:
             elif stance_before == "REFUTES":
                 refute_labeled_count += 1
                 refute_signal = max(contradiction_signal, refute_score)
-                refute_semantic_min = bool(
-                    predicate_match >= 0.12 and object_match >= 0.12 and overall_alignment_score >= 0.20
+                if refute_gate_passed:
+                    refute_gate_passed_count += 1
+
+                refute_admission_score = max(
+                    0.0,
+                    min(
+                        1.0,
+                        (
+                            0.30 * refute_signal
+                            + 0.12 * predicate_match
+                            + 0.12 * object_match
+                            + 0.10 * subject_match
+                            + 0.10 * semantic_alignment_score
+                            + 0.08 * polarity_opposition_score
+                            + 0.06 * source_quality_score
+                            + 0.04 * quantifier_match_score
+                            + 0.04 * comparator_match_score
+                            + 0.02 * timeframe_match_score
+                            + 0.02 * population_match_score
+                        ),
+                    ),
+                )
+
+                refute_admission_threshold = (
+                    refute_cfg["admission_threshold_absolute"]
+                    if claim_has_absolute_quantifier
+                    else refute_cfg["admission_threshold"]
+                )
+                has_subject_signal = "subject_match_score" in item
+                has_object_signal = ("object_match_score" in item) or ("object_match_ok" in item)
+                has_predicate_signal = "predicate_match_score" in item
+                has_alignment_signal = (
+                    ("anchor_match_score" in item) or ("alignment_score" in item) or ("overall_alignment_score" in item)
+                )
+
+                predicate_guard = predicate_match >= refute_cfg["predicate_min"] or (
+                    refute_gate_passed and not has_predicate_signal
+                )
+                object_floor = refute_cfg["object_min"]
+                if claim_has_absolute_quantifier and contradiction_signal >= 0.55:
+                    object_floor = min(object_floor, 0.05)
+                object_guard = object_match >= object_floor or (refute_gate_passed and not has_object_signal)
+                subject_or_object_guard = max(subject_match, object_match) >= refute_cfg["subject_or_object_min"] or (
+                    refute_gate_passed and not (has_subject_signal or has_object_signal)
+                )
+                alignment_guard = semantic_alignment_score >= refute_cfg["alignment_min"] or (
+                    refute_gate_passed and not has_alignment_signal
+                )
+                contradiction_guard = (
+                    contradiction_signal >= refute_cfg["contradiction_min"]
+                    or refute_signal >= refute_cfg["contradiction_min"]
+                    or polarity_opposition_score >= 0.65
+                )
+                hard_subject_object_mismatch = bool(
+                    has_subject_signal
+                    and has_object_signal
+                    and subject_match < refute_cfg["fatal_subject_floor"]
+                    and object_match < refute_cfg["fatal_object_floor"]
+                    and (semantic_alignment_score < refute_cfg["fatal_alignment_floor"] or not has_alignment_signal)
                 )
                 fallback_refute_guard = bool(
-                    refute_signal >= 0.55
-                    and predicate_match >= 0.15
-                    and object_match >= 0.15
-                    and overall_alignment_score >= 0.25
+                    contradiction_signal >= 0.55
+                    and predicate_match >= refute_cfg["predicate_min"]
+                    and semantic_alignment_score >= refute_cfg["alignment_min"]
+                    and object_match >= max(0.05, object_floor)
+                    and max(subject_match, object_match) >= 0.12
                 )
-                high_confidence_refute_override = bool(
-                    refute_gate_passed
-                    and refute_eligibility_score >= max(refute_threshold + 0.10, 0.70)
-                    and refute_signal >= 0.70
-                )
+
                 if fatal_mismatch_reason:
                     admission_block_reason = fatal_mismatch_reason
+                    refute_block_reason = admission_block_reason
+                    directional_blocked_count += 1
+                    directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)
+                    directional_block_reasons.append(admission_block_reason)
+                elif hard_subject_object_mismatch:
+                    admission_block_reason = "subject_object_mismatch"
+                    refute_block_reason = admission_block_reason
+                    directional_blocked_count += 1
+                    directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)
+                    directional_block_reasons.append(admission_block_reason)
+                elif not contradiction_guard:
+                    admission_block_reason = "low_contradiction_score"
+                    refute_block_reason = admission_block_reason
+                    directional_blocked_count += 1
+                    directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)
+                    directional_block_reasons.append(admission_block_reason)
+                elif not predicate_guard:
+                    admission_block_reason = "low_predicate_match"
+                    refute_block_reason = admission_block_reason
+                    directional_blocked_count += 1
+                    directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)
+                    directional_block_reasons.append(admission_block_reason)
+                elif not subject_or_object_guard:
+                    admission_block_reason = "low_subject_object_alignment"
+                    refute_block_reason = admission_block_reason
+                    directional_blocked_count += 1
+                    directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)
+                    directional_block_reasons.append(admission_block_reason)
+                elif not object_guard and not fallback_refute_guard:
+                    admission_block_reason = "low_object_semantic_match"
+                    refute_block_reason = admission_block_reason
+                    directional_blocked_count += 1
+                    directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)
+                    directional_block_reasons.append(admission_block_reason)
+                elif not alignment_guard and not fallback_refute_guard:
+                    admission_block_reason = "low_alignment_score"
+                    refute_block_reason = admission_block_reason
                     directional_blocked_count += 1
                     directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)
                     directional_block_reasons.append(admission_block_reason)
                 elif (
-                    refute_gate_passed and (refute_semantic_min or high_confidence_refute_override)
+                    (refute_admission_score >= refute_admission_threshold)
+                    and (
+                        refute_gate_passed
+                        or refute_eligibility_score >= refute_threshold
+                        or fallback_refute_guard
+                        or contradiction_signal >= 0.50
+                    )
                 ) or fallback_refute_guard:
                     if fallback_refute_guard and not refute_gate_passed:
                         item["refute_gate_block_reason"] = "gate_relaxed_by_directional_signal"
-                    elif high_confidence_refute_override and not refute_semantic_min:
-                        item["refute_gate_block_reason"] = "gate_relaxed_by_high_confidence_refute"
+                    elif refute_admission_score >= refute_admission_threshold and not refute_gate_passed:
+                        item["refute_gate_block_reason"] = "gate_relaxed_by_refute_admission_score"
                     contribution = max(base_weight, refute_signal, overall_alignment_score)
                     contradict_mass += contribution
                     directional_count += 1
@@ -8213,6 +8345,7 @@ class VerdictGenerator:
                     admitted_credibility_sum += source_quality_score
                     admission_passed = True
                     admitted_to_refute = True
+                    refute_block_reason = ""
                     src = str(item.get("source_url") or "").strip()
                     if src:
                         try:
@@ -8228,18 +8361,25 @@ class VerdictGenerator:
                     if not admission_block_reason:
                         if refute_eligibility_score < refute_threshold:
                             admission_block_reason = "low_refute_eligibility_score"
-                        elif predicate_match < 0.15:
+                        elif refute_admission_score < refute_admission_threshold:
+                            admission_block_reason = "low_refute_admission_score"
+                        elif predicate_match < refute_cfg["predicate_min"]:
                             admission_block_reason = "low_predicate_match"
-                        elif object_match < 0.15:
+                        elif object_match < refute_cfg["object_min"]:
                             admission_block_reason = "low_object_semantic_match"
-                        elif contradiction_signal < 0.45:
-                            admission_block_reason = "insufficient_contradiction_signal"
-                        elif polarity_compatibility_score < 0.20:
-                            admission_block_reason = "polarity_incompatibility"
-                        elif quantifier_consistency_score < 0.20:
+                        elif contradiction_signal < refute_cfg["contradiction_min"]:
+                            admission_block_reason = "low_contradiction_score"
+                        elif quantifier_match_score < refute_cfg["fatal_scope_floor"]:
                             admission_block_reason = "quantifier_inconsistency"
+                        elif comparator_match_score < refute_cfg["fatal_scope_floor"]:
+                            admission_block_reason = "comparator_inconsistency"
+                        elif timeframe_match_score < refute_cfg["fatal_scope_floor"]:
+                            admission_block_reason = "timeframe_mismatch"
+                        elif population_match_score < refute_cfg["fatal_scope_floor"]:
+                            admission_block_reason = "population_mismatch"
                         else:
                             admission_block_reason = "refute_gate_failed"
+                    refute_block_reason = admission_block_reason
                     directional_blocked_count += 1
                     directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)
                     directional_block_reasons.append(admission_block_reason)
@@ -8268,6 +8408,11 @@ class VerdictGenerator:
             item["stance_label_before_admission"] = stance_before
             item["admission_passed"] = bool(admission_passed)
             item["admission_block_reason"] = str(admission_block_reason)
+            item["refute_block_reason"] = (
+                ""
+                if admitted_to_refute
+                else str(refute_block_reason or item.get("refute_gate_block_reason") or admission_block_reason)
+            )
             item["admitted_to_support_mass"] = bool(admitted_to_support)
             item["admitted_to_contradict_mass"] = bool(admitted_to_refute)
             item["final_stance"] = (
@@ -8284,6 +8429,13 @@ class VerdictGenerator:
             item["subject_match_score"] = round(float(subject_match), 4)
             item["predicate_match_score"] = round(float(predicate_match), 4)
             item["object_match_score"] = round(float(object_match), 4)
+            item["polarity_match_score"] = round(float(polarity_match_score), 4)
+            item["quantifier_match_score"] = round(float(quantifier_match_score), 4)
+            item["comparator_match_score"] = round(float(comparator_match_score), 4)
+            item["timeframe_match_score"] = round(float(timeframe_match_score), 4)
+            item["population_match_score"] = round(float(population_match_score), 4)
+            item["semantic_alignment_score"] = round(float(semantic_alignment_score), 4)
+            item["refute_admission_score"] = round(float(refute_admission_score), 4)
             item["polarity_compatibility_score"] = round(float(polarity_compatibility_score), 4)
             item["quantifier_consistency_score"] = round(float(quantifier_consistency_score), 4)
             item["comparator_consistency_score"] = round(float(comparator_consistency_score), 4)
@@ -8338,6 +8490,7 @@ class VerdictGenerator:
             "support_admitted_count": int(support_admitted_count),
             "refute_labeled_count": int(refute_labeled_count),
             "refute_admitted_count": int(refute_admitted_count),
+            "refute_gate_passed_count": int(refute_gate_passed_count),
             "neutral_labeled_count": int(neutral_labeled_count),
             "neutral_topical_count": int(neutral_topical_count),
             "neutral_topical_mass": round(float(neutral_topical_mass), 4),
