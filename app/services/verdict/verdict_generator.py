@@ -7708,102 +7708,141 @@ class VerdictGenerator:
         c = max(0.0, float(contradict_mass or 0.0))
         n = max(0.0, float(neutral_mass or 0.0))
         suff = max(0.0, min(1.0, float(sufficiency_score or 0.0)))
+        directional_total = s + c
+        directional_delta = float(s - c)
+        directional_margin = abs(directional_delta) / max(1e-6, directional_total)
+        directional_count = int(payload.get("directional_admitted_count", 0) or 0)
+        directional_diversity = max(0.0, min(1.0, float(payload.get("directional_source_diversity", 0.0) or 0.0)))
+
         support_floor = max(0.05, float(os.getenv("VERDICT_DIRECTIONAL_MASS_FLOOR", "0.20")))
         suff_floor = max(0.20, float(os.getenv("VERDICT_SUFFICIENCY_FLOOR", "0.45")))
-        direction_margin = max(0.01, float(os.getenv("VERDICT_DIRECTION_MARGIN", "0.03")))
-
-        denom = s + c + n + 1e-6
-        direction_gap = abs(s - c) / denom
-        directional_delta = float(s - c)
-        try:
-            truth_score = float(1.0 / (1.0 + math.exp(-4.0 * directional_delta)))
-        except OverflowError:
-            truth_score = 1.0 if directional_delta > 0 else 0.0
+        direction_floor = max(0.02, float(os.getenv("VERDICT_DIRECTION_MARGIN", "0.08")))
+        conflict_floor = max(0.05, float(os.getenv("VERDICT_DIRECTION_CONFLICT_FLOOR", "0.12")))
 
         has_support = s >= support_floor
         has_contradict = c >= support_floor
-        if not has_support and not has_contradict:
+        has_directional_mass = bool(directional_total > 1e-9)
+        has_directional_items = bool(directional_count > 0)
+        conflict_ratio = min(s, c) / max(1e-6, max(s, c)) if (has_support and has_contradict) else 0.0
+        pre_quality = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    payload.get(
+                        "admitted_quality_avg",
+                        payload.get("evidence_quality_avg", payload.get("alignment_fused", 0.0)),
+                    )
+                    or 0.0
+                ),
+            ),
+        )
+        decisive_directional_unlock = bool(
+            has_directional_mass
+            and has_directional_items
+            and max(s, c) >= 0.65
+            and directional_margin >= 0.70
+            and pre_quality >= 0.55
+        )
+
+        if not has_directional_mass or not has_directional_items:
             verdict_internal = Verdict.UNVERIFIABLE.value
             abstain_reason = "no_directional_evidence"
-        elif suff < suff_floor:
+        elif suff < suff_floor and not decisive_directional_unlock:
             verdict_internal = Verdict.UNVERIFIABLE.value
-            abstain_reason = "insufficient_evidence"
-        elif direction_gap < 0.18:
+            abstain_reason = "directional_sufficiency_below_threshold"
+        elif has_support and has_contradict and directional_margin < conflict_floor:
             verdict_internal = Verdict.UNVERIFIABLE.value
-            abstain_reason = "low_direction_gap"
-        elif c > s + direction_margin:
-            verdict_internal = Verdict.FALSE.value
-            abstain_reason = ""
-        elif s > c + direction_margin:
+            abstain_reason = "conflicting_directional_evidence"
+        elif directional_delta >= direction_floor and has_support:
             verdict_internal = Verdict.TRUE.value
+            abstain_reason = ""
+        elif (-directional_delta) >= direction_floor and has_contradict:
+            verdict_internal = Verdict.FALSE.value
             abstain_reason = ""
         else:
             verdict_internal = Verdict.UNVERIFIABLE.value
-            abstain_reason = "ambiguous_directional_evidence"
+            abstain_reason = "insufficient_directional_margin"
 
-        verdict_binary = (
-            Verdict.FALSE.value if verdict_internal == Verdict.UNVERIFIABLE.value else str(verdict_internal)
+        # Binary projection is additive only and must not mutate internal semantics.
+        verdict_binary = str(verdict_internal) if verdict_internal in {Verdict.TRUE.value, Verdict.FALSE.value} else ""
+        binary_collapse_reason = str(payload.get("binary_collapse_reason") or "")
+        binary_projection_reason = (
+            "internal_identity_projection" if verdict_binary in {Verdict.TRUE.value, Verdict.FALSE.value} else ""
         )
-        binary_collapse_reason = "abstain_to_false_policy" if verdict_internal == Verdict.UNVERIFIABLE.value else ""
 
         evidence_map = payload.get("evidence_map", []) if isinstance(payload.get("evidence_map"), list) else []
         evidence_count = max(1, int(payload.get("evidence_count", len(evidence_map)) or len(evidence_map) or 1))
         avg_credibility = (
-            sum(float(ev.get("credibility", 0.5) or 0.5) for ev in evidence_map) / len(evidence_map)
+            sum(float(ev.get("source_quality_score", ev.get("credibility", 0.5)) or 0.5) for ev in evidence_map)
+            / len(evidence_map)
             if evidence_map
             else 0.5
         )
         align_fused = max(
-            0.0, min(1.0, float(payload.get("alignment_fused", payload.get("alignment_orig", 0.0)) or 0.0))
+            0.0,
+            min(
+                1.0,
+                float(
+                    payload.get(
+                        "alignment_fused",
+                        payload.get("alignment_orig", payload.get("alignment_score", 0.0)),
+                    )
+                    or 0.0
+                ),
+            ),
         )
         evidence_quality = max(
             0.0,
             min(
                 1.0,
-                (0.40 * min(1.0, evidence_count / 8.0)) + (0.35 * float(avg_credibility)) + (0.25 * align_fused),
+                (0.35 * min(1.0, evidence_count / 8.0)) + (0.35 * float(avg_credibility)) + (0.30 * align_fused),
             ),
         )
 
-        confidence_raw = (0.45 * suff) + (0.35 * direction_gap) + (0.20 * evidence_quality)
+        directional_strength = min(1.0, directional_margin)
+        confidence_raw = (
+            (0.36 * suff) + (0.30 * directional_strength) + (0.19 * evidence_quality) + (0.15 * directional_diversity)
+        )
+        confidence_raw *= max(0.55, 1.0 - (0.30 * conflict_ratio))
         if verdict_internal == Verdict.UNVERIFIABLE.value:
             confidence_raw = min(confidence_raw, 0.55)
-        if not has_support and not has_contradict:
-            confidence_raw *= 0.75
+        if not has_directional_mass:
+            confidence_raw = min(confidence_raw, 0.40)
         confidence = max(0.05, min(0.95, confidence_raw))
 
+        try:
+            truth_score = float(1.0 / (1.0 + math.exp(-4.0 * directional_delta)))
+        except OverflowError:
+            truth_score = 1.0 if directional_delta > 0 else 0.0
         if verdict_internal == Verdict.TRUE.value:
-            class_probs = {
-                "true": max(0.55, min(0.90, 0.50 + (0.40 * confidence))),
-                "false": max(0.05, min(0.25, 0.25 * (1.0 - direction_gap))),
-                "unverifiable": max(0.05, min(0.30, 1.0 - suff)),
-            }
+            truth_percent = 55.0 + min(43.0, (43.0 * directional_strength * max(0.45, suff)))
         elif verdict_internal == Verdict.FALSE.value:
-            class_probs = {
-                "true": max(0.05, min(0.25, 0.25 * (1.0 - direction_gap))),
-                "false": max(0.55, min(0.90, 0.50 + (0.40 * confidence))),
-                "unverifiable": max(0.05, min(0.30, 1.0 - suff)),
-            }
+            truth_percent = 45.0 - min(43.0, (43.0 * directional_strength * max(0.45, suff)))
         else:
-            class_probs = {
-                "true": max(0.05, min(0.40, truth_score * 0.45)),
-                "false": max(0.20, min(0.65, 0.45 + ((1.0 - truth_score) * 0.25))),
-                "unverifiable": max(0.40, min(0.85, 0.55 + ((1.0 - suff) * 0.30))),
-            }
+            uncertainty_shift = max(-5.0, min(5.0, directional_delta * 8.0))
+            truth_percent = 50.0 + uncertainty_shift
+            truth_percent = max(45.0, min(55.0, truth_percent))
+        truth_percent = float(max(1.0, min(99.0, truth_percent)))
+
+        if verdict_internal == Verdict.TRUE.value:
+            class_probs = {"true": 0.70, "false": 0.12, "unverifiable": 0.18}
+        elif verdict_internal == Verdict.FALSE.value:
+            class_probs = {"true": 0.12, "false": 0.70, "unverifiable": 0.18}
+        else:
+            class_probs = {"true": 0.20, "false": 0.30, "unverifiable": 0.50}
         norm = max(1e-6, sum(class_probs.values()))
         class_probs = {k: float(v / norm) for k, v in class_probs.items()}
-
-        truth_percent = float(max(1.0, min(99.0, truth_score * 100.0)))
-        if verdict_internal == Verdict.UNVERIFIABLE.value:
-            truth_percent = float(max(35.0, min(65.0, truth_percent)))
 
         payload["verdict"] = verdict_internal
         payload["verdict_internal"] = verdict_internal
         payload["display_verdict"] = verdict_internal
         payload["verdict_binary"] = verdict_binary
         payload["binary_collapse_reason"] = binary_collapse_reason
+        payload["binary_projection_reason"] = binary_projection_reason
         payload["truth_score_binary"] = float(truth_score)
-        payload["truthfulness_percent"] = truth_percent
-        payload["truth_score_percent"] = truth_percent
+        payload["truthfulness_percent"] = float(truth_percent)
+        payload["truth_score_percent"] = float(truth_percent)
         payload["confidence"] = float(confidence)
         payload["calibrated_confidence"] = float(confidence)
         payload["class_probs"] = class_probs
@@ -7811,12 +7850,15 @@ class VerdictGenerator:
         payload["contradict_mass"] = float(c)
         payload["neutral_mass"] = float(n)
         payload["sufficiency_score"] = float(suff)
-        payload["direction_gap"] = float(direction_gap)
+        payload["direction_gap"] = float(directional_strength)
         payload["abstain_reason"] = abstain_reason
         payload["verdict_band"] = self._truthfulness_band(payload["truthfulness_percent"])
         payload["policy_sufficient"] = bool(
-            (verdict_internal in {Verdict.TRUE.value, Verdict.FALSE.value}) and suff >= suff_floor
+            (verdict_internal in {Verdict.TRUE.value, Verdict.FALSE.value})
+            and has_directional_items
+            and suff >= suff_floor
         )
+        payload["trust_threshold_met"] = bool(payload["policy_sufficient"])
 
         policy_trace = payload.get("policy_trace")
         if not isinstance(policy_trace, list):
@@ -7829,13 +7871,18 @@ class VerdictGenerator:
                 "contradict_mass": round(float(c), 4),
                 "neutral_mass": round(float(n), 4),
                 "sufficiency_score": round(float(suff), 4),
-                "direction_gap": round(float(direction_gap), 4),
+                "direction_gap": round(float(directional_strength), 4),
+                "directional_count": int(directional_count),
+                "directional_diversity": round(float(directional_diversity), 4),
+                "conflict_ratio": round(float(conflict_ratio), 4),
+                "decisive_directional_unlock": bool(decisive_directional_unlock),
                 "truth_score_binary": round(float(truth_score), 4),
                 "evidence_quality": round(float(evidence_quality), 4),
                 "verdict_internal": verdict_internal,
                 "verdict_binary": verdict_binary,
                 "abstain_reason": abstain_reason,
                 "binary_collapse_reason": binary_collapse_reason,
+                "binary_projection_reason": binary_projection_reason,
             }
         )
         payload["policy_trace"] = policy_trace
@@ -7864,36 +7911,47 @@ class VerdictGenerator:
         support_mass = 0.0
         contradict_mass = 0.0
         neutral_mass = 0.0
+        neutral_topical_mass = 0.0
+        directional_blocked_mass = 0.0
         directional_count = 0
         quality_sum = 0.0
+        admitted_credibility_sum = 0.0
         support_labeled_count = 0
         support_admitted_count = 0
         refute_labeled_count = 0
         refute_admitted_count = 0
         neutral_labeled_count = 0
+        neutral_topical_count = 0
+        directional_blocked_count = 0
+        directional_sources: set[str] = set()
+        directional_block_reasons: List[str] = []
 
         for idx, item in enumerate(evidence_map or []):
             if not isinstance(item, dict):
                 continue
+
             rel = self._normalize_relevance_label(item.get("relevance", "NEUTRAL"))
             credibility = max(0.0, min(1.0, float(item.get("credibility", 0.5) or 0.5)))
             rel_score = max(0.0, min(1.0, float(item.get("relevance_score", 0.0) or 0.0)))
-            support_score = max(0.0, min(1.0, float(item.get("support_score", rel_score) or rel_score)))
-            refute_score = max(
-                0.0,
-                min(
-                    1.0,
-                    float(
-                        item.get(
-                            "refute_score",
-                            max(
-                                float(item.get("contradiction_score", 0.0) or 0.0),
-                                float(item.get("nli_contradict_prob", 0.0) or 0.0),
-                            ),
-                        )
-                    ),
-                ),
-            )
+            raw_support_score = item.get("support_score", None)
+            if raw_support_score is None:
+                if rel == "SUPPORTS":
+                    raw_support_score = rel_score
+                else:
+                    raw_support_score = float(item.get("nli_entail_prob", 0.0) or 0.0)
+            support_score = max(0.0, min(1.0, float(raw_support_score or 0.0)))
+
+            raw_refute_score = item.get("refute_score", None)
+            if raw_refute_score is None:
+                contradiction_like = max(
+                    float(item.get("contradiction_score", 0.0) or 0.0),
+                    float(item.get("nli_contradict_prob", 0.0) or 0.0),
+                )
+                if rel == "REFUTES":
+                    raw_refute_score = max(rel_score, contradiction_like)
+                else:
+                    raw_refute_score = contradiction_like
+            refute_score = max(0.0, min(1.0, float(raw_refute_score or 0.0)))
             neutral_score = max(0.0, min(1.0, float(item.get("neutral_score", 0.0) or 0.0)))
             refute_threshold = max(0.05, float(item.get("refute_threshold", 0.60) or 0.60))
             refute_eligibility_score = max(
@@ -7919,6 +7977,7 @@ class VerdictGenerator:
                 refute_gate_passed = raw_refute_gate_passed.strip().lower() in {"1", "true", "yes", "on"}
             else:
                 refute_gate_passed = bool(refute_eligibility_score >= refute_threshold)
+
             subject_match = max(0.0, min(1.0, float(item.get("subject_match_score", 0.0) or 0.0)))
             predicate_match = max(0.0, min(1.0, float(item.get("predicate_match_score", 0.0) or 0.0)))
             object_match = max(
@@ -7934,6 +7993,42 @@ class VerdictGenerator:
                     ),
                 ),
             )
+            polarity_compatibility_score = max(
+                0.0,
+                min(1.0, float(item.get("polarity_compatibility_score", item.get("polarity_consistency", 1.0)) or 0.0)),
+            )
+            quantifier_consistency_score = max(
+                0.0,
+                min(
+                    1.0,
+                    float(item.get("quantifier_consistency_score", item.get("quantifier_consistency", 1.0)) or 0.0),
+                ),
+            )
+            comparator_consistency_score = max(
+                0.0,
+                min(
+                    1.0,
+                    float(item.get("comparator_consistency_score", item.get("dose_scope_consistency", 1.0)) or 0.0),
+                ),
+            )
+            timeframe_consistency_score = max(
+                0.0,
+                min(
+                    1.0,
+                    float(item.get("timeframe_consistency_score", item.get("temporal_consistency_score", 1.0)) or 0.0),
+                ),
+            )
+            population_consistency_score = max(
+                0.0,
+                min(
+                    1.0,
+                    float(item.get("population_consistency_score", item.get("scope_alignment", 1.0)) or 0.0),
+                ),
+            )
+            source_quality_score = max(
+                0.0,
+                min(1.0, float(item.get("source_quality_score", item.get("credibility", 0.5)) or 0.0)),
+            )
             alignment_score = max(
                 0.0,
                 min(
@@ -7941,6 +8036,13 @@ class VerdictGenerator:
                     (0.40 * float(item.get("anchor_match_score", 0.0) or 0.0))
                     + (0.30 * predicate_match)
                     + (0.30 * object_match),
+                ),
+            )
+            overall_alignment_score = max(
+                0.0,
+                min(
+                    1.0,
+                    (0.32 * subject_match + 0.28 * predicate_match + 0.20 * object_match + 0.20 * alignment_score),
                 ),
             )
             quality = max(
@@ -7956,88 +8058,205 @@ class VerdictGenerator:
                 ),
             )
             quality_sum += quality
-            base_weight = max(rel_score, 0.10) * (0.55 + (0.45 * credibility))
+
+            contradiction_signal = max(
+                0.0,
+                min(
+                    1.0,
+                    max(
+                        float(item.get("contradiction_score", 0.0) or 0.0),
+                        float(item.get("nli_contradict_prob", 0.0) or 0.0),
+                        refute_score,
+                    ),
+                ),
+            )
+            support_signal = max(
+                0.0,
+                min(1.0, max(support_score, float(item.get("nli_entail_prob", 0.0) or 0.0))),
+            )
+            base_weight = max(rel_score, 0.10) * (0.55 + (0.45 * source_quality_score))
             stance_before = rel
+            if stance_before not in {"SUPPORTS", "REFUTES"}:
+                if contradiction_signal >= max(0.45, refute_threshold - 0.05):
+                    stance_before = "REFUTES"
+                elif support_signal >= 0.45:
+                    stance_before = "SUPPORTS"
+                else:
+                    stance_before = "NEUTRAL"
+
             admission_passed = False
             admission_block_reason = ""
             admitted_to_support = False
             admitted_to_refute = False
 
-            if rel == "SUPPORTS":
+            fatal_mismatch_reason = ""
+            if timeframe_consistency_score < 0.20:
+                fatal_mismatch_reason = "timeframe_mismatch"
+            elif population_consistency_score < 0.20:
+                fatal_mismatch_reason = "population_mismatch"
+            elif comparator_consistency_score < 0.20:
+                fatal_mismatch_reason = "comparator_mismatch"
+
+            if stance_before == "SUPPORTS":
                 support_labeled_count += 1
                 support_admission_score = max(
-                    support_score,
-                    rel_score,
-                    (0.40 * support_score) + (0.20 * predicate_match) + (0.20 * object_match) + (0.20 * quality),
+                    0.0,
+                    min(
+                        1.0,
+                        (0.38 * support_signal)
+                        + (0.18 * predicate_match)
+                        + (0.16 * object_match)
+                        + (0.10 * subject_match)
+                        + (0.10 * overall_alignment_score)
+                        + (0.04 * polarity_compatibility_score)
+                        + (0.04 * quantifier_consistency_score),
+                    ),
                 )
-                support_directional_guard = (
-                    predicate_match >= 0.20 and object_match >= 0.20 and alignment_score >= 0.25 and quality >= 0.20
+                support_threshold = max(0.35, float(os.getenv("VERDICT_SUPPORT_ADMISSION_THRESHOLD", "0.42")))
+                support_semantic_min = bool(
+                    predicate_match >= 0.12 and object_match >= 0.12 and overall_alignment_score >= 0.20
                 )
-                if support_admission_score >= 0.35 or support_directional_guard:
+                support_directional_guard = bool(
+                    support_signal >= 0.45
+                    and predicate_match >= 0.15
+                    and object_match >= 0.15
+                    and overall_alignment_score >= 0.25
+                )
+                if fatal_mismatch_reason:
+                    admission_block_reason = fatal_mismatch_reason
+                    directional_blocked_count += 1
+                    directional_blocked_mass += max(base_weight * 0.70, support_admission_score * 0.70)
+                    directional_block_reasons.append(admission_block_reason)
+                elif (
+                    support_admission_score >= support_threshold and support_semantic_min
+                ) or support_directional_guard:
                     contribution = max(
                         base_weight,
                         support_admission_score,
                         float(item.get("nli_entail_prob", 0.0) or 0.0),
+                        overall_alignment_score,
                     )
                     support_mass += contribution
                     directional_count += 1
                     support_admitted_count += 1
+                    admitted_credibility_sum += source_quality_score
                     admission_passed = True
                     admitted_to_support = True
+                    src = str(item.get("source_url") or "").strip()
+                    if src:
+                        try:
+                            host = urlparse(src).netloc.lower().strip()
+                        except Exception:
+                            host = ""
+                        if host.startswith("www."):
+                            host = host[4:]
+                        if host:
+                            directional_sources.add(host)
                 else:
-                    if support_admission_score < 0.35:
+                    if not support_semantic_min:
+                        if predicate_match < 0.12:
+                            admission_block_reason = "low_predicate_match"
+                        elif object_match < 0.12:
+                            admission_block_reason = "low_object_semantic_match"
+                        else:
+                            admission_block_reason = "low_alignment_score"
+                    elif support_admission_score < support_threshold:
                         admission_block_reason = "low_support_admission_score"
-                    elif predicate_match < 0.20:
+                    elif predicate_match < 0.15:
                         admission_block_reason = "low_predicate_match"
-                    elif object_match < 0.20:
+                    elif object_match < 0.15:
                         admission_block_reason = "low_object_semantic_match"
-                    elif alignment_score < 0.25:
+                    elif overall_alignment_score < 0.25:
                         admission_block_reason = "low_alignment_score"
+                    elif polarity_compatibility_score < 0.20:
+                        admission_block_reason = "polarity_incompatibility"
+                    elif quantifier_consistency_score < 0.20:
+                        admission_block_reason = "quantifier_inconsistency"
                     else:
                         admission_block_reason = "support_gate_failed"
-                    neutral_mass += max(base_weight * 0.80, neutral_score)
-            elif rel == "REFUTES":
+                    directional_blocked_count += 1
+                    directional_blocked_mass += max(base_weight * 0.70, support_admission_score * 0.70)
+                    directional_block_reasons.append(admission_block_reason)
+            elif stance_before == "REFUTES":
                 refute_labeled_count += 1
-                fallback_refute_guard = (
-                    refute_score >= 0.50 and predicate_match >= 0.20 and object_match >= 0.20 and quality >= 0.20
+                refute_signal = max(contradiction_signal, refute_score)
+                refute_semantic_min = bool(
+                    predicate_match >= 0.12 and object_match >= 0.12 and overall_alignment_score >= 0.20
                 )
-                if refute_gate_passed or fallback_refute_guard:
+                fallback_refute_guard = bool(
+                    refute_signal >= 0.55
+                    and predicate_match >= 0.15
+                    and object_match >= 0.15
+                    and overall_alignment_score >= 0.25
+                )
+                high_confidence_refute_override = bool(
+                    refute_gate_passed
+                    and refute_eligibility_score >= max(refute_threshold + 0.10, 0.70)
+                    and refute_signal >= 0.70
+                )
+                if fatal_mismatch_reason:
+                    admission_block_reason = fatal_mismatch_reason
+                    directional_blocked_count += 1
+                    directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)
+                    directional_block_reasons.append(admission_block_reason)
+                elif (
+                    refute_gate_passed and (refute_semantic_min or high_confidence_refute_override)
+                ) or fallback_refute_guard:
                     if fallback_refute_guard and not refute_gate_passed:
                         item["refute_gate_block_reason"] = "gate_relaxed_by_directional_signal"
-                    contribution = max(
-                        base_weight,
-                        refute_score,
-                        float(item.get("contradiction_score", 0.0) or 0.0),
-                        float(item.get("nli_contradict_prob", 0.0) or 0.0),
-                    )
+                    elif high_confidence_refute_override and not refute_semantic_min:
+                        item["refute_gate_block_reason"] = "gate_relaxed_by_high_confidence_refute"
+                    contribution = max(base_weight, refute_signal, overall_alignment_score)
                     contradict_mass += contribution
                     directional_count += 1
                     refute_admitted_count += 1
+                    admitted_credibility_sum += source_quality_score
                     admission_passed = True
                     admitted_to_refute = True
+                    src = str(item.get("source_url") or "").strip()
+                    if src:
+                        try:
+                            host = urlparse(src).netloc.lower().strip()
+                        except Exception:
+                            host = ""
+                        if host.startswith("www."):
+                            host = host[4:]
+                        if host:
+                            directional_sources.add(host)
                 else:
                     admission_block_reason = str(item.get("refute_gate_block_reason") or "").strip()
                     if not admission_block_reason:
                         if refute_eligibility_score < refute_threshold:
                             admission_block_reason = "low_refute_eligibility_score"
-                        elif predicate_match < 0.20:
+                        elif predicate_match < 0.15:
                             admission_block_reason = "low_predicate_match"
-                        elif object_match < 0.20:
+                        elif object_match < 0.15:
                             admission_block_reason = "low_object_semantic_match"
+                        elif contradiction_signal < 0.45:
+                            admission_block_reason = "insufficient_contradiction_signal"
+                        elif polarity_compatibility_score < 0.20:
+                            admission_block_reason = "polarity_incompatibility"
+                        elif quantifier_consistency_score < 0.20:
+                            admission_block_reason = "quantifier_inconsistency"
                         else:
                             admission_block_reason = "refute_gate_failed"
-                    neutral_mass += max(base_weight * 0.80, neutral_score)
+                    directional_blocked_count += 1
+                    directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)
+                    directional_block_reasons.append(admission_block_reason)
             else:
                 neutral_labeled_count += 1
+                neutral_topical_count += 1
                 admission_block_reason = "not_directional_label"
-                neutral_mass += max(base_weight * 0.80, neutral_score)
+                neutral_contribution = max(base_weight * 0.80, neutral_score)
+                neutral_topical_mass += neutral_contribution
+                neutral_mass += neutral_contribution
 
             effective_refute_gate_passed = bool(refute_gate_passed or admitted_to_refute)
             item["refute_eligibility_score"] = round(float(refute_eligibility_score), 4)
             item["refute_threshold"] = round(float(refute_threshold), 4)
             item["refute_gate_passed"] = bool(effective_refute_gate_passed)
             current_block_reason = str(item.get("refute_gate_block_reason") or "").strip()
-            if rel != "REFUTES":
+            if stance_before != "REFUTES":
                 item["refute_gate_block_reason"] = current_block_reason or "not_refute_candidate"
             elif not effective_refute_gate_passed:
                 item["refute_gate_block_reason"] = (
@@ -8052,26 +8271,58 @@ class VerdictGenerator:
             item["admitted_to_support_mass"] = bool(admitted_to_support)
             item["admitted_to_contradict_mass"] = bool(admitted_to_refute)
             item["final_stance"] = (
-                "SUPPORTS" if admitted_to_support else ("REFUTES" if admitted_to_refute else "NEUTRAL")
+                "SUPPORTS"
+                if admitted_to_support
+                else (
+                    "REFUTES"
+                    if admitted_to_refute
+                    else ("DIRECTIONAL_BLOCKED" if stance_before != "NEUTRAL" else "NEUTRAL")
+                )
             )
             item["alignment_score"] = round(float(alignment_score), 4)
+            item["overall_alignment_score"] = round(float(overall_alignment_score), 4)
             item["subject_match_score"] = round(float(subject_match), 4)
             item["predicate_match_score"] = round(float(predicate_match), 4)
             item["object_match_score"] = round(float(object_match), 4)
+            item["polarity_compatibility_score"] = round(float(polarity_compatibility_score), 4)
+            item["quantifier_consistency_score"] = round(float(quantifier_consistency_score), 4)
+            item["comparator_consistency_score"] = round(float(comparator_consistency_score), 4)
+            item["timeframe_consistency_score"] = round(float(timeframe_consistency_score), 4)
+            item["population_consistency_score"] = round(float(population_consistency_score), 4)
+            item["source_quality_score"] = round(float(source_quality_score), 4)
+            item["support_score"] = round(float(support_score), 4)
+            item["refute_score"] = round(float(refute_score), 4)
             evidence_map[idx] = item
 
         evidence_density = min(1.0, float(evidence_count) / 8.0)
-        diversity = min(1.0, float(source_domains) / 4.0)
+        source_diversity = min(1.0, float(source_domains) / 4.0)
         directionality = min(1.0, float(directional_count) / 3.0)
+        directional_diversity = min(1.0, float(len(directional_sources)) / 3.0)
         quality_avg = (quality_sum / len(evidence_map)) if evidence_map else 0.0
-        sufficiency = (
-            (0.35 * evidence_density)
-            + (0.25 * diversity)
-            + (0.20 * directionality)
-            + (0.20 * max(0.0, min(1.0, quality_avg)))
+        admitted_quality_avg = admitted_credibility_sum / max(1, directional_count)
+        directional_margin = abs(float(support_mass) - float(contradict_mass)) / max(
+            1e-6, support_mass + contradict_mass
         )
+        conflict_ratio = (
+            min(float(support_mass), float(contradict_mass))
+            / max(1e-6, max(float(support_mass), float(contradict_mass)))
+            if (support_mass > 1e-9 and contradict_mass > 1e-9)
+            else 0.0
+        )
+        sufficiency = (
+            (0.24 * evidence_density)
+            + (0.18 * source_diversity)
+            + (0.22 * directionality)
+            + (0.16 * directional_diversity)
+            + (0.12 * directional_margin)
+            + (0.08 * max(0.0, min(1.0, admitted_quality_avg)))
+        )
+        sufficiency *= max(0.55, 1.0 - (0.35 * conflict_ratio))
+        if support_mass <= 1e-9 and contradict_mass <= 1e-9:
+            sufficiency = 0.0
         if self._has_absolute_quantifier(claim):
             sufficiency *= 0.92
+
         support_zero_with_labels = bool(support_labeled_count > 0 and support_mass <= 1e-9)
         refute_zero_with_labels = bool(refute_labeled_count > 0 and contradict_mass <= 1e-9)
         warnings: List[str] = []
@@ -8079,12 +8330,25 @@ class VerdictGenerator:
             warnings.append("support_labeled_but_zero_support_mass")
         if refute_zero_with_labels:
             warnings.append("refute_labeled_but_zero_contradict_mass")
+        if directional_blocked_count > 0:
+            warnings.append("directional_candidates_blocked")
+
         diagnostics = {
             "support_labeled_count": int(support_labeled_count),
             "support_admitted_count": int(support_admitted_count),
             "refute_labeled_count": int(refute_labeled_count),
             "refute_admitted_count": int(refute_admitted_count),
             "neutral_labeled_count": int(neutral_labeled_count),
+            "neutral_topical_count": int(neutral_topical_count),
+            "neutral_topical_mass": round(float(neutral_topical_mass), 4),
+            "directional_blocked_count": int(directional_blocked_count),
+            "directional_blocked_mass": round(float(directional_blocked_mass), 4),
+            "directional_admitted_count": int(directional_count),
+            "directional_source_diversity": round(float(directional_diversity), 4),
+            "directional_margin": round(float(directional_margin), 4),
+            "conflict_ratio": round(float(conflict_ratio), 4),
+            "quality_avg": round(float(quality_avg), 4),
+            "admitted_quality_avg": round(float(admitted_quality_avg), 4),
             "support_zero_with_labels": support_zero_with_labels,
             "refute_zero_with_labels": refute_zero_with_labels,
             "warnings": warnings,
@@ -8093,6 +8357,15 @@ class VerdictGenerator:
                 for item in evidence_map
                 if isinstance(item, dict) and str(item.get("admission_block_reason") or "").strip()
             ],
+            "directional_block_reasons": directional_block_reasons,
+            "sufficiency_inputs": {
+                "evidence_density": round(float(evidence_density), 4),
+                "source_diversity": round(float(source_diversity), 4),
+                "directionality": round(float(directionality), 4),
+                "directional_diversity": round(float(directional_diversity), 4),
+                "directional_margin": round(float(directional_margin), 4),
+                "conflict_ratio": round(float(conflict_ratio), 4),
+            },
         }
         return (
             float(support_mass),
@@ -8114,8 +8387,9 @@ class VerdictGenerator:
         vv = str(verdict or "").upper()
         dv = str(display_verdict or "").upper()
         internal_fields_ok = (vi == vv) and (dv in {"", vi})
-        binary_ok = (vi in {Verdict.TRUE.value, Verdict.FALSE.value} and vb == vi) or (
-            vi == Verdict.UNVERIFIABLE.value and vb == Verdict.FALSE.value
+        # Binary is optional deployment projection and must not own internal semantics.
+        binary_ok = (vi in {Verdict.TRUE.value, Verdict.FALSE.value} and vb in {"", vi}) or (
+            vi == Verdict.UNVERIFIABLE.value and vb in {"", Verdict.TRUE.value, Verdict.FALSE.value}
         )
         return bool(internal_fields_ok and binary_ok)
 
@@ -8202,7 +8476,19 @@ class VerdictGenerator:
         out["refute_labeled_count"] = int(mass_diagnostics.get("refute_labeled_count", 0) or 0)
         out["refute_admitted_count"] = int(mass_diagnostics.get("refute_admitted_count", 0) or 0)
         out["neutral_labeled_count"] = int(mass_diagnostics.get("neutral_labeled_count", 0) or 0)
+        out["neutral_topical_count"] = int(mass_diagnostics.get("neutral_topical_count", 0) or 0)
+        out["neutral_topical_mass"] = float(mass_diagnostics.get("neutral_topical_mass", 0.0) or 0.0)
+        out["directional_blocked_count"] = int(mass_diagnostics.get("directional_blocked_count", 0) or 0)
+        out["directional_blocked_mass"] = float(mass_diagnostics.get("directional_blocked_mass", 0.0) or 0.0)
+        out["directional_admitted_count"] = int(mass_diagnostics.get("directional_admitted_count", 0) or 0)
+        out["directional_source_diversity"] = float(mass_diagnostics.get("directional_source_diversity", 0.0) or 0.0)
+        out["directional_margin"] = float(mass_diagnostics.get("directional_margin", 0.0) or 0.0)
+        out["directional_conflict_ratio"] = float(mass_diagnostics.get("conflict_ratio", 0.0) or 0.0)
+        out["evidence_quality_avg"] = float(mass_diagnostics.get("quality_avg", 0.0) or 0.0)
+        out["admitted_quality_avg"] = float(mass_diagnostics.get("admitted_quality_avg", 0.0) or 0.0)
         out["admission_block_reasons"] = list(mass_diagnostics.get("admission_block_reasons", []) or [])
+        out["directional_block_reasons"] = list(mass_diagnostics.get("directional_block_reasons", []) or [])
+        out["sufficiency_inputs"] = mass_diagnostics.get("sufficiency_inputs", {})
         out["admission_warnings"] = list(mass_diagnostics.get("warnings", []) or [])
         if mass_diagnostics.get("support_zero_with_labels"):
             logger.warning(
@@ -8838,7 +9124,6 @@ class VerdictGenerator:
             "yes",
             "on",
         }
-        internal_promoted_from_abstain = False
         if (
             binary_external_enabled
             and verdict in {Verdict.UNVERIFIABLE.value, Verdict.PARTIALLY_TRUE.value}
@@ -8858,16 +9143,11 @@ class VerdictGenerator:
                 or class_margin >= align_min_class_margin
                 or (support_label_count + refute_label_count) >= 1
             )
+            # Binary projection is additive only: never rewrite internal abstention semantics.
             if directional_enough and not exact_numeric_fragile_support:
-                payload["verdict_internal_original"] = verdict
-                verdict = verdict_binary
-                payload["verdict"] = verdict
-                payload["verdict_internal"] = verdict
-                payload["abstain_reason"] = ""
-                internal_promoted_from_abstain = True
                 guard_reasons = list(payload.get("verdict_guard_reasons") or [])
-                if "binary_external_alignment" not in guard_reasons:
-                    guard_reasons.append("binary_external_alignment")
+                if "binary_external_alignment_observed" not in guard_reasons:
+                    guard_reasons.append("binary_external_alignment_observed")
                 payload["verdict_guard_reasons"] = sorted(set(guard_reasons))
 
         policy_trace = payload.get("policy_trace")
@@ -8937,12 +9217,6 @@ class VerdictGenerator:
                 truth = max(float(truth), max(50.5, binary_truth))
             else:
                 truth = min(float(truth), min(49.5, binary_truth))
-        if internal_promoted_from_abstain:
-            promoted_truth = max(1.0, min(99.0, float(truth_score_binary) * 100.0))
-            if verdict == Verdict.TRUE.value:
-                truth = max(50.5, min(float(truth), max(50.5, promoted_truth)))
-            elif verdict == Verdict.FALSE.value:
-                truth = min(49.5, max(float(truth), min(49.5, promoted_truth)))
         payload["truthfulness_percent"] = truth
         payload["truth_score_percent"] = truth
         payload["verdict_band"] = self._truthfulness_band(truth)
@@ -8990,8 +9264,6 @@ class VerdictGenerator:
             confidence = min(confidence, 0.55)
         if exact_numeric_claim and exact_numeric_fragile_support:
             confidence = min(confidence, 0.55)
-        if internal_promoted_from_abstain and not (decisive_support_unlock or decisive_refute_unlock):
-            confidence = min(confidence, 0.62)
         payload["confidence"] = max(0.05, min(0.98, confidence))
         payload["calibrated_confidence"] = payload["confidence"]
         if not isinstance(payload.get("class_probs"), dict):
@@ -9216,21 +9488,45 @@ class VerdictGenerator:
         out["verdict_internal"] = verdict_internal
         out["display_verdict"] = verdict_internal
 
-        verdict_binary = Verdict.FALSE.value if verdict_internal == Verdict.UNVERIFIABLE.value else verdict_internal
+        upstream_binary = str(out.get("verdict_binary") or "").upper()
+        if verdict_internal in {Verdict.TRUE.value, Verdict.FALSE.value}:
+            verdict_binary = verdict_internal
+            out["binary_projection_reason"] = str(out.get("binary_projection_reason") or "internal_identity_projection")
+        else:
+            verdict_binary = upstream_binary if upstream_binary in {Verdict.TRUE.value, Verdict.FALSE.value} else ""
+            out["binary_projection_reason"] = str(out.get("binary_projection_reason") or "")
         out["verdict_binary"] = verdict_binary
-        out["binary_collapse_reason"] = (
-            "abstain_to_false_policy" if verdict_internal == Verdict.UNVERIFIABLE.value else ""
-        )
-
-        confidence = float(out.get("confidence", out.get("calibrated_confidence", 0.5)) or 0.5)
-        confidence = max(0.05, min(0.98, confidence))
-        out["confidence"] = confidence
-        out["calibrated_confidence"] = float(out.get("calibrated_confidence", confidence) or confidence)
+        out["binary_collapse_reason"] = str(out.get("binary_collapse_reason") or "")
 
         out["support_mass"] = float(out.get("support_mass", 0.0) or 0.0)
         out["contradict_mass"] = float(out.get("contradict_mass", 0.0) or 0.0)
         out["neutral_mass"] = float(out.get("neutral_mass", 0.0) or 0.0)
         out["sufficiency_score"] = float(out.get("sufficiency_score", out.get("evidence_sufficiency", 0.0)) or 0.0)
+        out["directional_admitted_count"] = int(out.get("directional_admitted_count", 0) or 0)
+        out["neutral_topical_count"] = int(out.get("neutral_topical_count", 0) or 0)
+        out["directional_blocked_count"] = int(out.get("directional_blocked_count", 0) or 0)
+        out["neutral_topical_mass"] = float(out.get("neutral_topical_mass", 0.0) or 0.0)
+        out["directional_blocked_mass"] = float(out.get("directional_blocked_mass", 0.0) or 0.0)
+        out["directional_source_diversity"] = float(out.get("directional_source_diversity", 0.0) or 0.0)
+
+        truth_percent = float(out.get("truthfulness_percent", out.get("truth_score_percent", 50.0)) or 50.0)
+        if verdict_internal == Verdict.TRUE.value:
+            truth_percent = max(55.0, min(99.0, truth_percent))
+        elif verdict_internal == Verdict.FALSE.value:
+            truth_percent = max(1.0, min(45.0, truth_percent))
+        else:
+            truth_percent = max(45.0, min(55.0, truth_percent))
+        out["truthfulness_percent"] = float(truth_percent)
+        out["truth_score_percent"] = float(truth_percent)
+
+        confidence = float(out.get("confidence", out.get("calibrated_confidence", 0.5)) or 0.5)
+        confidence = max(0.05, min(0.98, confidence))
+        if verdict_internal == Verdict.UNVERIFIABLE.value:
+            confidence = min(confidence, 0.55)
+            if out["support_mass"] <= 1e-9 and out["contradict_mass"] <= 1e-9:
+                confidence = min(confidence, 0.40)
+        out["confidence"] = confidence
+        out["calibrated_confidence"] = float(out.get("calibrated_confidence", confidence) or confidence)
 
         if not isinstance(out.get("class_probs"), dict):
             if verdict_internal == Verdict.TRUE.value:
@@ -9238,7 +9534,7 @@ class VerdictGenerator:
             elif verdict_internal == Verdict.FALSE.value:
                 out["class_probs"] = {"true": 0.13, "false": 0.72, "unverifiable": 0.15}
             else:
-                out["class_probs"] = {"true": 0.18, "false": 0.32, "unverifiable": 0.50}
+                out["class_probs"] = {"true": 0.20, "false": 0.30, "unverifiable": 0.50}
 
         policy_trace = out.get("policy_trace")
         if not isinstance(policy_trace, list):
@@ -9254,6 +9550,8 @@ class VerdictGenerator:
                 out["abstain_reason"] = "mixed_or_insufficient_evidence"
             else:
                 out["abstain_reason"] = ""
+        elif verdict_internal == Verdict.UNVERIFIABLE.value and not str(out.get("abstain_reason") or "").strip():
+            out["abstain_reason"] = "mixed_or_insufficient_evidence"
 
         if not isinstance(out.get("debug"), dict):
             out["debug"] = {}
@@ -9262,18 +9560,34 @@ class VerdictGenerator:
         debug_obj.setdefault("support_strength", float(out.get("support_mass", 0.0) or 0.0))
         debug_obj.setdefault("contradiction_strength", float(out.get("contradict_mass", 0.0) or 0.0))
         debug_obj.setdefault("alignment_score", None)
+        debug_obj.setdefault("neutral_topical_count", int(out.get("neutral_topical_count", 0) or 0))
+        debug_obj.setdefault("directional_blocked_count", int(out.get("directional_blocked_count", 0) or 0))
+        debug_obj.setdefault("directional_blocked_mass", float(out.get("directional_blocked_mass", 0.0) or 0.0))
         invariant_passed = self._compute_verdict_invariant(
             verdict_internal=verdict_internal,
             verdict_binary=verdict_binary,
             verdict=str(out.get("verdict") or ""),
             display_verdict=str(out.get("display_verdict") or ""),
         )
+        semantic_owner_invariant = (
+            str(out.get("verdict") or "").upper() == str(out.get("verdict_internal") or "").upper()
+        )
+        if not semantic_owner_invariant:
+            logger.error(
+                "[VerdictGenerator][SemanticOwnerInvariant] verdict=%s verdict_internal=%s",
+                out.get("verdict"),
+                out.get("verdict_internal"),
+            )
         out["verdict_field_invariant_passed"] = bool(invariant_passed)
         debug_obj["verdict_field_invariant_passed"] = bool(invariant_passed)
+        debug_obj["semantic_owner_invariant_passed"] = bool(semantic_owner_invariant)
         if not invariant_passed:
             debug_obj.setdefault("verdict_invariant_violation", "verdict_fields_disagree")
-        if verdict_internal == Verdict.UNVERIFIABLE.value:
-            debug_obj.setdefault("binary_projection_note", "internal_unverifiable_collapsed_to_binary_false")
+        if verdict_internal == Verdict.UNVERIFIABLE.value and verdict_binary in {
+            Verdict.TRUE.value,
+            Verdict.FALSE.value,
+        }:
+            debug_obj.setdefault("binary_projection_note", "explicit_external_binary_projection")
         out["debug"] = debug_obj
 
         return out

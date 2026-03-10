@@ -169,6 +169,15 @@ def _build_debug_block(
                 "subject_match_score": float(row.get("subject_match_score", 0.0) or 0.0),
                 "predicate_match_score": float(row.get("predicate_match_score", 0.0) or 0.0),
                 "object_match_score": float(row.get("object_match_score", 0.0) or 0.0),
+                "polarity_compatibility_score": float(row.get("polarity_compatibility_score", 0.0) or 0.0),
+                "quantifier_consistency_score": float(row.get("quantifier_consistency_score", 0.0) or 0.0),
+                "comparator_consistency_score": float(row.get("comparator_consistency_score", 0.0) or 0.0),
+                "timeframe_consistency_score": float(row.get("timeframe_consistency_score", 0.0) or 0.0),
+                "population_consistency_score": float(row.get("population_consistency_score", 0.0) or 0.0),
+                "source_quality_score": float(row.get("source_quality_score", 0.0) or 0.0),
+                "overall_alignment_score": float(row.get("overall_alignment_score", 0.0) or 0.0),
+                "support_score": float(row.get("support_score", 0.0) or 0.0),
+                "refute_score": float(row.get("refute_score", 0.0) or 0.0),
                 "alignment_score": float(row.get("alignment_score", 0.0) or 0.0),
             }
         )
@@ -333,6 +342,12 @@ def _build_debug_block(
         "refute_labeled_count": refute_labeled_count,
         "refute_admitted_count": refute_admitted_count,
         "neutral_labeled_count": neutral_labeled_count,
+        "neutral_topical_count": int(verdict_result.get("neutral_topical_count", 0) or 0),
+        "neutral_topical_mass": round(float(verdict_result.get("neutral_topical_mass", 0.0) or 0.0), 4),
+        "directional_blocked_count": int(verdict_result.get("directional_blocked_count", 0) or 0),
+        "directional_blocked_mass": round(float(verdict_result.get("directional_blocked_mass", 0.0) or 0.0), 4),
+        "directional_admitted_count": int(verdict_result.get("directional_admitted_count", 0) or 0),
+        "directional_source_diversity": round(float(verdict_result.get("directional_source_diversity", 0.0) or 0.0), 4),
         "evidence_admission": evidence_admission[:20],
         "evidence_sources": sorted(sources),
         "alignment_score": round(float(alignment_score), 4),
@@ -359,6 +374,8 @@ def _build_debug_block(
         "refute_gate_block_reasons": refute_gate_block_reasons,
         "evidence_refute_gates": evidence_refute_gates,
         "admission_block_reasons": verdict_result.get("admission_block_reasons", []),
+        "directional_block_reasons": verdict_result.get("directional_block_reasons", []),
+        "sufficiency_inputs": verdict_result.get("sufficiency_inputs", {}),
         "admission_warnings": verdict_result.get("admission_warnings", []),
         "trust_gate": {
             "threshold_met": bool(
@@ -432,19 +449,17 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "BINARY_EXTERNAL_VERDICT_ENABLED",
         _env_flag("VERDICT_POLICY_V3_ENABLED", True),
     )
-    verdict_internal = str(
-        verdict_result.get("verdict_internal") or verdict_result.get("verdict") or "UNVERIFIABLE"
-    ).upper()
-    if verdict_internal == "PARTIALLY_TRUE":
+    verdict_internal = (
+        str(verdict_result.get("verdict_internal") or verdict_result.get("verdict") or "UNVERIFIABLE").strip().upper()
+    )
+    if not verdict_internal:
         verdict_internal = "UNVERIFIABLE"
-    if verdict_internal not in {"TRUE", "FALSE", "UNVERIFIABLE"}:
-        verdict_internal = "UNVERIFIABLE"
-    verdict_binary = str(verdict_result.get("verdict_binary") or "").upper()
-    if verdict_internal == "UNVERIFIABLE":
-        verdict_binary = "FALSE"
-    elif verdict_binary not in {"TRUE", "FALSE"}:
-        verdict_binary = verdict_internal
-    response_verdict = verdict_binary if binary_first else verdict_internal
+    verdict_binary = str(verdict_result.get("verdict_binary") or "").strip().upper()
+    if verdict_binary not in {"TRUE", "FALSE"}:
+        verdict_binary = ""
+    response_verdict = verdict_internal
+    if binary_first and verdict_binary:
+        response_verdict = verdict_binary
     display_verdict = response_verdict
     debug_block_enabled = _env_flag("VERDICT_DEBUG_BLOCK_ENABLED", True)
     debug_block = _build_debug_block(result, verdict_result, final_evidence) if debug_block_enabled else {}
@@ -461,7 +476,7 @@ def _format_completed_response(payload: VerifyRequest, result: dict[str, Any]) -
         "verdict": response_verdict,
         "verdict_binary": verdict_binary,
         "verdict_internal": verdict_internal,
-        "binary_collapse_reason": ("abstain_to_false_policy" if verdict_internal == "UNVERIFIABLE" else ""),
+        "binary_collapse_reason": str(verdict_result.get("binary_collapse_reason") or ""),
         "abstain_reason": verdict_result.get("abstain_reason", ""),
         "display_verdict": display_verdict,
         "verdict_field_invariant_passed": bool(verdict_result.get("verdict_field_invariant_passed", True)),
