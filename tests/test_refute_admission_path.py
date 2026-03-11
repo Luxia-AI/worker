@@ -43,7 +43,8 @@ def test_clear_negation_contradiction_is_admitted_to_contradict_mass():
     assert row.get("final_stance") == "REFUTES"
 
 
-def test_absolute_claim_contradiction_patterns_are_admitted():
+def test_absolute_claim_contradiction_patterns_are_admitted(monkeypatch):
+    monkeypatch.setenv("ENABLE_ABSOLUTE_CLAIM_CONTRADICTION_EXPERIMENT", "true")
     claims = [
         "Vitamin X always prevents colds.",
         "Supplement Y never causes side effects.",
@@ -233,7 +234,8 @@ def test_refute_candidate_is_not_neutralized_before_admission_review():
         assert str(row.get("refute_gate_block_reason") or "").strip()
 
 
-def test_absolute_claim_partial_effect_forms_refute_candidate_and_is_admitted():
+def test_absolute_claim_partial_effect_forms_refute_candidate_and_is_admitted(monkeypatch):
+    monkeypatch.setenv("ENABLE_ABSOLUTE_CLAIM_CONTRADICTION_EXPERIMENT", "true")
     vg = _vg()
     claim = "Antibiotics always cure bacterial infections."
     statement = "Antibiotics treat bacterial infections in many cases but not all."
@@ -270,7 +272,8 @@ def test_absolute_claim_partial_effect_forms_refute_candidate_and_is_admitted():
     assert diagnostics["refute_admitted_count"] > 0
 
 
-def test_completely_prevents_claim_contradicted_by_incomplete_protection():
+def test_completely_prevents_claim_contradicted_by_incomplete_protection(monkeypatch):
+    monkeypatch.setenv("ENABLE_ABSOLUTE_CLAIM_CONTRADICTION_EXPERIMENT", "true")
     row, _, contradict_mass, _, _, _ = _run_refute_admission(
         "Vitamin C completely prevents the common cold.",
         {
@@ -294,7 +297,8 @@ def test_completely_prevents_claim_contradicted_by_incomplete_protection():
     assert contradict_mass > 0.0
 
 
-def test_hundred_percent_claim_contradicted_by_less_than_total_effect():
+def test_hundred_percent_claim_contradicted_by_less_than_total_effect(monkeypatch):
+    monkeypatch.setenv("ENABLE_ABSOLUTE_CLAIM_CONTRADICTION_EXPERIMENT", "true")
     row, _, contradict_mass, _, _, _ = _run_refute_admission(
         "Hand sanitizer instantly kills 100% of all known germs and viruses.",
         {
@@ -317,7 +321,8 @@ def test_hundred_percent_claim_contradicted_by_less_than_total_effect():
     assert contradict_mass > 0.0
 
 
-def test_only_effective_claim_contradicted_by_multiple_options():
+def test_only_effective_claim_contradicted_by_multiple_options(monkeypatch):
+    monkeypatch.setenv("ENABLE_ABSOLUTE_CLAIM_CONTRADICTION_EXPERIMENT", "true")
     row, _, contradict_mass, _, _, _ = _run_refute_admission(
         "Drug A is the only effective treatment for condition Z.",
         {
