@@ -3837,6 +3837,70 @@ class VerdictGenerator:
             return 1.0
         return max(0.0, min(1.0, total / used))
 
+    @staticmethod
+    def _population_mismatch_policy(
+        claim_text: str,
+        statement_text: str,
+        population_consistency_score: float,
+    ) -> Dict[str, Any]:
+        """
+        Distinguish fatal population mismatches from subgroup penalties.
+        Keep hard blocks for clearly incompatible groups; otherwise apply a soft
+        penalty so broad health claims can still be contradicted by relevant subgroups.
+        """
+        score = max(0.0, min(1.0, float(population_consistency_score or 0.0)))
+        claim_low = str(claim_text or "").lower()
+        stmt_low = str(statement_text or "").lower()
+        if score >= 0.12:
+            return {
+                "fatal": False,
+                "penalty_applied": False,
+                "penalty_factor": 1.0,
+                "reason": "",
+            }
+
+        claim_adult = bool(re.search(r"\b(adults?|elderly|older adults?)\b", claim_low))
+        claim_child = bool(re.search(r"\b(child|children|pediatric|adolescen)\w*\b", claim_low))
+        stmt_adult = bool(re.search(r"\b(adults?|elderly|older adults?)\b", stmt_low))
+        stmt_child = bool(re.search(r"\b(child|children|pediatric|adolescen)\w*\b", stmt_low))
+
+        claim_male = bool(re.search(r"\b(male|men|boys?)\b", claim_low))
+        claim_female = bool(re.search(r"\b(female|women|girls?|pregnan\w*)\b", claim_low))
+        stmt_male = bool(re.search(r"\b(male|men|boys?)\b", stmt_low))
+        stmt_female = bool(re.search(r"\b(female|women|girls?|pregnan\w*)\b", stmt_low))
+
+        # Fatal incompatibilities.
+        if (claim_adult and stmt_child) or (claim_child and stmt_adult):
+            return {
+                "fatal": True,
+                "penalty_applied": False,
+                "penalty_factor": 1.0,
+                "reason": "population_mismatch_fatal",
+            }
+        if (claim_male and stmt_female) or (claim_female and stmt_male):
+            return {
+                "fatal": True,
+                "penalty_applied": False,
+                "penalty_factor": 1.0,
+                "reason": "population_mismatch_fatal",
+            }
+
+        # Subgroup mismatch (e.g., broad adults claim vs specific subgroup evidence):
+        # keep candidate alive but penalize admission score.
+        if score < 0.12:
+            return {
+                "fatal": False,
+                "penalty_applied": True,
+                "penalty_factor": 0.78,
+                "reason": "population_mismatch_penalty",
+            }
+        return {
+            "fatal": False,
+            "penalty_applied": False,
+            "penalty_factor": 1.0,
+            "reason": "",
+        }
+
     def _segment_topic_guard_ok(self, segment: str, statement: str) -> bool:
         seg_concepts = self._concept_hits(segment)
         stmt_concepts = self._concept_hits(statement)
@@ -4427,6 +4491,107 @@ class VerdictGenerator:
             )
         )
 
+    @staticmethod
+    def _has_subtotal_percentage(text: str) -> bool:
+        low = str(text or "").lower()
+        if not low:
+            return False
+        for m in re.finditer(r"\b(\d{1,3}(?:\.\d+)?)\s*%\b", low):
+            try:
+                val = float(m.group(1))
+            except Exception:
+                continue
+            if val < 99.9:
+                return True
+        return False
+
+    @staticmethod
+    def _absolute_claim_semantic_flags(text: str) -> Dict[str, bool]:
+        low = str(text or "").lower()
+        universal_scope_flag = bool(
+            re.search(
+                r"\b(always|never|every|each|all|all\s+types?|all\s+known|universally|without\s+exception)\b",
+                low,
+            )
+        )
+        total_effect_flag = bool(
+            re.search(
+                r"\b(100\s*%|completely|fully|entirely|guaranteed|instantly|fully\s+protective)\b",
+                low,
+            )
+        )
+        exclusivity_flag = bool(re.search(r"\b(only|sole|exclusive|best|primary)\b", low))
+        absolute_quantifier_flag = bool(universal_scope_flag or total_effect_flag or exclusivity_flag)
+        zero_exception_expectation = bool(
+            absolute_quantifier_flag or re.search(r"\b(no\s+exceptions?|never|impossible|cannot\s+fail)\b", low)
+        )
+        return {
+            "absolute_quantifier_flag": absolute_quantifier_flag,
+            "universal_scope_flag": universal_scope_flag,
+            "total_effect_flag": total_effect_flag,
+            "exclusivity_flag": exclusivity_flag,
+            "zero_exception_expectation": zero_exception_expectation,
+        }
+
+    def _absolute_claim_contradiction_flags(self, claim_text: str, statement: str) -> Dict[str, bool]:
+        claim_flags = self._absolute_claim_semantic_flags(claim_text)
+        stmt_low = str(statement or "").lower()
+        statement_has_absolute = self._absolute_claim_semantic_flags(statement).get("absolute_quantifier_flag", False)
+        partial_effect_contradiction_flag = bool(
+            re.search(
+                (
+                    r"\b(may|might|can|sometimes|some|most|often|up to|mixed|variable|limited|"
+                    r"in some|not always|not all|not fully|not complete|incomplete|partial)\b"
+                ),
+                stmt_low,
+            )
+            or self._has_subtotal_percentage(stmt_low)
+            or bool(
+                re.search(
+                    (
+                        r"\b(reduce|decrease|lower|improve|helps?|effective|treats?)\b.{0,28}"
+                        r"\b(risk|severity|symptoms?|chance|odds|incidence)\b"
+                    ),
+                    stmt_low,
+                )
+            )
+        )
+        exclusivity_contradiction_flag = bool(
+            re.search(
+                r"\b(one of|several|multiple|alternative|other (?:effective )?(?:treatments?|options?))\b",
+                stmt_low,
+            )
+        )
+        universal_scope_contradiction_flag = bool(
+            claim_flags.get("universal_scope_flag", False)
+            and (partial_effect_contradiction_flag or bool(re.search(r"\b(most|many|some|subset|not all)\b", stmt_low)))
+        )
+        contradiction_to_absolute_flag = bool(
+            claim_flags.get("absolute_quantifier_flag", False)
+            and (
+                partial_effect_contradiction_flag
+                or exclusivity_contradiction_flag
+                or universal_scope_contradiction_flag
+                or (
+                    claim_flags.get("total_effect_flag", False)
+                    and not statement_has_absolute
+                    and bool(
+                        re.search(
+                            r"\b(effective|helps?|treats?|prevents?|reduces?|decreases?)\b",
+                            stmt_low,
+                        )
+                    )
+                )
+            )
+        )
+        return {
+            **claim_flags,
+            "contradiction_to_absolute_flag": contradiction_to_absolute_flag,
+            "partial_effect_contradiction_flag": partial_effect_contradiction_flag,
+            "exclusivity_contradiction_flag": exclusivity_contradiction_flag,
+            "universal_scope_contradiction_flag": universal_scope_contradiction_flag,
+        }
+
     def _quantifier_refute_allowed(self, claim_text: str, statement: str) -> bool:
         # For "not all X are Y" claims, subset-level statements like
         # "trans fats are harmful" must not be treated as full contradiction.
@@ -4960,6 +5125,26 @@ class VerdictGenerator:
                 if inverse_directional_support:
                     direction_conflict = False
                 claim_requirement = self._has_requirement_quantifier(claim_for_semantics)
+                absolute_flags = self._absolute_claim_contradiction_flags(claim_for_semantics, statement)
+                claim_absolute_flag = bool(absolute_flags.get("absolute_quantifier_flag", False))
+                contradiction_to_absolute_flag = bool(absolute_flags.get("contradiction_to_absolute_flag", False))
+                partial_effect_contradiction_flag = bool(absolute_flags.get("partial_effect_contradiction_flag", False))
+                exclusivity_contradiction_flag = bool(absolute_flags.get("exclusivity_contradiction_flag", False))
+                universal_scope_contradiction_flag = bool(
+                    absolute_flags.get("universal_scope_contradiction_flag", False)
+                )
+                zero_exception_expectation = bool(absolute_flags.get("zero_exception_expectation", False))
+                absolute_contradiction_guard = bool(
+                    claim_absolute_flag
+                    and contradiction_to_absolute_flag
+                    and (object_overlap_ok or object_match_score >= 0.20)
+                    and (
+                        predicate_match_score >= 0.20
+                        or anchor_score >= 0.30
+                        or intervention_match
+                        or intervention_anchors_ok
+                    )
+                )
                 statement_limited_use = self._statement_indicates_limited_use(statement)
                 refute_by_polarity_override = (
                     polarity_conflict
@@ -4981,11 +5166,12 @@ class VerdictGenerator:
                         and anchor_score >= 0.35
                     )
                     or (
-                        self._has_absolute_quantifier(claim_for_semantics)
+                        claim_absolute_flag
                         and predicate_match_score >= 0.45
                         and anchor_score >= 0.45
                         and not object_overlap_ok
                     )
+                    or absolute_contradiction_guard
                     or (
                         contradiction_score >= CONTRADICTION_THRESHOLD
                         and predicate_match_score >= 0.4
@@ -5051,13 +5237,13 @@ class VerdictGenerator:
                     # Absolute claims ("only/all/every/always") require
                     # absolute-support evidence; non-absolute evidence should
                     # not be promoted to SUPPORTS.
-                    if self._has_absolute_quantifier(claim_for_semantics) and not self._has_absolute_quantifier(
-                        statement
-                    ):
+                    if claim_absolute_flag and not self._has_absolute_quantifier(statement):
                         support_gate = False
                     # Requirement claims ("necessary/standard") are contradicted by
                     # limited-use language ("sometimes/selected cases").
                     if claim_requirement and statement_limited_use:
+                        support_gate = False
+                    if absolute_contradiction_guard:
                         support_gate = False
                     # Directional inconsistency ("increases risk" vs "benefits/protects")
                     # should not be promoted as support.
@@ -5204,13 +5390,21 @@ class VerdictGenerator:
                     ),
                 ),
             )
-            is_refute_candidate = bool(
-                relevance == "REFUTES"
-                or explicit_refute_statement
-                or contradiction_score >= max(0.35, CONTRADICTION_THRESHOLD - 0.10)
-                or nli_contradict_prob >= 0.45
-                or polarity_rel == "contradicts"
-            )
+            refute_candidate_reasons: List[str] = []
+            if relevance == "REFUTES":
+                refute_candidate_reasons.append("relevance_refutes")
+            if explicit_refute_statement:
+                refute_candidate_reasons.append("explicit_refute_statement")
+            if contradiction_score >= max(0.35, CONTRADICTION_THRESHOLD - 0.10):
+                refute_candidate_reasons.append("contradiction_score")
+            if nli_contradict_prob >= 0.45:
+                refute_candidate_reasons.append("nli_contradiction")
+            if polarity_rel == "contradicts":
+                refute_candidate_reasons.append("polarity_contradiction")
+            if absolute_contradiction_guard:
+                refute_candidate_reasons.append("absolute_claim_non_universal_contradiction")
+            is_refute_candidate = bool(refute_candidate_reasons)
+            refute_candidate_reason = "|".join(refute_candidate_reasons)
             refute_gate_block_reason = ""
             refute_gate_passed = bool(
                 is_refute_candidate
@@ -5286,8 +5480,15 @@ class VerdictGenerator:
                     "refute_eligibility_score": round(float(refute_eligibility_score), 4),
                     "refute_threshold": round(float(refute_threshold), 4),
                     "refute_candidate": bool(is_refute_candidate),
+                    "refute_candidate_reason": str(refute_candidate_reason),
                     "refute_gate_passed": bool(refute_gate_passed),
                     "refute_gate_block_reason": str(refute_gate_block_reason),
+                    "claim_absolute_flag": bool(claim_absolute_flag),
+                    "contradiction_to_absolute_flag": bool(contradiction_to_absolute_flag),
+                    "partial_effect_contradiction_flag": bool(partial_effect_contradiction_flag),
+                    "exclusivity_contradiction_flag": bool(exclusivity_contradiction_flag),
+                    "universal_scope_contradiction_flag": bool(universal_scope_contradiction_flag),
+                    "zero_exception_expectation": bool(zero_exception_expectation),
                     "quantifier_consistency": round(float(quantifier_consistency), 4),
                     "polarity_consistency": round(float(polarity_consistency), 4),
                     "dose_scope_consistency": round(float(dose_scope_consistency), 4),
@@ -6694,8 +6895,9 @@ class VerdictGenerator:
         return bool(
             re.search(
                 (
-                    r"\b(always|never|all|none|every|entirely|completely|must|only|"
-                    r"exactly|exact|precisely|prevents|prevents|cures|cure)\b"
+                    r"\b(always|never|all|none|every|entirely|completely|fully|must|only|"
+                    r"exactly|exact|precisely|guaranteed|instantly|universally|"
+                    r"100\s*%|all\s+types?|all\s+known|prevents|prevents|cures|cure)\b"
                 ),
                 low,
             )
@@ -7932,6 +8134,7 @@ class VerdictGenerator:
         directional_sources: set[str] = set()
         directional_block_reasons: List[str] = []
         claim_has_absolute_quantifier = self._has_absolute_quantifier(claim)
+        claim_absolute_semantics = self._absolute_claim_semantic_flags(claim)
 
         # Refute admission thresholds are explicit and centralized here to avoid
         # hidden/stacked gate behavior across the evidence loop.
@@ -7954,6 +8157,7 @@ class VerdictGenerator:
                 continue
 
             rel = self._normalize_relevance_label(item.get("relevance", "NEUTRAL"))
+            statement_text = str(item.get("statement") or "")
             credibility = max(0.0, min(1.0, float(item.get("credibility", 0.5) or 0.5)))
             rel_score = max(0.0, min(1.0, float(item.get("relevance_score", 0.0) or 0.0)))
             raw_support_score = item.get("support_score", None)
@@ -8107,13 +8311,57 @@ class VerdictGenerator:
                 0.0,
                 min(1.0, max(1.0 - polarity_match_score, contradiction_signal)),
             )
+            absolute_semantics = self._absolute_claim_contradiction_flags(claim, statement_text)
+            claim_absolute_flag = bool(
+                item.get("claim_absolute_flag", absolute_semantics.get("absolute_quantifier_flag", False))
+                or claim_absolute_semantics.get("absolute_quantifier_flag", False)
+            )
+            contradiction_to_absolute_flag = bool(
+                item.get(
+                    "contradiction_to_absolute_flag", absolute_semantics.get("contradiction_to_absolute_flag", False)
+                )
+            )
+            partial_effect_contradiction_flag = bool(
+                item.get(
+                    "partial_effect_contradiction_flag",
+                    absolute_semantics.get("partial_effect_contradiction_flag", False),
+                )
+            )
+            exclusivity_contradiction_flag = bool(
+                item.get(
+                    "exclusivity_contradiction_flag",
+                    absolute_semantics.get("exclusivity_contradiction_flag", False),
+                )
+            )
+            universal_scope_contradiction_flag = bool(
+                item.get(
+                    "universal_scope_contradiction_flag",
+                    absolute_semantics.get("universal_scope_contradiction_flag", False),
+                )
+            )
+            zero_exception_expectation = bool(
+                item.get(
+                    "zero_exception_expectation",
+                    absolute_semantics.get("zero_exception_expectation", False),
+                )
+            )
+            if claim_absolute_flag and contradiction_to_absolute_flag:
+                contradiction_signal = max(contradiction_signal, 0.56)
+                refute_score = max(refute_score, 0.52)
             base_weight = max(rel_score, 0.10) * (0.55 + (0.45 * source_quality_score))
             stance_before = rel
             if stance_before not in {"SUPPORTS", "REFUTES"}:
-                if contradiction_signal >= max(0.45, refute_threshold - 0.05):
+                if contradiction_to_absolute_flag and (
+                    object_match >= 0.20 and (predicate_match >= 0.20 or semantic_alignment_score >= 0.22)
+                ):
+                    stance_before = "REFUTES"
+                elif contradiction_signal >= max(0.45, refute_threshold - 0.05):
                     stance_before = "REFUTES"
                 elif support_signal >= 0.45:
-                    stance_before = "SUPPORTS"
+                    if claim_absolute_flag and not self._has_absolute_quantifier(statement_text):
+                        stance_before = "NEUTRAL"
+                    else:
+                        stance_before = "SUPPORTS"
                 else:
                     stance_before = "NEUTRAL"
 
@@ -8123,14 +8371,22 @@ class VerdictGenerator:
             admitted_to_refute = False
             refute_admission_score = 0.0
             refute_block_reason = ""
+            population_mismatch_penalty_applied = False
+            population_mismatch_fatal = False
+            population_penalty_factor = 1.0
 
             fatal_mismatch_reason = ""
             if timeframe_consistency_score < refute_cfg["fatal_scope_floor"]:
                 fatal_mismatch_reason = "timeframe_mismatch"
-            elif population_consistency_score < refute_cfg["fatal_scope_floor"]:
-                fatal_mismatch_reason = "population_mismatch"
             elif comparator_consistency_score < refute_cfg["fatal_scope_floor"]:
                 fatal_mismatch_reason = "comparator_mismatch"
+            elif population_consistency_score < refute_cfg["fatal_scope_floor"]:
+                pop_policy = self._population_mismatch_policy(claim, statement_text, population_consistency_score)
+                population_mismatch_penalty_applied = bool(pop_policy.get("penalty_applied", False))
+                population_mismatch_fatal = bool(pop_policy.get("fatal", False))
+                population_penalty_factor = max(0.10, min(1.0, float(pop_policy.get("penalty_factor", 1.0) or 1.0)))
+                if population_mismatch_fatal:
+                    fatal_mismatch_reason = str(pop_policy.get("reason") or "population_mismatch_fatal")
 
             if stance_before == "SUPPORTS":
                 support_labeled_count += 1
@@ -8237,6 +8493,11 @@ class VerdictGenerator:
                         ),
                     ),
                 )
+                if population_mismatch_penalty_applied and not population_mismatch_fatal:
+                    refute_admission_score = max(
+                        0.0,
+                        min(1.0, refute_admission_score * population_penalty_factor),
+                    )
 
                 refute_admission_threshold = (
                     refute_cfg["admission_threshold_absolute"]
@@ -8250,8 +8511,16 @@ class VerdictGenerator:
                     ("anchor_match_score" in item) or ("alignment_score" in item) or ("overall_alignment_score" in item)
                 )
 
-                predicate_guard = predicate_match >= refute_cfg["predicate_min"] or (
-                    refute_gate_passed and not has_predicate_signal
+                absolute_predicate_contradiction_guard = bool(
+                    claim_absolute_flag
+                    and contradiction_to_absolute_flag
+                    and contradiction_signal >= 0.50
+                    and (object_match >= 0.20 or semantic_alignment_score >= 0.20)
+                )
+                predicate_guard = (
+                    predicate_match >= refute_cfg["predicate_min"]
+                    or absolute_predicate_contradiction_guard
+                    or (refute_gate_passed and not has_predicate_signal)
                 )
                 object_floor = refute_cfg["object_min"]
                 if claim_has_absolute_quantifier and contradiction_signal >= 0.55:
@@ -8375,8 +8644,12 @@ class VerdictGenerator:
                             admission_block_reason = "comparator_inconsistency"
                         elif timeframe_match_score < refute_cfg["fatal_scope_floor"]:
                             admission_block_reason = "timeframe_mismatch"
+                        elif population_mismatch_fatal:
+                            admission_block_reason = "population_mismatch_fatal"
+                        elif population_mismatch_penalty_applied:
+                            admission_block_reason = "population_mismatch_penalty"
                         elif population_match_score < refute_cfg["fatal_scope_floor"]:
-                            admission_block_reason = "population_mismatch"
+                            admission_block_reason = "population_mismatch_fatal"
                         else:
                             admission_block_reason = "refute_gate_failed"
                     refute_block_reason = admission_block_reason
@@ -8444,6 +8717,28 @@ class VerdictGenerator:
             item["source_quality_score"] = round(float(source_quality_score), 4)
             item["support_score"] = round(float(support_score), 4)
             item["refute_score"] = round(float(refute_score), 4)
+            item["claim_absolute_flag"] = bool(claim_absolute_flag)
+            item["contradiction_to_absolute_flag"] = bool(contradiction_to_absolute_flag)
+            item["partial_effect_contradiction_flag"] = bool(partial_effect_contradiction_flag)
+            item["exclusivity_contradiction_flag"] = bool(exclusivity_contradiction_flag)
+            item["universal_scope_contradiction_flag"] = bool(universal_scope_contradiction_flag)
+            item["zero_exception_expectation"] = bool(zero_exception_expectation)
+            item["population_mismatch_penalty_applied"] = bool(population_mismatch_penalty_applied)
+            item["population_mismatch_fatal"] = bool(population_mismatch_fatal)
+            item["population_mismatch_penalty_factor"] = round(float(population_penalty_factor), 4)
+            item["absolute_predicate_contradiction_guard"] = bool(
+                claim_absolute_flag
+                and contradiction_to_absolute_flag
+                and contradiction_signal >= 0.50
+                and (object_match >= 0.20 or semantic_alignment_score >= 0.20)
+            )
+            if not str(item.get("refute_candidate_reason") or "").strip():
+                if contradiction_to_absolute_flag:
+                    item["refute_candidate_reason"] = "absolute_claim_non_universal_contradiction"
+                elif stance_before == "REFUTES":
+                    item["refute_candidate_reason"] = "directional_refute_signal"
+                else:
+                    item["refute_candidate_reason"] = ""
             evidence_map[idx] = item
 
         evidence_density = min(1.0, float(evidence_count) / 8.0)
