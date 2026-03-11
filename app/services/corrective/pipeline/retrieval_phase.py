@@ -6,6 +6,7 @@ import asyncio
 import math
 import re
 from hashlib import sha1
+from time import perf_counter
 from typing import Any, Dict, List, Optional
 
 from app.core.logger import get_logger, is_debug_enabled, log_value_payload
@@ -275,6 +276,8 @@ async def retrieve_candidates(
     bm25_ids: Dict[str, float] = {}
     query_embeddings: List[List[float]] = []
     normalized_queries: List[str] = []
+    semantic_started_at = perf_counter()
+    semantic_latency_seconds = 0.0
     anchors = [str(a).strip() for a in (claim_anchors or all_entities or []) if str(a).strip()]
     anchors = _normalize_retrieval_anchors(anchors)
     claim_tokens = _tokenize(query_text)
@@ -286,6 +289,7 @@ async def retrieve_candidates(
         )
 
     # Run KG retrieval concurrently with semantic retrieval loop.
+    kg_started_at = perf_counter()
     kg_task = asyncio.create_task(
         kg_retriever.retrieve(
             all_entities,
@@ -302,6 +306,7 @@ async def retrieve_candidates(
             continue
         normalized_queries.append(q_embed)
         try:
+            sem_query_started_at = perf_counter()
             sem_res = await vdb_retriever.search(
                 q_embed,
                 top_k=top_k,
@@ -310,6 +315,7 @@ async def retrieve_candidates(
                 claim_anchors=anchors,
                 claim_context_hash=effective_claim_context_hash,
             )
+            semantic_latency_seconds += perf_counter() - sem_query_started_at
             semantic_candidates.extend(sem_res or [])
         except Exception as e:
             logger.warning(f"[RetrievalPhase:{round_id}] VDB retrieval failed for query='{q_embed}': {e}")
@@ -445,13 +451,18 @@ async def retrieve_candidates(
             context={"dedup_candidates": len(dedup_sem), "raw_candidates": len(semantic_candidates)},
         )
 
+    semantic_latency_seconds = max(semantic_latency_seconds, perf_counter() - semantic_started_at)
+
     # KG retrieval
     kg_candidates = []
     kg_fallback_triggered = False
+    kg_latency_seconds = 0.0
     try:
         kg_candidates = await kg_task
+        kg_latency_seconds = perf_counter() - kg_started_at
     except Exception as e:
         logger.warning(f"[RetrievalPhase:{round_id}] KG retrieval failed: {e}")
+        kg_latency_seconds = perf_counter() - kg_started_at
 
     if not kg_candidates:
         fallback_entities = _kg_fallback_entities(query_text=query_text, anchors=anchors, entities=all_entities)
@@ -470,8 +481,10 @@ async def retrieve_candidates(
                     claim_anchors=anchors,
                     claim_context_hash=effective_claim_context_hash,
                 )
+                kg_latency_seconds = perf_counter() - kg_started_at
             except Exception as e:
                 logger.warning(f"[RetrievalPhase:{round_id}] KG fallback retrieval failed: {e}")
+                kg_latency_seconds = perf_counter() - kg_started_at
 
     if anchors and kg_candidates:
         filtered_kg: List[Dict[str, Any]] = []
@@ -560,6 +573,8 @@ async def retrieve_candidates(
         "sem_filtered": len(dedup_sem),
         "kg_raw": len(kg_candidates),
         "kg_with_score": kg_with_positive_score,
+        "semantic_latency_seconds": round(float(semantic_latency_seconds), 4),
+        "kg_latency_seconds": round(float(kg_latency_seconds), 4),
         "kg_zero_signal": 1 if len(kg_candidates) == 0 else 0,
         "kg_fallback_triggered": 1 if kg_fallback_triggered else 0,
     }
