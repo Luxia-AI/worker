@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock
 
@@ -217,7 +218,7 @@ async def test_pipeline_no_queries_emits_timing_profile(monkeypatch: pytest.Monk
 
 
 @pytest.mark.asyncio
-async def test_pipeline_skips_duplicates_and_stops_on_zero_yield(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_pipeline_duplicate_counters_do_not_change_baseline_flow(monkeypatch: pytest.MonkeyPatch) -> None:
     pipeline = _build_pipeline()
     pipeline.search_agent.generate_search_queries = AsyncMock(side_effect=[["q1", "q1", "q2"], []])
     pipeline.search_agent.execute_single_query = AsyncMock(
@@ -242,7 +243,6 @@ async def test_pipeline_skips_duplicates_and_stops_on_zero_yield(monkeypatch: py
         ],
     )
     monkeypatch.setenv("LUXIA_CONFIDENCE_MODE", "true")
-    monkeypatch.setenv("PIPELINE_MAX_ZERO_EXTRACTION_ROUNDS", "2")
 
     async def _fake_retrieve_candidates(
         *args: Any, **kwargs: Any
@@ -298,13 +298,63 @@ async def test_pipeline_skips_duplicates_and_stops_on_zero_yield(monkeypatch: py
     result = await pipeline.run("Magnesium bracelets cure chronic migraines.", "health", top_k=3)
     profile = result["timing_profile"]
 
-    assert result["pipeline_diagnostics_v2"]["stop_reason"] == "zero_yield_saturation"
+    assert result["pipeline_diagnostics_v2"]["stop_reason"] == "query_budget_exhausted"
     assert profile["duplicate_queries_skipped"] >= 1
     assert profile["duplicate_urls_skipped"] >= 1
     assert profile["duplicate_docs_skipped"] >= 1
-    assert profile["unique_queries_executed"] >= 1
-    assert profile["zero_yield_round_count"] >= 2
-    assert profile["stop_reason"] == "zero_yield_saturation"
+    assert profile["unique_queries_executed"] == 2
+    assert result["queries_used"] == 2
+    assert profile["stop_reason"] == "query_budget_exhausted"
+
+
+@pytest.mark.asyncio
+async def test_stage_callback_latency_is_measured_with_blocking_callbacks(monkeypatch: pytest.MonkeyPatch) -> None:
+    pipeline = _build_pipeline()
+    pipeline.search_agent.generate_search_queries = AsyncMock(return_value=[])
+    monkeypatch.setenv("LUXIA_CONFIDENCE_MODE", "true")
+
+    async def _fake_retrieve_candidates(
+        *args: Any, **kwargs: Any
+    ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+        _ = (args, kwargs)
+        return (
+            [],
+            [],
+            {
+                "sem_raw": 0,
+                "sem_filtered": 0,
+                "kg_raw": 0,
+                "kg_with_score": 0,
+                "semantic_latency_seconds": 0.01,
+                "kg_latency_seconds": 0.02,
+                "kg_zero_signal": 1,
+                "kg_fallback_triggered": 0,
+            },
+        )
+
+    callback_stages: List[str] = []
+
+    async def _stage_callback(stage: str, payload: Dict[str, Any]) -> None:
+        _ = payload
+        callback_stages.append(stage)
+        await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(pipeline_module, "retrieve_candidates", _fake_retrieve_candidates)
+    monkeypatch.setattr(pipeline_module, "rank_candidates", AsyncMock(return_value=[]))
+    monkeypatch.setattr(pipeline_module, "PipelineDebugReporter", _DummyDebugReporter)
+    monkeypatch.setattr(pipeline_module, "reset_groq_counter", lambda job_id=None: None)
+
+    result = await pipeline.run(
+        "Magnesium bracelets cure chronic migraines.",
+        "health",
+        top_k=3,
+        stage_callback=_stage_callback,
+    )
+    profile = result["timing_profile"]
+
+    assert callback_stages[0] == "started"
+    assert callback_stages[-1] == "completed"
+    assert profile["stage_callback_latency_seconds_total"] > 0.0
 
 
 def test_pipeline_url_and_directional_helpers() -> None:

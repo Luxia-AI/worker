@@ -24,12 +24,10 @@ This approach MAXIMIZES quota efficiency by:
     - Never wasting API calls on unused queries
 """
 
-import asyncio
 import os
 import re
 import urllib.parse
 import uuid
-from hashlib import sha1
 from time import perf_counter
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
@@ -358,50 +356,6 @@ class CorrectivePipeline:
         return urllib.parse.urlunsplit((scheme, netloc, path, query, ""))
 
     @staticmethod
-    def _dedupe_scraped_pages(
-        scraped_pages: List[Dict[str, Any]],
-        seen_doc_signatures: Optional[set[str]] = None,
-    ) -> tuple[List[Dict[str, Any]], int]:
-        seen_doc_signatures = seen_doc_signatures or set()
-        deduped_pages: List[Dict[str, Any]] = []
-        skipped = 0
-        for page in scraped_pages or []:
-            url = str(page.get("url") or "")
-            url_key = CorrectivePipeline._normalize_url_key(url)
-            content = str(page.get("content") or "")
-            if content:
-                normalized_content = re.sub(r"\s+", " ", content).strip().lower()
-                content_key = sha1(normalized_content.encode("utf-8")).hexdigest()
-            else:
-                content_key = ""
-            doc_signature = content_key or f"url:{url_key}"
-            if doc_signature in seen_doc_signatures:
-                skipped += 1
-                continue
-            seen_doc_signatures.add(doc_signature)
-            deduped_pages.append(page)
-        return deduped_pages, skipped
-
-    @staticmethod
-    def _candidate_pool_signature(
-        semantic_candidates: List[Dict[str, Any]],
-        kg_candidates: List[Dict[str, Any]],
-    ) -> str:
-        parts: List[str] = []
-        for item in (semantic_candidates or [])[:60]:
-            src = str(item.get("source_url") or item.get("source") or "").strip().lower()
-            stmt = re.sub(r"\s+", " ", str(item.get("statement") or item.get("text") or "").strip().lower())
-            parts.append(f"S|{src}|{stmt}")
-        for item in (kg_candidates or [])[:60]:
-            src = str(item.get("source_url") or item.get("source") or "").strip().lower()
-            stmt = re.sub(r"\s+", " ", str(item.get("statement") or item.get("text") or "").strip().lower())
-            parts.append(f"K|{src}|{stmt}")
-        if not parts:
-            return ""
-        raw = "||".join(parts)
-        return sha1(raw.encode("utf-8")).hexdigest()
-
-    @staticmethod
     def _directional_evidence_keys(
         ranked_items: List[Dict[str, Any]],
         min_directional_score: float = 0.58,
@@ -698,13 +652,6 @@ class CorrectivePipeline:
         trace_started_at = perf_counter()
         run_started_at = trace_started_at
         stage_callback_latency_seconds_total = 0.0
-        stage_callback_async = str(os.getenv("PIPELINE_STAGE_CALLBACK_NON_BLOCKING", "false")).strip().lower() in {
-            "1",
-            "true",
-            "yes",
-            "on",
-        }
-        pending_stage_tasks: List[asyncio.Task[Any]] = []
         timing_profile: Dict[str, Any] = {
             "total_latency_seconds": 0.0,
             "intake_latency_seconds": 0.0,
@@ -818,27 +765,8 @@ class CorrectivePipeline:
             body = {"round_id": round_id, **(payload or {})}
             maybe = stage_callback(stage, body)
             if maybe is not None:
-                if stage_callback_async:
-                    pending_stage_tasks.append(asyncio.create_task(maybe))
-                else:
-                    await maybe
+                await maybe
             stage_callback_latency_seconds_total += perf_counter() - callback_started
-
-        async def _flush_stage_callbacks() -> None:
-            nonlocal stage_callback_latency_seconds_total
-            if not pending_stage_tasks:
-                return
-            started = perf_counter()
-            done, pending = await asyncio.wait(set(pending_stage_tasks), timeout=2.0)
-            for task in done:
-                try:
-                    _ = task.result()
-                except Exception as exc:
-                    logger.debug("[CorrectivePipeline:%s] Stage callback failed: %s", round_id, exc)
-            for task in pending:
-                task.cancel()
-            pending_stage_tasks.clear()
-            stage_callback_latency_seconds_total += perf_counter() - started
 
         def _build_timing_profile(stop_reason_value: str) -> Dict[str, Any]:
             profile = dict(timing_profile)
@@ -1239,7 +1167,6 @@ class CorrectivePipeline:
                 timing_profile["unique_queries_generated"] = 0
                 timing_profile["unique_queries_executed"] = 0
                 timing_profile["stop_reason"] = "cache_sufficient"
-                await _flush_stage_callbacks()
                 return {
                     "round_id": round_id,
                     "status": "completed_from_cache",
@@ -1366,21 +1293,17 @@ class CorrectivePipeline:
             + (queries_canonical[:3] if queries_canonical else [])
             + (template_canonical[:2] if isinstance(template_canonical, list) else [])
         )
+        queries = dedupe_list(query_candidates)[:8]
         generated_query_keys: set[str] = set()
-        normalized_queries: List[str] = []
-        duplicate_generated_queries = 0
+        valid_generated_queries = 0
         for raw_query in query_candidates:
             q = str(raw_query or "").strip()
             q_key = self._normalize_query_key(q)
             if not q_key:
-                duplicate_generated_queries += 1
                 continue
-            if q_key in generated_query_keys:
-                duplicate_generated_queries += 1
-                continue
+            valid_generated_queries += 1
             generated_query_keys.add(q_key)
-            normalized_queries.append(q)
-        queries = normalized_queries[:8]
+        duplicate_generated_queries = max(0, valid_generated_queries - len(generated_query_keys))
         timing_profile["unique_queries_generated"] = int(len(generated_query_keys))
         timing_profile["duplicate_queries_skipped"] = int(duplicate_generated_queries)
         canonical_claim_payload["queries_original"] = list(queries_original)
@@ -1433,7 +1356,6 @@ class CorrectivePipeline:
             timing_profile["unique_queries_generated"] = 0
             timing_profile["unique_queries_executed"] = 0
             timing_profile["stop_reason"] = "no_queries_generated"
-            await _flush_stage_callbacks()
 
             return {
                 "round_id": round_id,
@@ -1526,11 +1448,6 @@ class CorrectivePipeline:
         logger.info(
             f"[CorrectivePipeline:{round_id}] Found {len(already_processed_urls)} " "already-processed URLs in VDB"
         )
-        already_processed_url_keys = {
-            key for key in (self._normalize_url_key(url) for url in already_processed_urls) if key
-        }
-        processed_url_keys: set[str] = set()
-        seen_doc_signatures: set[str] = set()
 
         # Process ONE QUERY AT A TIME for maximum quota efficiency
         all_facts: List[Dict[str, Any]] = []
@@ -1540,42 +1457,14 @@ class CorrectivePipeline:
         skipped_urls: List[str] = []
         search_api_calls = 0
         queries_executed: List[str] = []
-        executed_query_keys: set[str] = set()
         zero_extraction_rounds = 0
         low_yield_rounds = 0
         kg_timeout_count = 0
         stop_reason = "query_budget_exhausted"
         gain_estimate = 0.0
         corrective_loop_started_at = perf_counter()
-        last_candidate_pool_signature = self._candidate_pool_signature(dedup_sem, kg_candidates)
-        unchanged_candidate_pool_rounds = 0
-        consecutive_zero_directional_rounds = 0
-        consecutive_no_new_url_rounds = 0
-        directional_evidence_seen: set[str] = self._directional_evidence_keys(top_ranked)
-        try:
-            max_zero_directional_rounds = max(2, int(os.getenv("PIPELINE_MAX_ZERO_DIRECTIONAL_ROUNDS", "2")))
-        except Exception:
-            max_zero_directional_rounds = 2
-        try:
-            min_rounds_for_directional_stop = max(3, int(os.getenv("PIPELINE_MIN_ROUNDS_FOR_DIRECTIONAL_STOP", "4")))
-        except Exception:
-            min_rounds_for_directional_stop = 4
-        try:
-            max_no_new_url_rounds = max(2, int(os.getenv("PIPELINE_MAX_CONSECUTIVE_NO_NEW_URL_ROUNDS", "2")))
-        except Exception:
-            max_no_new_url_rounds = 2
-        try:
-            max_unchanged_pool_rounds = max(2, int(os.getenv("PIPELINE_MAX_UNCHANGED_POOL_ROUNDS", "2")))
-        except Exception:
-            max_unchanged_pool_rounds = 2
-        try:
-            max_zero_extraction_rounds = max(2, int(os.getenv("PIPELINE_MAX_ZERO_EXTRACTION_ROUNDS", "3")))
-        except Exception:
-            max_zero_extraction_rounds = 3
-        try:
-            min_directional_score = float(os.getenv("PIPELINE_MIN_DIRECTIONAL_EVIDENCE_SCORE", "0.58"))
-        except Exception:
-            min_directional_score = 0.58
+        total_duplicate_urls_observed = 0
+        total_duplicate_docs_observed = 0
         confidence_target_coverage = float(os.getenv("CONFIDENCE_TARGET_COVERAGE", "0.5"))
         confidence_max_new_trusted_urls = max(
             1,
@@ -1593,11 +1482,6 @@ class CorrectivePipeline:
         except Exception:
             max_runtime_seconds = 430.0 if confidence_mode else 360.0
         max_runtime_seconds = max(30.0, float(max_runtime_seconds))
-        try:
-            min_meaningful_round_seconds = float(os.getenv("PIPELINE_MIN_MEANINGFUL_ROUND_SECONDS", "20"))
-        except Exception:
-            min_meaningful_round_seconds = 20.0
-        min_meaningful_round_seconds = max(5.0, float(min_meaningful_round_seconds))
         try:
             default_headroom = "25" if confidence_mode else "15"
             runtime_guard_headroom_seconds = float(
@@ -1635,24 +1519,6 @@ class CorrectivePipeline:
                 timing_profile["new_directional_evidence_by_round"].append(0)
                 timing_profile["corrective_round_latencies"].append(round(float(perf_counter() - round_started_at), 3))
                 break
-            remaining_runtime_before_round = max_runtime_seconds - elapsed_runtime_seconds
-            if (
-                search_api_calls > 0
-                and remaining_runtime_before_round <= min_meaningful_round_seconds
-                and elapsed_runtime_seconds > runtime_guard_headroom_seconds
-            ):
-                logger.info(
-                    "[CorrectivePipeline:%s] Stopping before query %d due to low remaining runtime "
-                    "(remaining=%.2fs, minimum_round=%.2fs).",
-                    round_id,
-                    query_idx + 1,
-                    remaining_runtime_before_round,
-                    min_meaningful_round_seconds,
-                )
-                stop_reason = "insufficient_runtime_for_meaningful_round"
-                timing_profile["new_directional_evidence_by_round"].append(0)
-                timing_profile["corrective_round_latencies"].append(round(float(perf_counter() - round_started_at), 3))
-                break
             # OPTIMIZATION: Hard limit on search queries to prevent runaway searches
             if search_api_calls >= self.MAX_SEARCH_QUERIES:
                 logger.info(
@@ -1665,19 +1531,6 @@ class CorrectivePipeline:
                 break
 
             query = str(query or "").strip()
-            query_key = self._normalize_query_key(query)
-            if not query_key or query_key in executed_query_keys:
-                timing_profile["duplicate_queries_skipped"] = int(timing_profile["duplicate_queries_skipped"]) + 1
-                logger.debug(
-                    "[CorrectivePipeline:%s] Skipping duplicate query at position %d: %s",
-                    round_id,
-                    query_idx + 1,
-                    query,
-                )
-                timing_profile["new_directional_evidence_by_round"].append(0)
-                timing_profile["corrective_round_latencies"].append(round(float(perf_counter() - round_started_at), 3))
-                continue
-            executed_query_keys.add(query_key)
 
             logger.info(f"[CorrectivePipeline:{round_id}] === Query {query_idx + 1}/{len(queries)} ===")
             logger.info(f"[CorrectivePipeline:{round_id}] Executing: '{query}'")
@@ -1729,9 +1582,7 @@ class CorrectivePipeline:
             logger.info(f"[CorrectivePipeline:{round_id}] Query {query_idx + 1} returned " f"{len(query_urls)} URLs")
             timing_profile["urls_considered"] = int(timing_profile["urls_considered"]) + int(len(query_urls))
 
-            # Filter out duplicate and already-processed URLs using normalized URL keys.
-            unique_query_urls: List[str] = []
-            unique_query_url_keys: List[str] = []
+            # Observability-only duplicate URL counting (no behavioral suppression here).
             seen_query_url_keys: set[str] = set()
             duplicate_urls_in_query = 0
             for url in query_urls:
@@ -1740,38 +1591,19 @@ class CorrectivePipeline:
                     continue
                 if key in seen_query_url_keys:
                     duplicate_urls_in_query += 1
-                    continue
                 seen_query_url_keys.add(key)
-                unique_query_urls.append(url)
-                unique_query_url_keys.append(key)
             if duplicate_urls_in_query > 0:
-                timing_profile["duplicate_urls_skipped"] = int(timing_profile["duplicate_urls_skipped"]) + int(
-                    duplicate_urls_in_query
-                )
+                total_duplicate_urls_observed += int(duplicate_urls_in_query)
 
-            new_urls: List[str] = []
-            new_url_keys: List[str] = []
-            skipped_this_query = 0
-            for url, key in zip(unique_query_urls, unique_query_url_keys):
-                if key in already_processed_url_keys or key in processed_url_keys:
-                    skipped_this_query += 1
-                    continue
-                new_urls.append(url)
-                new_url_keys.append(key)
+            # Baseline filter behavior: skip only already-processed URLs.
+            new_urls = [url for url in query_urls if url not in already_processed_urls and url not in processed_urls]
+            skipped_this_query = len(query_urls) - len(new_urls)
 
             if skipped_this_query > 0:
-                timing_profile["duplicate_urls_skipped"] = int(timing_profile["duplicate_urls_skipped"]) + int(
-                    skipped_this_query
-                )
-                skipped_urls.extend(
-                    [
-                        url
-                        for url, key in zip(unique_query_urls, unique_query_url_keys)
-                        if key in already_processed_url_keys
-                    ]
-                )
+                total_duplicate_urls_observed += int(skipped_this_query)
+                skipped_urls.extend([url for url in query_urls if url in already_processed_urls])
                 logger.info(
-                    f"[CorrectivePipeline:{round_id}] Filtered {skipped_this_query} duplicate/already-processed URLs, "
+                    f"[CorrectivePipeline:{round_id}] Filtered {skipped_this_query} already-processed URLs, "
                     f"{len(new_urls)} new URLs to scrape"
                 )
 
@@ -1780,20 +1612,10 @@ class CorrectivePipeline:
                     f"[CorrectivePipeline:{round_id}] All URLs from query {query_idx + 1} already processed, "
                     "trying next query..."
                 )
-                consecutive_no_new_url_rounds += 1
                 low_yield_rounds += 1
                 timing_profile["new_directional_evidence_by_round"].append(0)
                 timing_profile["corrective_round_latencies"].append(round(float(perf_counter() - round_started_at), 3))
-                if consecutive_no_new_url_rounds >= max_no_new_url_rounds:
-                    stop_reason = "duplicate_url_saturation"
-                    logger.info(
-                        "[CorrectivePipeline:%s] Stopping after %d rounds with no new URLs.",
-                        round_id,
-                        consecutive_no_new_url_rounds,
-                    )
-                    break
                 continue
-            consecutive_no_new_url_rounds = 0
 
             # Step 2: Scrape only NEW URLs from this query
             if len(new_urls) > self.MAX_URLS_PER_QUERY:
@@ -1829,16 +1651,20 @@ class CorrectivePipeline:
                 3,
             )
             processed_urls.extend(new_urls)
-            processed_url_keys.update(new_url_keys)
             # Add to already_processed set to avoid re-scraping in subsequent queries
             already_processed_urls.update(new_urls)
-            already_processed_url_keys.update(new_url_keys)
-
-            scraped_pages, duplicate_docs_skipped = self._dedupe_scraped_pages(scraped_pages, seen_doc_signatures)
-            if duplicate_docs_skipped > 0:
-                timing_profile["duplicate_docs_skipped"] = int(timing_profile["duplicate_docs_skipped"]) + int(
-                    duplicate_docs_skipped
-                )
+            seen_scraped_doc_keys: set[str] = set()
+            duplicate_docs_this_round = 0
+            for page in scraped_pages or []:
+                key = self._normalize_url_key(str(page.get("url") or ""))
+                if not key:
+                    continue
+                if key in seen_scraped_doc_keys:
+                    duplicate_docs_this_round += 1
+                    continue
+                seen_scraped_doc_keys.add(key)
+            if duplicate_docs_this_round > 0:
+                total_duplicate_docs_observed += int(duplicate_docs_this_round)
             timing_profile["extracted_docs_count"] = int(timing_profile["extracted_docs_count"]) + int(
                 len(scraped_pages)
             )
@@ -1885,14 +1711,6 @@ class CorrectivePipeline:
                 low_yield_rounds += 1
                 timing_profile["new_directional_evidence_by_round"].append(0)
                 timing_profile["corrective_round_latencies"].append(round(float(perf_counter() - round_started_at), 3))
-                if zero_extraction_rounds >= max_zero_extraction_rounds:
-                    stop_reason = "zero_yield_saturation"
-                    logger.info(
-                        "[CorrectivePipeline:%s] Stopping after %d consecutive zero-extraction rounds.",
-                        round_id,
-                        zero_extraction_rounds,
-                    )
-                    break
                 continue
             zero_extraction_rounds = 0
             if len(query_facts) <= 1:
@@ -1933,7 +1751,6 @@ class CorrectivePipeline:
             # Step 5: Re-retrieve and re-rank with new evidence
             # Keep retrieval anchored to claim entities to avoid topic drift from scraped-page artifacts.
             retrieval_entities = list(set(claim_entities + failed_entities))
-            reretrieve_started_at = perf_counter()
             dedup_sem, kg_candidates, retrieval_metrics = await retrieve_candidates(
                 self.vdb_retriever,
                 self.kg_retriever,
@@ -1977,30 +1794,6 @@ class CorrectivePipeline:
                     "kg_candidates": kg_candidates,
                 },
             )
-
-            candidate_pool_signature = self._candidate_pool_signature(dedup_sem, kg_candidates)
-            if candidate_pool_signature and candidate_pool_signature == last_candidate_pool_signature:
-                unchanged_candidate_pool_rounds += 1
-                low_yield_rounds += 1
-                logger.info(
-                    "[CorrectivePipeline:%s] Candidate pool unchanged after query %d (rounds=%d); skipping rerank.",
-                    round_id,
-                    query_idx + 1,
-                    unchanged_candidate_pool_rounds,
-                )
-                round_new_directional_evidence = 0
-                timing_profile["rerank_latency_seconds_total"] = round(
-                    float(timing_profile["rerank_latency_seconds_total"]) + (perf_counter() - reretrieve_started_at),
-                    3,
-                )
-                timing_profile["new_directional_evidence_by_round"].append(int(round_new_directional_evidence))
-                timing_profile["corrective_round_latencies"].append(round(float(perf_counter() - round_started_at), 3))
-                if unchanged_candidate_pool_rounds >= max_unchanged_pool_rounds:
-                    stop_reason = "unchanged_candidate_pool"
-                    break
-                continue
-            unchanged_candidate_pool_rounds = 0
-            last_candidate_pool_signature = candidate_pool_signature
 
             rerank_started_at = perf_counter()
             top_ranked = await rank_candidates(
@@ -2054,14 +1847,9 @@ class CorrectivePipeline:
 
             directional_now = self._directional_evidence_keys(
                 top_ranked,
-                min_directional_score=min_directional_score,
+                min_directional_score=0.58,
             )
-            round_new_directional_evidence = len(directional_now - directional_evidence_seen)
-            if round_new_directional_evidence > 0:
-                directional_evidence_seen.update(directional_now)
-                consecutive_zero_directional_rounds = 0
-            else:
-                consecutive_zero_directional_rounds += 1
+            round_new_directional_evidence = int(len(directional_now))
 
             if is_comparative_claim:
                 diversity_now = float(adaptive_trust.get("diversity", 0.0) or 0.0)
@@ -2088,6 +1876,10 @@ class CorrectivePipeline:
                         comparative_monopoly_rounds,
                     )
                     stop_reason = "comparative_monopoly"
+                    timing_profile["new_directional_evidence_by_round"].append(int(round_new_directional_evidence))
+                    timing_profile["corrective_round_latencies"].append(
+                        round(float(perf_counter() - round_started_at), 3)
+                    )
                     break
                 strong_covered_now = int(adaptive_trust.get("strong_covered", 0) or 0)
                 trust_post_now = float(adaptive_trust.get("trust_post", 0.0) or 0.0)
@@ -2125,23 +1917,6 @@ class CorrectivePipeline:
                 timing_profile["corrective_round_latencies"].append(round(float(perf_counter() - round_started_at), 3))
                 break
 
-            if (
-                (query_idx + 1) >= min_rounds_for_directional_stop
-                and consecutive_zero_directional_rounds >= max_zero_directional_rounds
-                and low_yield_rounds >= 2
-            ):
-                stop_reason = "no_new_directional_evidence"
-                logger.info(
-                    "[CorrectivePipeline:%s] Stopping due to repeated zero directional gain "
-                    "(rounds=%d, low_yield_rounds=%d).",
-                    round_id,
-                    consecutive_zero_directional_rounds,
-                    low_yield_rounds,
-                )
-                timing_profile["new_directional_evidence_by_round"].append(int(round_new_directional_evidence))
-                timing_profile["corrective_round_latencies"].append(round(float(perf_counter() - round_started_at), 3))
-                break
-
             if confidence_mode:
                 gain_estimate = self._estimate_information_gain(
                     adaptive_trust,
@@ -2174,7 +1949,9 @@ class CorrectivePipeline:
             float(perf_counter() - corrective_loop_started_at),
             3,
         )
-        timing_profile["unique_queries_executed"] = int(len(executed_query_keys))
+        timing_profile["unique_queries_executed"] = int(len(queries_executed))
+        timing_profile["duplicate_urls_skipped"] = int(total_duplicate_urls_observed)
+        timing_profile["duplicate_docs_skipped"] = int(total_duplicate_docs_observed)
         timing_profile["zero_yield_round_count"] = int(zero_extraction_rounds)
         timing_profile["stop_reason"] = str(stop_reason)
         logger.info(
@@ -2341,7 +2118,6 @@ class CorrectivePipeline:
             },
         )
         await debug_reporter.close()
-        await _flush_stage_callbacks()
         elapsed_total = perf_counter() - pipeline_started_at
         final_timing_profile = _build_timing_profile(stop_reason)
         _trace_final_stages(
