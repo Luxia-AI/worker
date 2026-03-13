@@ -104,8 +104,8 @@ def compute_posteriors_v2(
     # Uncertainty should shrink when directional evidence is strong and polarized.
     uncertainty_base = (1.0 - sufficiency) * (1.0 - (0.55 * directional_strength))
     # Dampen neutral residual more aggressively when any directional signal exists.
-    neutral_damping = (0.65 * margin) + (0.20 * directional_strength)
-    residual_neutral = neutral_mass_n * max(0.10, 1.0 - neutral_damping)
+    neutral_damping = (0.65 * margin) + (0.20 * directional_strength) + (0.30 * directional_mass)
+    residual_neutral = neutral_mass_n * max(0.08, 1.0 - neutral_damping)
     p_unv_raw = max(0.0, uncertainty_base + residual_neutral)
     s = max(1e-9, p_true_raw + p_false_raw + p_unv_raw)
     p_true = _clamp01(p_true_raw / s)

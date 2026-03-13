@@ -1149,15 +1149,22 @@ class VerdictGenerator:
             score = ev.get("final_score") or ev.get("score") or 0
             credibility = ev.get("credibility") or 0.5
             grade = ev.get("grade") or "N/A"
+            stance = str(ev.get("stance") or "").strip().upper()
+            stance_label = (
+                "SUPPORTS"
+                if stance in {"SUPPORTS", "SUPPORT", "PRO", "ENTAILS"}
+                else ("CONTRADICTS" if stance in {"REFUTES", "CONTRADICTS", "CONTRA", "AGAINST"} else "")
+            )
 
             # Skip items without valid statement
             if not statement:
                 continue
 
+            stance_hint = f" | Stance: {stance_label}" if stance_label else ""
             lines.append(
                 f"[{i}] Statement: {statement}\n"
                 f"    Source: {source_url}\n"
-                f"    Score: {score:.2f} | Credibility: {credibility:.2f} | Grade: {grade}"
+                f"    Score: {score:.2f} | Credibility: {credibility:.2f} | Grade: {grade}{stance_hint}"
             )
 
         return "\n\n".join(lines)
@@ -7994,7 +8001,7 @@ class VerdictGenerator:
         directional_diversity = max(0.0, min(1.0, float(payload.get("directional_source_diversity", 0.0) or 0.0)))
 
         support_floor = max(0.05, float(os.getenv("VERDICT_DIRECTIONAL_MASS_FLOOR", "0.20")))
-        suff_floor = max(0.20, float(os.getenv("VERDICT_SUFFICIENCY_FLOOR", "0.45")))
+        suff_floor = max(0.18, float(os.getenv("VERDICT_SUFFICIENCY_FLOOR", "0.38")))
         direction_floor = max(0.02, float(os.getenv("VERDICT_DIRECTION_MARGIN", "0.08")))
         conflict_floor = max(0.05, float(os.getenv("VERDICT_DIRECTION_CONFLICT_FLOOR", "0.12")))
 
@@ -8019,9 +8026,9 @@ class VerdictGenerator:
         decisive_directional_unlock = bool(
             has_directional_mass
             and has_directional_items
-            and max(s, c) >= 0.65
-            and directional_margin >= 0.70
-            and pre_quality >= 0.55
+            and max(s, c) >= 0.55
+            and directional_margin >= 0.60
+            and pre_quality >= 0.45
         )
 
         if not has_directional_mass or not has_directional_items:
@@ -8222,8 +8229,8 @@ class VerdictGenerator:
             "alignment_min": 0.14,
             "contradiction_min": 0.38,
             "subject_or_object_min": 0.16,
-            "admission_threshold": 0.46,
-            "admission_threshold_absolute": 0.42,
+            "admission_threshold": 0.38,
+            "admission_threshold_absolute": 0.34,
         }
 
         for idx, item in enumerate(evidence_map or []):
@@ -8440,9 +8447,9 @@ class VerdictGenerator:
                     and (object_match >= 0.20 and (predicate_match >= 0.20 or semantic_alignment_score >= 0.22))
                 ):
                     stance_before = "REFUTES"
-                elif contradiction_signal >= max(0.45, refute_threshold - 0.05):
+                elif contradiction_signal >= max(0.38, refute_threshold - 0.15):
                     stance_before = "REFUTES"
-                elif support_signal >= 0.45:
+                elif support_signal >= 0.38:
                     if (
                         absolute_claim_experiment_enabled
                         and claim_absolute_flag
@@ -8492,15 +8499,17 @@ class VerdictGenerator:
                         + (0.04 * quantifier_consistency_score),
                     ),
                 )
-                support_threshold = max(0.35, float(os.getenv("VERDICT_SUPPORT_ADMISSION_THRESHOLD", "0.42")))
+                support_threshold = max(0.28, float(os.getenv("VERDICT_SUPPORT_ADMISSION_THRESHOLD", "0.36")))
                 support_semantic_min = bool(
-                    predicate_match >= 0.12 and object_match >= 0.12 and overall_alignment_score >= 0.20
+                    (predicate_match >= 0.08 or semantic_alignment_score >= 0.22)
+                    and object_match >= 0.10
+                    and overall_alignment_score >= 0.16
                 )
                 support_directional_guard = bool(
-                    support_signal >= 0.45
-                    and predicate_match >= 0.15
-                    and object_match >= 0.15
-                    and overall_alignment_score >= 0.25
+                    support_signal >= 0.38
+                    and predicate_match >= 0.10
+                    and object_match >= 0.10
+                    and overall_alignment_score >= 0.18
                 )
                 if fatal_mismatch_reason:
                     admission_block_reason = fatal_mismatch_reason
@@ -8635,11 +8644,11 @@ class VerdictGenerator:
                     and (semantic_alignment_score < refute_cfg["fatal_alignment_floor"] or not has_alignment_signal)
                 )
                 fallback_refute_guard = bool(
-                    contradiction_signal >= 0.55
+                    contradiction_signal >= 0.45
                     and predicate_match >= refute_cfg["predicate_min"]
                     and semantic_alignment_score >= refute_cfg["alignment_min"]
                     and object_match >= max(0.05, object_floor)
-                    and max(subject_match, object_match) >= 0.12
+                    and max(subject_match, object_match) >= 0.10
                 )
 
                 if fatal_mismatch_reason:
@@ -8690,7 +8699,7 @@ class VerdictGenerator:
                         refute_gate_passed
                         or refute_eligibility_score >= refute_threshold
                         or fallback_refute_guard
-                        or contradiction_signal >= 0.50
+                        or contradiction_signal >= 0.44
                     )
                 ) or fallback_refute_guard:
                     if fallback_refute_guard and not refute_gate_passed:

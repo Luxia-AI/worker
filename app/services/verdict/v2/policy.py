@@ -92,30 +92,30 @@ def compute_verdict_policy_v2(
     unv_margin = p_unv_cal - directional_competitor
     _weakness_count = (
         int(directional_margin <= 0.10)
-        + int(directional_signal <= 0.45)
-        + int(sufficiency <= 0.52)
-        + int(admissibility_rate <= 0.40)
+        + int(directional_signal <= 0.28)
+        + int(sufficiency <= 0.42)
+        + int(admissibility_rate <= 0.30)
     )
     if p_unv_cal >= 0.55 and unv_margin >= 0.12 and _weakness_count >= 3:
         verdict = "UNVERIFIABLE"
     # Directional lock: avoid conservative collapse to UNVERIFIABLE when calibrated
     # directional posterior is clearly dominant and evidence sufficiency is acceptable.
     if (
-        p_true_cal >= 0.44
-        and p_true_cal >= (p_false_cal + 0.06)
+        p_true_cal >= 0.40
+        and p_true_cal >= (p_false_cal + 0.05)
         and p_true_cal >= (p_unv_cal + 0.03)
-        and support_signal >= 0.35
-        and sufficiency >= 0.48
-        and admissibility_rate >= 0.40
+        and support_signal >= 0.28
+        and sufficiency >= 0.42
+        and admissibility_rate >= 0.35
     ):
         verdict = "TRUE"
     elif (
-        p_false_cal >= 0.44
-        and p_false_cal >= (p_true_cal + 0.06)
+        p_false_cal >= 0.40
+        and p_false_cal >= (p_true_cal + 0.05)
         and p_false_cal >= (p_unv_cal + 0.03)
-        and refute_signal >= 0.35
-        and sufficiency >= 0.48
-        and admissibility_rate >= 0.40
+        and refute_signal >= 0.28
+        and sufficiency >= 0.42
+        and admissibility_rate >= 0.35
     ):
         verdict = "FALSE"
     class_max = max(float(v or 0.0) for v in class_probs.values())

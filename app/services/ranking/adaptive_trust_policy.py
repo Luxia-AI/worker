@@ -423,8 +423,8 @@ class AdaptiveTrustPolicy:
 
         overlap_ratio = overlap / max(1, len(sub_set))
         sem = max(getattr(evidence, "semantic_score", 0.0), getattr(evidence, "trust", 0.0))
-        # Require both: decent overlap and strong semantic/trust match
-        return overlap_ratio >= 0.20 and sem >= 0.45
+        # Require both: decent overlap and acceptable semantic/trust match
+        return overlap_ratio >= 0.18 and sem >= 0.38
 
     def calculate_diversity(self, evidence_list: List[EvidenceItem]) -> float:
         """
