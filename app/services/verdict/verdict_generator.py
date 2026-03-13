@@ -8041,11 +8041,19 @@ class VerdictGenerator:
             verdict_internal = Verdict.UNVERIFIABLE.value
             abstain_reason = "conflicting_directional_evidence"
         elif directional_delta >= direction_floor and has_support:
-            verdict_internal = Verdict.TRUE.value
-            abstain_reason = ""
+            if has_contradict and conflict_ratio >= 0.40:
+                verdict_internal = Verdict.UNVERIFIABLE.value
+                abstain_reason = "conflicting_evidence_balance"
+            else:
+                verdict_internal = Verdict.TRUE.value
+                abstain_reason = ""
         elif (-directional_delta) >= direction_floor and has_contradict:
-            verdict_internal = Verdict.FALSE.value
-            abstain_reason = ""
+            if has_support and conflict_ratio >= 0.40:
+                verdict_internal = Verdict.UNVERIFIABLE.value
+                abstain_reason = "conflicting_evidence_balance"
+            else:
+                verdict_internal = Verdict.FALSE.value
+                abstain_reason = ""
         else:
             verdict_internal = Verdict.UNVERIFIABLE.value
             abstain_reason = "insufficient_directional_margin"
@@ -8455,6 +8463,9 @@ class VerdictGenerator:
                         and claim_absolute_flag
                         and not self._has_absolute_quantifier(statement_text)
                     ):
+                        stance_before = "NEUTRAL"
+                    elif rel == "NEUTRAL" and support_signal < 0.52:
+                        # LLM explicitly labeled NEUTRAL — respect that unless signal is unambiguous.
                         stance_before = "NEUTRAL"
                     else:
                         stance_before = "SUPPORTS"
