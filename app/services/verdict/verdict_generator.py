@@ -254,15 +254,17 @@ class VerdictGenerator:
         self.MAX_WEB_ROUNDS_PRE_VERDICT = int(os.getenv("VERDICT_MAX_WEB_ROUNDS_PRE", "4"))
         self.WEB_SEGMENTS_LIMIT = int(os.getenv("VERDICT_WEB_SEGMENTS_LIMIT", "5"))
         self.MAX_UNKNOWN_ROUNDS_POST_VERDICT = int(os.getenv("VERDICT_MAX_UNKNOWN_ROUNDS_POST", "4"))
-        v2_enabled_env = os.getenv("VERDICT_ENGINE_V2_ENABLED", "false")
-        # Active decision ownership is deterministic 3-class policy in this generator.
-        # Keep v2 available only for shadow comparison / rollback diagnostics.
-        self.v2_enabled = False
-        if v2_enabled_env.strip().lower() in {"1", "true", "yes", "on"}:
-            logger.info(
-                "[VerdictGenerator] VERDICT_ENGINE_V2_ENABLED ignored for active ownership; "
-                "v2 kept in shadow/rollback mode only."
-            )
+        v2_enabled_env = os.getenv("VERDICT_ENGINE_V2_ENABLED", "true")
+        # Active decision ownership should be controlled by configuration, not hard-disabled
+        # in code. The previous forced-disable created a clean-architecture violation where
+        # the calibrated 3-class policy existed but could never own the final decision.
+        self.v2_enabled = v2_enabled_env.strip().lower() in {"1", "true", "yes", "on"}
+        logger.info(
+            "[VerdictGenerator] v2 active ownership enabled=%s shadow=%s fail_open=%s",
+            self.v2_enabled,
+            os.getenv("VERDICT_ENGINE_V2_SHADOW", "true"),
+            os.getenv("VERDICT_ENGINE_V2_FAIL_OPEN", "true"),
+        )
         self.v2_shadow = os.getenv("VERDICT_ENGINE_V2_SHADOW", "true").strip().lower() in {
             "1",
             "true",
@@ -1268,7 +1270,7 @@ class VerdictGenerator:
         v2_fail_open = bool(getattr(self, "v2_fail_open", True))
         calibrator = getattr(self, "v2_calibrator", None) or ConfidenceCalibrator(None)
         decision_trace_id = self._build_decision_trace_id(claim, evidence)
-        engine_version = "deterministic_owner_v3"
+        engine_version = "calibrated_owner_v4"
 
         # Extract confidence (will be re-scored from evidence if possible)
         confidence = llm_result.get("confidence", 0.5)
@@ -4153,7 +4155,7 @@ class VerdictGenerator:
         groups = {
             "causal": (
                 r"\b(cause|causes|caused|causing|lead|leads|leading|result|results|resulting|"
-                r"associate|associated|link|linked|contribut(?:e|es|ed|ing))\b"
+                r"associate|associated|link|linked|contribut(?:e|es|ed|ing)|mediate(?:s|d|ing)?)\b"
             ),
             "preventive": (
                 r"\b(prevent|prevents|prevention|reduce|reduces|reduced|decrease|decreases|decreased|"
@@ -4165,17 +4167,26 @@ class VerdictGenerator:
             ),
             "therapeutic": (
                 r"\b(treat|treats|treatment|cure|cures|help|helps|promote|promotes|improve|improves|"
-                r"enhance|enhances|boost|boosts|effective|efficacious)\b"
+                r"enhance|enhances|boost|boosts|effective|efficacious|recommend|recommends|recommended)\b"
+            ),
+            "diagnostic": (
+                r"\b(screen|screens|screened|screening|detect|detects|detected|detecting|"
+                r"diagnos(?:e|es|ed|ing)|indicat(?:e|es|ed|ing))\b"
+            ),
+            "facilitation": (
+                r"\b(expedit(?:e|es|ed|ing)|accelerat(?:e|es|ed|ing)|streamlin(?:e|es|ed|ing)|"
+                r"facilitat(?:e|es|ed|ing))\b"
             ),
             "genomic_change": (
                 r"\b(alter|alters|altered|change|changes|changed|integrate|integration|"
-                r"incorporat|modify|modifies)\b"
+                r"incorporat|modify|modifies|modulat(?:e|es|ed|ing)|regulat(?:e|es|ed|ing))\b"
             ),
             "build_support": (
                 r"\b(build|builds|built|maintain|maintains|maintained|support|supports|supported|"
                 r"strengthen|strengthens|strengthened|needed|need|needs|required|requires|essential|necessary|"
                 r"increase|increases|increased|enhance|enhances|enhanced|boost|boosts|boosted|"
-                r"contribut(?:e|es|ed|ing))\b"
+                r"contribut(?:e|es|ed|ing)|facilitat(?:e|es|ed|ing)|streamlin(?:e|es|ed|ing)|"
+                r"expedit(?:e|es|ed|ing)|accelerat(?:e|es|ed|ing))\b"
             ),
             "source_relation": (
                 r"\b(contain|contains|contained|include|includes|included|found in|source of|"
@@ -4225,7 +4236,11 @@ class VerdictGenerator:
                     r"\b(is|are|was|were|be|been|being|do|does|did|can|could|may|might|must|should|would|will|"
                     r"support(?:s|ed|ing)?|help(?:s|ed|ing)?|contribut(?:e|es|ed|ing)|"
                     r"prevent(?:s|ed|ing)?|reduce(?:s|d|ing)?|increase(?:s|d|ing)?|"
-                    r"improve(?:s|d|ing)?|cause(?:s|d|ing)?|require(?:s|d|ing)?|need(?:s|ed|ing)?)\b"
+                    r"improve(?:s|d|ing)?|cause(?:s|d|ing)?|require(?:s|d|ing)?|need(?:s|ed|ing)?|"
+                    r"recommend(?:s|ed|ing)?|screen(?:s|ed|ing)?|detect(?:s|ed|ing)?|diagnos(?:e|es|ed|ing)|"
+                    r"indicat(?:e|es|ed|ing)|expedit(?:e|es|ed|ing)|accelerat(?:e|es|ed|ing)|"
+                    r"streamlin(?:e|es|ed|ing)|facilitat(?:e|es|ed|ing)|modulat(?:e|es|ed|ing)|"
+                    r"regulat(?:e|es|ed|ing)|mediate(?:s|d|ing)?|establish(?:es|ed|ing)?)\b"
                 ),
                 low,
                 flags=re.IGNORECASE,
@@ -4320,6 +4335,9 @@ class VerdictGenerator:
             "change",
             "integrate",
             "modify",
+            "modulate",
+            "regulate",
+            "mediate",
             "lead",
             "result",
             "associate",
@@ -4332,6 +4350,16 @@ class VerdictGenerator:
             "contain",
             "manage",
             "contribut",
+            "recommend",
+            "screen",
+            "detect",
+            "diagnose",
+            "indicate",
+            "expedite",
+            "accelerate",
+            "streamline",
+            "facilitate",
+            "establish",
             "necessary",
             "important",
             "required",
@@ -4808,12 +4836,39 @@ class VerdictGenerator:
         ev_neg = self._has_negation_cue(evidence_text)
         negation_mismatch = 1.0 if claim_neg != ev_neg else 0.0
         polarity_signal = 1.0 if pol == "contradicts" else 0.0
-        score = (
-            (0.35 * predicate)
-            + (0.25 * anchor_overlap)
-            + (0.20 * explicit_refute)
-            + (0.20 * max(negation_mismatch, polarity_signal))
+        same_polarity_support = 1.0 if pol == "entails" else 0.0
+
+        evidence_low = str(evidence_text or "").lower()
+        lexical_refute = (
+            1.0
+            if re.search(
+                (
+                    r"\b(ineffective|not effective|not recommended|fails? to|cannot|can't|will not|won't|"
+                    r"does not|do not|did not|doesn't|don't|didn't|no effect|no evidence)\b"
+                ),
+                evidence_low,
+                flags=re.IGNORECASE,
+            )
+            else 0.0
         )
+
+        # Alignment terms should gate contradiction, not create it.
+        # The previous formula added predicate and anchor overlap directly into the
+        # contradiction score, which inverted obviously supportive evidence into REFUTES.
+        alignment_gate = 0.40 + (0.60 * max(anchor_overlap, predicate))
+        base = max(
+            polarity_signal,
+            explicit_refute * 0.90,
+            lexical_refute * 0.75,
+            negation_mismatch * 0.65,
+        )
+        if base <= 0.0:
+            return 0.0
+        score = base * alignment_gate
+        if same_polarity_support:
+            score *= 0.10
+        if explicit_refute and max(anchor_overlap, predicate) >= 0.25:
+            score = max(score, 0.55)
         return max(0.0, min(1.0, score))
 
     def _evidence_score(self, ev: Dict[str, Any]) -> float:
