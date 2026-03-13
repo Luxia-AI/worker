@@ -8041,19 +8041,11 @@ class VerdictGenerator:
             verdict_internal = Verdict.UNVERIFIABLE.value
             abstain_reason = "conflicting_directional_evidence"
         elif directional_delta >= direction_floor and has_support:
-            if has_contradict and conflict_ratio >= 0.40:
-                verdict_internal = Verdict.UNVERIFIABLE.value
-                abstain_reason = "conflicting_evidence_balance"
-            else:
-                verdict_internal = Verdict.TRUE.value
-                abstain_reason = ""
+            verdict_internal = Verdict.TRUE.value
+            abstain_reason = ""
         elif (-directional_delta) >= direction_floor and has_contradict:
-            if has_support and conflict_ratio >= 0.40:
-                verdict_internal = Verdict.UNVERIFIABLE.value
-                abstain_reason = "conflicting_evidence_balance"
-            else:
-                verdict_internal = Verdict.FALSE.value
-                abstain_reason = ""
+            verdict_internal = Verdict.FALSE.value
+            abstain_reason = ""
         else:
             verdict_internal = Verdict.UNVERIFIABLE.value
             abstain_reason = "insufficient_directional_margin"
