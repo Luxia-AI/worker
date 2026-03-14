@@ -194,21 +194,47 @@ def _action_markers(text: str) -> set[str]:
         (
             r"\b(improv(?:e|es|ed|ing)|enhanc(?:e|es|ed|ing)|"
             r"benefit(?:s|ed|ing)?|help(?:s|ed|ing)?|"
-            r"reliev(?:e|es|ed|ing)|facilitat(?:e|es|ed|ing))\b"
+            r"reliev(?:e|es|ed|ing)|facilitat(?:e|es|ed|ing)|"
+            r"alleviat(?:e|es|ed|ing)|mitigat(?:e|es|ed|ing)|heal(?:s|ed|ing)?)\b"
         ),
         low,
     ):
         markers.add("improve")
-    if re.search(r"\b(reduc(?:e|es|ed|ing)|lower(?:s|ed|ing)?|decreas(?:e|es|ed|ing))\b", low):
+    if re.search(r"\b(reduc(?:e|es|ed|ing)|lower(?:s|ed|ing)?|decreas(?:e|es|ed|ing)|suppress(?:es|ed|ing)?)\b", low):
         markers.add("reduce")
-    if re.search(r"\b(prevent(?:s|ed|ing)?|protect(?:s|ed|ing)?)\b", low):
+    if re.search(r"\b(prevent(?:s|ed|ing)?|protect(?:s|ed|ing)?|block(?:s|ed|ing)?|inhibit(?:s|ed|ing)?)\b", low):
         markers.add("prevent")
-    if re.search(r"\b(caus(?:e|es|ed|ing)|trigger(?:s|ed|ing)?|increas(?:e|es|ed|ing))\b", low):
+    if re.search(r"\b(caus(?:e|es|ed|ing)|trigger(?:s|ed|ing)?|increas(?:e|es|ed|ing)|induc(?:e|es|ed|ing))\b", low):
         markers.add("cause")
-    if re.search(r"\b(treat(?:s|ed|ing)?|cure(?:s|d|ing)?|manag(?:e|es|ed|ing))\b", low):
+    if re.search(
+        (
+            r"\b(treat(?:s|ed|ing)?|cure(?:s|d|ing)?|"
+            r"manag(?:e|es|ed|ing)|administer(?:s|ed|ing)?|"
+            r"prescrib(?:e|es|ed|ing))\b"
+        ),
+        low,
+    ):
         markers.add("treat")
-    if re.search(r"\b(diagnos(?:e|es|ed|ing)|detect(?:s|ed|ing)?|determin(?:e|es|ed|ing)|test(?:s|ed|ing)?)\b", low):
+    if re.search(
+        (
+            r"\b(diagnos(?:e|es|ed|ing)|detect(?:s|ed|ing)?|"
+            r"determin(?:e|es|ed|ing)|test(?:s|ed|ing)?|"
+            r"screen(?:s|ed|ing)?)\b"
+        ),
+        low,
+    ):
         markers.add("diagnose")
+    if re.search(
+        (
+            r"\b(disrupt(?:s|ed|ing)?|damage(?:s|d|ing)?|"
+            r"impair(?:s|ed|ing)?|destroy(?:s|ed|ing)?|"
+            r"worsen(?:s|ed|ing)?)\b"
+        ),
+        low,
+    ):
+        markers.add("harm")
+    if re.search(r"\b(spread(?:s|ing)?|transmit(?:s|ted|ting)?|infect(?:s|ed|ing)?)\b", low):
+        markers.add("spread")
     return markers
 
 

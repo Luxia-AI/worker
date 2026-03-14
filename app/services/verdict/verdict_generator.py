@@ -4162,11 +4162,14 @@ class VerdictGenerator:
         groups = {
             "causal": (
                 r"\b(cause|causes|caused|causing|lead|leads|leading|result|results|resulting|"
-                r"associate|associated|link|linked|contribut(?:e|es|ed|ing)|mediate(?:s|d|ing)?)\b"
+                r"associate|associated|link|linked|contribut(?:e|es|ed|ing)|mediate(?:s|d|ing)?|"
+                r"trigger(?:s|ed|ing)?|induc(?:e|es|ed|ing)|spread(?:s|ing)?|"
+                r"transmit(?:s|ted|ting)?|infect(?:s|ed|ing)?|produc(?:e|es|ed|ing))\b"
             ),
             "preventive": (
                 r"\b(prevent|prevents|prevention|reduce|reduces|reduced|decrease|decreases|decreased|"
-                r"lower|lowers|lowered|protect|protects)\b"
+                r"lower|lowers|lowered|protect|protects|block(?:s|ed|ing)?|"
+                r"inhibit(?:s|ed|ing)?|suppress(?:es|ed|ing)?)\b"
             ),
             "risk_factor": (
                 r"\b(risk\s+factor|risk\s+factors|associated\s+with|association\s+with|"
@@ -4174,7 +4177,9 @@ class VerdictGenerator:
             ),
             "therapeutic": (
                 r"\b(treat|treats|treatment|cure|cures|help|helps|promote|promotes|improve|improves|"
-                r"enhance|enhances|boost|boosts|effective|efficacious|recommend|recommends|recommended)\b"
+                r"enhance|enhances|boost|boosts|effective|efficacious|recommend|recommends|recommended|"
+                r"alleviat(?:e|es|ed|ing)|mitigat(?:e|es|ed|ing)|heal(?:s|ed|ing)?|"
+                r"administer(?:s|ed|ing)?|prescrib(?:e|es|ed|ing))\b"
             ),
             "diagnostic": (
                 r"\b(screen|screens|screened|screening|detect|detects|detected|detecting|"
@@ -4193,11 +4198,17 @@ class VerdictGenerator:
                 r"strengthen|strengthens|strengthened|needed|need|needs|required|requires|essential|necessary|"
                 r"increase|increases|increased|enhance|enhances|enhanced|boost|boosts|boosted|"
                 r"contribut(?:e|es|ed|ing)|facilitat(?:e|es|ed|ing)|streamlin(?:e|es|ed|ing)|"
-                r"expedit(?:e|es|ed|ing)|accelerat(?:e|es|ed|ing))\b"
+                r"expedit(?:e|es|ed|ing)|accelerat(?:e|es|ed|ing)|"
+                r"stimulat(?:e|es|ed|ing)|activat(?:e|es|ed|ing)|raise(?:s|d)?|elevat(?:e|es|ed|ing))\b"
             ),
             "source_relation": (
                 r"\b(contain|contains|contained|include|includes|included|found in|source of|"
                 r"rich in|high in|low in|such as|including|part of|as part of)\b"
+            ),
+            "harmful": (
+                r"\b(disrupt(?:s|ed|ing)?|damage(?:s|d|ing)?|impair(?:s|ed|ing)?|"
+                r"worsen(?:s|ed|ing)?|aggravat(?:e|es|ed|ing)|destroy(?:s|ed|ing)?|"
+                r"kill(?:s|ed|ing)?|wash(?:es|ed|ing)?)\b"
             ),
         }
         for name, pattern in groups.items():
@@ -4360,7 +4371,7 @@ class VerdictGenerator:
             "recommend",
             "screen",
             "detect",
-            "diagnose",
+            "diagnos",
             "indicate",
             "expedite",
             "accelerate",
@@ -4371,6 +4382,34 @@ class VerdictGenerator:
             "important",
             "required",
             "needed",
+            # ── Health-domain verbs added for predicate coverage ──
+            "disrupt",
+            "block",
+            "inhibit",
+            "suppress",
+            "spread",
+            "transmit",
+            "infect",
+            "wash",
+            "kill",
+            "damage",
+            "impair",
+            "trigger",
+            "worsen",
+            "aggravat",
+            "alleviat",
+            "mitigat",
+            "stimulat",
+            "activat",
+            "destroy",
+            "heal",
+            "develop",
+            "raise",
+            "administer",
+            "prescrib",
+            "produc",
+            "induc",
+            "elevat",
         }
         pred_idx = -1
         best_score = -1
@@ -4846,6 +4885,7 @@ class VerdictGenerator:
         same_polarity_support = 1.0 if pol == "entails" else 0.0
 
         evidence_low = str(evidence_text or "").lower()
+        claim_low = str(claim_text or "").lower()
         lexical_refute = (
             1.0
             if re.search(
@@ -4859,6 +4899,40 @@ class VerdictGenerator:
             else 0.0
         )
 
+        # ── Antonym pair detection ────────────────────────────────────
+        # Detect cases where claim and evidence share structure but differ
+        # by a semantic antonym (e.g. "minor cause" vs "major cause").
+        _antonym_pairs = [
+            (r"\bminor\b", r"\bmajor\b"),
+            (r"\bleast\b", r"\bmost\b"),
+            (r"\brare\b", r"\bcommon\b"),
+            (r"\brare\b", r"\bfrequent\b"),
+            (r"\bsafe\b", r"\bdangerous\b"),
+            (r"\bsafe\b", r"\bunsafe\b"),
+            (r"\bbeneficial\b", r"\bharmful\b"),
+            (r"\bfavorable\b", r"\bunfavorable\b"),
+            (r"\bfavourable\b", r"\bunfavourable\b"),
+            (r"\beffective\b", r"\bineffective\b"),
+            (r"\blow\b", r"\bhigh\b"),
+            (r"\bsmall\b", r"\blarge\b"),
+            (r"\bmild\b", r"\bsevere\b"),
+            (r"\bworse\b", r"\bbetter\b"),
+            (r"\bweak\b", r"\bstrong\b"),
+            (r"\bincrease\w*\b", r"\bdecrease\w*\b"),
+            (r"\bprevent\w*\b", r"\bcause[sd]?\b"),
+            (r"\bprotect\w*\b", r"\bdamage\w*\b"),
+            (r"\breduce\w*\b", r"\bincrease\w*\b"),
+        ]
+        antonym_signal = 0.0
+        for pat_a, pat_b in _antonym_pairs:
+            claim_has_a = bool(re.search(pat_a, claim_low))
+            claim_has_b = bool(re.search(pat_b, claim_low))
+            ev_has_a = bool(re.search(pat_a, evidence_low))
+            ev_has_b = bool(re.search(pat_b, evidence_low))
+            if (claim_has_a and ev_has_b and not ev_has_a) or (claim_has_b and ev_has_a and not ev_has_b):
+                antonym_signal = 1.0
+                break
+
         # Alignment terms should gate contradiction, not create it.
         # The previous formula added predicate and anchor overlap directly into the
         # contradiction score, which inverted obviously supportive evidence into REFUTES.
@@ -4868,6 +4942,7 @@ class VerdictGenerator:
             explicit_refute * 0.90,
             lexical_refute * 0.75,
             negation_mismatch * 0.65,
+            antonym_signal * 0.85,
         )
         if base <= 0.0:
             return 0.0
@@ -5495,6 +5570,7 @@ class VerdictGenerator:
                     or nli_contradict_prob >= 0.45
                     or explicit_refute_statement
                     or polarity_rel == "contradicts"
+                    or relevance == "REFUTES"
                 )
             )
             if not is_refute_candidate:
@@ -8439,6 +8515,51 @@ class VerdictGenerator:
                     refute_score = max(refute_score, 0.52)
                     absolute_claim_experiment_path_used = True
             base_weight = max(rel_score, 0.10) * (0.55 + (0.45 * source_quality_score))
+
+            # ── Self-reference guard ──────────────────────────────────────
+            # Detect evidence that is the claim text itself (VDB echo).
+            _sr_stop = {
+                "the",
+                "a",
+                "an",
+                "is",
+                "are",
+                "was",
+                "were",
+                "and",
+                "or",
+                "of",
+                "in",
+                "to",
+                "for",
+                "by",
+                "on",
+                "at",
+                "it",
+                "that",
+                "this",
+                "with",
+                "as",
+                "be",
+                "its",
+            }
+            _sr_claim_tok = {
+                w for w in re.findall(r"\b[a-z][a-z0-9'-]*\b", claim.lower()) if w not in _sr_stop and len(w) > 2
+            }
+            _sr_ev_tok = {
+                w
+                for w in re.findall(r"\b[a-z][a-z0-9'-]*\b", statement_text.lower())
+                if w not in _sr_stop and len(w) > 2
+            }
+            _sr_union = _sr_claim_tok | _sr_ev_tok
+            _sr_jaccard = len(_sr_claim_tok & _sr_ev_tok) / max(1, len(_sr_union))
+            _sr_min_tokens = min(len(_sr_claim_tok), len(_sr_ev_tok))
+            # Require high overlap AND enough tokens to avoid catching short simple
+            # claims like "X treats Y" that naturally match genuine evidence.
+            self_reference_detected = _sr_jaccard >= 0.92 and _sr_min_tokens >= 6
+            if self_reference_detected:
+                item["self_reference_detected"] = True
+
             stance_before = rel
             if stance_before not in {"SUPPORTS", "REFUTES"}:
                 if (
@@ -8473,6 +8594,11 @@ class VerdictGenerator:
             population_mismatch_penalty_applied = False
             population_mismatch_fatal = False
             population_penalty_factor = 1.0
+
+            # ── Self-reference block: claim-echo evidence cannot admit directionally ──
+            if self_reference_detected:
+                stance_before = "NEUTRAL"
+                admission_block_reason = "self_reference_echo"
 
             fatal_mismatch_reason = ""
             if timeframe_consistency_score < refute_cfg["fatal_scope_floor"]:
@@ -8638,6 +8764,7 @@ class VerdictGenerator:
                     contradiction_signal >= refute_cfg["contradiction_min"]
                     or refute_signal >= refute_cfg["contradiction_min"]
                     or polarity_opposition_score >= 0.65
+                    or rel == "REFUTES"
                 )
                 hard_subject_object_mismatch = bool(
                     has_subject_signal
