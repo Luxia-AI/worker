@@ -4169,7 +4169,8 @@ class VerdictGenerator:
             "preventive": (
                 r"\b(prevent|prevents|prevention|reduce|reduces|reduced|decrease|decreases|decreased|"
                 r"lower|lowers|lowered|protect|protects|block(?:s|ed|ing)?|"
-                r"inhibit(?:s|ed|ing)?|suppress(?:es|ed|ing)?)\b"
+                r"inhibit(?:s|ed|ing)?|suppress(?:es|ed|ing)?|"
+                r"bind(?:s|ing)?|bound)\b"
             ),
             "risk_factor": (
                 r"\b(risk\s+factor|risk\s+factors|associated\s+with|association\s+with|"
@@ -4410,6 +4411,13 @@ class VerdictGenerator:
             "produc",
             "induc",
             "elevat",
+            "bind",
+            "target",
+            "modulat",
+            "regulat",
+            "metabol",
+            "encod",
+            "synthesiz",
         }
         pred_idx = -1
         best_score = -1
@@ -4835,6 +4843,12 @@ class VerdictGenerator:
             if claim_preventive and evidence_risk_reduction_only:
                 return 0.0
             return 0.7
+        # Entity-anchored bucket fallback: when the primary entity matches
+        # (high subject overlap) and predicate families agree, allow a
+        # weaker score.  Covers cases where object vocabulary diverges
+        # (e.g. "enzyme" vs "CPSF3").
+        if full_bucket_overlap and sub_overlap >= 0.40 and subject_guard_ok and pol in {"entails", "contradicts"}:
+            return 0.4
         if (
             self._predicate_semantic_equivalent(cp_full, ep_full)
             and (obj_overlap >= 0.5 or anchor_overlap >= ANCHOR_THRESHOLD)
@@ -4922,6 +4936,9 @@ class VerdictGenerator:
             (r"\bprevent\w*\b", r"\bcause[sd]?\b"),
             (r"\bprotect\w*\b", r"\bdamage\w*\b"),
             (r"\breduce\w*\b", r"\bincrease\w*\b"),
+            (r"\blower\w*\b", r"\bincrease\w*\b"),
+            (r"\blower\w*\b", r"\bhigher\w*\b"),
+            (r"\bsusceptibl\w*\b", r"\bresistan\w*\b"),
         ]
         antonym_signal = 0.0
         for pat_a, pat_b in _antonym_pairs:
@@ -4947,7 +4964,11 @@ class VerdictGenerator:
         if base <= 0.0:
             return 0.0
         score = base * alignment_gate
-        if same_polarity_support:
+        if same_polarity_support and antonym_signal < 1.0:
+            # Dampen contradiction score when evidence supports the claim
+            # — but NOT when an antonym flip was detected. The polarity
+            # model sees high surface overlap and returns "entails"; the
+            # antonym pair proves it is actually a contradiction.
             score *= 0.10
         if explicit_refute and max(anchor_overlap, predicate) >= 0.25:
             score = max(score, 0.55)
@@ -5561,7 +5582,12 @@ class VerdictGenerator:
             refute_gate_block_reason = ""
             refute_gate_passed = bool(
                 is_refute_candidate
-                and refute_eligibility_score >= refute_threshold
+                and (
+                    refute_eligibility_score >= refute_threshold
+                    # Strong dual-signal bypass: when both NLI and lexical
+                    # contradiction agree, trust them over alignment scores.
+                    or (contradiction_score >= 0.50 and nli_contradict_prob >= 0.45)
+                )
                 and credibility >= 0.55
                 and quantifier_consistency >= 1.0
                 and dose_scope_consistency >= 1.0
@@ -8561,6 +8587,45 @@ class VerdictGenerator:
                 item["self_reference_detected"] = True
 
             stance_before = rel
+
+            # ── Antonym override ────────────────────────────────────────
+            # When an antonym flip exists between claim and evidence
+            # (e.g. "minor" vs "major"), the LLM often mislabels as
+            # SUPPORTS because surface overlap is high.  Re-classify
+            # to REFUTES when the structural contradiction is clear.
+            _antonym_override = False
+            if stance_before == "SUPPORTS" and predicate_match >= 0.50:
+                _ao_claim_low = claim.lower()
+                _ao_ev_low = statement_text.lower()
+                _ao_pairs = [
+                    (r"\bminor\b", r"\bmajor\b"),
+                    (r"\bleast\b", r"\bmost\b"),
+                    (r"\brare\b", r"\bcommon\b"),
+                    (r"\brare\b", r"\bfrequent\b"),
+                    (r"\bsafe\b", r"\bdangerous\b"),
+                    (r"\bbeneficial\b", r"\bharmful\b"),
+                    (r"\beffective\b", r"\bineffective\b"),
+                    (r"\blow\b", r"\bhigh\b"),
+                    (r"\bmild\b", r"\bsevere\b"),
+                    (r"\bincrease\w*\b", r"\bdecrease\w*\b"),
+                    (r"\breduce\w*\b", r"\bincrease\w*\b"),
+                    (r"\bprevent\w*\b", r"\bcause[sd]?\b"),
+                    (r"\bprotect\w*\b", r"\bdamage\w*\b"),
+                    (r"\blower\w*\b", r"\bincrease\w*\b"),
+                ]
+                for _ao_a, _ao_b in _ao_pairs:
+                    _c_a = bool(re.search(_ao_a, _ao_claim_low))
+                    _c_b = bool(re.search(_ao_b, _ao_claim_low))
+                    _e_a = bool(re.search(_ao_a, _ao_ev_low))
+                    _e_b = bool(re.search(_ao_b, _ao_ev_low))
+                    if (_c_a and _e_b and not _e_a) or (_c_b and _e_a and not _e_b):
+                        _antonym_override = True
+                        break
+                if _antonym_override:
+                    stance_before = "REFUTES"
+                    contradiction_signal = max(contradiction_signal, 0.60)
+                    item["antonym_override_applied"] = True
+
             if stance_before not in {"SUPPORTS", "REFUTES"}:
                 if (
                     absolute_claim_experiment_enabled
@@ -8749,6 +8814,11 @@ class VerdictGenerator:
                     predicate_match >= refute_cfg["predicate_min"]
                     or absolute_predicate_contradiction_guard
                     or (refute_gate_passed and not has_predicate_signal)
+                    # Strong NLI contradiction + high contradiction_score
+                    # should bypass predicate requirement — the NLI model
+                    # already has semantic understanding of predicate
+                    # alignment.
+                    or (contradiction_signal >= 0.50 and float(item.get("nli_contradict_prob", 0.0) or 0.0) >= 0.45)
                 )
                 object_floor = refute_cfg["object_min"]
                 if claim_has_absolute_quantifier and contradiction_signal >= 0.55:
