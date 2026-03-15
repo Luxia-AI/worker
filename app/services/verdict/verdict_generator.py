@@ -36,6 +36,7 @@ from app.constants.config import (
     PREDICATE_MATCH_THRESHOLD,
     UNVERIFIABLE_CONFIDENCE_CAP,
 )
+from app.constants.llm_prompts import SYSTEM_MSG_RATIONALE_WRITER, SYSTEM_MSG_VERDICT_GENERATOR
 from app.core.config import settings
 from app.core.logger import get_logger, log_value_payload
 from app.services.common.claim_segmentation import split_claim_into_segments
@@ -108,62 +109,62 @@ class Verdict(Enum):
 
 
 # RAG Prompt for verdict generation
-VERDICT_GENERATION_PROMPT = """You are an expert biomedical fact-checker. \
-Your task is to evaluate a claim based on the retrieved evidence.
+VERDICT_GENERATION_PROMPT = """## Task
+Evaluate the health claim below against the retrieved evidence and produce a structured verdict.
 
-CLAIM TO VERIFY:
+## Claim to Verify
 {claim}
 
-RETRIEVED EVIDENCE (ranked by relevance and credibility):
+## Retrieved Evidence (ranked by relevance and credibility)
 {evidence_text}
 
-INSTRUCTIONS:
-1. Extract claim segments as short, complete clauses or sentences
-2. For each segment, search the evidence for supporting or contradicting facts
-3. Determine each segment's status based on evidence strength and credibility
-4. Calculate truthfulness_percent by comparing claim content against evidence
+## Step-by-Step Analysis Process
+1. Split the claim into its logical segments (short, complete clauses copied verbatim from the claim)
+2. For each segment, search the evidence for supporting AND contradicting facts
+3. Determine each segment's status based on evidence strength
+4. Calculate overall truthfulness by weighing all segments against all evidence
 
-EVIDENCE INTERPRETATION GUARDS (STRICT):
-- Do NOT treat "belief/concern/perception/hesitancy/myth/misinformation" statements as factual support.
-- If evidence reports what people believe, mark as NEUTRAL unless the claim itself is about beliefs/surveys.
-- Give higher weight to direct biological/clinical assertions over meta-discussion.
-- Explicit negation statements (e.g., "does not contain", "cannot",
-  "no evidence") should be treated as contradiction when aligned.
-- Never infer unstated facts; use only explicit evidence text.
+## Evidence Interpretation Guards (STRICT)
+- Do NOT treat "belief/concern/perception/hesitancy/myth/misinformation" statements as factual support or refutation
+- If evidence reports what people believe, mark as NEUTRAL unless the claim itself is about beliefs
+- Give higher weight to direct biological/clinical assertions over meta-discussion
+- Explicit negation ("does not", "cannot", "no evidence") IS contradiction when it addresses the claim predicate
+- Antonyms and opposite-direction findings ARE contradiction (e.g., claim says "major cause"
+  but evidence says "minor contributor" or "not a significant factor")
+- Never infer unstated facts; use ONLY explicit evidence text
 
-CRITICAL RULES FOR CLAIM SEGMENTS:
-- claim_segment MUST be copied from the original claim (verbatim), but you may
-  trim leading/trailing filler words for readability
-- DO NOT paraphrase, summarize, or add new words
-- Avoid splitting on a single conjunction unless it forms two independent clauses
+## Claim Segment Rules
+- claim_segment MUST be copied verbatim from the original claim (trimming leading/trailing filler is OK)
+- Do NOT paraphrase, summarize, or add new words
 - Each segment should be a complete, verifiable statement from the claim
 
-VERDICT OPTIONS:
+## Verdict Options
 - TRUE: Evidence strongly supports ALL segments (>=90% truthfulness)
-- FALSE: Evidence contradicts the claim (<=30% truthfulness)
+- FALSE: Evidence contradicts the claim or key segments (<=30% truthfulness).
+  Use FALSE when evidence shows the opposite of what the claim states
 - PARTIALLY_TRUE: Some segments supported, others not (30-90% truthfulness)
-- UNVERIFIABLE: Insufficient evidence to determine
+- UNVERIFIABLE: Insufficient relevant evidence to determine truth
 
-SEGMENT STATUS OPTIONS:
+## Segment Status Options
 - VALID: Evidence confirms this exact claim segment
 - INVALID: Evidence contradicts this exact claim segment
-- PARTIALLY_VALID: Some evidence supports, with minor caveats
-- PARTIALLY_INVALID: Some evidence contradicts, not completely wrong
+- PARTIALLY_VALID: Some support with minor caveats
+- PARTIALLY_INVALID: Some contradiction, not completely wrong
 - UNKNOWN: No relevant evidence found for this segment
 
-TRUTHFULNESS CALCULATION:
+## Truthfulness Calculation
 Analyze the entire claim holistically against all evidence:
-- How much of the claim is factually accurate based on evidence?
+- What percentage of the claim is factually accurate based on evidence?
 - Consider evidence quality, source credibility, and direct relevance
-- Return as a precise percentage (calculate this based on actual evidence, not example values)
-- Example ranges: high accuracy (80-100%), moderate (40-79%), low (0-39%)
+- Return as a precise percentage (0-100)
 
-CONFIDENCE CALCULATION:
+## Confidence Calculation
 - How confident are you in this verdict based on evidence quality and quantity?
 - Consider source credibility, evidence recency, and consensus
-- Reduce confidence when support/refute is based on one source or one weakly aligned statement.
-- Return as a decimal between 0.0 and 1.0 (calculate this based on actual evidence)
+- Reduce confidence when verdict relies on a single source or weakly aligned statement
+- Return as decimal 0.0 to 1.0
 
+## Output Format
 Return ONLY valid JSON (no markdown, no extra text):
 {{
     "verdict": "TRUE|FALSE|PARTIALLY_TRUE|UNVERIFIABLE",
@@ -172,10 +173,10 @@ Return ONLY valid JSON (no markdown, no extra text):
     "rationale": "Brief explanation of why this verdict was reached",
     "claim_breakdown": [
         {{
-            "claim_segment": "Verbatim text copied from the claim (trim OK)",
+            "claim_segment": "Verbatim text from the claim",
             "status": "VALID|INVALID|PARTIALLY_VALID|PARTIALLY_INVALID|UNKNOWN",
-            "supporting_fact": "Short direct evidence sentence supporting or contradicting this segment",
-            "source_url": "https://source.url.of.the.fact"
+            "supporting_fact": "Short direct evidence sentence",
+            "source_url": "https://source.url"
         }}
     ],
     "evidence_map": [
@@ -191,31 +192,30 @@ Return ONLY valid JSON (no markdown, no extra text):
 }}"""
 
 
-RATIONALE_GENERATION_PROMPT = """You are an expert scientific fact-checking writer.
-Write a short, human-readable verification rationale.
+RATIONALE_GENERATION_PROMPT = """## Task
+Write a short, human-readable verification rationale for the claim below.
 
-Input claim:
-{claim}
-
-Final verdict:
-{verdict}
+## Input
+Claim: {claim}
+Final verdict: {verdict}
 
 Claim breakdown (segment status + cited fact):
 {claim_breakdown_text}
 
-Relevant evidence only (supporting/contradicting):
+Relevant evidence (supporting/contradicting):
 {relevant_evidence_text}
 
-Instructions:
-- Write 2-4 sentences that are easy to understand at a glance.
-- Start with a direct verdict statement about the claim.
-- Mention the main supporting and/or contradicting evidence balance.
-- Keep language precise and non-hyped. Do not use boilerplate phrasing.
-- Do not invent evidence. Use only the provided inputs.
-- If evidence is mixed or limited, state that clearly.
-- Do NOT present belief/rumor/misinformation-reporting statements as factual proof.
-- Keep quoted evidence snippets short and concrete.
+## Writing Rules
+1. Write 2-4 sentences that are easy to understand at a glance
+2. Start with a direct verdict statement about the claim
+3. Mention the main supporting and/or contradicting evidence balance
+4. Use precise, non-hyped language. No boilerplate phrasing
+5. Do NOT invent evidence. Use ONLY the provided inputs
+6. If evidence is mixed or limited, state that clearly
+7. Do NOT present belief/rumor/misinformation-reporting statements as factual proof
+8. Keep quoted evidence snippets short and concrete
 
+## Output Format
 Return ONLY valid JSON:
 {{
   "rationale": "..."
@@ -977,6 +977,7 @@ class VerdictGenerator:
                 priority=LLMPriority.HIGH,
                 temperature=LLM_TEMPERATURE_VERDICT,
                 call_tag="verdict_generation",
+                system_message=SYSTEM_MSG_VERDICT_GENERATOR,
             )
 
             # Validate and parse result
@@ -1081,6 +1082,7 @@ class VerdictGenerator:
                             priority=LLMPriority.HIGH,
                             temperature=LLM_TEMPERATURE_VERDICT,
                             call_tag="verdict_generation",
+                            system_message=SYSTEM_MSG_VERDICT_GENERATOR,
                         )
                         verdict_result = self._parse_verdict_result(
                             enriched_result,
@@ -1241,7 +1243,8 @@ class VerdictGenerator:
                 response_format="json",
                 priority=LLMPriority.HIGH,
                 temperature=LLM_TEMPERATURE_VERDICT,
-                call_tag="verdict_generation",
+                call_tag="rationale_generation",
+                system_message=SYSTEM_MSG_RATIONALE_WRITER,
             )
             rationale = ""
             if isinstance(result, dict):
@@ -4939,6 +4942,15 @@ class VerdictGenerator:
             (r"\blower\w*\b", r"\bincrease\w*\b"),
             (r"\blower\w*\b", r"\bhigher\w*\b"),
             (r"\bsusceptibl\w*\b", r"\bresistan\w*\b"),
+            (r"\bleast\s+common\b", r"\bleading\b"),
+            (r"\bleast\s+common\b", r"\bmost\s+common\b"),
+            (r"\bstrengthen\w*\b", r"\bdamag\w*\b"),
+            (r"\bstrengthen\w*\b", r"\bweaken\w*\b"),
+            (r"\bstrengthen\w*\b", r"\binflam\w*\b"),
+            (r"\bstrengthen\w*\b", r"\bdelay\w*\b"),
+            (r"\bdetrimental\b", r"\bbeneficial\b"),
+            (r"\bdetrimental\b", r"\bhelpful\b"),
+            (r"\bharmful\b", r"\bhelpful\b"),
         ]
         antonym_signal = 0.0
         for pat_a, pat_b in _antonym_pairs:
@@ -8612,6 +8624,13 @@ class VerdictGenerator:
                     (r"\bprevent\w*\b", r"\bcause[sd]?\b"),
                     (r"\bprotect\w*\b", r"\bdamage\w*\b"),
                     (r"\blower\w*\b", r"\bincrease\w*\b"),
+                    (r"\bleast\s+common\b", r"\bleading\b"),
+                    (r"\bleast\s+common\b", r"\bmost\s+common\b"),
+                    (r"\bstrengthen\w*\b", r"\bdamag\w*\b"),
+                    (r"\bstrengthen\w*\b", r"\binflam\w*\b"),
+                    (r"\bstrengthen\w*\b", r"\bdelay\w*\b"),
+                    (r"\bdetrimental\b", r"\bbeneficial\b"),
+                    (r"\bharmful\b", r"\bhelpful\b"),
                 ]
                 for _ao_a, _ao_b in _ao_pairs:
                     _c_a = bool(re.search(_ao_a, _ao_claim_low))
@@ -8664,6 +8683,43 @@ class VerdictGenerator:
             if self_reference_detected:
                 stance_before = "NEUTRAL"
                 admission_block_reason = "self_reference_echo"
+
+            # ── Minimum content guard ───────────────────────────────
+            # Evidence that is essentially just an entity name or
+            # title (< 5 content words) carries no assertional signal
+            # and must not be admitted directionally.
+            _mc_stop = {
+                "the",
+                "a",
+                "an",
+                "is",
+                "are",
+                "was",
+                "were",
+                "and",
+                "or",
+                "of",
+                "in",
+                "to",
+                "for",
+                "by",
+                "on",
+                "at",
+                "it",
+                "that",
+                "this",
+                "with",
+                "as",
+                "be",
+            }
+            _mc_tokens = [
+                w
+                for w in re.findall(r"\b[a-z][a-z0-9'-]*\b", statement_text.lower())
+                if w not in _mc_stop and len(w) > 1
+            ]
+            if len(_mc_tokens) < 5 and not admission_block_reason:
+                stance_before = "NEUTRAL"
+                admission_block_reason = "evidence_too_short"
 
             fatal_mismatch_reason = ""
             if timeframe_consistency_score < refute_cfg["fatal_scope_floor"]:
@@ -8843,6 +8899,58 @@ class VerdictGenerator:
                     and object_match < refute_cfg["fatal_object_floor"]
                     and (semantic_alignment_score < refute_cfg["fatal_alignment_floor"] or not has_alignment_signal)
                 )
+                # ── Entity-anchor guard for refute path ──────────────
+                # Prevent admitting refutation evidence about a
+                # completely different entity.  Extract named-entity
+                # tokens from the claim (capitalized words, excluding
+                # common sentence starters) and verify at least one
+                # appears in the evidence.
+                _ea_stop = {
+                    "the",
+                    "a",
+                    "an",
+                    "this",
+                    "that",
+                    "these",
+                    "those",
+                    "it",
+                    "its",
+                    "new",
+                    "no",
+                    "not",
+                    "all",
+                    "some",
+                    "many",
+                    "most",
+                    "each",
+                    "every",
+                    "only",
+                    "both",
+                    "also",
+                    "however",
+                    "but",
+                    "according",
+                    "after",
+                    "before",
+                    "during",
+                    "following",
+                    "proper",
+                    "eating",
+                    "taking",
+                    "using",
+                    "having",
+                    "getting",
+                    "being",
+                    "drinking",
+                    "washing",
+                    "pregnant",
+                }
+                _ea_claim_entities = {
+                    w.lower() for w in re.findall(r"\b[A-Z][a-z]{2,}\b", claim) if w.lower() not in _ea_stop
+                }
+                _ea_ev_low = statement_text.lower()
+                _ea_entity_found = not _ea_claim_entities or any(e in _ea_ev_low for e in _ea_claim_entities)
+                refute_entity_guard = _ea_entity_found
                 fallback_refute_guard = bool(
                     contradiction_signal >= 0.45
                     and predicate_match >= refute_cfg["predicate_min"]
@@ -8859,6 +8967,12 @@ class VerdictGenerator:
                     directional_block_reasons.append(admission_block_reason)
                 elif hard_subject_object_mismatch:
                     admission_block_reason = "subject_object_mismatch"
+                    refute_block_reason = admission_block_reason
+                    directional_blocked_count += 1
+                    directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)
+                    directional_block_reasons.append(admission_block_reason)
+                elif not refute_entity_guard:
+                    admission_block_reason = "refute_entity_mismatch"
                     refute_block_reason = admission_block_reason
                     directional_blocked_count += 1
                     directional_blocked_mass += max(base_weight * 0.70, refute_signal * 0.70)

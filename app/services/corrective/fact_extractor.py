@@ -3,7 +3,11 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
-from app.constants.llm_prompts import FACT_EXTRACTION_PREDICATE_FORCING_PROMPT, FACT_EXTRACTION_PROMPT
+from app.constants.llm_prompts import (
+    FACT_EXTRACTION_PREDICATE_FORCING_PROMPT,
+    FACT_EXTRACTION_PROMPT,
+    SYSTEM_MSG_FACT_EXTRACTOR,
+)
 from app.core.config import settings
 from app.core.logger import get_logger, log_value_payload
 from app.services.common.dedup import generate_fact_id
@@ -13,34 +17,39 @@ from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 logger = get_logger(__name__)
 
 # Batch fact extraction prompt - extract facts from multiple pages at once
-BATCH_FACT_PROMPT = """Extract key factual statements from each content section below.
-For each section, return ONLY atomic, single-claim facts (no conjunctions).
-Keep only truth-grounded statements explicitly asserted in the section.
-Exclude speculative/hedged language (may, might, could, possible, suggests, appears),
-opinion text, claim-about-claim text, and generic background filler.
+BATCH_FACT_PROMPT = """## Task
+Extract key factual statements from each content section below for health claim verification.
 
-Claim alignment rules (strict):
-- Keep statements directly useful for verifying the claim context.
-- Prefer statements containing claim intervention/outcome entities or close lexical equivalents.
-- Drop off-topic biomedical facts even if true in isolation.
-- Keep explicit support and explicit contradiction statements when claim-relevant.
+## Extraction Rules
+1. Return ONLY atomic, single-claim facts (no conjunctions)
+2. Keep only truth-grounded statements explicitly asserted in the section
+3. EXCLUDE: speculative/hedged language (may, might, could, possible, suggests, appears),
+   opinions, claim-about-claims, generic background filler
+4. Keep statements directly useful for verifying the claim context
+5. Prefer statements containing claim intervention/outcome entities or close lexical equivalents
+6. Drop off-topic biomedical facts even if true in isolation
+7. Keep explicit support AND explicit contradiction statements when claim-relevant
 
-Stance labeling (required):
-For EVERY fact you extract, assign one of these stance values relative to the CLAIM CONTEXT:
-- "SUPPORTS": the statement is consistent with the claim being TRUE (it affirms the claim or a key part of it)
-- "REFUTES": the statement is inconsistent with the claim being TRUE (it contradicts or negates the claim)
-- "NEUTRAL": the statement is topically related but neither confirms nor denies the claim
+## Stance Labeling (REQUIRED for every fact)
+- "SUPPORTS": consistent with the claim being TRUE (affirms the claim or a key part)
+- "REFUTES": inconsistent with the claim being TRUE (contradicts, negates, presents antonym/opposite mechanism)
+- "NEUTRAL": topically related but neither confirms nor denies
 
-IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
-Return ONLY valid JSON with this exact structure:
-{{"results": [{{"index": 0, "facts": [{{"statement": "...", "confidence": 0.85, "stance": "SUPPORTS"}}]}},
-{{"index": 1, "facts": [...]}}]}}
-Index integrity:
-- Facts under each "index" must come only from that section index.
-- Do not move or merge facts across section indices.
-- If a section has no claim-relevant facts, return that section with an empty facts list.
+## Critical: Detecting Refutation
+Label a fact as "REFUTES" when it contains: explicit negation of claim predicate,
+antonym of claim action, contradictory magnitude/direction, or mechanism impossibility.
 
-SECTIONS:
+## Output Format
+Return ONLY valid JSON (no markdown, no explanations):
+{"results": [{"index": 0, "facts": [{"statement": "...", "confidence": 0.85,
+"stance": "SUPPORTS"}]}, {"index": 1, "facts": [...]}]}
+
+## Index Integrity Rules
+- Facts under each "index" must come ONLY from that section index
+- Do not move or merge facts across section indices
+- If a section has no claim-relevant facts, return that index with an empty facts list
+
+## SECTIONS:
 """
 
 # Retry prompt when LLM returns non-dict
@@ -52,6 +61,7 @@ Required format:
 
 Original request:
 {original_prompt}
+/no_think
 """
 
 
@@ -640,6 +650,7 @@ class FactExtractor:
                     response_format="json",
                     priority=LLMPriority.LOW,
                     call_tag="fact_extraction",
+                    system_message=SYSTEM_MSG_FACT_EXTRACTOR,
                 )
                 if self._is_provider_exhausted_payload(retry_result):
                     logger.warning("[FactExtractor] Stopping retries: LLM providers exhausted by rate limit")
@@ -896,6 +907,7 @@ class FactExtractor:
                 response_format="json",
                 priority=LLMPriority.LOW,
                 call_tag="fact_extraction",
+                system_message=SYSTEM_MSG_FACT_EXTRACTOR,
             )
             if self._is_degraded_payload(result):
                 retry_after = float(result.get("retry_after_seconds", 0.0) or 0.0)
@@ -930,6 +942,7 @@ class FactExtractor:
                     priority=LLMPriority.HIGH,
                     call_tag="fact_extraction",
                     allow_quota_override=True,
+                    system_message=SYSTEM_MSG_FACT_EXTRACTOR,
                 )
                 if self._is_degraded_payload(retry_result):
                     retry_after = float(retry_result.get("retry_after_seconds", 0.0) or 0.0)
@@ -1068,6 +1081,7 @@ class FactExtractor:
                     priority=LLMPriority.HIGH if allow_override else LLMPriority.LOW,
                     call_tag="fact_extraction",
                     allow_quota_override=allow_override,
+                    system_message=SYSTEM_MSG_FACT_EXTRACTOR,
                 )
                 if self._is_degraded_payload(result):
                     logger.warning("[FactExtractor] Per-page fallback stopped: LLM providers exhausted by rate limit")

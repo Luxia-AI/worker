@@ -14,7 +14,7 @@ from app.constants.config import (
     LLM_MAX_TOKENS_QUERY_REFORMULATION,
     PIPELINE_MAX_URLS_PER_QUERY,
 )
-from app.constants.llm_prompts import QUERY_REFORMULATION_PROMPT, REINFORCEMENT_QUERY_PROMPT
+from app.constants.llm_prompts import QUERY_REFORMULATION_PROMPT, REINFORCEMENT_QUERY_PROMPT, SYSTEM_MSG_QUERY_PLANNER
 from app.core.config import settings
 from app.core.logger import get_logger, is_debug_enabled, log_value_payload
 from app.core.rate_limit import throttled
@@ -1027,24 +1027,27 @@ class TrustedSearch:
         anchors = ", ".join(entity_obj.anchors[:8]) if entity_obj.anchors else "none"
         max_items = min(max(1, int(max_queries)), self._query_reformulation_max_items())
         prompt = (
-            f"Generate up to {max_items} high-precision health fact-check search queries.\n"
-            'Return JSON only in this exact form: {"queries":["..."]}\n'
-            "Rules:\n"
-            "- prioritize exact claim verification wording\n"
-            "- generate diverse perspectives: direct evidence, mechanism, guideline, review, opposing view\n"
-            "- prefer broad semantic queries first (do not force site: operators)\n"
-            "- include numeric comparison phrasing when claim compares magnitudes/counts\n"
-            "- preserve negation exactly (do not flip does/do not/cannot)\n"
-            "- avoid belief/rumor phrasing unless the claim itself is explicitly about beliefs\n"
-            "- no repeated tokens and no malformed grammar\n"
-            "- keep each query concise and content-rich\n\n"
+            f"## Task\nGenerate up to {max_items} high-precision health fact-check search queries.\n\n"
+            "## Rules\n"
+            "- Prioritize exact claim verification wording\n"
+            "- Generate diverse perspectives: direct evidence, mechanism, guideline, review, opposing view\n"
+            "- Prefer broad semantic queries first (do not force site: operators)\n"
+            "- Include numeric comparison phrasing when claim compares magnitudes/counts\n"
+            "- Preserve negation exactly (do not flip does/do not/cannot)\n"
+            "- Avoid belief/rumor phrasing unless the claim itself is explicitly about beliefs\n"
+            "- No repeated tokens and no malformed grammar\n"
+            "- Keep each query concise and content-rich\n\n"
+            '## Output Format\nReturn JSON only: {{"queries":["..."]}}\n\n'
+            "## Input\n"
             f"Claim: {claim}\n"
             f"Anchors: {anchors}\n"
+            "/no_think"
         )
         retry_prompt = (
             "Return exactly the JSON object with key 'queries' and an array of strings. No other text.\n"
             f'Format: {{"queries":["..."]}}\n'
             f"Claim: {claim}\n"
+            "/no_think"
         )
 
         async def _invoke(prompt_text: str) -> Any:
@@ -1054,6 +1057,7 @@ class TrustedSearch:
                 priority=LLMPriority.HIGH,
                 temperature=0.0,
                 call_tag="query_reformulation",
+                system_message=SYSTEM_MSG_QUERY_PLANNER,
             )
 
         try:
@@ -1551,18 +1555,21 @@ class TrustedSearch:
             return dedupe_list(filtered)
 
         max_items = self._query_reformulation_max_items()
-        prompt = f"""
+        prompt = f"""## Task
 {QUERY_REFORMULATION_PROMPT}
 
-Return JSON only in this exact format: {{"queries":["..."]}}
-Constraints:
-- Return at most {max_items} queries
-- queries must be short strings
-- no markdown, no prose
-- preserve claim polarity and negation exactly
-- do not generate belief/rumor-only queries for factual claims
-- avoid repeated tokens and malformed phrases
+## Output Format
+Return JSON only: {{"queries":["..."]}}
 
+## Rules
+- Return at most {max_items} queries
+- Queries must be short strings
+- No markdown, no prose
+- Preserve claim polarity and negation exactly
+- Do not generate belief/rumor-only queries for factual claims
+- Avoid repeated tokens and malformed phrases
+
+## Input
 POST TEXT:
 {text}
 
@@ -1574,12 +1581,13 @@ ENTITIES:
 
 FAILED ENTITIES:
 {failed_entities}
-"""
+/no_think"""
         retry_prompt = (
             "Return exactly the JSON object with key 'queries' and an array of strings. No other text.\n"
             f'Format: {{"queries":["..."]}}\n'
             f"Max queries: {max_items}\n"
             f"Claim: {text}\n"
+            "/no_think"
         )
 
         try:
@@ -1590,6 +1598,7 @@ FAILED ENTITIES:
                 priority=LLMPriority.HIGH,
                 temperature=0.0,
                 call_tag="query_reformulation",
+                system_message=SYSTEM_MSG_QUERY_PLANNER,
             )
             queries = self._extract_llm_queries(result, max_items=max_items)
             if not queries:
@@ -1599,6 +1608,7 @@ FAILED ENTITIES:
                     priority=LLMPriority.HIGH,
                     temperature=0.0,
                     call_tag="query_reformulation",
+                    system_message=SYSTEM_MSG_QUERY_PLANNER,
                 )
                 queries = self._extract_llm_queries(result, max_items=max_items)
             logger.debug(
@@ -1628,6 +1638,7 @@ FAILED ENTITIES:
                     priority=LLMPriority.HIGH,
                     temperature=0.0,
                     call_tag="query_reformulation",
+                    system_message=SYSTEM_MSG_QUERY_PLANNER,
                 )
                 retry_queries = self._extract_llm_queries(result, max_items=max_items)
                 if retry_queries:
@@ -2685,15 +2696,18 @@ FAILED ENTITIES:
 
         max_items = self._query_reformulation_max_items()
         prompt = (
-            REINFORCEMENT_QUERY_PROMPT.format(statements=base_statements, entities=base_entities)
-            + f'\nReturn JSON only: {{"queries":["..."]}} with max {max_items} queries.'
-            + "\nPreserve negation exactly and avoid repeated tokens."
+            "## Task\n"
+            + REINFORCEMENT_QUERY_PROMPT.format(statements=base_statements, entities=base_entities)
+            + f'\n\n## Output Format\nReturn JSON only: {{"queries":["..."]}} with max {max_items} queries.'
+            + "\n\n## Rules\nPreserve negation exactly and avoid repeated tokens."
+            + "\n/no_think"
         )
         retry_prompt = (
             "Return exactly the JSON object with key 'queries' and an array of strings. No other text.\n"
             f'Format: {{"queries":["..."]}}\n'
             f"Max queries: {max_items}\n"
             f"Statements: {base_statements}\n"
+            "/no_think"
         )
 
         try:
@@ -2704,6 +2718,7 @@ FAILED ENTITIES:
                 priority=LLMPriority.HIGH,
                 temperature=0.0,
                 call_tag="query_reformulation",
+                system_message=SYSTEM_MSG_QUERY_PLANNER,
             )
             queries = self._extract_llm_queries(result, max_items=max_items)
             if not queries:
@@ -2713,6 +2728,7 @@ FAILED ENTITIES:
                     priority=LLMPriority.HIGH,
                     temperature=0.0,
                     call_tag="query_reformulation",
+                    system_message=SYSTEM_MSG_QUERY_PLANNER,
                 )
                 queries = self._extract_llm_queries(result, max_items=max_items)
             logger.debug(
@@ -2732,6 +2748,7 @@ FAILED ENTITIES:
                     priority=LLMPriority.HIGH,
                     temperature=0.0,
                     call_tag="query_reformulation",
+                    system_message=SYSTEM_MSG_QUERY_PLANNER,
                 )
                 retry_queries = self._extract_llm_queries(result, max_items=max_items)
                 if retry_queries:

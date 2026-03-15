@@ -5,6 +5,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from app.constants.llm_prompts import SYSTEM_MSG_CLAIM_CANONICALIZER
 from app.core.logger import get_logger
 from app.services.common.claim_segmentation import split_claim_into_segments
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
@@ -368,28 +369,25 @@ class ClaimCanonicalizer:
         if llm is None:
             return None
         prompt = (
-            "Normalize the health claim segment into canonical structured form without changing meaning.\n"
-            "Preserve negation, numbers, units, timeframe, and modality exactly.\n"
-            "Do not introduce new entities, mechanisms, or causal direction.\n"
-            "If uncertain, keep fields close to original text instead of guessing.\n"
-            "Return JSON only.\n"
-            "{\n"
-            '  "normalized_text": "...",\n'
-            '  "subject": "...",\n'
-            '  "predicate": "...",\n'
-            '  "object": "...",\n'
-            '  "predicate_family": "",\n'
-            '  "polarity": "positive|negative",\n'
-            '  "quantifier": "",\n'
-            '  "comparator": "",\n'
-            '  "numeric_value": "",\n'
-            '  "unit": "",\n'
-            '  "population": "",\n'
-            '  "timeframe": "",\n'
-            '  "modality": "",\n'
-            '  "parse_confidence": 0.0\n'
-            "}\n"
+            "## Task\n"
+            "Normalize the health claim segment into canonical structured form.\n"
+            "\n"
+            "## Rules\n"
+            "1. Preserve negation, numbers, units, timeframe, and modality EXACTLY\n"
+            "2. Do NOT introduce new entities, mechanisms, or causal direction\n"
+            "3. If uncertain about any field, keep it close to the original text\n"
+            "4. Do NOT change the meaning in any way\n"
+            "\n"
+            "## Output Format\n"
+            "Return ONLY valid JSON:\n"
+            '{"normalized_text": "...", "subject": "...", "predicate": "...", "object": "...", '
+            '"predicate_family": "", "polarity": "positive|negative", "quantifier": "", '
+            '"comparator": "", "numeric_value": "", "unit": "", "population": "", '
+            '"timeframe": "", "modality": "", "parse_confidence": 0.0}\n'
+            "\n"
+            "## Input\n"
             f"Segment: {original_text}\n"
+            "/no_think"
         )
         try:
             raw = await llm.ainvoke(
@@ -398,6 +396,7 @@ class ClaimCanonicalizer:
                 priority=LLMPriority.LOW,
                 temperature=0.0,
                 call_tag="claim_canonicalization",
+                system_message=SYSTEM_MSG_CLAIM_CANONICALIZER,
             )
         except Exception as exc:
             logger.warning("[ClaimCanonicalizer] LLM canonicalization failed: %s", exc)

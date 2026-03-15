@@ -1,7 +1,7 @@
 import json
 from typing import Any, Dict, List, Optional
 
-from app.constants.llm_prompts import BIOMED_NER_PROMPT
+from app.constants.llm_prompts import BIOMED_NER_PROMPT, SYSTEM_MSG_BIOMEDICAL_NER
 from app.core.logger import get_logger
 from app.services.common.list_ops import dedupe_list
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
@@ -9,17 +9,22 @@ from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 logger = get_logger(__name__)
 
 # Batch entity extraction prompt - extract entities for multiple facts at once
-BATCH_NER_PROMPT = """Extract biomedical entities from each fact below.
-For each fact, identify: genes, proteins, diseases, drugs, chemicals, biological processes, anatomical terms.
-Keep only entities explicitly present in factual assertions.
-Do not infer entities from speculative/hedged clauses.
-Do not return generic meta terms (e.g., study, research, evidence, article, claim).
+BATCH_NER_PROMPT = """## Task
+Extract biomedical entities from each numbered fact below.
 
-IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
-Respond with JSON in this exact format:
-{{"results": [{{"index": 0, "entities": ["entity1", "entity2"]}}, {{"index": 1, "entities": [...]}}]}}
+## Entity Types
+Genes, proteins, diseases, drugs, chemicals, biological processes, anatomical terms.
 
-FACTS:
+## Rules
+1. Keep only entities explicitly present in factual assertions
+2. Do NOT infer entities from speculative/hedged clauses
+3. Do NOT return generic meta terms (study, research, evidence, article, claim)
+
+## Output Format
+Return ONLY valid JSON (no markdown, no explanations):
+{"results": [{"index": 0, "entities": ["entity1", "entity2"]}, {"index": 1, "entities": [...]}]}
+
+## FACTS:
 """
 
 # Retry prompt when LLM returns non-dict
@@ -31,7 +36,7 @@ Required format:
 
 Original request:
 {original_prompt}
-"""
+/no_think"""
 
 
 class EntityExtractor:
@@ -83,6 +88,7 @@ class EntityExtractor:
                 response_format="json",
                 priority=LLMPriority.HIGH,
                 call_tag="entity_extraction",
+                system_message=SYSTEM_MSG_BIOMEDICAL_NER,
             )
             logger.info(f"[EntityExtractor] LLM returned: {result}")
             ents = result.get("entities", [])
@@ -147,6 +153,7 @@ class EntityExtractor:
                     response_format="json",
                     priority=LLMPriority.HIGH,
                     call_tag="entity_extraction",
+                    system_message=SYSTEM_MSG_BIOMEDICAL_NER,
                 )
                 parsed = self._try_parse_result(retry_result)
                 if parsed is not None:
@@ -177,6 +184,7 @@ class EntityExtractor:
                 response_format="json",
                 priority=LLMPriority.HIGH,
                 call_tag="entity_extraction",
+                system_message=SYSTEM_MSG_BIOMEDICAL_NER,
             )
 
             # Parse with retry logic

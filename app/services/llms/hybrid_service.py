@@ -15,6 +15,7 @@ from app.constants.config import (
     LLM_MAX_TOKENS_ENTITY_EXTRACTION,
     LLM_MAX_TOKENS_FACT_EXTRACTION,
     LLM_MAX_TOKENS_QUERY_REFORMULATION,
+    LLM_MAX_TOKENS_RATIONALE,
     LLM_MAX_TOKENS_RELATION_EXTRACTION,
     LLM_MAX_TOKENS_VERDICT_GENERATION,
 )
@@ -386,6 +387,7 @@ class HybridLLMService:
             "fact_extraction": LLM_MAX_TOKENS_FACT_EXTRACTION,
             "query_reformulation": LLM_MAX_TOKENS_QUERY_REFORMULATION,
             "verdict_generation": LLM_MAX_TOKENS_VERDICT_GENERATION,
+            "rationale_generation": LLM_MAX_TOKENS_RATIONALE,
         }
         base = int(mapping.get(tag, LLM_MAX_TOKENS_DEFAULT))
         if _env_confidence_mode() and tag == "fact_extraction":
@@ -403,6 +405,7 @@ class HybridLLMService:
         temperature: float | None = None,
         call_tag: str = "",
         allow_quota_override: bool = False,
+        system_message: str | None = None,
     ) -> Dict[str, Any]:
         """
         Calls LLM with priority-based routing and automatic fallback.
@@ -457,6 +460,7 @@ class HybridLLMService:
                                 temperature=temperature,
                                 max_tokens=max_tokens,
                                 force_client="fallback",
+                                system_message=system_message,
                             )
                     except RateLimitError as e:
                         if getattr(e, "provider_exhausted", False):
@@ -490,6 +494,7 @@ class HybridLLMService:
                         max_retries=1 if confidence_mode and critical_call else 2,
                         temperature=temperature,
                         max_tokens=max_tokens,
+                        system_message=system_message,
                     )
                 logger.debug(f"[HybridLLMService] Groq succeeded (call {call_num})")
                 return result
@@ -524,6 +529,7 @@ class HybridLLMService:
                                 temperature=temperature,
                                 max_tokens=max_tokens,
                                 force_client="fallback",
+                                system_message=system_message,
                             )
                     except Exception as fallback_error:
                         logger.warning(
@@ -567,6 +573,7 @@ class HybridLLMService:
                                 temperature=temperature,
                                 max_tokens=max_tokens,
                                 force_client="fallback",
+                                system_message=system_message,
                             )
                     except Exception as fallback_error:
                         logger.warning(

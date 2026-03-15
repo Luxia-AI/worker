@@ -1,157 +1,238 @@
 """
 LLM Prompts for biomedical fact extraction, entity recognition, and knowledge graph construction.
 Centralized prompt definitions used across the corrective and ranking pipelines.
+Optimized for Qwen3-32b with system/user message separation.
 """
+
+# ============================================================================
+# SYSTEM MESSAGES (role assignment for Qwen3-32b system prompt)
+# ============================================================================
+
+SYSTEM_MSG_BIOMEDICAL_NER = (
+    "You are a precise biomedical Named Entity Recognition model. "
+    "You extract only medically relevant entities from factual text. "
+    "You always respond with valid JSON and never include markdown or explanations."
+)
+
+SYSTEM_MSG_FACT_EXTRACTOR = (
+    "You are a biomedical fact extraction specialist for a health claim verification system. "
+    "You extract atomic, evidence-grounded factual statements and label their stance "
+    "(SUPPORTS, REFUTES, or NEUTRAL) relative to a target claim. "
+    "You are especially vigilant about detecting refutation signals: explicit negation, "
+    "antonyms, contradictory magnitudes, and mechanism impossibility. "
+    "You always respond with valid JSON and never include markdown or explanations."
+)
+
+SYSTEM_MSG_RELATION_EXTRACTOR = (
+    "You are a biomedical relation extraction agent. "
+    "You identify entity-relation-entity triples from factual statements. "
+    "You always respond with valid JSON and never include markdown or explanations."
+)
+
+SYSTEM_MSG_QUERY_PLANNER = (
+    "You are a medical claim verification query planner. "
+    "You generate precise, evidence-oriented search queries for health fact-checking. "
+    "You always respond with valid JSON and never include markdown or explanations."
+)
+
+SYSTEM_MSG_VERDICT_GENERATOR = (
+    "You are an expert biomedical fact-checker with clinical reasoning ability. "
+    "You evaluate health claims against retrieved evidence with careful analysis of "
+    "supporting and contradicting information. You are rigorous about distinguishing "
+    "factual biological evidence from belief/perception/rumor statements. "
+    "You always respond with valid JSON."
+)
+
+SYSTEM_MSG_RATIONALE_WRITER = (
+    "You are a scientific fact-checking writer. You produce concise, accurate, "
+    "human-readable verification rationales based on evidence. "
+    "You always respond with valid JSON."
+)
+
+SYSTEM_MSG_CLAIM_CANONICALIZER = (
+    "You are a health claim normalization specialist. "
+    "You convert claim segments into structured canonical form without changing meaning. "
+    "You always respond with valid JSON."
+)
+
+SYSTEM_MSG_TOPIC_CLASSIFIER = (
+    "You are a biomedical topic classifier. "
+    "You categorize health statements into predefined topic categories. "
+    "You always respond with valid JSON."
+)
+
+SYSTEM_MSG_ANCHOR_EXTRACTOR = (
+    "You are a biomedical evidence anchor extraction model. "
+    "You identify concrete entities and noun phrases useful for evidence retrieval. "
+    "You always respond with valid JSON."
+)
 
 # ============================================================================
 # ENTITY EXTRACTION PROMPTS
 # ============================================================================
 
-BIOMED_NER_PROMPT = """You are a biomedical Named Entity Recognition (NER) model.
-Extract only medically relevant entities that are explicitly asserted in the fact.
-Do not infer entities not directly present in the statement.
-Do not return entities from speculative/hedged parts (may, might, could, possible, hypothesis).
-Do not return belief/rumor/misinformation framing words as biomedical entities.
-Entities: diseases, conditions, symptoms, chemicals, nutrients, organs, viruses,
-medication names, biological processes.
-Return ONLY valid JSON (no markdown, no extra text):
-{"entities": ["entity1", "entity2", ...]}
+BIOMED_NER_PROMPT = """## Task
+Extract medically relevant entities from the following factual statement.
 
-Fact: {statement}"""
+## Rules
+1. Extract ONLY entities explicitly present in the statement text
+2. Entity types: diseases, conditions, symptoms, chemicals, nutrients, organs, viruses,
+   medications, biological processes
+3. Do NOT extract from speculative/hedged clauses (may, might, could, possible, hypothesis)
+4. Do NOT extract belief/rumor/misinformation framing words as entities
+5. Do NOT infer entities not directly stated
+
+## Output Format
+Return ONLY valid JSON (no markdown, no extra text):
+{{"entities": ["entity1", "entity2"]}}
+
+## Input
+Fact: {statement}
+/no_think"""
 
 # ============================================================================
 # FACT EXTRACTION PROMPTS
 # ============================================================================
 
-FACT_EXTRACTION_PROMPT = """Extract key factual statements from this content.
-IMPORTANT: Return only truth-grounded statements explicitly supported by the provided content.
-IMPORTANT: Return only atomic, single-claim facts (no conjunctions, no multi-part statements).
-Exclude:
-- speculation/hedging (may, might, could, possible, potentially, suggests, appears)
-- opinion/normative language
-- rumors, claims-about-claims, rhetorical questions, anecdotal statements
-- survey/belief/perception statements unless the claim itself is explicitly about beliefs
-- generic background not tied to a concrete assertion in the text
-Assign a stance label relative to the CLAIM CONTEXT for each fact:
+FACT_EXTRACTION_PROMPT = """## Task
+Extract key factual statements from the content below for health claim verification.
+
+## Extraction Rules
+1. Return ONLY atomic, single-claim facts (no conjunctions, no multi-part statements)
+2. Keep only truth-grounded statements explicitly supported by the content
+3. EXCLUDE: speculation (may, might, could, suggests, appears), opinions, rumors,
+   claim-about-claims, rhetorical questions, anecdotal statements, survey/belief statements,
+   generic background
+
+## Stance Labeling (REQUIRED for every fact)
+Assign stance relative to the CLAIM CONTEXT:
 - "SUPPORTS": statement affirms or is consistent with the claim being TRUE
-- "REFUTES": statement contradicts or is inconsistent with the claim being TRUE
+- "REFUTES": statement contradicts, negates, or is inconsistent with the claim being TRUE
 - "NEUTRAL": topically related but neither confirms nor denies the claim
-Return ONLY valid JSON with this exact structure (no extra text, no markdown):
+
+## Critical: Detecting Refutation
+A statement REFUTES the claim when it contains:
+- Direct negation of the claim predicate ("does not cause", "cannot alter")
+- Antonym of the claim predicate (claim says "major cause" but evidence says "minor contributor")
+- Contradictory magnitude or direction (claim says "increases" but evidence says "decreases")
+- Mechanism impossibility statements
+
+## Output Format
+Return ONLY valid JSON (no markdown, no extra text):
 {{"facts": [{{"statement": "...", "confidence": 0.85, "stance": "SUPPORTS"}},
 {{"statement": "...", "confidence": 0.90, "stance": "REFUTES"}}]}}
 
-Content:
-{content}"""
+## Content
+{content}
+/no_think"""
 
-FACT_EXTRACTION_PREDICATE_FORCING_PROMPT = """Extract only statements that explicitly address whether:
-subject: {subject}
-predicate: {predicate}
-object: {object}
+FACT_EXTRACTION_PREDICATE_FORCING_PROMPT = """## Task
+Extract ONLY statements that explicitly address this specific predicate relation:
+- Subject: {subject}
+- Predicate: {predicate}
+- Object: {object}
 
-Strict extraction rules:
-1) Keep only statements that explicitly negate or confirm the predicate mechanism for this subject/object.
-2) A statement qualifies as refuting only when it contains explicit negation,
-   biological impossibility, or mechanism preventing the predicate.
-   Refutation cues include patterns such as:
-   - does not
-   - cannot
-   - no evidence
-   - does not enter
-   - does not integrate
-   - cannot alter
-   - cannot modify
-   - does not affect
-3) Generic background information must be excluded.
-4) If the predicate phrase (or a clear semantic equivalent) is not present, skip it.
-5) Return atomic single-claim statements only.
-6) Assign stance relative to the CLAIM CONTEXT:
-   - "SUPPORTS": confirms the predicate relation holds
-   - "REFUTES": denies the predicate relation holds
-   - "NEUTRAL": related but inconclusive
-7) Do not use "belief in X", "concern about X", or rumor discussion as factual support.
+## Extraction Rules
+1. Keep ONLY statements that explicitly confirm or negate the predicate mechanism for this subject/object pair
+2. A statement qualifies as REFUTING when it contains:
+   - Explicit negation: "does not", "cannot", "no evidence"
+   - Biological impossibility: "does not enter", "does not integrate",
+     "cannot alter", "cannot modify", "does not affect"
+   - Antonym of predicate: if predicate is "causes" and evidence says "prevents" or "is unrelated to"
+3. EXCLUDE generic background information
+4. If the predicate phrase (or clear semantic equivalent) is not present, skip it
+5. Return atomic single-claim statements only
+6. Do NOT use belief/rumor/misinformation framing as factual support
 
+## Stance Labeling (REQUIRED)
+- "SUPPORTS": confirms the predicate relation holds
+- "REFUTES": denies the predicate relation holds (negation, antonym, impossibility)
+- "NEUTRAL": related but inconclusive
+
+## Output Format
 Return ONLY valid JSON:
 {{"facts": [{{"statement": "...", "confidence": 0.85, "stance": "REFUTES"}},
 {{"statement": "...", "confidence": 0.90, "stance": "SUPPORTS"}}]}}
 
-Content:
-{content}"""
+## Content
+{content}
+/no_think"""
 
 # ============================================================================
 # RELATION EXTRACTION PROMPTS
 # ============================================================================
 
-TRIPLE_EXTRACTION_PROMPT = """You are a relation extraction agent specialized in biomedical/health facts.
-Given a factual statement and detected entities, return ALL valid entity-relation-entity triples.
+TRIPLE_EXTRACTION_PROMPT = """## Task
+Extract ALL valid entity-relation-entity triples from the given statement and entities.
 
-Requirements:
-- Return ONLY valid JSON (no markdown, no explanation):
-- Subject/object must be entity strings from provided list
-- Relation should be concise (e.g., "causes", "reduces risk of", "is treatment for")
-- Confidence: float 0-1 indicating support strength
-- For negated statements, encode negation in relation label (e.g., "does_not_cause", "not_associated_with")
-- Do not infer relations not explicitly stated in the sentence
-- Skip triples that only describe beliefs, rumors, perceptions, or misinformation discussions.
-- If no triples found: {{"triples": []}}
+## Rules
+1. Subject and object must be entity strings from the provided entity list
+2. Relation should be concise (e.g., "causes", "reduces risk of", "is treatment for")
+3. Confidence: float 0-1 indicating support strength
+4. For negated statements, encode negation in the relation label (e.g., "does_not_cause", "not_associated_with")
+5. Do NOT infer relations not explicitly stated in the sentence
+6. Skip triples describing beliefs, rumors, perceptions, or misinformation discussions
+7. If no triples found, return {{"triples": []}}
 
-Example:
+## Example
 Statement: "COVID-19 vaccines reduce hospitalization."
 Entities: ["covid-19", "vaccines", "hospitalization"]
-Output: {{"triples": [{{"subject":"vaccines", "relation":"reduce",
-"object":"hospitalization", "confidence":0.92}}]}}
+Output: {{"triples": [{{"subject":"vaccines", "relation":"reduce", "object":"hospitalization", "confidence":0.92}}]}}
 
+## Input
 Statement: {statement}
-Entities: {entities}"""
+Entities: {entities}
+/no_think"""
 
 # ============================================================================
 # QUERY REFORMULATION PROMPTS
 # ============================================================================
 
-QUERY_REFORMULATION_PROMPT = """You are a medical claim verification query planner.
-Generate exactly 4 search queries in two logical tracks:
-- Track A (support-check): queries that could support the claim.
-- Track B (refute-check): queries that could refute the claim.
+QUERY_REFORMULATION_PROMPT = """## Task
+Generate exactly 4 search queries in two logical tracks for verifying a health claim:
+- Track A (2 queries, support-check): queries that could find evidence supporting the claim
+- Track B (2 queries, refute-check): queries that could find evidence refuting the claim
 
-Hard constraints:
-1) Keep subject, predicate, and object aligned to the claim text. Do not add new entities.
-2) Preserve negation logic exactly (e.g., "does not", "cannot"). No malformed grammar.
-3) Include at least one high-evidence formulation:
-   - systematic review OR meta-analysis OR randomized trial OR guideline.
-4) If claim includes numbers/dose/population, include them verbatim in at least one query.
-5) Keep each query concise (4-10 words) and evidence-oriented.
-6) No promotional language, no broad/vague phrases.
-7) Keep contradiction-track queries explicit (e.g., "does not", "cannot", "no evidence") when claim is positive.
-8) Output valid JSON only. No markdown. No prose.
+## Hard Constraints
+1. Keep subject, predicate, and object aligned to the claim text. Do NOT add new entities
+2. Preserve negation logic exactly ("does not", "cannot"). No malformed grammar
+3. Include at least one high-evidence formulation: systematic review, meta-analysis, randomized trial, or guideline
+4. If claim includes numbers/dose/population, include them verbatim in at least one query
+5. Keep each query concise (4-10 words) and evidence-oriented
+6. No promotional language, no vague phrases
+7. Contradiction-track queries must be explicit ("does not", "cannot", "no evidence") when the claim is positive
 
-Expected JSON schema:
-{"queries":["q1","q2","q3","q4"]}
-
-Few-shot guidance:
+## Few-Shot Examples
 - Claim: "Vitamin C does not support immune health"
-  Good refute-check query: "vitamin c supports immune health systematic review"
-  Good support-check query: "no evidence vitamin c supports immunity trial"
+  Support: "no evidence vitamin c supports immunity trial"
+  Refute: "vitamin c supports immune health systematic review"
 - Claim: "X reduces blood pressure"
-  Good support-check query: "x reduces blood pressure randomized trial"
-  Good refute-check query: "x does not reduce blood pressure meta-analysis"
+  Support: "x reduces blood pressure randomized trial"
+  Refute: "x does not reduce blood pressure meta-analysis"
 
-Return ONLY:
-{"queries":["...","...","...","..."]}"""
-REINFORCEMENT_QUERY_PROMPT = """You are a search-query optimization model for claim verification.
-Generate 8–12 highly effective web search queries for authoritative evidence.
+## Output Format
+Return ONLY valid JSON:
+{{"queries":["q1","q2","q3","q4"]}}
+/no_think"""
 
-Inputs:
+REINFORCEMENT_QUERY_PROMPT = """## Task
+Generate 8-12 targeted web search queries to find authoritative evidence for low-confidence statements.
+
+## Inputs
 Low-confidence statements:
 {statements}
 
-Entities (use these; do NOT add new ones):
+Entities (use ONLY these; do NOT add new ones):
 {entities}
 
-STRICT RULES:
-1) Every query must include at least one entity term from the provided Entities list (verbatim).
-2) Do NOT introduce new entities/topics not present in Entities or Statements.
-3) Prefer authoritative targets: WHO, CDC, NIH, NICE, Cochrane, PubMed, major journals.
-4) Keep queries 4–9 words, specific and evidence-oriented.
-5) Output ONLY valid JSON.
+## Rules
+1. Every query must include at least one entity term from the provided list (verbatim)
+2. Do NOT introduce new entities or topics not present in the inputs
+3. Target authoritative sources: WHO, CDC, NIH, NICE, Cochrane, PubMed, major journals
+4. Keep queries 4-9 words, specific and evidence-oriented
+5. Include both support-seeking and refute-seeking query variants
 
+## Output Format
 Return ONLY valid JSON:
-{"queries": ["query1", "query2", "query3"]}"""
+{{"queries": ["query1", "query2", "query3"]}}
+/no_think"""

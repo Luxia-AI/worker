@@ -79,8 +79,8 @@ LEXICAL_BM25_LIMIT = 50
 # LLM MODEL SETTINGS
 # ============================================================================
 
-# Default LLM model for Groq service (Llama 3.1 Instant)
-LLM_MODEL_NAME = "llama-3.1-8b-instant"
+# Default LLM model for Groq service (env-overridable for rollback)
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "qwen/qwen3-32b")
 
 # Temperature for LLM calls (lower = more deterministic)
 LLM_TEMPERATURE = 0.2
@@ -90,15 +90,16 @@ LLM_TEMPERATURE = 0.2
 LLM_TEMPERATURE_VERDICT = 0.0
 
 # Per-call output caps to protect Groq TPM and preserve verdict generation headroom.
-LLM_MAX_TOKENS_DEFAULT = int(os.getenv("LLM_MAX_TOKENS_DEFAULT", "384"))
-LLM_MAX_TOKENS_ENTITY_EXTRACTION = int(os.getenv("LLM_MAX_TOKENS_ENTITY_EXTRACTION", "320"))
-LLM_MAX_TOKENS_RELATION_EXTRACTION = int(os.getenv("LLM_MAX_TOKENS_RELATION_EXTRACTION", "320"))
-LLM_MAX_TOKENS_FACT_EXTRACTION = int(os.getenv("LLM_MAX_TOKENS_FACT_EXTRACTION", "512"))
+LLM_MAX_TOKENS_DEFAULT = int(os.getenv("LLM_MAX_TOKENS_DEFAULT", "512"))
+LLM_MAX_TOKENS_ENTITY_EXTRACTION = int(os.getenv("LLM_MAX_TOKENS_ENTITY_EXTRACTION", "384"))
+LLM_MAX_TOKENS_RELATION_EXTRACTION = int(os.getenv("LLM_MAX_TOKENS_RELATION_EXTRACTION", "384"))
+LLM_MAX_TOKENS_FACT_EXTRACTION = int(os.getenv("LLM_MAX_TOKENS_FACT_EXTRACTION", "768"))
 LLM_MAX_TOKENS_QUERY_REFORMULATION = int(os.getenv("LLM_MAX_TOKENS_QUERY_REFORMULATION", "512"))
-LLM_MAX_TOKENS_VERDICT_GENERATION = int(os.getenv("LLM_MAX_TOKENS_VERDICT_GENERATION", "512"))
+LLM_MAX_TOKENS_VERDICT_GENERATION = int(os.getenv("LLM_MAX_TOKENS_VERDICT_GENERATION", "1024"))
+LLM_MAX_TOKENS_RATIONALE = int(os.getenv("LLM_MAX_TOKENS_RATIONALE", "512"))
 
 # Max tokens for reinforcement query generation
-LLM_MAX_TOKENS_REINFORCEMENT = 300
+LLM_MAX_TOKENS_REINFORCEMENT = 384
 
 # ============================================================================
 # EMBEDDING MODEL SETTINGS

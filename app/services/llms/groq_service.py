@@ -133,6 +133,7 @@ class GroqService:
         temperature: float | None = None,
         max_tokens: int | None = None,
         force_client: str | None = None,
+        system_message: str | None = None,
     ) -> Dict[str, Any]:
         """
         Calls Groq async chat completion endpoint with retry logic for rate limits.
@@ -143,14 +144,20 @@ class GroqService:
             response_format: "json" or "text" response format
             max_retries: Maximum retry attempts on rate limit (default 1, used by hybrid service)
             temperature: Override default temperature (0.0-1.0, lower = more deterministic)
+            system_message: Optional system role message prepended before the user prompt
 
         Raises:
             RateLimitError: When rate limited after max retries
             Exception: On other API errors
         """
+        messages = []
+        if system_message:
+            messages.append({"role": "system", "content": system_message})
+        messages.append({"role": "user", "content": prompt})
+
         kwargs: Dict[str, Any] = {
             "model": self.model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": messages,
             "temperature": temperature if temperature is not None else LLM_TEMPERATURE,
             "max_tokens": int(max_tokens if max_tokens is not None else LLM_MAX_TOKENS_DEFAULT),
         }
@@ -194,7 +201,10 @@ class GroqService:
                     # JSON response
                     if response_format == "json":
                         if msg.content:
-                            result: Dict[str, Any] = json.loads(msg.content)
+                            raw_content = msg.content
+                            # Strip Qwen3 thinking tags if present
+                            raw_content = re.sub(r"<think>.*?</think>\s*", "", raw_content, flags=re.DOTALL).strip()
+                            result: Dict[str, Any] = json.loads(raw_content)
                             logger.info(
                                 "[GroqService] Request served by %s Groq credentials",
                                 client_name,

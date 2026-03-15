@@ -8,6 +8,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
+from app.constants.llm_prompts import SYSTEM_MSG_ANCHOR_EXTRACTOR
 from app.core.logger import get_logger
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
 from app.shared.trust_config import get_trust_config
@@ -97,19 +98,22 @@ _JUNK_ANCHORS = {
 _WORD_RE = re.compile(r"\b[a-zA-Z][a-zA-Z0-9\-']+\b")
 _PUNCT_RE = re.compile(r"[^a-z0-9\-\s]")
 
-_ANCHOR_PROMPT = """Extract 2 to 5 concrete evidence anchors for each subclaim.
-Anchors must be biomedical entities or short noun phrases useful for retrieval.
-Do not include stopwords or generic verbs.
+_ANCHOR_PROMPT = """## Task
+Extract 2 to 5 concrete evidence anchors for each subclaim.
 
-Return JSON only:
+## Rules
+1. Anchors must be biomedical entities or short noun phrases useful for evidence retrieval
+2. Do NOT include stopwords or generic verbs
+3. Prefer specific medical terms, drug names, disease names, biological processes
+
+## Output Format
+Return ONLY valid JSON:
 {{"subclaim_anchors":[{{"subclaim":"...","anchors":["...", "..."]}}]}}
 
-Claim:
-{claim}
-
-Subclaims:
-{subclaims}
-"""
+## Input
+Claim: {claim}
+Subclaims: {subclaims}
+/no_think"""
 
 
 @dataclass(slots=True)
@@ -229,6 +233,7 @@ class AnchorExtractor:
             response_format="json",
             priority=LLMPriority.HIGH,
             call_tag="anchor_extraction",
+            system_message=SYSTEM_MSG_ANCHOR_EXTRACTOR,
         )
         payload: Mapping[str, Any]
         if isinstance(result, dict):

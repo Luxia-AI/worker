@@ -2,6 +2,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple
 
+from app.constants.llm_prompts import SYSTEM_MSG_TOPIC_CLASSIFIER
 from app.core.logger import get_logger
 from app.services.common.url_helpers import extract_domain
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
@@ -125,14 +126,28 @@ class TopicClassifier:
 
         # LLM fallback if rule-based classification is inconclusive
         prompt = (
-            "Choose the single best topic for the statement from this taxonomy: "
+            "## Task\n"
+            "Classify the statement into the single best topic from: "
             f"{', '.join(TOPIC_TAXONOMY)}.\n"
-            "Use only explicit statement content. Do not infer missing context.\n"
-            'Return JSON only: {"topic": "...", "confidence": 0.0}\n'
-            f"Statement: {statement}"
+            "\n"
+            "## Rules\n"
+            "1. Use ONLY explicit statement content\n"
+            "2. Do NOT infer missing context\n"
+            "\n"
+            "## Output Format\n"
+            'Return ONLY valid JSON: {"topic": "...", "confidence": 0.0}\n'
+            "\n"
+            "## Input\n"
+            f"Statement: {statement}\n"
+            "/no_think"
         )
         try:
-            result = await self.llm.ainvoke(prompt, response_format="json", priority=LLMPriority.LOW)
+            result = await self.llm.ainvoke(
+                prompt,
+                response_format="json",
+                priority=LLMPriority.LOW,
+                system_message=SYSTEM_MSG_TOPIC_CLASSIFIER,
+            )
             topic = (result.get("topic") or "other").strip().lower()
             conf = float(result.get("confidence", 0.0) or 0.0)
             if topic not in TOPIC_TAXONOMY:

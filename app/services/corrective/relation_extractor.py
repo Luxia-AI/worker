@@ -5,6 +5,7 @@ import uuid
 from hashlib import sha1
 from typing import Any, Dict, List, Optional
 
+from app.constants.llm_prompts import SYSTEM_MSG_RELATION_EXTRACTOR
 from app.core.logger import get_logger, log_value_payload
 from app.services.common.dedup import dedup_triples_by_structure
 from app.services.llms.hybrid_service import HybridLLMService, LLMPriority
@@ -13,30 +14,33 @@ logger = get_logger(__name__)
 RELATION_MIN_CONF = float(os.getenv("RELATION_MIN_CONFIDENCE", "0.2"))
 
 # Batch relation extraction prompt - extract triples from multiple facts at once
-BATCH_TRIPLE_PROMPT = """You are a relation extraction agent specialized in biomedical/health facts.
-Extract entity-relation-entity triples from each fact below.
+BATCH_TRIPLE_PROMPT = """## Task
+Extract entity-relation-entity triples from each numbered fact below.
 
-Requirements:
-- Subject/object must be entity strings
-- Relation should be concise (e.g., "causes", "reduces risk of", "is treatment for")
-- Confidence: float 0-1 indicating support strength
-- Keep only triples directly relevant to the claim context and anchors.
-- Prefer intervention/outcome relations that help verify/refute the claim.
-- Drop triples that are medically true but unrelated to the claim focus.
+## Rules
+1. Subject/object must be entity strings
+2. Relation should be concise (e.g., "causes", "reduces risk of", "is treatment for")
+3. Confidence: float 0-1 indicating support strength
+4. Keep only triples directly relevant to the claim context and anchors
+5. Prefer intervention/outcome relations that help verify/refute the claim
+6. Drop triples that are medically true but unrelated to the claim focus
+7. For negated facts, use negated relation labels (e.g., "does_not_cause")
 
-IMPORTANT: You MUST respond with valid JSON only. No markdown, no explanations.
-Return ONLY valid JSON:
-{{"results": [{{"index": 0, "triples": [{{"subject": "...", "relation": "...", "object": "...",
-"confidence": 0.9}}]}}]}}
-Index integrity:
-- Triples under each "index" must come only from that fact index.
-- Do not attach triples from one fact to another index.
-- If a fact has no claim-relevant triples, return that index with an empty triples list.
+## Output Format
+Return ONLY valid JSON (no markdown, no explanations):
+{{"results": [{{"index": 0, "triples": [
+{{"subject": "...", "relation": "...", "object": "...", "confidence": 0.9}}]}}]}}
 
+## Index Integrity
+- Triples under each "index" must come ONLY from that fact index
+- Do not attach triples from one fact to another index
+- If a fact has no claim-relevant triples, return that index with an empty triples list
+
+## Context
 ENTITIES PROVIDED: {entities}
 CLAIM CONTEXT: {claim_context}
 
-FACTS:
+## FACTS:
 """
 
 # Retry prompt when LLM returns non-dict
@@ -48,7 +52,7 @@ Required format:
 
 Original request:
 {original_prompt}
-"""
+/no_think"""
 
 
 class RelationExtractor:
@@ -461,6 +465,7 @@ class RelationExtractor:
                     response_format="json",
                     priority=LLMPriority.LOW,
                     call_tag="relation_extraction",
+                    system_message=SYSTEM_MSG_RELATION_EXTRACTOR,
                 )
                 parsed = self._try_parse_result(retry_result, allow_single_index_fallback=allow_single_index_fallback)
                 if parsed is not None:
@@ -523,6 +528,7 @@ class RelationExtractor:
                 response_format="json",
                 priority=LLMPriority.LOW,
                 call_tag="relation_extraction",
+                system_message=SYSTEM_MSG_RELATION_EXTRACTOR,
             )
             if isinstance(result, str):
                 preview = result[:900].replace("\n", "\\n")
