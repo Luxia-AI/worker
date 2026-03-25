@@ -80,7 +80,7 @@ LEXICAL_BM25_LIMIT = 50
 # ============================================================================
 
 # Default LLM model for Groq service (env-overridable for rollback)
-LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "qwen/qwen3-32b")
+LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "llama-3.1-8b-instant")
 
 # Temperature for LLM calls (lower = more deterministic)
 LLM_TEMPERATURE = 0.2
