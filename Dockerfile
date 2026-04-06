@@ -23,9 +23,8 @@ COPY requirements-docker.txt .
 
 RUN pip install -r requirements-docker.txt
 
-# Install shared repository (multi-repo dependency)
+# Copy shared repository (multi-repo dependency)
 COPY shared /app/shared
-RUN pip install /app/shared
 
 # Clean up in separate layer (only runs if above changes)
 RUN rm -rf /root/.cache/pip /tmp/* && \
@@ -40,7 +39,7 @@ COPY --from=builder /opt/venv /opt/venv
 # Set environment to use the venv
 ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app:$PYTHONPATH \
+    PYTHONPATH=/app/shared:/app:$PYTHONPATH \
     REDIS_URL=redis://redis:6379 \
     LOG_DB_PATH=/app/logs.db \
     TRANSFORMERS_CACHE=/app/model_cache \
