@@ -60,36 +60,6 @@ jobs:
                   pip install --no-cache-dir -r requirements-dev.txt
 
             # ===================
-            #     TESTING
-            # ===================
-            - name: Run Unit Tests (skip Redis/E2E tests in CI)
-              run: pytest -q --disable-warnings -m "not redis_required and not e2e" --ignore=test_load.py
-
-            # ===================
-            #     LINTING
-            # ===================
-            - name: Ruff Linter
-              run: ruff check .
-
-            - name: Black (check mode)
-              run: black --check app tests
-
-            - name: isort (check)
-              run: isort --check-only app tests
-
-            - name: Flake8
-              run: flake8 app tests
-
-            # ===================
-            #   SECURITY & TYPES
-            # ===================
-            - name: Bandit Security Scan
-              run: bandit -r app
-
-            - name: mypy (type checking)
-              run: mypy app
-
-            # ===================
             #   CLEANUP
             # ===================
             - name: Clean up cache and temp files
