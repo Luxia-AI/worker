@@ -27,6 +27,12 @@ jobs:
             - name: Checkout Repo
               uses: actions/checkout@v4
 
+            - name: Checkout shared repo
+              uses: actions/checkout@v4
+              with:
+                  repository: Luxia-AI/shared
+                  path: shared
+
             - name: Set up Python
               uses: actions/setup-python@v5
               with:
@@ -51,6 +57,7 @@ jobs:
               run: |
                   pip install --upgrade pip
                   pip install --no-cache-dir -r requirements-dev.txt
+                  pip install -e ./shared
 
             # ===================
             #     TESTING

@@ -23,6 +23,10 @@ COPY requirements-docker.txt .
 
 RUN pip install -r requirements-docker.txt
 
+# Install shared repository (multi-repo dependency)
+COPY shared /app/shared
+RUN pip install /app/shared
+
 # Clean up in separate layer (only runs if above changes)
 RUN rm -rf /root/.cache/pip /tmp/* && \
     find /opt/venv -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
