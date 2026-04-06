@@ -152,17 +152,35 @@ Evaluate the health claim below against the retrieved evidence and produce a str
 - PARTIALLY_INVALID: Some contradiction, not completely wrong
 - UNKNOWN: No relevant evidence found for this segment
 
-## Truthfulness Calculation
-Analyze the entire claim holistically against all evidence:
-- What percentage of the claim is factually accurate based on evidence?
-- Consider evidence quality, source credibility, and direct relevance
-- Return as a precise percentage (0-100)
+## Truthfulness Calculation (0-100%)
+Analyze the claim holistically against evidence strength and coverage:
+- **90-100%**: All major claim components strongly supported by direct, high-quality evidence
+- **70-89%**: Core claim supported, minor components may lack evidence or have weak contradictions
+- **50-69%**: Mixed evidence - significant support but also meaningful contradictions or gaps
+- **30-49%**: Weak support - evidence is indirect, limited, or contradicted by stronger sources
+- **10-29%**: Mostly contradicted - evidence predominantly refutes the claim
+- **0-9%**: Strongly contradicted - clear, direct evidence shows claim is false
+- Consider: evidence directness, source authority, sample sizes, biological plausibility
 
-## Confidence Calculation
-- How confident are you in this verdict based on evidence quality and quantity?
-- Consider source credibility, evidence recency, and consensus
-- Reduce confidence when verdict relies on a single source or weakly aligned statement
-- Return as decimal 0.0 to 1.0
+## Confidence Calculation (0.0-1.0)
+Assess certainty in the verdict based on evidence robustness:
+- **0.9-1.0**: Multiple high-quality sources, systematic reviews, large RCTs, clear consensus
+- **0.7-0.8**: Good evidence from reputable sources, some studies, reasonable consensus
+- **0.5-0.6**: Moderate evidence, mixed source quality, limited studies, some uncertainty
+- **0.3-0.4**: Weak evidence, few sources, conflicting findings, high uncertainty
+- **0.1-0.2**: Very limited evidence, unreliable sources, major disagreement
+- **0.0**: No relevant evidence or completely unreliable sources
+- Reduce for: single sources, weak study designs, conflicting evidence, old studies
+
+## Examples of Appropriate Scoring
+- **Strong Support (truthfulness: 85-95%, confidence: 0.8-0.9)**: "Vitamin D deficiency increases infection risk"
+  + multiple RCTs + meta-analyses showing clear association
+- **Moderate Support (truthfulness: 60-75%, confidence: 0.6-0.7)**: "Exercise reduces depression"
+  + several studies but mixed effect sizes
+- **Contradicted Claim (truthfulness: 15-25%, confidence: 0.7-0.8)**: "Vaccines cause autism"
+  + large cohort studies showing no association
+- **Insufficient Evidence (truthfulness: 40-60%, confidence: 0.2-0.4)**: Novel treatment
+  with only preliminary/animal studies
 
 ## Output Format
 Return ONLY valid JSON (no markdown, no extra text):
