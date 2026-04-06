@@ -291,6 +291,14 @@ class VerdictGenerator:
                 "on",
             }
 
+        # Pure LLM mode: bypass all deterministic overrides and trust LLM decisions
+        pure_llm_mode_env = os.getenv("VERDICT_PURE_LLM_MODE", "false")
+        self.pure_llm_mode = pure_llm_mode_env.strip().lower() in {"1", "true", "yes", "on"}
+        logger.info(
+            "[VerdictGenerator] pure_llm_mode=%s (bypasses deterministic overrides when enabled)",
+            self.pure_llm_mode,
+        )
+
     def _quick_web_score(self, segment: str, fact_stmt: str, conf: float) -> float:
         stop = {
             "the",
@@ -1256,6 +1264,141 @@ class VerdictGenerator:
             logger.warning("[VerdictGenerator] LLM rationale generation failed, using fallback rationale: %s", e)
             return str(payload.get("rationale") or "").strip()
 
+    def _validate_pure_llm_output(
+        self,
+        llm_result: Dict[str, Any],
+        claim: str,
+        evidence: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Validate and sanitize LLM output for pure LLM mode.
+
+        Applies minimal validation:
+        - Clamps confidence to [0.0, 1.0]
+        - Clamps truthfulness to [0, 100]
+        - Provides safe defaults for missing fields
+        - Preserves LLM's verdict decision without deterministic overrides
+        """
+        # Extract and validate verdict
+        verdict_str = str(llm_result.get("verdict", "UNVERIFIABLE")).upper()
+        if verdict_str not in [v.value for v in Verdict]:
+            logger.warning(
+                "[VerdictGenerator] pure_llm_mode: invalid verdict '%s', defaulting to UNVERIFIABLE",
+                verdict_str,
+            )
+            verdict_str = "UNVERIFIABLE"
+
+        # Extract and clamp confidence
+        confidence = llm_result.get("confidence", 0.5)
+        try:
+            confidence = float(confidence)
+            confidence = max(0.0, min(1.0, confidence))
+        except (TypeError, ValueError):
+            logger.warning("[VerdictGenerator] pure_llm_mode: invalid confidence, defaulting to 0.5")
+            confidence = 0.5
+
+        # Extract and clamp truthfulness_percent
+        truthfulness_percent = llm_result.get("truthfulness_percent", 50.0)
+        try:
+            truthfulness_percent = float(truthfulness_percent)
+            truthfulness_percent = max(0.0, min(100.0, truthfulness_percent))
+        except (TypeError, ValueError):
+            logger.warning("[VerdictGenerator] pure_llm_mode: invalid truthfulness_percent, defaulting to 50.0")
+            truthfulness_percent = 50.0
+
+        # Extract rationale
+        rationale = llm_result.get("rationale", "No rationale provided by LLM")
+
+        # Extract claim_breakdown
+        claim_breakdown = llm_result.get("claim_breakdown", [])
+        if not isinstance(claim_breakdown, list):
+            claim_breakdown = []
+        if not claim_breakdown:
+            # Fallback: create minimal breakdown with single segment
+            claim_breakdown = [
+                {
+                    "claim_segment": claim,
+                    "status": "UNKNOWN",
+                    "supporting_fact": "",
+                    "source_url": "",
+                    "evidence_used_ids": [],
+                }
+            ]
+
+        # Extract evidence_map
+        evidence_map = llm_result.get("evidence_map", [])
+        if not isinstance(evidence_map, list):
+            evidence_map = []
+        if not evidence_map and evidence:
+            # Fallback: build minimal map from evidence
+            evidence_map = [
+                {
+                    "evidence_id": idx,
+                    "statement": ev.get("statement") or ev.get("text", ""),
+                    "relevance": "NEUTRAL",
+                    "relevance_score": 0.5,
+                    "source_url": ev.get("source_url") or ev.get("source", ""),
+                }
+                for idx, ev in enumerate(evidence[:10])
+            ]
+
+        # Extract key_findings
+        key_findings = llm_result.get("key_findings", [])
+        if not isinstance(key_findings, list):
+            key_findings = []
+
+        # Build minimal payload matching existing output structure
+        payload = {
+            # Core verdict fields
+            "verdict": verdict_str,
+            "confidence": confidence,
+            "calibrated_confidence": confidence,
+            "truthfulness_percent": truthfulness_percent,
+            "truth_score_percent": truthfulness_percent,
+            "rationale": rationale,
+            # Evidence structure
+            "claim_breakdown": claim_breakdown,
+            "evidence_map": evidence_map,
+            "key_findings": key_findings,
+            "evidence": list(evidence or []),
+            "evidence_count": len(evidence or []),
+            # Metadata
+            "claim": claim,
+            "pure_llm_mode": True,
+            "engine_version": "pure_llm_v1",
+            # Placeholders for backward compatibility
+            "class_probs": {
+                "true": 0.33,
+                "false": 0.33,
+                "unverifiable": 0.34,
+            },
+            "calibration_meta": {
+                "calibrator_version": "pure_llm_bypass",
+                "v2_policy_active": False,
+                "pure_llm_mode": True,
+            },
+            "policy_sufficient": True,
+            "trust_threshold_met": True,
+            "override_fired": False,
+            "override_reason": "pure_llm_mode_bypass",
+            # Analysis counts
+            "analysis_counts": {
+                "evidence_total_input": len(evidence or []),
+                "evidence_map_count": len(evidence_map),
+                "claim_breakdown_segments": len(claim_breakdown),
+                "pure_llm_mode": True,
+            },
+        }
+
+        logger.info(
+            "[VerdictGenerator] pure_llm_mode: verdict=%s confidence=%.3f truthfulness=%.1f",
+            verdict_str,
+            confidence,
+            truthfulness_percent,
+        )
+
+        return payload
+
     def _parse_verdict_result(
         self,
         llm_result: Dict[str, Any],
@@ -1275,6 +1418,16 @@ class VerdictGenerator:
         if verdict_str not in [v.value for v in Verdict]:
             verdict_str = "UNVERIFIABLE"
         llm_verdict = verdict_str
+
+        # PURE LLM MODE BYPASS: Trust LLM decisions without deterministic overrides
+        if self.pure_llm_mode:
+            logger.info("[VerdictGenerator] pure_llm_mode enabled: bypassing deterministic overrides")
+            return self._validate_pure_llm_output(
+                llm_result=llm_result,
+                claim=claim,
+                evidence=evidence,
+            )
+
         v2_enabled = bool(getattr(self, "v2_enabled", False))
         v2_shadow = bool(getattr(self, "v2_shadow", True))
         v2_fail_open = bool(getattr(self, "v2_fail_open", True))
@@ -9466,6 +9619,11 @@ class VerdictGenerator:
         """Normalize final payload and only force binary verdict when evidence is decisive."""
         payload = dict(payload or {})
         evidence = list(evidence or [])
+
+        # PURE LLM MODE BYPASS: Return payload unmodified
+        if self.pure_llm_mode:
+            logger.debug("[VerdictGenerator] pure_llm_mode: skipping binary enforcement")
+            return payload
 
         evidence_map = payload.get("evidence_map", []) or []
         if not evidence_map and evidence:
